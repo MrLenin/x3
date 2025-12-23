@@ -2869,6 +2869,13 @@ parse_line(char *line, int recursive)
     int argc, cmd, res=0;
     cmd_func_t *func;
 
+    /* Skip IRCv3 message tags if present (backward compatibility) */
+    if (line[0] == '@') {
+        char *tag_end = strchr(line, ' ');
+        if (tag_end)
+            line = tag_end + 1;
+    }
+
     argc = split_line(line, true, MAXNUMPARAMS, argv);
     cmd = self->uplink || !argv[0][1] || !argv[0][2];
     if (argc > cmd) {
