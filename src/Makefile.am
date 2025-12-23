@@ -72,6 +72,7 @@ x3_SOURCES = \
 	md5.c md5.h \
 	modcmd.c modcmd.h \
 	modules.c modules.h \
+	keycloak.c keycloak.h \
 	nickserv.c nickserv.h \
 	opserv.c opserv.h \
 	policer.c policer.h \
@@ -83,6 +84,7 @@ x3_SOURCES = \
 	shun.c shun.h \
 	timeq.c timeq.h \
 	tools.c x3ldap.c x3ldap.h \
+	keycloak.c keycloak.h \
 	version.c version.h
 
 checkdb_SOURCES = checkdb.c common.h compat.c compat.h dict-splay.c dict.h recdb.c recdb.h saxdb.c saxdb.h tools.c conf.h log.h modcmd.h saxdb.h timeq.h

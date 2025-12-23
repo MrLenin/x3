@@ -36,6 +36,10 @@
 #include <ldap.h>
 #endif
 
+#ifdef WITH_KEYCLOAK
+#include "keycloak.h"
+#endif
+
 #define NICKSERV_CONF_NAME "services/nickserv"
 
 #define KEY_DISABLE_NICKS "disable_nicks"
@@ -144,6 +148,20 @@
 #define KEY_LDAP_TIMEOUT "ldap_timeout"
 #endif
 
+#define KEY_KEYCLOAK_ENABLE "keycloak_enable"
+
+#ifdef WITH_KEYCLOAK
+#define KEY_KEYCLOAK_URI "keycloak_uri"
+#define KEY_KEYCLOAK_REALM "keycloak_realm"
+#define KEY_KEYCLOAK_CLIENT_ID "keycloak_client_id"
+#define KEY_KEYCLOAK_CLIENT_SECRET "keycloak_client_secret"
+#define KEY_KEYCLOAK_AUTOCREATE "keycloak_autocreate"
+#define KEY_KEYCLOAK_OPER_GROUP "keycloak_oper_group"
+#define KEY_KEYCLOAK_OPER_GROUP_LEVEL "keycloak_oper_group_level"
+#define KEY_KEYCLOAK_ATTR_OSLEVEL "keycloak_attr_oslevel"
+#define KEY_KEYCLOAK_EMAIL_POLICY "keycloak_email_policy"
+#endif
+
 #define NICKSERV_VALID_CHARS	"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_"
 
 #define NICKSERV_FUNC(NAME) MODCMD_FUNC(NAME)
@@ -175,6 +193,27 @@ static dict_t nickserv_allow_auth_dict; /* contains struct handle_info* */
 static dict_t nickserv_email_dict; /* contains struct handle_info_list*, indexed by email addr */
 static char handle_inverse_flags[256];
 static unsigned int flag_access_levels[32];
+
+#ifdef WITH_KEYCLOAK
+/* Keycloak client state - cached token for admin operations */
+static struct kc_realm kc_realm_config;
+static struct kc_client kc_client_config;
+static struct access_token *kc_admin_token = NULL;
+static time_t kc_token_expires = 0;
+
+/* Forward declarations for Keycloak wrapper functions */
+static int kc_ensure_token(void);
+static int kc_check_auth(const char *handle, const char *password);
+static int kc_get_user_info(const char *handle, char **email_out);
+static int kc_do_add(const char *handle, const char *password, const char *email);
+static int kc_do_modify(const char *handle, const char *password, const char *email);
+static int kc_delete_account(const char *handle);
+static int kc_do_oslevel(const char *handle, int level, int oldlevel);
+static int kc_add2group(const char *handle, const char *group);
+static int kc_delfromgroup(const char *handle, const char *group);
+static struct handle_info *loc_auth_oauth(const char *bearer_token, const char *username_hint, const char *hostmask);
+#endif
+
 static const struct message_entry msgtab[] = {
     { "NSMSG_NO_ANGLEBRACKETS", "The < and > in help indicate that that word is a required parameter, but DO NOT actually type them in messages to me." },
     { "NSMSG_HANDLE_EXISTS", "Account $b%s$b is already registered." },
@@ -601,6 +640,18 @@ nickserv_unregister_handle(struct handle_info *hi, struct userNode *notify, stru
                if(rc != LDAP_NO_SUCH_OBJECT)
                  return false; /* if theres noone there to delete, its kinda ok, right ?:) */
             }
+        }
+    }
+#endif
+#ifdef WITH_KEYCLOAK
+    if (nickserv_conf.keycloak_enable) {
+        int rc;
+        if ((rc = kc_delete_account(hi->handle)) != KC_SUCCESS) {
+            if (notify) {
+                send_message(notify, bot, "NSMSG_LDAP_FAIL", "keycloak error");
+            }
+            if (rc != KC_NOT_FOUND)
+                return false; /* if theres noone there to delete, its kinda ok, right ?:) */
         }
     }
 #endif
@@ -1165,6 +1216,17 @@ nickserv_register(struct userNode *user, struct userNode *settee, const char *ha
            if(user)
              send_message(user, nickserv, "NSMSG_LDAP_FAIL", ldap_err2string(rc));
            return 0;
+        }
+    }
+#endif
+#ifdef WITH_KEYCLOAK
+    if (nickserv_conf.keycloak_enable) {
+        int rc;
+        rc = kc_do_add(handle, (no_auth || !passwd ? NULL : passwd), NULL);
+        if (rc != KC_SUCCESS && rc != KC_ALREADY_EXISTS) {
+            if (user)
+                send_message(user, nickserv, "NSMSG_LDAP_FAIL", "keycloak error");
+            return 0;
         }
     }
 #endif
@@ -2116,7 +2178,11 @@ struct handle_info *loc_auth(char *sslfp, char *handle, char *password, char *us
     int ldap_result = LDAP_SUCCESS;
     char *email = NULL;
 #endif
-    
+#ifdef WITH_KEYCLOAK
+    int kc_result = KC_ERROR;
+    char *kc_email = NULL;
+#endif
+
     if (handle != NULL)
         hi = dict_find(nickserv_handle_dict, handle, NULL);
     if (!hi && (sslfp != NULL)) {
@@ -2177,12 +2243,57 @@ struct handle_info *loc_auth(char *sslfp, char *handle, char *password, char *us
     }
 #endif
 
+#ifdef WITH_KEYCLOAK
+    if (nickserv_conf.keycloak_enable && (password != NULL)) {
+        kc_result = kc_check_auth(handle, password);
+        if (!hi && (kc_result != KC_SUCCESS))
+            return NULL;
+        if (kc_result == KC_SUCCESS) {
+            /* Mark auth as successful */
+            auth++;
+        }
+
+        if (!hi && (kc_result == KC_SUCCESS) && nickserv_conf.keycloak_autocreate) {
+            /* user not found, but authed to keycloak successfully..
+             * create the account.
+             */
+            char *mask;
+
+            /* Add a *@* mask */
+            if (nickserv_conf.default_hostmask)
+                mask = "*@*";
+            else
+                return NULL; /* They dont have a *@* mask so they can't loc */
+
+            if (!(hi = nickserv_register(NULL, NULL, handle, password, 0))) {
+                return 0; /* couldn't add the user for some reason */
+            }
+
+            if (kc_get_user_info(handle, &kc_email) != KC_SUCCESS) {
+                if (nickserv_conf.email_required) {
+                    return 0;
+                }
+            }
+            if (kc_email) {
+                nickserv_set_email_addr(hi, kc_email);
+                free(kc_email);
+            }
+            if (mask) {
+                char *mask_canonicalized = canonicalize_hostmask(strdup(mask));
+                string_list_append(hi->masks, mask_canonicalized);
+            }
+            if (nickserv_conf.sync_log)
+                SyncLog("REGISTER %s %s %s %s", hi->handle, hi->passwd, "@", handle);
+        }
+    }
+#endif
+
     /* hi should now be a valid handle, if not return NULL */
     if (!hi)
         return NULL;
 
-#ifdef WITH_LDAP
-    if (password && *password && !nickserv_conf.ldap_enable) {
+#if defined(WITH_LDAP) || defined(WITH_KEYCLOAK)
+    if (password && *password && !nickserv_conf.ldap_enable && !nickserv_conf.keycloak_enable) {
 #else
     if (password && *password) {
 #endif
@@ -2369,6 +2480,10 @@ static NICKSERV_FUNC(cmd_auth)
     int ldap_result = LDAP_OTHER;
     char *email = NULL;
 #endif
+#ifdef WITH_KEYCLOAK
+    int kc_result = KC_ERROR;
+    char *kc_email = NULL;
+#endif
 
     if (user->handle_info) {
         reply("NSMSG_ALREADY_AUTHED", user->handle_info->handle);
@@ -2443,6 +2558,26 @@ static NICKSERV_FUNC(cmd_auth)
     }
 #endif
 
+#ifdef WITH_KEYCLOAK
+    if (nickserv_conf.keycloak_enable) {
+        kc_result = kc_check_auth(handle, passwd);
+        /* Get the users email address and update it */
+        if (kc_result == KC_SUCCESS) {
+            if (kc_get_user_info(handle, &kc_email) != KC_SUCCESS) {
+                if (nickserv_conf.email_required) {
+                    reply("NSMSG_LDAP_FAIL_GET_EMAIL", "keycloak error");
+                    return 0;
+                }
+            }
+        }
+        else if (kc_result != KC_FORBIDDEN) {
+            /* KC_FORBIDDEN = invalid credentials, anything else is an error */
+            reply("NSMSG_LDAP_FAIL", "keycloak error");
+            return 0;
+        }
+    }
+#endif
+
     if (!hi) {
 #ifdef WITH_LDAP
         if(nickserv_conf.ldap_enable && ldap_result == LDAP_SUCCESS && nickserv_conf.ldap_autocreate) {
@@ -2471,13 +2606,41 @@ static NICKSERV_FUNC(cmd_auth)
              if(nickserv_conf.sync_log)
                 SyncLog("REGISTER %s %s %s %s", hi->handle, hi->passwd, email ? email : "@", user->info);
         }
-        else {
+        else
 #endif
-             reply("NSMSG_HANDLE_NOT_FOUND");
-             return 0;
-#ifdef WITH_LDAP
+#ifdef WITH_KEYCLOAK
+        if (nickserv_conf.keycloak_enable && kc_result == KC_SUCCESS && nickserv_conf.keycloak_autocreate) {
+            /* user not found, but authed to keycloak successfully..
+             * create the account.
+             */
+            char *mask;
+            if (!(hi = nickserv_register(user, user, handle, passwd, 0))) {
+                reply("NSMSG_UNABLE_TO_ADD");
+                return 0; /* couldn't add the user for some reason */
+            }
+            /* Add a *@* mask */
+            if (nickserv_conf.default_hostmask)
+                mask = "*@*";
+            else
+                mask = generate_hostmask(user, GENMASK_OMITNICK|GENMASK_NO_HIDING|GENMASK_ANY_IDENT);
+
+            if (mask) {
+                char *mask_canonicalized = canonicalize_hostmask(strdup(mask));
+                string_list_append(hi->masks, mask_canonicalized);
+            }
+            if (kc_email) {
+                nickserv_set_email_addr(hi, kc_email);
+                free(kc_email);
+            }
+            if (nickserv_conf.sync_log)
+                SyncLog("REGISTER %s %s %s %s", hi->handle, hi->passwd, kc_email ? kc_email : "@", user->info);
         }
+        else
 #endif
+        {
+            reply("NSMSG_HANDLE_NOT_FOUND");
+            return 0;
+        }
     }
     /* Responses from here on look up the language used by the handle they asked about. */
     if (!valid_user_for(user, hi)) {
@@ -2496,6 +2659,12 @@ static NICKSERV_FUNC(cmd_auth)
     if (valid_user_sslfp(user, hi))
         sslfpauth = 1;
 
+#ifdef WITH_KEYCLOAK
+    if (nickserv_conf.keycloak_enable) {
+        if (kc_result == KC_SUCCESS)
+            sslfpauth = 1; /* reuse sslfpauth flag for successful keycloak auth */
+    }
+#endif
 #ifdef WITH_LDAP
     if(( ( nickserv_conf.ldap_enable && ldap_result == LDAP_INVALID_CREDENTIALS )  ||
         ( (!nickserv_conf.ldap_enable) && (!checkpass(passwd, hi->passwd)) ) ) && !sslfpauth) {
@@ -2963,6 +3132,9 @@ static NICKSERV_FUNC(cmd_pass)
 #ifdef WITH_LDAP
     int ldap_result;
 #endif
+#ifdef WITH_KEYCLOAK
+    int kc_result;
+#endif
 
     NICKSERV_MIN_PARMS(3);
     hi = user->handle_info;
@@ -2975,7 +3147,7 @@ static NICKSERV_FUNC(cmd_pass)
     if(nickserv_conf.ldap_enable) {
         ldap_result = ldap_check_auth(hi->handle, old_pass);
         if(ldap_result != LDAP_SUCCESS) {
-            if(ldap_result == LDAP_INVALID_CREDENTIALS) 
+            if(ldap_result == LDAP_INVALID_CREDENTIALS)
 	       reply("NSMSG_PASSWORD_INVALID");
             else
                reply("NSMSG_LDAP_FAIL", ldap_err2string(ldap_result));
@@ -2983,18 +3155,39 @@ static NICKSERV_FUNC(cmd_pass)
         }
     }else
 #endif
+#ifdef WITH_KEYCLOAK
+    if (nickserv_conf.keycloak_enable) {
+        kc_result = kc_check_auth(hi->handle, old_pass);
+        if (kc_result != KC_SUCCESS) {
+            if (kc_result == KC_FORBIDDEN)
+                reply("NSMSG_PASSWORD_INVALID");
+            else
+                reply("NSMSG_LDAP_FAIL", "keycloak error");
+            return 0;
+        }
+    } else
+#endif
     if (!checkpass(old_pass, hi->passwd)) {
         argv[1] = "BADPASS";
 	reply("NSMSG_PASSWORD_INVALID");
 	return 0;
     }
     cryptpass(new_pass, crypted);
-#ifdef WITH_LDAP   
+#ifdef WITH_LDAP
     if(nickserv_conf.ldap_enable && nickserv_conf.ldap_admin_dn) {
         int rc;
         if((rc = ldap_do_modify(hi->handle, crypted, NULL)) != LDAP_SUCCESS) {
              reply("NSMSG_LDAP_FAIL", ldap_err2string(rc));
              return 0;
+        }
+    }
+#endif
+#ifdef WITH_KEYCLOAK
+    if (nickserv_conf.keycloak_enable) {
+        int rc;
+        if ((rc = kc_do_modify(hi->handle, new_pass, NULL)) != KC_SUCCESS) {
+            reply("NSMSG_LDAP_FAIL", "keycloak error");
+            return 0;
         }
     }
 #endif
@@ -3549,6 +3742,16 @@ static OPTION_FUNC(opt_email)
                 }
             }
 #endif
+#ifdef WITH_KEYCLOAK
+            if (nickserv_conf.keycloak_enable) {
+                int rc;
+                if ((rc = kc_do_modify(hi->handle, NULL, argv[1])) != KC_SUCCESS) {
+                    if (!(noreply))
+                        reply("NSMSG_LDAP_FAIL", "keycloak error");
+                    return 0;
+                }
+            }
+#endif
             nickserv_set_email_addr(hi, argv[1]);
             if (hi->cookie)
                 nickserv_eat_cookie(hi->cookie);
@@ -3678,6 +3881,26 @@ oper_try_set_access(struct userNode *user, struct userNode *bot, struct handle_i
         send_message(user, bot, "NSMSG_LDAP_FAIL", ldap_err2string(rc));
         return 0;
       }
+    }
+#endif
+#ifdef WITH_KEYCLOAK
+    if (nickserv_conf.keycloak_enable && nickserv_conf.keycloak_oper_group && *nickserv_conf.keycloak_oper_group) {
+        int rc;
+        if (new_level >= nickserv_conf.keycloak_oper_group_level)
+            rc = kc_add2group(target->handle, nickserv_conf.keycloak_oper_group);
+        else
+            rc = kc_delfromgroup(target->handle, nickserv_conf.keycloak_oper_group);
+        if (rc != KC_SUCCESS && rc != KC_ALREADY_EXISTS && rc != KC_NOT_FOUND) {
+            send_message(user, bot, "NSMSG_LDAP_FAIL", "keycloak error");
+            return 0;
+        }
+    }
+    if (nickserv_conf.keycloak_enable && nickserv_conf.keycloak_attr_oslevel && *nickserv_conf.keycloak_attr_oslevel) {
+        int rc;
+        if ((rc = kc_do_oslevel(target->handle, new_level, target->opserv_level)) != KC_SUCCESS) {
+            send_message(user, bot, "NSMSG_LDAP_FAIL", "keycloak error");
+            return 0;
+        }
     }
 #endif
     if (target->opserv_level == new_level)
@@ -5178,6 +5401,358 @@ reclaim_action_from_string(const char *str) {
         return RECLAIM_NONE;
 }
 
+#ifdef WITH_KEYCLOAK
+/* Ensure we have a valid admin token, refresh if expired */
+static int
+kc_ensure_token(void)
+{
+    time_t now_time = time(NULL);
+
+    /* Check if token is still valid (with 60s margin) */
+    if (kc_admin_token && kc_token_expires > (now_time + 60)) {
+        kc_client_config.access_token = kc_admin_token;
+        return KC_SUCCESS;
+    }
+
+    /* Free old token if exists */
+    if (kc_admin_token) {
+        keycloak_free_access_token(kc_admin_token);
+        kc_admin_token = NULL;
+        kc_client_config.access_token = NULL;
+    }
+
+    /* Get new token */
+    int rc = keycloak_get_client_token(kc_realm_config, kc_client_config, &kc_admin_token);
+    if (rc != KC_SUCCESS) {
+        return rc;
+    }
+
+    kc_client_config.access_token = kc_admin_token;
+    kc_token_expires = now_time + kc_admin_token->expires_in;
+    return KC_SUCCESS;
+}
+
+/* Check authentication via Keycloak password grant */
+static int
+kc_check_auth(const char *handle, const char *password)
+{
+    struct access_token *user_token = NULL;
+    int rc;
+
+    rc = keycloak_get_user_token(kc_realm_config, kc_client_config,
+                                  handle, password, &user_token);
+    if (rc == KC_SUCCESS && user_token) {
+        keycloak_free_access_token(user_token);
+        return KC_SUCCESS;
+    }
+
+    return rc == KC_FORBIDDEN ? KC_FORBIDDEN : KC_ERROR;
+}
+
+/* Get user info (email) from Keycloak */
+static int
+kc_get_user_info(const char *handle, char **email_out)
+{
+    if (kc_ensure_token() != KC_SUCCESS) {
+        return KC_ERROR;
+    }
+
+    struct kc_user user;
+    int rc = keycloak_get_user(kc_realm_config, kc_client_config, handle, &user);
+    if (rc == KC_SUCCESS) {
+        if (user.email) {
+            *email_out = strdup(user.email);
+        }
+        keycloak_user_free(&user);
+        return KC_SUCCESS;
+    }
+
+    return rc;
+}
+
+/* Create user in Keycloak */
+static int
+kc_do_add(const char *handle, const char *password, const char *email)
+{
+    if (kc_ensure_token() != KC_SUCCESS) {
+        return KC_ERROR;
+    }
+
+    return keycloak_create_user(kc_realm_config, kc_client_config,
+                                handle, email ? email : "", password);
+}
+
+/* Modify user password and/or email in Keycloak */
+static int
+kc_do_modify(const char *handle, const char *password, const char *email)
+{
+    if (kc_ensure_token() != KC_SUCCESS) {
+        return KC_ERROR;
+    }
+
+    /* First get user ID */
+    struct kc_user user;
+    int rc = keycloak_get_user(kc_realm_config, kc_client_config, handle, &user);
+    if (rc != KC_SUCCESS) {
+        return rc;
+    }
+
+    char *user_id = strdup(user.id);
+    keycloak_user_free(&user);
+
+    rc = keycloak_update_user(kc_realm_config, kc_client_config,
+                              user_id, password, email);
+    free(user_id);
+    return rc;
+}
+
+/* Delete user from Keycloak */
+static int
+kc_delete_account(const char *handle)
+{
+    if (kc_ensure_token() != KC_SUCCESS) {
+        return KC_ERROR;
+    }
+
+    /* First get user ID */
+    struct kc_user user;
+    int rc = keycloak_get_user(kc_realm_config, kc_client_config, handle, &user);
+    if (rc != KC_SUCCESS) {
+        return rc;
+    }
+
+    char *user_id = strdup(user.id);
+    keycloak_user_free(&user);
+
+    rc = keycloak_delete_user(kc_realm_config, kc_client_config, user_id);
+    free(user_id);
+    return rc;
+}
+
+/* Set opserv level attribute and manage group membership */
+static int
+kc_do_oslevel(const char *handle, int level, int oldlevel)
+{
+    if (kc_ensure_token() != KC_SUCCESS) {
+        return KC_ERROR;
+    }
+
+    /* Get user ID */
+    struct kc_user user;
+    int rc = keycloak_get_user(kc_realm_config, kc_client_config, handle, &user);
+    if (rc != KC_SUCCESS) {
+        return rc;
+    }
+
+    char *user_id = strdup(user.id);
+    keycloak_user_free(&user);
+
+    /* Set the opserv_level attribute */
+    char level_str[16];
+    snprintf(level_str, sizeof(level_str), "%d", level);
+    rc = keycloak_set_user_attribute(kc_realm_config, kc_client_config,
+                                     user_id, nickserv_conf.keycloak_attr_oslevel,
+                                     level_str);
+
+    free(user_id);
+    return rc;
+}
+
+/* Add user to Keycloak group */
+static int
+kc_add2group(const char *handle, const char *group_name)
+{
+    if (kc_ensure_token() != KC_SUCCESS) {
+        return KC_ERROR;
+    }
+
+    /* Get user ID */
+    struct kc_user user;
+    int rc = keycloak_get_user(kc_realm_config, kc_client_config, handle, &user);
+    if (rc != KC_SUCCESS) {
+        return rc;
+    }
+    char *user_id = strdup(user.id);
+    keycloak_user_free(&user);
+
+    /* Get group ID */
+    char *group_id = NULL;
+    rc = keycloak_get_group_by_name(kc_realm_config, kc_client_config,
+                                    group_name, &group_id);
+    if (rc != KC_SUCCESS) {
+        free(user_id);
+        return rc;
+    }
+
+    rc = keycloak_add_user_to_group(kc_realm_config, kc_client_config,
+                                    user_id, group_id);
+    free(user_id);
+    free(group_id);
+    return rc;
+}
+
+/* Remove user from Keycloak group */
+static int
+kc_delfromgroup(const char *handle, const char *group_name)
+{
+    if (kc_ensure_token() != KC_SUCCESS) {
+        return KC_ERROR;
+    }
+
+    /* Get user ID */
+    struct kc_user user;
+    int rc = keycloak_get_user(kc_realm_config, kc_client_config, handle, &user);
+    if (rc != KC_SUCCESS) {
+        return rc;
+    }
+    char *user_id = strdup(user.id);
+    keycloak_user_free(&user);
+
+    /* Get group ID */
+    char *group_id = NULL;
+    rc = keycloak_get_group_by_name(kc_realm_config, kc_client_config,
+                                    group_name, &group_id);
+    if (rc != KC_SUCCESS) {
+        free(user_id);
+        return rc;
+    }
+
+    rc = keycloak_remove_user_from_group(kc_realm_config, kc_client_config,
+                                         user_id, group_id);
+    free(user_id);
+    free(group_id);
+    return rc;
+}
+
+/**
+ * Authenticate via OAuth2 bearer token (for SASL OAUTHBEARER)
+ */
+static struct handle_info *
+loc_auth_oauth(const char *bearer_token, const char *username_hint, const char *hostmask)
+{
+    struct kc_token_info *token_info = NULL;
+    struct handle_info *hi = NULL;
+    const char *username;
+    int rc;
+
+    if (!nickserv_conf.keycloak_enable || !bearer_token) {
+        return NULL;
+    }
+
+    if (kc_ensure_token() != KC_SUCCESS) {
+        log_module(NS_LOG, LOG_WARNING, "loc_auth_oauth: Failed to get admin token");
+        return NULL;
+    }
+
+    /* Introspect the bearer token */
+    rc = keycloak_introspect_token(kc_realm_config, kc_client_config,
+                                   bearer_token, &token_info);
+
+    if (rc != KC_SUCCESS || !token_info) {
+        log_module(NS_LOG, LOG_DEBUG, "loc_auth_oauth: Token introspection failed (rc=%d)", rc);
+        return NULL;
+    }
+
+    if (!token_info->active) {
+        log_module(NS_LOG, LOG_DEBUG, "loc_auth_oauth: Token is not active");
+        keycloak_free_token_info(token_info);
+        return NULL;
+    }
+
+    /* Use username from token, or fall back to hint */
+    username = token_info->username;
+    if (!username || !*username) {
+        username = username_hint;
+    }
+
+    if (!username || !*username) {
+        log_module(NS_LOG, LOG_DEBUG, "loc_auth_oauth: No username in token or hint");
+        keycloak_free_token_info(token_info);
+        return NULL;
+    }
+
+    log_module(NS_LOG, LOG_DEBUG, "loc_auth_oauth: Token valid for user %s", username);
+
+    /* Look up local account */
+    hi = get_handle_info(username);
+
+    if (!hi && nickserv_conf.keycloak_autocreate) {
+        /* Auto-create local account from Keycloak user */
+        char *mask;
+        char *email = NULL;
+
+        log_module(NS_LOG, LOG_INFO, "loc_auth_oauth: Auto-creating account for %s", username);
+
+        /* Get email from token or Keycloak */
+        if (token_info->email && *token_info->email) {
+            email = strdup(token_info->email);
+        } else {
+            kc_get_user_info(username, &email);
+        }
+
+        /* Create the account (without password - OAuth only) */
+        if (!(hi = nickserv_register(NULL, NULL, username, NULL, 0))) {
+            log_module(NS_LOG, LOG_WARNING, "loc_auth_oauth: Failed to create account for %s", username);
+            keycloak_free_token_info(token_info);
+            free(email);
+            return NULL;
+        }
+
+        /* Add a *@* mask for OAuth users */
+        if (nickserv_conf.default_hostmask)
+            mask = "*@*";
+        else
+            mask = NULL;
+
+        if (mask) {
+            char *mask_canonicalized = canonicalize_hostmask(strdup(mask));
+            string_list_append(hi->masks, mask_canonicalized);
+        }
+
+        if (email) {
+            nickserv_set_email_addr(hi, email);
+            free(email);
+        }
+
+        /* Set opserv level from token if available */
+        if (token_info->opserv_level > 0) {
+            hi->opserv_level = token_info->opserv_level;
+        }
+
+        if (nickserv_conf.sync_log)
+            SyncLog("REGISTER %s %s %s %s", hi->handle, hi->passwd ? hi->passwd : "*", "@", "oauth");
+    }
+
+    if (!hi) {
+        log_module(NS_LOG, LOG_DEBUG, "loc_auth_oauth: Account %s not found and autocreate disabled", username);
+        keycloak_free_token_info(token_info);
+        return NULL;
+    }
+
+    /* Check if account is suspended */
+    if (HANDLE_FLAGGED(hi, SUSPENDED)) {
+        log_module(NS_LOG, LOG_DEBUG, "loc_auth_oauth: Account %s is suspended", username);
+        keycloak_free_token_info(token_info);
+        return NULL;
+    }
+
+    /* Check maxlogins */
+    int used = 0;
+    int maxlogins = hi->maxlogins ? hi->maxlogins : nickserv_conf.default_maxlogins;
+    struct userNode *other;
+    for (other = hi->users; other; other = other->next_authed) {
+        if (++used >= maxlogins) {
+            log_module(NS_LOG, LOG_DEBUG, "loc_auth_oauth: Account %s at max logins", username);
+            keycloak_free_token_info(token_info);
+            return NULL;
+        }
+    }
+
+    keycloak_free_token_info(token_info);
+    return hi;
+}
+#endif /* WITH_KEYCLOAK */
+
 static void
 nickserv_conf_read(void)
 {
@@ -5385,6 +5960,9 @@ nickserv_conf_read(void)
     str = database_get_data(conf_node, KEY_LDAP_ENABLE, RECDB_QSTRING);
     nickserv_conf.ldap_enable = str ? strtoul(str, NULL, 0) : 0;
 
+    str = database_get_data(conf_node, KEY_KEYCLOAK_ENABLE, RECDB_QSTRING);
+    nickserv_conf.keycloak_enable = str ? strtoul(str, NULL, 0) : 0;
+
     str = database_get_data(conf_node, KEY_FORCE_HANDLES_LOWERCASE, RECDB_QSTRING);
     nickserv_conf.force_handles_lowercase = str ? strtol(str, NULL, 0) : 0;
 
@@ -5395,6 +5973,14 @@ nickserv_conf_read(void)
         exit(2);
         /* nickserv_conf.ldap_enable = 0; */
         /* sleep(5); */
+    }
+#endif
+
+#ifndef WITH_KEYCLOAK
+    if (nickserv_conf.keycloak_enable > 0) {
+        /* keycloak is enabled but not compiled in - error out */
+        log_module(MAIN_LOG, LOG_ERROR, "keycloak is enabled in config, but not compiled in!");
+        exit(2);
     }
 #endif 
 
@@ -5454,6 +6040,46 @@ nickserv_conf_read(void)
     }
     nickserv_conf.ldap_object_classes = strlist;
 
+#endif
+
+#ifdef WITH_KEYCLOAK
+    str = database_get_data(conf_node, KEY_KEYCLOAK_URI, RECDB_QSTRING);
+    nickserv_conf.keycloak_uri = str ? str : "";
+
+    str = database_get_data(conf_node, KEY_KEYCLOAK_REALM, RECDB_QSTRING);
+    nickserv_conf.keycloak_realm = str ? str : "";
+
+    str = database_get_data(conf_node, KEY_KEYCLOAK_CLIENT_ID, RECDB_QSTRING);
+    nickserv_conf.keycloak_client_id = str ? str : "";
+
+    str = database_get_data(conf_node, KEY_KEYCLOAK_CLIENT_SECRET, RECDB_QSTRING);
+    nickserv_conf.keycloak_client_secret = str ? str : "";
+
+    str = database_get_data(conf_node, KEY_KEYCLOAK_AUTOCREATE, RECDB_QSTRING);
+    nickserv_conf.keycloak_autocreate = str ? strtoul(str, NULL, 0) : 0;
+
+    str = database_get_data(conf_node, KEY_KEYCLOAK_OPER_GROUP, RECDB_QSTRING);
+    nickserv_conf.keycloak_oper_group = str ? str : "";
+
+    str = database_get_data(conf_node, KEY_KEYCLOAK_OPER_GROUP_LEVEL, RECDB_QSTRING);
+    nickserv_conf.keycloak_oper_group_level = str ? strtoul(str, NULL, 0) : 99;
+
+    str = database_get_data(conf_node, KEY_KEYCLOAK_ATTR_OSLEVEL, RECDB_QSTRING);
+    nickserv_conf.keycloak_attr_oslevel = str ? str : "";
+
+    str = database_get_data(conf_node, KEY_KEYCLOAK_EMAIL_POLICY, RECDB_QSTRING);
+    nickserv_conf.keycloak_email_policy = str ? strtoul(str, NULL, 0) : 0;
+
+    /* Initialize Keycloak client if enabled */
+    if (nickserv_conf.keycloak_enable) {
+        memset(&kc_realm_config, 0, sizeof(kc_realm_config));
+        memset(&kc_client_config, 0, sizeof(kc_client_config));
+        kc_realm_config.base_url = nickserv_conf.keycloak_uri;
+        kc_realm_config.realm = nickserv_conf.keycloak_realm;
+        kc_client_config.client_id = nickserv_conf.keycloak_client_id;
+        kc_client_config.client_secret = nickserv_conf.keycloak_client_secret;
+        log_module(NS_LOG, LOG_INFO, "Keycloak integration enabled for realm %s", nickserv_conf.keycloak_realm);
+    }
 #endif
 
 }

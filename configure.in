@@ -543,6 +543,56 @@ fi
 )
 
 dnl *********************************************************************
+dnl ** KEYCLOAK *********************************************************
+dnl *********************************************************************
+
+dnl keycloak checking (requires libcurl and libjansson)
+AC_ARG_WITH(keycloak,
+[  --with-keycloak        Enable Keycloak authentication support (requires libcurl and libjansson)],
+[with_keycloak=$withval], [with_keycloak=no])
+
+if test "x$with_keycloak" = "xyes"; then
+   AC_MSG_RESULT([Checking for Keycloak dependencies (libcurl, libjansson)])
+
+   dnl Check for libcurl
+   AC_CHECK_LIB(curl, curl_easy_init,
+   [
+      LIBS="-lcurl $LIBS"
+      AC_CHECK_HEADERS(curl/curl.h,
+      [
+         have_curl=yes
+      ],
+      [
+         AC_MSG_ERROR([curl/curl.h not found but required for --with-keycloak])
+      ])
+   ],
+   [
+      AC_MSG_ERROR([libcurl not found but required for --with-keycloak])
+   ])
+
+   dnl Check for libjansson
+   AC_CHECK_LIB(jansson, json_object,
+   [
+      LIBS="-ljansson $LIBS"
+      AC_CHECK_HEADERS(jansson.h,
+      [
+         have_jansson=yes
+      ],
+      [
+         AC_MSG_ERROR([jansson.h not found but required for --with-keycloak])
+      ])
+   ],
+   [
+      AC_MSG_ERROR([libjansson not found but required for --with-keycloak])
+   ])
+
+   if test "x$have_curl" = "xyes" -a "x$have_jansson" = "xyes"; then
+      AC_DEFINE(WITH_KEYCLOAK, 1, [Define if Keycloak support is enabled])
+      keycloak_message="Keycloak support:   enabled"
+   fi
+fi
+
+dnl *********************************************************************
 dnl ** PYTHON ***********************************************************
 dnl *********************************************************************
 
@@ -628,7 +678,8 @@ X3 is now configured as follows:
   Protocol:           $x3_ircd
   Regexp Library      TRE $tre_version
   Coredumper Library  Coredumper $core_version
-  $ldap_message 
+  $ldap_message
+  $keycloak_message
   python: $python
 
   Install to:         $prefix

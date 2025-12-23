@@ -278,6 +278,22 @@
         //"ldap_field_group_member" "memberUid"; // what field group members are in
         //"ldap_timeout" "10"; // seconds
 
+        // Keycloak configuration
+        // Keycloak is an open source identity and access management solution.
+        // Configure X3 to use Keycloak for authentication instead of local passwords.
+        // Also enables SASL OAUTHBEARER mechanism for IRC client authentication.
+
+        //"keycloak_enable" "0";
+        //"keycloak_uri" "https://keycloak.example.com";
+        //"keycloak_realm" "afternet";
+        //"keycloak_client_id" "x3-services";
+        //"keycloak_client_secret" "your-client-secret-here";
+        //"keycloak_autocreate" "1";  // automatically create accounts if they exist in keycloak but not x3
+        //"keycloak_oper_group" "x3-opers";  // group name for opers (optional)
+        //"keycloak_oper_group_level" "99";  // min level to add to oper group
+        //"keycloak_attr_oslevel" "x3_opserv_level";  // custom attribute for opserv level
+        //"keycloak_email_policy" "0";  // 0=trust KC, 1=always X3 cookie, 2=check emailVerified
+
     };
 
     /* 

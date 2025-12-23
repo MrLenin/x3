@@ -216,6 +216,18 @@ struct nickserv_config {
     const char *ldap_field_group_member;
     unsigned int ldap_timeout;
 #endif
+    unsigned int keycloak_enable;
+#ifdef WITH_KEYCLOAK
+    const char *keycloak_uri;               // Keycloak server URL
+    const char *keycloak_realm;             // Realm name
+    const char *keycloak_client_id;         // Service account client ID
+    const char *keycloak_client_secret;     // Service account client secret
+    unsigned int keycloak_autocreate;       // Auto-create local accounts from Keycloak
+    const char *keycloak_oper_group;        // Group name for opers (optional)
+    unsigned int keycloak_oper_group_level; // Min level to add to oper group
+    const char *keycloak_attr_oslevel;      // Attribute name for opserv_level
+    unsigned int keycloak_email_policy;     // 0=trust KC, 1=always X3 cookie, 2=check emailVerified
+#endif
 };
 
 void init_nickserv(const char *nick);

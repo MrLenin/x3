@@ -4,7 +4,7 @@ ENV GID=1234
 ENV UID=1234
 
 RUN DEBIAN_FRONTEND=noninteractive RUNLEVEL=1 apt-get update 
-RUN DEBIAN_FRONTEND=noninteractive RUNLEVEL=1 apt-get update && apt-get -y install build-essential libssl-dev autoconf2.69 automake1.11 flex byacc gawk git vim procps net-tools libtre5 libtre-dev
+RUN DEBIAN_FRONTEND=noninteractive RUNLEVEL=1 apt-get update && apt-get -y install build-essential libcurl4-openssl-dev libjansson-dev libssl-dev autoconf2.69 automake1.11 flex byacc gawk git vim procps net-tools libtre5 libtre-dev
 
 RUN mkdir -p /x3
 RUN mkdir -p /x3/x3src
@@ -13,12 +13,13 @@ COPY . /x3/x3src
 RUN groupadd -g ${GID} x3
 RUN useradd -u ${UID} -g ${GID} x3
 RUN chown -R x3:x3 /x3
+
 USER x3
 
 WORKDIR  /x3/x3src
 
 #RUN ./autogen.sh
-RUN ./configure --prefix=/x3 --enable-modules=snoop,memoserv,helpserv
+RUN ./configure --prefix=/x3 --enable-modules=snoop,memoserv,helpserv --with-keycloak
 
 RUN make
 RUN make install
