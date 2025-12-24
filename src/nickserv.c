@@ -194,12 +194,16 @@ static dict_t nickserv_email_dict; /* contains struct handle_info_list*, indexed
 static char handle_inverse_flags[256];
 static unsigned int flag_access_levels[32];
 
+/* Track last-broadcast SASL mechanism list for change detection */
+static char last_sasl_mechs[128] = "";
+
 #ifdef WITH_KEYCLOAK
 /* Keycloak client state - cached token for admin operations */
 static struct kc_realm kc_realm_config;
 static struct kc_client kc_client_config;
 static struct access_token *kc_admin_token = NULL;
 static time_t kc_token_expires = 0;
+static int keycloak_available = 1;  /* Track Keycloak availability */
 
 /* Forward declarations for Keycloak wrapper functions */
 static int kc_ensure_token(void);
@@ -2414,12 +2418,27 @@ const char *nickserv_get_sasl_mechanisms(void)
     strcat(mechs, ",EXTERNAL");
 
 #ifdef WITH_KEYCLOAK
-    /* Add OAUTHBEARER if Keycloak is enabled */
-    if (nickserv_conf.keycloak_enable)
+    /* Add OAUTHBEARER if Keycloak is enabled AND available */
+    if (nickserv_conf.keycloak_enable && keycloak_available)
         strcat(mechs, ",OAUTHBEARER");
 #endif
 
     return mechs;
+}
+
+void nickserv_update_sasl_mechanisms(void)
+{
+    const char *mechs;
+
+    /* Get current mechanism list */
+    mechs = nickserv_get_sasl_mechanisms();
+
+    /* Only broadcast if mechanism list has changed */
+    if (strcmp(mechs, last_sasl_mechs) != 0) {
+        strcpy(last_sasl_mechs, mechs);
+        irc_sasl_mechs_broadcast(mechs);
+        log_module(NS_LOG, LOG_INFO, "SASL mechanisms updated: %s", mechs);
+    }
 }
 
 void nickserv_do_autoauth(struct userNode *user)
@@ -5421,6 +5440,18 @@ reclaim_action_from_string(const char *str) {
 }
 
 #ifdef WITH_KEYCLOAK
+/* Update Keycloak availability and broadcast mechanism change if needed */
+static void
+kc_set_available(int available)
+{
+    if (keycloak_available != available) {
+        keycloak_available = available;
+        log_module(NS_LOG, LOG_INFO, "Keycloak availability changed: %s",
+                   available ? "available" : "unavailable");
+        nickserv_update_sasl_mechanisms();
+    }
+}
+
 /* Ensure we have a valid admin token, refresh if expired */
 static int
 kc_ensure_token(void)
@@ -5443,9 +5474,11 @@ kc_ensure_token(void)
     /* Get new token */
     int rc = keycloak_get_client_token(kc_realm_config, kc_client_config, &kc_admin_token);
     if (rc != KC_SUCCESS) {
+        kc_set_available(0);
         return rc;
     }
 
+    kc_set_available(1);
     kc_client_config.access_token = kc_admin_token;
     kc_token_expires = now_time + kc_admin_token->expires_in;
     return KC_SUCCESS;

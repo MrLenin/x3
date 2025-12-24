@@ -1453,8 +1453,8 @@ static CMD_FUNC(cmd_eob)
         irc_eob();
         irc_eob_ack();
 
-        /* Broadcast SASL mechanism list to all servers */
-        irc_sasl_mechs_broadcast(nickserv_get_sasl_mechanisms());
+        /* Broadcast SASL mechanism list to all servers (uses change tracking) */
+        nickserv_update_sasl_mechanisms();
 
         /* now that we know who our uplink is,
          * we can center the routing map and activate auto-routing.

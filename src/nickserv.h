@@ -245,6 +245,8 @@ void nickserv_do_autoauth(struct userNode *user);
 
 /* Get the SASL mechanism list based on current configuration */
 const char *nickserv_get_sasl_mechanisms(void);
+/* Check if mechanism list has changed and broadcast update to IRCd */
+void nickserv_update_sasl_mechanisms(void);
 
 struct handle_info *get_victim_oper(struct userNode *user, const char *target);
 struct handle_info *loc_auth(char *sslfp, char *handle, char *password, char *userhost);
