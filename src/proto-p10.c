@@ -2668,6 +2668,8 @@ static CMD_FUNC(cmd_register_acct)
     const char *account;
     const char *email;
     const char *password;
+    char result_msg[256];
+    enum nickserv_register_result result;
 
     if (argc < 5)
         return 0;
@@ -2685,10 +2687,39 @@ static CMD_FUNC(cmd_register_acct)
     log_module(MAIN_LOG, LOG_INFO, "RG (REGISTER) request: account=%s email=%s from %s!%s",
                account, email, user->nick, user->numeric);
 
-    /* TODO: Call into NickServ to actually register the account.
-     * For now, send a "not implemented" response. */
-    irc_regreply(user->numeric, 'F', account,
-                 "Registration via REGISTER command not yet implemented - use /msg NickServ REGISTER");
+    /* Call NickServ to register the account */
+    result = nickserv_ircv3_register(user, account, email, password, result_msg);
+
+    /* Map result to REGREPLY status */
+    switch (result) {
+    case NSREG_SUCCESS:
+        irc_regreply(user->numeric, 'S', account, result_msg);
+        break;
+    case NSREG_VERIFY_REQUIRED:
+        irc_regreply(user->numeric, 'V', account, result_msg);
+        break;
+    case NSREG_ACCOUNT_EXISTS:
+        irc_regreply(user->numeric, 'F', account, result_msg[0] ? result_msg : "ACCOUNT_EXISTS");
+        break;
+    case NSREG_WEAK_PASSWORD:
+        irc_regreply(user->numeric, 'F', account, result_msg[0] ? result_msg : "WEAK_PASSWORD");
+        break;
+    case NSREG_INVALID_EMAIL:
+    case NSREG_EMAIL_PROHIBITED:
+    case NSREG_EMAIL_LIMIT:
+        irc_regreply(user->numeric, 'F', account, result_msg[0] ? result_msg : "INVALID_EMAIL");
+        break;
+    case NSREG_INVALID_HANDLE:
+        irc_regreply(user->numeric, 'F', account, result_msg[0] ? result_msg : "BAD_ACCOUNT_NAME");
+        break;
+    case NSREG_ALREADY_AUTHED:
+        irc_regreply(user->numeric, 'F', account, result_msg[0] ? result_msg : "ALREADY_AUTHENTICATED");
+        break;
+    case NSREG_INTERNAL_ERROR:
+    default:
+        irc_regreply(user->numeric, 'F', account, result_msg[0] ? result_msg : "TEMPORARILY_UNAVAILABLE");
+        break;
+    }
 
     return 1;
 }
@@ -2700,7 +2731,9 @@ static CMD_FUNC(cmd_verify_acct)
 {
     struct userNode *user;
     const char *account;
-    /* const char *code; */
+    const char *code;
+    char result_msg[256];
+    enum nickserv_verify_result result;
 
     if (argc < 4)
         return 0;
@@ -2712,14 +2745,36 @@ static CMD_FUNC(cmd_verify_acct)
     }
 
     account = argv[2];
-    /* code = argv[3]; */
+    code = argv[3];
 
     log_module(MAIN_LOG, LOG_INFO, "VF (VERIFY) request: account=%s from %s!%s",
                account, user->nick, user->numeric);
 
-    /* TODO: Call into NickServ to verify the account. */
-    irc_regreply(user->numeric, 'F', account,
-                 "Verification via VERIFY command not yet implemented");
+    /* Call NickServ to verify the account */
+    result = nickserv_ircv3_verify(user, account, code, result_msg);
+
+    /* Map result to REGREPLY status */
+    switch (result) {
+    case NSVERIFY_SUCCESS:
+        irc_regreply(user->numeric, 'S', account, result_msg);
+        break;
+    case NSVERIFY_NO_ACCOUNT:
+        irc_regreply(user->numeric, 'F', account, result_msg[0] ? result_msg : "Account not found");
+        break;
+    case NSVERIFY_NO_COOKIE:
+        irc_regreply(user->numeric, 'F', account, result_msg[0] ? result_msg : "No verification pending");
+        break;
+    case NSVERIFY_BAD_CODE:
+        irc_regreply(user->numeric, 'F', account, result_msg[0] ? result_msg : "INVALID_CODE");
+        break;
+    case NSVERIFY_SUSPENDED:
+        irc_regreply(user->numeric, 'F', account, result_msg[0] ? result_msg : "Account suspended");
+        break;
+    case NSVERIFY_INTERNAL_ERROR:
+    default:
+        irc_regreply(user->numeric, 'F', account, result_msg[0] ? result_msg : "TEMPORARILY_UNAVAILABLE");
+        break;
+    }
 
     return 1;
 }

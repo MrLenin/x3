@@ -6724,6 +6724,241 @@ void handle_loc_auth_oper(struct userNode *user, UNUSED_ARG(struct handle_info *
     }
 }
 
+/* ================== IRCv3 account-registration API ================== */
+
+/**
+ * Register a new account via IRCv3 REGISTER command.
+ * This is the exported function called from proto-p10.c when handling RG token.
+ */
+enum nickserv_register_result
+nickserv_ircv3_register(struct userNode *user, const char *handle,
+                        const char *email, const char *password, char *result_msg)
+{
+    struct handle_info *hi;
+    struct handle_info_list *hil;
+    char crypted[MD5_CRYPT_LENGTH] = "";
+    int email_required;
+    int use_email;
+    const char *actual_handle;
+
+    /* Default empty result message */
+    result_msg[0] = '\0';
+
+    /* Check if user is already authenticated */
+    if (user->handle_info) {
+        snprintf(result_msg, 256, "You are already authenticated as %s", user->handle_info->handle);
+        return NSREG_ALREADY_AUTHED;
+    }
+
+    /* Resolve handle ("*" means use current nick) */
+    actual_handle = (handle[0] == '*' && handle[1] == '\0') ? user->nick : handle;
+
+    /* Validate handle length */
+    if (strlen(actual_handle) > NICKSERV_HANDLE_LEN) {
+        snprintf(result_msg, 256, "Account name too long (max %d characters)", NICKSERV_HANDLE_LEN);
+        return NSREG_INVALID_HANDLE;
+    }
+
+    /* Check if account already exists */
+    if (get_handle_info(actual_handle)) {
+        snprintf(result_msg, 256, "Account '%s' already exists", actual_handle);
+        return NSREG_ACCOUNT_EXISTS;
+    }
+
+    /* Determine if email is required and whether user provided one */
+    use_email = !(email[0] == '*' && email[1] == '\0');
+    email_required = nickserv_conf.email_required;
+
+    if (email_required && !use_email) {
+        snprintf(result_msg, 256, "Email address is required for registration");
+        return NSREG_INVALID_EMAIL;
+    }
+
+    /* Validate email if provided */
+    if (use_email) {
+        const char *prohibited_reason;
+
+        if (!valid_email(email)) {
+            snprintf(result_msg, 256, "Invalid email address format");
+            return NSREG_INVALID_EMAIL;
+        }
+
+        if ((prohibited_reason = mail_prohibited_address(email))) {
+            snprintf(result_msg, 256, "Email address not allowed: %s", prohibited_reason);
+            return NSREG_EMAIL_PROHIBITED;
+        }
+
+        /* Check handles per email limit */
+        if ((hil = dict_find(nickserv_email_dict, email, NULL))) {
+            if (hil->used >= nickserv_conf.handles_per_email) {
+                snprintf(result_msg, 256, "Too many accounts registered with this email");
+                return NSREG_EMAIL_LIMIT;
+            }
+        }
+    }
+
+    /* Validate password strength */
+    if (!is_secure_password(actual_handle, password, NULL)) {
+        snprintf(result_msg, 256, "Password does not meet requirements "
+                 "(min %lu chars, %lu digits, %lu uppercase, %lu lowercase)",
+                 nickserv_conf.password_min_length,
+                 nickserv_conf.password_min_digits,
+                 nickserv_conf.password_min_upper,
+                 nickserv_conf.password_min_lower);
+        return NSREG_WEAK_PASSWORD;
+    }
+
+    /* Hash the password */
+    cryptpass(password, crypted);
+
+#ifdef WITH_LDAP
+    if (nickserv_conf.ldap_enable && nickserv_conf.ldap_admin_dn) {
+        int rc = ldap_do_add(actual_handle, crypted, use_email ? email : NULL);
+        if (LDAP_SUCCESS != rc && LDAP_ALREADY_EXISTS != rc) {
+            snprintf(result_msg, 256, "LDAP error: %s", ldap_err2string(rc));
+            return NSREG_INTERNAL_ERROR;
+        }
+    }
+#endif
+#ifdef WITH_KEYCLOAK
+    if (nickserv_conf.keycloak_enable) {
+        int rc = kc_do_add(actual_handle, password, use_email ? email : NULL);
+        if (rc != KC_SUCCESS && rc != KC_ALREADY_EXISTS) {
+            snprintf(result_msg, 256, "Keycloak error");
+            return NSREG_INTERNAL_ERROR;
+        }
+    }
+#endif
+
+    /* Create the account - with email verification if email was provided */
+    if (use_email && nickserv_conf.email_enabled) {
+        /* Create account but require email verification */
+        hi = register_handle(actual_handle, "", 0); /* Empty password initially */
+        if (!hi) {
+            snprintf(result_msg, 256, "Failed to create account");
+            return NSREG_INTERNAL_ERROR;
+        }
+        hi->masks = alloc_string_list(1);
+        hi->sslfps = alloc_string_list(1);
+        hi->ignores = alloc_string_list(1);
+        hi->users = NULL;
+        hi->language = lang_C;
+        hi->registered = now;
+        hi->lastseen = now;
+        hi->flags = HI_DEFAULT_FLAGS;
+
+        /* Set the email address */
+        nickserv_set_email_addr(hi, email);
+
+        /* Create activation cookie with hashed password */
+        nickserv_make_cookie(user, hi, ACTIVATION, crypted, 0);
+
+        snprintf(result_msg, 256, "Verification email sent to %s", email);
+        return NSREG_VERIFY_REQUIRED;
+    } else {
+        /* No email verification needed - create and authenticate immediately */
+        hi = register_handle(actual_handle, crypted, 0);
+        if (!hi) {
+            snprintf(result_msg, 256, "Failed to create account");
+            return NSREG_INTERNAL_ERROR;
+        }
+        hi->masks = alloc_string_list(1);
+        hi->sslfps = alloc_string_list(1);
+        hi->ignores = alloc_string_list(1);
+        hi->users = NULL;
+        hi->language = lang_C;
+        hi->registered = now;
+        hi->lastseen = now;
+        hi->flags = HI_DEFAULT_FLAGS;
+
+        /* Set email if provided (but no verification needed) */
+        if (use_email) {
+            nickserv_set_email_addr(hi, email);
+        }
+
+        /* Authenticate the user */
+        set_user_handle_info(user, hi, 1);
+
+        /* Register the nick if possible */
+        if (!nickserv_conf.disable_nicks && is_registerable_nick(user->nick)) {
+            register_nick(user->nick, hi);
+        }
+
+        snprintf(result_msg, 256, "Account '%s' created and authenticated", actual_handle);
+        return NSREG_SUCCESS;
+    }
+}
+
+/**
+ * Verify a pending account via IRCv3 VERIFY command.
+ * This is the exported function called from proto-p10.c when handling VF token.
+ */
+enum nickserv_verify_result
+nickserv_ircv3_verify(struct userNode *user, const char *handle,
+                      const char *code, char *result_msg)
+{
+    struct handle_info *hi;
+
+    /* Default empty result message */
+    result_msg[0] = '\0';
+
+    /* Find the account */
+    hi = get_handle_info(handle);
+    if (!hi) {
+        snprintf(result_msg, 256, "Account '%s' not found", handle);
+        return NSVERIFY_NO_ACCOUNT;
+    }
+
+    /* Check if suspended */
+    if (HANDLE_FLAGGED(hi, SUSPENDED)) {
+        snprintf(result_msg, 256, "Account '%s' is suspended", handle);
+        return NSVERIFY_SUSPENDED;
+    }
+
+    /* Check if there's a pending cookie */
+    if (!hi->cookie) {
+        snprintf(result_msg, 256, "No verification pending for '%s'", handle);
+        return NSVERIFY_NO_COOKIE;
+    }
+
+    /* We only handle ACTIVATION cookies for account verification */
+    if (hi->cookie->type != ACTIVATION) {
+        snprintf(result_msg, 256, "No activation pending for '%s'", handle);
+        return NSVERIFY_NO_COOKIE;
+    }
+
+    /* Validate the code */
+    if (strcmp(code, hi->cookie->cookie)) {
+        snprintf(result_msg, 256, "Invalid verification code");
+        return NSVERIFY_BAD_CODE;
+    }
+
+    /* Apply the hashed password from cookie */
+#ifdef WITH_LDAP
+    if (nickserv_conf.ldap_enable && nickserv_conf.ldap_admin_dn) {
+        int rc = ldap_do_modify(hi->handle, hi->cookie->data, NULL);
+        if (rc != LDAP_SUCCESS) {
+            snprintf(result_msg, 256, "LDAP error: %s", ldap_err2string(rc));
+            return NSVERIFY_INTERNAL_ERROR;
+        }
+    }
+#endif
+    safestrncpy(hi->passwd, hi->cookie->data, sizeof(hi->passwd));
+
+    /* Authenticate the user */
+    set_user_handle_info(user, hi, 1);
+
+    /* Clean up the cookie */
+    nickserv_eat_cookie(hi->cookie);
+
+    /* Log the activation */
+    if (nickserv_conf.sync_log)
+        SyncLog("ACCOUNTACC %s", hi->handle);
+
+    snprintf(result_msg, 256, "Account '%s' verified and activated", handle);
+    return NSVERIFY_SUCCESS;
+}
+
 void
 init_nickserv(const char *nick)
 {

@@ -288,4 +288,53 @@ void send_func_list(struct userNode *user);
 
 extern dict_t nickserv_handle_dict;
 
+/* IRCv3 account-registration support (REGISTER/VERIFY commands via RG/VF P10 tokens) */
+
+/* Result codes for nickserv_ircv3_register */
+enum nickserv_register_result {
+    NSREG_SUCCESS,              /* Account created and authenticated */
+    NSREG_VERIFY_REQUIRED,      /* Verification email sent */
+    NSREG_ACCOUNT_EXISTS,       /* Account name already taken */
+    NSREG_WEAK_PASSWORD,        /* Password doesn't meet requirements */
+    NSREG_INVALID_EMAIL,        /* Invalid email address format */
+    NSREG_EMAIL_PROHIBITED,     /* Email address on blacklist */
+    NSREG_EMAIL_LIMIT,          /* Too many accounts with this email */
+    NSREG_INVALID_HANDLE,       /* Invalid account name */
+    NSREG_ALREADY_AUTHED,       /* User already authenticated */
+    NSREG_INTERNAL_ERROR        /* Internal error */
+};
+
+/* Result codes for nickserv_ircv3_verify */
+enum nickserv_verify_result {
+    NSVERIFY_SUCCESS,           /* Verification successful, user authenticated */
+    NSVERIFY_NO_ACCOUNT,        /* Account not found */
+    NSVERIFY_NO_COOKIE,         /* No pending verification */
+    NSVERIFY_BAD_CODE,          /* Invalid verification code */
+    NSVERIFY_SUSPENDED,         /* Account is suspended */
+    NSVERIFY_INTERNAL_ERROR     /* Internal error */
+};
+
+/**
+ * Register a new account via IRCv3 REGISTER command.
+ * @param user The user requesting registration
+ * @param handle Account name to register ("*" means use current nick)
+ * @param email Email address ("*" means no email)
+ * @param password Plaintext password
+ * @param result_msg Buffer to receive human-readable result message (at least 256 bytes)
+ * @return Result code indicating success or failure reason
+ */
+enum nickserv_register_result nickserv_ircv3_register(struct userNode *user,
+    const char *handle, const char *email, const char *password, char *result_msg);
+
+/**
+ * Verify a pending account via IRCv3 VERIFY command.
+ * @param user The user requesting verification
+ * @param handle Account name to verify
+ * @param code Verification code
+ * @param result_msg Buffer to receive human-readable result message (at least 256 bytes)
+ * @return Result code indicating success or failure reason
+ */
+enum nickserv_verify_result nickserv_ircv3_verify(struct userNode *user,
+    const char *handle, const char *code, char *result_msg);
+
 #endif
