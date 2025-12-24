@@ -682,6 +682,105 @@ AddChannel(const char *name, time_t time_, const char *modes, char *banlist, cha
     return cNode;
 }
 
+static rename_channel_func_t *rcf_list;
+static void **rcf_list_extra;
+static unsigned int rcf_size = 0, rcf_used = 0;
+
+void
+reg_rename_channel_func(rename_channel_func_t handler, void *extra)
+{
+    if (rcf_used == rcf_size) {
+        if (rcf_size) {
+            rcf_size <<= 1;
+            rcf_list = realloc(rcf_list, rcf_size*sizeof(rcf_list[0]));
+            rcf_list_extra = realloc(rcf_list_extra, rcf_size*sizeof(void*));
+        } else {
+            rcf_size = 8;
+            rcf_list = malloc(rcf_size*sizeof(rcf_list[0]));
+            rcf_list_extra = malloc(rcf_size*sizeof(rcf_list_extra[0]));
+        }
+    }
+    rcf_list[rcf_used] = handler;
+    rcf_list_extra[rcf_used++] = extra;
+}
+
+struct chanNode*
+RenameChannel(struct chanNode *channel, const char *new_name)
+{
+    struct chanNode *newNode;
+    unsigned int n;
+    char old_name[CHANNELLEN+1];
+
+    if (!channel || !new_name || !*new_name)
+        return NULL;
+
+    /* Save old name before we free the channel */
+    safestrncpy(old_name, channel->name, sizeof(old_name));
+
+    /* Check if new name already exists */
+    if (dict_find(channels, new_name, NULL)) {
+        log_module(MAIN_LOG, LOG_WARNING, "RenameChannel: %s already exists", new_name);
+        return NULL;
+    }
+
+    /* Allocate new channel node with new name */
+    newNode = calloc(1, sizeof(*newNode) + strlen(new_name));
+    if (!newNode)
+        return NULL;
+
+    /* Copy all fields from old to new */
+    newNode->modes = channel->modes;
+    newNode->limit = channel->limit;
+    newNode->locks = channel->locks;
+    memcpy(newNode->key, channel->key, sizeof(newNode->key));
+    memcpy(newNode->upass, channel->upass, sizeof(newNode->upass));
+    memcpy(newNode->apass, channel->apass, sizeof(newNode->apass));
+    newNode->timestamp = channel->timestamp;
+    memcpy(newNode->topic, channel->topic, sizeof(newNode->topic));
+    memcpy(newNode->topic_nick, channel->topic_nick, sizeof(newNode->topic_nick));
+    newNode->topic_time = channel->topic_time;
+    newNode->join_flooded = channel->join_flooded;
+    newNode->bad_channel = channel->bad_channel;
+    newNode->channel_info = channel->channel_info;
+    newNode->channel_help = channel->channel_help;
+    strcpy(newNode->name, new_name);
+
+    /* Move the member list - just copy the list structure */
+    newNode->members = channel->members;
+    modeList_init(&channel->members); /* Clear old to prevent double-free */
+
+    /* Update all modeNodes to point to new channel */
+    for (n = 0; n < newNode->members.used; n++) {
+        newNode->members.list[n]->channel = newNode;
+    }
+
+    /* Move ban list */
+    newNode->banlist = channel->banlist;
+    banList_init(&channel->banlist);
+
+    /* Move exempt list */
+    newNode->exemptlist = channel->exemptlist;
+    exemptList_init(&channel->exemptlist);
+
+    /* Move join policer state */
+    newNode->join_policer = channel->join_policer;
+
+    /* Remove old from dict, add new */
+    dict_remove(channels, channel->name);
+    dict_insert(channels, newNode->name, newNode);
+
+    /* Free the old node (but not its contents - we moved them) */
+    free(channel);
+
+    log_module(MAIN_LOG, LOG_INFO, "Renamed channel to %s", new_name);
+
+    /* Call rename callbacks (e.g., chanserv updates channel_info back-pointer) */
+    for (n = 0; n < rcf_used; n++)
+        rcf_list[n](newNode, old_name, rcf_list_extra[n]);
+
+    return newNode;
+}
+
 static del_channel_func_t *dcf_list;
 static void **dcf_list_extra;
 static unsigned int dcf_size = 0, dcf_used = 0;

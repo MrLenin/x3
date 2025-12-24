@@ -444,8 +444,11 @@ void reg_join_func_pos(join_func_t handler, void *extra, int pos);
 void reg_join_func(join_func_t handler, void *extra);
 typedef void (*del_channel_func_t) (struct chanNode *chan, void *extra);
 void reg_del_channel_func(del_channel_func_t handler, void *extra);
+typedef void (*rename_channel_func_t) (struct chanNode *chan, const char *old_name, void *extra);
+void reg_rename_channel_func(rename_channel_func_t handler, void *extra);
 
 struct chanNode* AddChannel(const char *name, time_t time_, const char *modes, char *banlist, char *exemptlist);
+struct chanNode* RenameChannel(struct chanNode *channel, const char *new_name);
 void LockChannel(struct chanNode *channel);
 void UnlockChannel(struct chanNode *channel);
 

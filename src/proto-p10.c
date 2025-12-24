@@ -81,6 +81,7 @@
 #define CMD_QUIT                "QUIT"
 #define CMD_REHASH              "REHASH"
 #define CMD_REMOVE		"REMOVE"
+#define CMD_RENAME              "RENAME"
 #define CMD_RESET		"RESET"
 #define CMD_RESTART             "RESTART"
 #define CMD_RPING               "RPING"
@@ -187,6 +188,7 @@
 #define TOK_QUIT                "Q"
 #define TOK_REHASH              "REHASH"
 #define TOK_REMOVE		"RM"
+#define TOK_RENAME              "RN"
 #define TOK_RESET		"RESET"
 #define TOK_RESTART             "RESTART"
 #define TOK_RPING               "RI"
@@ -2473,6 +2475,40 @@ static CMD_FUNC(cmd_kick)
     return 1;
 }
 
+static CMD_FUNC(cmd_rename)
+{
+    struct chanNode *channel;
+    const char *oldname;
+    const char *newname;
+
+    /* argv[1] = old channel name
+     * argv[2] = new channel name
+     * argv[3] = reason (optional)
+     */
+    if (argc < 3)
+        return 0;
+
+    oldname = argv[1];
+    newname = argv[2];
+
+    channel = GetChannel(oldname);
+    if (!channel) {
+        log_module(MAIN_LOG, LOG_WARNING, "RENAME for unknown channel %s", oldname);
+        return 0;
+    }
+
+    /* Rename the channel in our internal structures */
+    channel = RenameChannel(channel, newname);
+    if (!channel) {
+        log_module(MAIN_LOG, LOG_ERROR, "Failed to rename channel %s to %s", oldname, newname);
+        return 0;
+    }
+
+    log_module(MAIN_LOG, LOG_INFO, "Channel %s renamed to %s by %s", oldname, newname, origin);
+
+    return 1;
+}
+
 static CMD_FUNC(cmd_squit)
 {
     struct server *server;
@@ -3094,6 +3130,8 @@ init_parse(void)
     dict_insert(irc_func_dict, TOK_SILENCE, cmd_silence);
     dict_insert(irc_func_dict, CMD_KICK, cmd_kick);
     dict_insert(irc_func_dict, TOK_KICK, cmd_kick);
+    dict_insert(irc_func_dict, CMD_RENAME, cmd_rename);
+    dict_insert(irc_func_dict, TOK_RENAME, cmd_rename);
     dict_insert(irc_func_dict, CMD_SQUIT, cmd_squit);
     dict_insert(irc_func_dict, TOK_SQUIT, cmd_squit);
     dict_insert(irc_func_dict, CMD_KILL, cmd_kill);

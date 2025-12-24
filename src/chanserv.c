@@ -8321,6 +8321,16 @@ handle_new_channel(struct chanNode *channel, UNUSED_ARG(void *extra))
         SetChannelTopic(channel, chanserv, chanserv, channel->channel_info->topic, 1);
 }
 
+static void
+handle_rename_channel(struct chanNode *channel, UNUSED_ARG(const char *old_name), UNUSED_ARG(void *extra))
+{
+    /* Update the channel_info back-pointer after a channel rename.
+     * This is called via callback from RenameChannel() in hash.c
+     * because hash.c cannot access struct chanData directly. */
+    if (channel->channel_info)
+        channel->channel_info->channel = channel;
+}
+
 int
 trace_check_bans(struct userNode *user, struct chanNode *chan)
 {
@@ -10035,6 +10045,7 @@ init_chanserv(const char *nick)
     if (nick) {
         reg_server_link_func(handle_server_link, NULL);
         reg_new_channel_func(handle_new_channel, NULL);
+        reg_rename_channel_func(handle_rename_channel, NULL);
         reg_join_func(handle_join, NULL);
         reg_part_func(handle_part, NULL);
         reg_kick_func(handle_kick, NULL);
