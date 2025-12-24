@@ -189,6 +189,34 @@ int keycloak_get_user_attribute(struct kc_realm realm, struct kc_client client,
                                 char** value_out);
 
 /**
+ * Metadata key-value pair for listing attributes
+ */
+struct kc_metadata_entry {
+    char* key;
+    char* value;
+    struct kc_metadata_entry* next;
+};
+
+/**
+ * Lists all user attributes matching a prefix
+ * @param realm       Keycloak realm configuration
+ * @param client      Client with admin access token
+ * @param user_id     User's Keycloak ID (UUID)
+ * @param prefix      Attribute prefix to match (e.g., "metadata.")
+ * @param entries_out Output pointer for linked list of entries (caller must free with keycloak_free_metadata_entries)
+ * @return KC_SUCCESS on success, KC_NOT_FOUND if user doesn't exist, KC_ERROR on failure
+ */
+int keycloak_list_user_attributes(struct kc_realm realm, struct kc_client client,
+                                  const char* user_id, const char* prefix,
+                                  struct kc_metadata_entry** entries_out);
+
+/**
+ * Frees a linked list of metadata entries
+ * @param entries     Head of the list to free (can be NULL)
+ */
+void keycloak_free_metadata_entries(struct kc_metadata_entry* entries);
+
+/**
  * Adds a user to a Keycloak group
  * @param realm     Keycloak realm configuration
  * @param client    Client with admin access token

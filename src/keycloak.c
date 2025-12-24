@@ -1234,6 +1234,143 @@ cleanup:
     return result;
 }
 
+void keycloak_free_metadata_entries(struct kc_metadata_entry* entries)
+{
+    struct kc_metadata_entry* curr;
+    struct kc_metadata_entry* next;
+
+    for (curr = entries; curr; curr = next) {
+        next = curr->next;
+        if (curr->key)
+            free(curr->key);
+        if (curr->value)
+            free(curr->value);
+        free(curr);
+    }
+}
+
+int keycloak_list_user_attributes(struct kc_realm realm, struct kc_client client,
+                                  const char* user_id, const char* prefix,
+                                  struct kc_metadata_entry** entries_out)
+{
+    if (!realm.base_uri || !realm.realm || !client.access_token ||
+        !user_id || !entries_out) {
+        log_module(KC_LOG, LOG_DEBUG, "keycloak_list_user_attributes: Invalid arguments");
+        return KC_ERROR;
+    }
+
+    *entries_out = NULL;
+    int result = KC_ERROR;
+    char* uri = NULL;
+    struct memory chunk = { .response = NULL, .size = 0 };
+    size_t prefix_len = prefix ? strlen(prefix) : 0;
+
+    static const char uri_tmpl[] = "%s/admin/realms/%s/users/%s";
+    int uri_len = snprintf(NULL, 0, uri_tmpl, realm.base_uri, realm.realm, user_id) + 1;
+    uri = malloc(uri_len);
+    if (!uri) {
+        log_module(KC_LOG, LOG_DEBUG, "keycloak_list_user_attributes: Failed to allocate uri");
+        goto cleanup;
+    }
+    snprintf(uri, uri_len, uri_tmpl, realm.base_uri, realm.realm, user_id);
+
+    struct curl_opts opts = {
+        .uri = uri,
+        .method = HTTP_GET,
+        .xoauth2_bearer = client.access_token->access_token,
+        .write_callback = curl_write_cb,
+        .header_count = 0
+    };
+
+    long http_code = curl_perform(opts, &chunk);
+
+    if (http_code == 200 && chunk.response) {
+        json_error_t error;
+        json_t* root = json_loads(chunk.response, 0, &error);
+        if (!root) {
+            log_module(KC_LOG, LOG_DEBUG, "keycloak_list_user_attributes: Failed to parse JSON: %s", error.text);
+            goto cleanup;
+        }
+
+        json_t* attrs = json_object_get(root, "attributes");
+        if (attrs && json_is_object(attrs)) {
+            const char* key;
+            json_t* value;
+            struct kc_metadata_entry* head = NULL;
+            struct kc_metadata_entry* tail = NULL;
+
+            json_object_foreach(attrs, key, value) {
+                /* Skip if prefix specified and doesn't match */
+                if (prefix && prefix_len > 0) {
+                    if (strncmp(key, prefix, prefix_len) != 0)
+                        continue;
+                }
+
+                /* Get first value from array */
+                if (!json_is_array(value) || json_array_size(value) == 0)
+                    continue;
+
+                json_t* first_val = json_array_get(value, 0);
+                if (!first_val || !json_is_string(first_val))
+                    continue;
+
+                const char* val_str = json_string_value(first_val);
+                if (!val_str || !*val_str)
+                    continue;
+
+                /* Create entry */
+                struct kc_metadata_entry* entry = malloc(sizeof(*entry));
+                if (!entry)
+                    continue;
+
+                entry->key = strdup(key);
+                entry->value = strdup(val_str);
+                entry->next = NULL;
+
+                if (!entry->key || !entry->value) {
+                    if (entry->key) free(entry->key);
+                    if (entry->value) free(entry->value);
+                    free(entry);
+                    continue;
+                }
+
+                /* Add to list */
+                if (!head) {
+                    head = tail = entry;
+                } else {
+                    tail->next = entry;
+                    tail = entry;
+                }
+            }
+
+            *entries_out = head;
+            result = KC_SUCCESS;
+        } else {
+            log_module(KC_LOG, LOG_DEBUG, "keycloak_list_user_attributes: No attributes on user");
+            result = KC_SUCCESS; /* Empty list is valid */
+        }
+
+        json_decref(root);
+    } else if (http_code == 404) {
+        log_module(KC_LOG, LOG_DEBUG, "keycloak_list_user_attributes: User not found (HTTP 404)");
+        result = KC_NOT_FOUND;
+    } else {
+        log_module(KC_LOG, LOG_DEBUG, "keycloak_list_user_attributes: Failed with HTTP %ld: %s",
+            http_code, chunk.response ? chunk.response : "no response");
+    }
+
+cleanup:
+    if (chunk.response) {
+        memset(chunk.response, 0, chunk.size);
+        free(chunk.response);
+    }
+    if (uri) {
+        free(uri);
+    }
+
+    return result;
+}
+
 int keycloak_add_user_to_group(struct kc_realm realm, struct kc_client client,
                                const char* user_id, const char* group_id)
 {

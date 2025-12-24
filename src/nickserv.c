@@ -1164,6 +1164,9 @@ set_user_handle_info(struct userNode *user, struct handle_info *hi, int stamp)
             }
             /* send the account to the ircd */
             StampUser(user, id, hi->registered);
+
+            /* Sync any stored metadata from Keycloak to the IRCd */
+            nickserv_sync_metadata_to_ircd(user);
         }
 
         /* Stop trying to kick this user off their nick */
@@ -5924,20 +5927,63 @@ nickserv_get_user_metadata(struct handle_info *hi, const char *key, char *value_
 void
 nickserv_sync_metadata_to_ircd(struct userNode *user)
 {
-    /* This function would iterate over stored metadata and push to IRCd.
-     * For now, we rely on clients requesting metadata via METADATA GET.
-     * Future enhancement: fetch all metadata.* attributes and push them.
-     */
     if (!user || !user->handle_info)
         return;
 
-    log_module(NS_LOG, LOG_DEBUG, "nickserv_sync_metadata_to_ircd: Would sync metadata for %s",
-               user->handle_info->handle);
+#ifdef WITH_KEYCLOAK
+    if (nickserv_conf.keycloak_enable) {
+        struct kc_user kc_user;
+        struct kc_metadata_entry *entries = NULL;
+        struct kc_metadata_entry *entry;
+        int rc;
 
-    /* TODO: If we want proactive sync, we would:
-     * 1. Fetch all metadata.* attributes from Keycloak
-     * 2. For each, call irc_metadata(user->nick, key, value)
-     */
+        if (kc_ensure_token() != KC_SUCCESS) {
+            log_module(NS_LOG, LOG_DEBUG, "nickserv_sync_metadata_to_ircd: Failed to get admin token");
+            return;
+        }
+
+        /* Get user ID from Keycloak */
+        rc = keycloak_get_user(kc_realm_config, kc_client_config, user->handle_info->handle, &kc_user);
+        if (rc != KC_SUCCESS) {
+            log_module(NS_LOG, LOG_DEBUG, "nickserv_sync_metadata_to_ircd: User %s not found in Keycloak",
+                       user->handle_info->handle);
+            return;
+        }
+
+        char *user_id = strdup(kc_user.id);
+        keycloak_user_free(&kc_user);
+
+        /* Fetch all metadata.* attributes */
+        rc = keycloak_list_user_attributes(kc_realm_config, kc_client_config,
+                                           user_id, "metadata.", &entries);
+        free(user_id);
+
+        if (rc != KC_SUCCESS) {
+            log_module(NS_LOG, LOG_DEBUG, "nickserv_sync_metadata_to_ircd: Failed to list attributes for %s",
+                       user->handle_info->handle);
+            return;
+        }
+
+        /* Push each metadata entry to the IRCd */
+        for (entry = entries; entry; entry = entry->next) {
+            /* Strip "metadata." prefix from key */
+            const char *key = entry->key;
+            if (strncmp(key, "metadata.", 9) == 0)
+                key += 9;
+
+            log_module(NS_LOG, LOG_DEBUG, "nickserv_sync_metadata_to_ircd: Pushing %s.%s = %s",
+                       user->nick, key, entry->value);
+
+            irc_metadata(user->nick, key, entry->value);
+        }
+
+        keycloak_free_metadata_entries(entries);
+        return;
+    }
+#endif
+
+    log_module(NS_LOG, LOG_DEBUG, "nickserv_sync_metadata_to_ircd: No backend for %s",
+               user->handle_info->handle);
 }
 
 static void
