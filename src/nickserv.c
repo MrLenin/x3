@@ -5814,10 +5814,14 @@ loc_auth_oauth(const char *bearer_token, const char *username_hint, const char *
  *
  * Metadata is stored in Keycloak as user attributes with a "metadata." prefix.
  * This allows IRC clients to set/get metadata that persists across sessions.
+ *
+ * Visibility is stored as a prefix in the value:
+ *   - Public values are stored as-is: "value"
+ *   - Private values are stored with prefix: "P:value"
  */
 
 int
-nickserv_set_user_metadata(struct handle_info *hi, const char *key, const char *value)
+nickserv_set_user_metadata(struct handle_info *hi, const char *key, const char *value, int visibility)
 {
     if (!hi || !key)
         return -1;
@@ -5825,6 +5829,7 @@ nickserv_set_user_metadata(struct handle_info *hi, const char *key, const char *
 #ifdef WITH_KEYCLOAK
     if (nickserv_conf.keycloak_enable) {
         char attr_name[128];
+        char stored_value[2048];
         struct kc_user user;
         int rc;
 
@@ -5848,8 +5853,14 @@ nickserv_set_user_metadata(struct handle_info *hi, const char *key, const char *
 
         /* Set or delete the attribute */
         if (value && *value) {
+            /* Encode visibility in stored value: P:value for private, value for public */
+            if (visibility == METADATA_VIS_PRIVATE) {
+                snprintf(stored_value, sizeof(stored_value), "P:%s", value);
+            } else {
+                snprintf(stored_value, sizeof(stored_value), "%s", value);
+            }
             rc = keycloak_set_user_attribute(kc_realm_config, kc_client_config,
-                                             user_id, attr_name, value);
+                                             user_id, attr_name, stored_value);
         } else {
             /* Delete by setting to empty string */
             rc = keycloak_set_user_attribute(kc_realm_config, kc_client_config,
@@ -5863,8 +5874,8 @@ nickserv_set_user_metadata(struct handle_info *hi, const char *key, const char *
             return -1;
         }
 
-        log_module(NS_LOG, LOG_DEBUG, "nickserv_set_user_metadata: Set %s.%s = %s",
-                   hi->handle, key, value ? value : "(deleted)");
+        log_module(NS_LOG, LOG_DEBUG, "nickserv_set_user_metadata: Set %s.%s = %s (vis=%d)",
+                   hi->handle, key, value ? value : "(deleted)", visibility);
         return 0;
     }
 #endif
@@ -5875,12 +5886,14 @@ nickserv_set_user_metadata(struct handle_info *hi, const char *key, const char *
 }
 
 int
-nickserv_get_user_metadata(struct handle_info *hi, const char *key, char *value_out)
+nickserv_get_user_metadata(struct handle_info *hi, const char *key, char *value_out, int *visibility_out)
 {
     if (!hi || !key || !value_out)
         return -1;
 
     value_out[0] = '\0';
+    if (visibility_out)
+        *visibility_out = METADATA_VIS_PUBLIC;
 
 #ifdef WITH_KEYCLOAK
     if (nickserv_conf.keycloak_enable) {
@@ -5910,7 +5923,14 @@ nickserv_get_user_metadata(struct handle_info *hi, const char *key, char *value_
         free(user_id);
 
         if (rc == KC_SUCCESS && attr_value) {
-            strncpy(value_out, attr_value, 1023);
+            /* Check for visibility prefix "P:" for private */
+            if (attr_value[0] == 'P' && attr_value[1] == ':') {
+                if (visibility_out)
+                    *visibility_out = METADATA_VIS_PRIVATE;
+                strncpy(value_out, attr_value + 2, 1023);
+            } else {
+                strncpy(value_out, attr_value, 1023);
+            }
             value_out[1023] = '\0';
             free(attr_value);
             return 0;
@@ -5968,13 +5988,22 @@ nickserv_sync_metadata_to_ircd(struct userNode *user)
         for (entry = entries; entry; entry = entry->next) {
             /* Strip "metadata." prefix from key */
             const char *key = entry->key;
+            const char *value = entry->value;
+            int visibility = METADATA_VIS_PUBLIC;
+
             if (strncmp(key, "metadata.", 9) == 0)
                 key += 9;
 
-            log_module(NS_LOG, LOG_DEBUG, "nickserv_sync_metadata_to_ircd: Pushing %s.%s = %s",
-                       user->nick, key, entry->value);
+            /* Parse visibility prefix from stored value (P:value for private) */
+            if (value && value[0] == 'P' && value[1] == ':') {
+                visibility = METADATA_VIS_PRIVATE;
+                value += 2;
+            }
 
-            irc_metadata(user->nick, key, entry->value);
+            log_module(NS_LOG, LOG_DEBUG, "nickserv_sync_metadata_to_ircd: Pushing %s.%s = %s (vis=%d)",
+                       user->nick, key, value, visibility);
+
+            irc_metadata(user->nick, key, value, visibility);
         }
 
         keycloak_free_metadata_entries(entries);

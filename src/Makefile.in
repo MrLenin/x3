@@ -71,7 +71,7 @@ am_x3_OBJECTS = base64.$(OBJEXT) chanserv.$(OBJEXT) compat.$(OBJEXT) conf.$(OBJE
 	opserv.$(OBJEXT) policer.$(OBJEXT) recdb.$(OBJEXT) \
 	sar.$(OBJEXT) saxdb.$(OBJEXT) spamserv.$(OBJEXT) \
 	shun.$(OBJEXT) timeq.$(OBJEXT) tools.$(OBJEXT) \
-	x3ldap.$(OBJEXT) version.$(OBJEXT)
+	webpush.$(OBJEXT) x3ldap.$(OBJEXT) version.$(OBJEXT)
 x3_OBJECTS = $(am_x3_OBJECTS)
 DEFAULT_INCLUDES = -I.@am__isrc@
 depcomp = $(SHELL) $(top_srcdir)/depcomp

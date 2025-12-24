@@ -25,6 +25,7 @@
 #include "dict.h"
 #include <tre/regex.h> /* for regex in nickserv_config */
 struct svccmd;
+struct kc_metadata_entry;
 
 #define NICKSERV_HANDLE_LEN ACCOUNTLEN
 #define COOKIELEN 10
@@ -339,23 +340,29 @@ enum nickserv_verify_result nickserv_ircv3_verify(struct userNode *user,
 
 /* IRCv3 metadata-2 support */
 
+/** Metadata visibility levels */
+#define METADATA_VIS_PUBLIC  0  /* Anyone can see */
+#define METADATA_VIS_PRIVATE 1  /* Only owner can see */
+
 /**
  * Set user metadata (stored in Keycloak as user attribute if available).
  * @param hi Handle info for the user
  * @param key Metadata key name
  * @param value Metadata value (NULL to delete)
+ * @param visibility Visibility level (METADATA_VIS_PUBLIC or METADATA_VIS_PRIVATE)
  * @return 0 on success, -1 on error
  */
-int nickserv_set_user_metadata(struct handle_info *hi, const char *key, const char *value);
+int nickserv_set_user_metadata(struct handle_info *hi, const char *key, const char *value, int visibility);
 
 /**
  * Get user metadata (from Keycloak if available).
  * @param hi Handle info for the user
  * @param key Metadata key name
  * @param value_out Buffer to receive value (at least 1024 bytes)
+ * @param visibility_out Pointer to receive visibility (or NULL)
  * @return 0 on success, 1 if not found, -1 on error
  */
-int nickserv_get_user_metadata(struct handle_info *hi, const char *key, char *value_out);
+int nickserv_get_user_metadata(struct handle_info *hi, const char *key, char *value_out, int *visibility_out);
 
 /**
  * Send all metadata for a user to the IRCd.

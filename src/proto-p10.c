@@ -644,10 +644,11 @@ irc_account(struct userNode *user, const char *stamp, time_t timestamp)
 }
 
 void
-irc_metadata(const char *target, const char *key, const char *value)
+irc_metadata(const char *target, const char *key, const char *value, int visibility)
 {
+    const char *vis_token = (visibility == METADATA_VIS_PRIVATE) ? "P" : "*";
     if (value && *value)
-        putsock("%s " P10_METADATA " %s %s :%s", self->numeric, target, key, value);
+        putsock("%s " P10_METADATA " %s %s %s :%s", self->numeric, target, key, vis_token, value);
     else
         putsock("%s " P10_METADATA " %s %s", self->numeric, target, key);
 }
@@ -2814,8 +2815,9 @@ static CMD_FUNC(cmd_verify_acct)
 }
 
 /** Handle MD (METADATA) command - P10 metadata propagation.
- * Format: <source> MD <target> <key> [:<value>]
+ * Format: <source> MD <target> <key> [<visibility>] [:<value>]
  * When value is omitted, the key is being deleted.
+ * Visibility is "*" for public or "P" for private.
  * X3 stores account-linked metadata in Keycloak as user attributes.
  */
 static CMD_FUNC(cmd_metadata)
@@ -2824,14 +2826,30 @@ static CMD_FUNC(cmd_metadata)
     const char *target;
     const char *key;
     const char *value = NULL;
+    int visibility = METADATA_VIS_PUBLIC;
 
     if (argc < 3)
         return 0;
 
     target = argv[1];
     key = argv[2];
-    if (argc > 3)
-        value = argv[3];
+
+    /* Parse visibility and value.
+     * New format: target key [visibility] [:value]
+     * Old format: target key [:value]
+     */
+    if (argc >= 4) {
+        /* Check if argv[3] is a visibility token */
+        if ((argv[3][0] == '*' && argv[3][1] == '\0') ||
+            (argv[3][0] == 'P' && argv[3][1] == '\0')) {
+            visibility = (argv[3][0] == 'P') ? METADATA_VIS_PRIVATE : METADATA_VIS_PUBLIC;
+            if (argc >= 5)
+                value = argv[4];
+        } else {
+            /* Old format or no visibility - argv[3] is value */
+            value = argv[3];
+        }
+    }
 
     /* Find the target user */
     user = GetUserH(target);
@@ -2847,12 +2865,13 @@ static CMD_FUNC(cmd_metadata)
     }
 
     /* Store in Keycloak as user attribute if keycloak is enabled */
-    log_module(MAIN_LOG, LOG_INFO, "METADATA: %s.%s = %s (account: %s)",
+    log_module(MAIN_LOG, LOG_INFO, "METADATA: %s.%s = %s (vis=%s, account: %s)",
                target, key, value ? value : "(deleted)",
+               visibility == METADATA_VIS_PRIVATE ? "private" : "public",
                user->handle_info->handle);
 
     /* Call the keycloak attribute API if available */
-    nickserv_set_user_metadata(user->handle_info, key, value);
+    nickserv_set_user_metadata(user->handle_info, key, value, visibility);
 
     return 1;
 }
@@ -2925,7 +2944,8 @@ static CMD_FUNC(cmd_webpush)
         snprintf(attr_value, sizeof(attr_value), "%s|%s|%s",
                  endpoint, p256dh, auth_secret);
 
-        nickserv_set_user_metadata(user->handle_info, attr_name, attr_value);
+        /* Webpush subscriptions are private data */
+        nickserv_set_user_metadata(user->handle_info, attr_name, attr_value, METADATA_VIS_PRIVATE);
 
     } else if (subcmd[0] == 'U') {
         /* UNREGISTER: WP U <user_numeric> <endpoint> */
@@ -2945,7 +2965,8 @@ static CMD_FUNC(cmd_webpush)
         snprintf(attr_name, sizeof(attr_name), "webpush.%08lx",
                  webpush_hash(endpoint));
 
-        nickserv_set_user_metadata(user->handle_info, attr_name, NULL);
+        /* Visibility doesn't matter for deletion */
+        nickserv_set_user_metadata(user->handle_info, attr_name, NULL, METADATA_VIS_PUBLIC);
 
     } else if (subcmd[0] == 'P') {
         /* PUSH: WP P <account_name> :<message>
