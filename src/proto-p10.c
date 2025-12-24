@@ -124,6 +124,9 @@
 #define CMD_WHOIS               "WHOIS"
 #define CMD_WHOWAS              "WHOWAS"
 #define CMD_ZLINE		"ZLINE"
+#define CMD_REGISTER_ACCT       "REGISTER"
+#define CMD_VERIFY_ACCT         "VERIFY"
+#define CMD_REGREPLY            "REGREPLY"
 
 /* Tokenized commands. */
 #define TOK_ACCOUNT		"AC"
@@ -225,6 +228,9 @@
 #define TOK_WHOIS               "W"
 #define TOK_WHOWAS              "X"
 #define TOK_ZLINE		"ZL"
+#define TOK_REGISTER_ACCT       "RG"
+#define TOK_VERIFY_ACCT         "VF"
+#define TOK_REGREPLY            "RR"
 
 /* Protocol messages; aliased to full commands or tokens depending
    on compile-time configuration. ircu prefers tokens WITH THE
@@ -335,6 +341,9 @@
 #define P10_WHOWAS              TYPE(WHOWAS)
 #define P10_ZLINE		TYPE(ZLINE)
 #define P10_EXEMPT		TYPE(EXEMPT)
+#define P10_REGISTER_ACCT       TYPE(REGISTER_ACCT)
+#define P10_VERIFY_ACCT         TYPE(VERIFY_ACCT)
+#define P10_REGREPLY            TYPE(REGREPLY)
 
 /* Servers claiming to have a boot or link time before PREHISTORY
  * trigger errors to the log.  We hope no server has been running
@@ -2637,6 +2646,84 @@ parse_cleanup(UNUSED_ARG(void *extra))
     userList_clean(&dead_users);
 }
 
+/** Send REGREPLY to a user via their server.
+ * @param user_numeric The user's numeric (e.g., "ABAAB")
+ * @param status 'S' for success, 'F' for failure, 'V' for verification needed
+ * @param account Account name
+ * @param message Response message
+ */
+void
+irc_regreply(const char *user_numeric, char status, const char *account, const char *message)
+{
+    putsock("%s " P10_REGREPLY " %s %c %s :%s",
+            self->numeric, user_numeric, status, account, message);
+}
+
+/** Handle RG (REGISTER) command - P10 account registration.
+ * Format: <user_numeric> RG <target_server> <account> <email> :<password>
+ */
+static CMD_FUNC(cmd_register_acct)
+{
+    struct userNode *user;
+    const char *account;
+    const char *email;
+    const char *password;
+
+    if (argc < 5)
+        return 0;
+
+    user = GetUserN(origin);
+    if (!user) {
+        log_module(MAIN_LOG, LOG_WARNING, "RG from unknown user %s", origin);
+        return 0;
+    }
+
+    account = argv[2];
+    email = argv[3];
+    password = argv[argc - 1]; /* Password is last param (may have spaces) */
+
+    log_module(MAIN_LOG, LOG_INFO, "RG (REGISTER) request: account=%s email=%s from %s!%s",
+               account, email, user->nick, user->numeric);
+
+    /* TODO: Call into NickServ to actually register the account.
+     * For now, send a "not implemented" response. */
+    irc_regreply(user->numeric, 'F', account,
+                 "Registration via REGISTER command not yet implemented - use /msg NickServ REGISTER");
+
+    return 1;
+}
+
+/** Handle VF (VERIFY) command - P10 account verification.
+ * Format: <user_numeric> VF <target_server> <account> <code>
+ */
+static CMD_FUNC(cmd_verify_acct)
+{
+    struct userNode *user;
+    const char *account;
+    /* const char *code; */
+
+    if (argc < 4)
+        return 0;
+
+    user = GetUserN(origin);
+    if (!user) {
+        log_module(MAIN_LOG, LOG_WARNING, "VF from unknown user %s", origin);
+        return 0;
+    }
+
+    account = argv[2];
+    /* code = argv[3]; */
+
+    log_module(MAIN_LOG, LOG_INFO, "VF (VERIFY) request: account=%s from %s!%s",
+               account, user->nick, user->numeric);
+
+    /* TODO: Call into NickServ to verify the account. */
+    irc_regreply(user->numeric, 'F', account,
+                 "Verification via VERIFY command not yet implemented");
+
+    return 1;
+}
+
 static void
 p10_conf_reload(void) {
     hidden_host_suffix = conf_get_data("server/hidden_host", RECDB_QSTRING);
@@ -2783,6 +2870,12 @@ init_parse(void)
 
     dict_insert(irc_func_dict, CMD_SASL, cmd_sasl);
     dict_insert(irc_func_dict, TOK_SASL, cmd_sasl);
+
+    /* IRCv3 account-registration support */
+    dict_insert(irc_func_dict, CMD_REGISTER_ACCT, cmd_register_acct);
+    dict_insert(irc_func_dict, TOK_REGISTER_ACCT, cmd_register_acct);
+    dict_insert(irc_func_dict, CMD_VERIFY_ACCT, cmd_verify_acct);
+    dict_insert(irc_func_dict, TOK_VERIFY_ACCT, cmd_verify_acct);
 
     /* In P10, DESTRUCT doesn't do anything except be broadcast to servers.
      * Apparently to obliterate channels from any servers that think they
