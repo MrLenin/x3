@@ -5986,6 +5986,54 @@ nickserv_sync_metadata_to_ircd(struct userNode *user)
                user->handle_info->handle);
 }
 
+int
+nickserv_get_webpush_subscriptions(const char *account_name,
+                                   struct kc_metadata_entry **entries_out)
+{
+    if (!account_name || !entries_out)
+        return -1;
+
+    *entries_out = NULL;
+
+#ifdef WITH_KEYCLOAK
+    if (nickserv_conf.keycloak_enable) {
+        struct kc_user kc_user;
+        int rc;
+
+        if (kc_ensure_token() != KC_SUCCESS) {
+            log_module(NS_LOG, LOG_DEBUG, "nickserv_get_webpush_subscriptions: Failed to get admin token");
+            return -1;
+        }
+
+        /* Get user ID from Keycloak */
+        rc = keycloak_get_user(kc_realm_config, kc_client_config, account_name, &kc_user);
+        if (rc != KC_SUCCESS) {
+            log_module(NS_LOG, LOG_DEBUG, "nickserv_get_webpush_subscriptions: User %s not found in Keycloak",
+                       account_name);
+            return -1;
+        }
+
+        char *user_id = strdup(kc_user.id);
+        keycloak_user_free(&kc_user);
+
+        /* Fetch all webpush.* attributes */
+        rc = keycloak_list_user_attributes(kc_realm_config, kc_client_config,
+                                           user_id, "webpush.", entries_out);
+        free(user_id);
+
+        if (rc != KC_SUCCESS) {
+            log_module(NS_LOG, LOG_DEBUG, "nickserv_get_webpush_subscriptions: Failed to list attributes for %s",
+                       account_name);
+            return -1;
+        }
+
+        return 0;
+    }
+#endif
+
+    return -1;
+}
+
 static void
 nickserv_conf_read(void)
 {

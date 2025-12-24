@@ -479,19 +479,24 @@ AC_ARG_WITH(ssl,
 [  --with-ssl=PATH      Base path to where openssl is installed],)
 if test "x$withval" != "x"; then
    AC_MSG_RESULT(Using include dir $withval to find openssl)
-   CPPFLAGS="$CPPFLAGS -I$withval/include -L$withval/lib"
+   CPPFLAGS="$CPPFLAGS -I$withval/include"
    LIBS="$LIBS -L$withval/lib"
 else
    AC_MSG_RESULT([Looking for openssl in system ])
 fi
 
-AC_CHECK_LIB(ssl, BIO_new,
+dnl Check for libcrypto first (needed by libssl)
+AC_CHECK_LIB(crypto, EVP_DigestInit_ex,
+[
+LIBS="-lcrypto $LIBS"
+dnl Now check for libssl (depends on libcrypto)
+AC_CHECK_LIB(ssl, SSL_new,
 [
 LIBS="-lssl $LIBS"
-AC_CHECK_HEADERS(openssl/bio.h,
+AC_CHECK_HEADERS(openssl/ssl.h openssl/evp.h,
 [
 AC_DEFINE(WITH_SSL, 1, [Define if SSL libs are linked])
-ssl_message="LDAP library:        enabled"
+ssl_message="OpenSSL library:     enabled"
 ],
 [
 if test "x$withval" != "x"; then
@@ -501,7 +506,13 @@ fi
 ],
 [
 if test "x$withval" != "x"; then
-   AC_MSG_ERROR([libldap not found or not valid])
+   AC_MSG_ERROR([libssl not found or not valid])
+fi
+])
+],
+[
+if test "x$withval" != "x"; then
+   AC_MSG_ERROR([libcrypto not found or not valid])
 fi
 ]
 )

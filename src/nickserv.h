@@ -364,4 +364,16 @@ int nickserv_get_user_metadata(struct handle_info *hi, const char *key, char *va
  */
 void nickserv_sync_metadata_to_ircd(struct userNode *user);
 
+/* IRCv3 draft/webpush support */
+
+/**
+ * Get webpush subscriptions for an account.
+ * Returns a linked list of subscription values (endpoint|p256dh|auth format).
+ * @param account_name The account name to look up
+ * @param entries_out Output pointer for linked list (caller must free with keycloak_free_metadata_entries)
+ * @return 0 on success, -1 on error
+ */
+int nickserv_get_webpush_subscriptions(const char *account_name,
+                                       struct kc_metadata_entry **entries_out);
+
 #endif
