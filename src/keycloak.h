@@ -1,8 +1,12 @@
 #ifndef KEYCLOAK_H
 #define KEYCLOAK_H
 
+#include "config.h"
+
 #include <stdbool.h>
 #include <stddef.h>
+
+#ifdef WITH_KEYCLOAK
 
 #include <curl/curl.h>
 #include <jansson.h>
@@ -266,5 +270,12 @@ int keycloak_introspect_token(struct kc_realm realm, struct kc_client client,
  * @param info      Pointer to token info (can be NULL)
  */
 void keycloak_free_token_info(struct kc_token_info* info);
+
+/**
+ * Initialize keycloak module
+ */
+void init_keycloak(void);
+
+#endif /* WITH_KEYCLOAK */
 
 #endif /* KEYCLOAK_H */

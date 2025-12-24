@@ -1,3 +1,7 @@
+#include "config.h"
+
+#ifdef WITH_KEYCLOAK
+
 #include <string.h>
 
 #include "keycloak.h"
@@ -1743,3 +1747,5 @@ void keycloak_free_token_info(struct kc_token_info* info)
 
     free(info);
 }
+
+#endif /* WITH_KEYCLOAK */

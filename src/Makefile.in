@@ -65,7 +65,7 @@ slab_read_LDADD = $(LDADD)
 am_x3_OBJECTS = base64.$(OBJEXT) chanserv.$(OBJEXT) compat.$(OBJEXT) conf.$(OBJEXT) \
 	dict-splay.$(OBJEXT) eventhooks.$(OBJEXT) getopt.$(OBJEXT) getopt1.$(OBJEXT) \
 	gline.$(OBJEXT) global.$(OBJEXT) hash.$(OBJEXT) heap.$(OBJEXT) \
-	helpfile.$(OBJEXT) ioset.$(OBJEXT) \
+	helpfile.$(OBJEXT) ioset.$(OBJEXT) keycloak.$(OBJEXT) \
 	log.$(OBJEXT) main.$(OBJEXT) math.$(OBJEXT) md5.$(OBJEXT) \
 	modcmd.$(OBJEXT) modules.$(OBJEXT) nickserv.$(OBJEXT) \
 	opserv.$(OBJEXT) policer.$(OBJEXT) recdb.$(OBJEXT) \
@@ -226,11 +226,13 @@ EXTRA_x3_SOURCES = \
 	ioset-epoll.c \
 	ioset-kevent.c \
 	ioset-select.c \
+	keycloak.c keycloak.h \
 	mail-common.c \
 	mail-sendmail.c \
 	main-common.c \
 	proto-common.c \
 	proto-p10.c \
+	webpush.c webpush.h \
 	mod-blacklist.c \
 	mod-snoop.c \
 	mod-track.c \
@@ -373,6 +375,7 @@ distclean-compile:
 @AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/ioset-kevent.Po@am__quote@
 @AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/ioset-select.Po@am__quote@
 @AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/ioset.Po@am__quote@
+@AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/keycloak.Po@am__quote@
 @AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/log.Po@am__quote@
 @AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/mail-common.Po@am__quote@
 @AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/mail-sendmail.Po@am__quote@
@@ -405,6 +408,7 @@ distclean-compile:
 @AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/timeq.Po@am__quote@
 @AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/tools.Po@am__quote@
 @AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/version.Po@am__quote@
+@AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/webpush.Po@am__quote@
 @AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/x3ldap.Po@am__quote@
 
 .c.o:
