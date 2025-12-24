@@ -25,6 +25,7 @@
 #include "global.h"
 #include "modcmd.h"
 #include "opserv.h" /* for gag_create(), opserv_bad_channel() */
+#include "proto.h"  /* for irc_metadata() */
 #include "saxdb.h"
 #include "mail.h"
 #include "timeq.h"
@@ -5804,6 +5805,140 @@ loc_auth_oauth(const char *bearer_token, const char *username_hint, const char *
     return hi;
 }
 #endif /* WITH_KEYCLOAK */
+
+/*
+ * IRCv3 Metadata-2 Support
+ *
+ * Metadata is stored in Keycloak as user attributes with a "metadata." prefix.
+ * This allows IRC clients to set/get metadata that persists across sessions.
+ */
+
+int
+nickserv_set_user_metadata(struct handle_info *hi, const char *key, const char *value)
+{
+    if (!hi || !key)
+        return -1;
+
+#ifdef WITH_KEYCLOAK
+    if (nickserv_conf.keycloak_enable) {
+        char attr_name[128];
+        struct kc_user user;
+        int rc;
+
+        if (kc_ensure_token() != KC_SUCCESS) {
+            log_module(NS_LOG, LOG_WARNING, "nickserv_set_user_metadata: Failed to get admin token");
+            return -1;
+        }
+
+        /* Get user ID from Keycloak */
+        rc = keycloak_get_user(kc_realm_config, kc_client_config, hi->handle, &user);
+        if (rc != KC_SUCCESS) {
+            log_module(NS_LOG, LOG_WARNING, "nickserv_set_user_metadata: User %s not found in Keycloak", hi->handle);
+            return -1;
+        }
+
+        char *user_id = strdup(user.id);
+        keycloak_user_free(&user);
+
+        /* Prefix metadata keys with "metadata." to avoid conflicts */
+        snprintf(attr_name, sizeof(attr_name), "metadata.%s", key);
+
+        /* Set or delete the attribute */
+        if (value && *value) {
+            rc = keycloak_set_user_attribute(kc_realm_config, kc_client_config,
+                                             user_id, attr_name, value);
+        } else {
+            /* Delete by setting to empty string */
+            rc = keycloak_set_user_attribute(kc_realm_config, kc_client_config,
+                                             user_id, attr_name, "");
+        }
+
+        free(user_id);
+
+        if (rc != KC_SUCCESS) {
+            log_module(NS_LOG, LOG_WARNING, "nickserv_set_user_metadata: Failed to set %s for %s", key, hi->handle);
+            return -1;
+        }
+
+        log_module(NS_LOG, LOG_DEBUG, "nickserv_set_user_metadata: Set %s.%s = %s",
+                   hi->handle, key, value ? value : "(deleted)");
+        return 0;
+    }
+#endif
+
+    /* Without Keycloak, metadata is not persisted */
+    log_module(NS_LOG, LOG_DEBUG, "nickserv_set_user_metadata: No backend available for %s.%s", hi->handle, key);
+    return 0;
+}
+
+int
+nickserv_get_user_metadata(struct handle_info *hi, const char *key, char *value_out)
+{
+    if (!hi || !key || !value_out)
+        return -1;
+
+    value_out[0] = '\0';
+
+#ifdef WITH_KEYCLOAK
+    if (nickserv_conf.keycloak_enable) {
+        char attr_name[128];
+        struct kc_user user;
+        char *attr_value = NULL;
+        int rc;
+
+        if (kc_ensure_token() != KC_SUCCESS) {
+            return -1;
+        }
+
+        /* Get user ID from Keycloak */
+        rc = keycloak_get_user(kc_realm_config, kc_client_config, hi->handle, &user);
+        if (rc != KC_SUCCESS) {
+            return -1;
+        }
+
+        char *user_id = strdup(user.id);
+        keycloak_user_free(&user);
+
+        /* Prefix metadata keys with "metadata." */
+        snprintf(attr_name, sizeof(attr_name), "metadata.%s", key);
+
+        rc = keycloak_get_user_attribute(kc_realm_config, kc_client_config,
+                                         user_id, attr_name, &attr_value);
+        free(user_id);
+
+        if (rc == KC_SUCCESS && attr_value) {
+            strncpy(value_out, attr_value, 1023);
+            value_out[1023] = '\0';
+            free(attr_value);
+            return 0;
+        } else if (rc == KC_NOT_FOUND) {
+            return 1; /* Not found */
+        }
+        return -1;
+    }
+#endif
+
+    return 1; /* Not found - no backend */
+}
+
+void
+nickserv_sync_metadata_to_ircd(struct userNode *user)
+{
+    /* This function would iterate over stored metadata and push to IRCd.
+     * For now, we rely on clients requesting metadata via METADATA GET.
+     * Future enhancement: fetch all metadata.* attributes and push them.
+     */
+    if (!user || !user->handle_info)
+        return;
+
+    log_module(NS_LOG, LOG_DEBUG, "nickserv_sync_metadata_to_ircd: Would sync metadata for %s",
+               user->handle_info->handle);
+
+    /* TODO: If we want proactive sync, we would:
+     * 1. Fetch all metadata.* attributes from Keycloak
+     * 2. For each, call irc_metadata(user->nick, key, value)
+     */
+}
 
 static void
 nickserv_conf_read(void)

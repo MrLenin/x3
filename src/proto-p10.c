@@ -127,6 +127,7 @@
 #define CMD_REGISTER_ACCT       "REGISTER"
 #define CMD_VERIFY_ACCT         "VERIFY"
 #define CMD_REGREPLY            "REGREPLY"
+#define CMD_METADATA            "METADATA"
 
 /* Tokenized commands. */
 #define TOK_ACCOUNT		"AC"
@@ -229,6 +230,7 @@
 #define TOK_WHOWAS              "X"
 #define TOK_ZLINE		"ZL"
 #define TOK_REGISTER_ACCT       "RG"
+#define TOK_METADATA            "MD"
 #define TOK_VERIFY_ACCT         "VF"
 #define TOK_REGREPLY            "RR"
 
@@ -344,6 +346,7 @@
 #define P10_REGISTER_ACCT       TYPE(REGISTER_ACCT)
 #define P10_VERIFY_ACCT         TYPE(VERIFY_ACCT)
 #define P10_REGREPLY            TYPE(REGREPLY)
+#define P10_METADATA            TYPE(METADATA)
 
 /* Servers claiming to have a boot or link time before PREHISTORY
  * trigger errors to the log.  We hope no server has been running
@@ -631,9 +634,18 @@ void
 irc_account(struct userNode *user, const char *stamp, time_t timestamp)
 {
     if(extended_accounts)
-        putsock("%s " P10_ACCOUNT " %s R %s "FMT_TIME_T, self->numeric, user->numeric, stamp, timestamp); 
+        putsock("%s " P10_ACCOUNT " %s R %s "FMT_TIME_T, self->numeric, user->numeric, stamp, timestamp);
     else
         putsock("%s " P10_ACCOUNT " %s %s "FMT_TIME_T, self->numeric, user->numeric, stamp, timestamp);
+}
+
+void
+irc_metadata(const char *target, const char *key, const char *value)
+{
+    if (value && *value)
+        putsock("%s " P10_METADATA " %s %s :%s", self->numeric, target, key, value);
+    else
+        putsock("%s " P10_METADATA " %s %s", self->numeric, target, key);
 }
 
 void
@@ -2779,6 +2791,50 @@ static CMD_FUNC(cmd_verify_acct)
     return 1;
 }
 
+/** Handle MD (METADATA) command - P10 metadata propagation.
+ * Format: <source> MD <target> <key> [:<value>]
+ * When value is omitted, the key is being deleted.
+ * X3 stores account-linked metadata in Keycloak as user attributes.
+ */
+static CMD_FUNC(cmd_metadata)
+{
+    struct userNode *user;
+    const char *target;
+    const char *key;
+    const char *value = NULL;
+
+    if (argc < 3)
+        return 0;
+
+    target = argv[1];
+    key = argv[2];
+    if (argc > 3)
+        value = argv[3];
+
+    /* Find the target user */
+    user = GetUserH(target);
+    if (!user) {
+        /* Target might be a channel, or user is gone - ignore */
+        return 1;
+    }
+
+    /* Only store metadata for authenticated users */
+    if (!user->handle_info) {
+        log_module(MAIN_LOG, LOG_DEBUG, "METADATA for unauthenticated user %s ignored", target);
+        return 1;
+    }
+
+    /* Store in Keycloak as user attribute if keycloak is enabled */
+    log_module(MAIN_LOG, LOG_INFO, "METADATA: %s.%s = %s (account: %s)",
+               target, key, value ? value : "(deleted)",
+               user->handle_info->handle);
+
+    /* Call the keycloak attribute API if available */
+    nickserv_set_user_metadata(user->handle_info, key, value);
+
+    return 1;
+}
+
 static void
 p10_conf_reload(void) {
     hidden_host_suffix = conf_get_data("server/hidden_host", RECDB_QSTRING);
@@ -2931,6 +2987,10 @@ init_parse(void)
     dict_insert(irc_func_dict, TOK_REGISTER_ACCT, cmd_register_acct);
     dict_insert(irc_func_dict, CMD_VERIFY_ACCT, cmd_verify_acct);
     dict_insert(irc_func_dict, TOK_VERIFY_ACCT, cmd_verify_acct);
+
+    /* IRCv3 metadata-2 support */
+    dict_insert(irc_func_dict, CMD_METADATA, cmd_metadata);
+    dict_insert(irc_func_dict, TOK_METADATA, cmd_metadata);
 
     /* In P10, DESTRUCT doesn't do anything except be broadcast to servers.
      * Apparently to obliterate channels from any servers that think they

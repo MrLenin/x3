@@ -337,4 +337,31 @@ enum nickserv_register_result nickserv_ircv3_register(struct userNode *user,
 enum nickserv_verify_result nickserv_ircv3_verify(struct userNode *user,
     const char *handle, const char *code, char *result_msg);
 
+/* IRCv3 metadata-2 support */
+
+/**
+ * Set user metadata (stored in Keycloak as user attribute if available).
+ * @param hi Handle info for the user
+ * @param key Metadata key name
+ * @param value Metadata value (NULL to delete)
+ * @return 0 on success, -1 on error
+ */
+int nickserv_set_user_metadata(struct handle_info *hi, const char *key, const char *value);
+
+/**
+ * Get user metadata (from Keycloak if available).
+ * @param hi Handle info for the user
+ * @param key Metadata key name
+ * @param value_out Buffer to receive value (at least 1024 bytes)
+ * @return 0 on success, 1 if not found, -1 on error
+ */
+int nickserv_get_user_metadata(struct handle_info *hi, const char *key, char *value_out);
+
+/**
+ * Send all metadata for a user to the IRCd.
+ * Called when a user authenticates to push their stored metadata.
+ * @param user The user who just authenticated
+ */
+void nickserv_sync_metadata_to_ircd(struct userNode *user);
+
 #endif
