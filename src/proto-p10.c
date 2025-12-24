@@ -1270,6 +1270,13 @@ irc_sasl(struct server* dest, const char *identifier, const char *subcmd, const 
     putsock("%s " P10_SASL " %s %s %s %s", self->numeric, dest->numeric, identifier, subcmd, data);
 }
 
+void
+irc_sasl_mechs_broadcast(const char *mechs)
+{
+    /* Broadcast SASL mechanism list to all servers: SASL * * M :PLAIN,EXTERNAL,... */
+    putsock("%s " P10_SASL " * * M :%s", self->numeric, mechs);
+}
+
 static void send_burst(void);
 
 static void
@@ -1445,6 +1452,9 @@ static CMD_FUNC(cmd_eob)
         unbursted_channels = NULL;
         irc_eob();
         irc_eob_ack();
+
+        /* Broadcast SASL mechanism list to all servers */
+        irc_sasl_mechs_broadcast(nickserv_get_sasl_mechanisms());
 
         /* now that we know who our uplink is,
          * we can center the routing map and activate auto-routing.

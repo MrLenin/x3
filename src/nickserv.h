@@ -243,6 +243,9 @@ void nickserv_show_oper_accounts(struct userNode *user, struct svccmd *cmd);
 
 void nickserv_do_autoauth(struct userNode *user);
 
+/* Get the SASL mechanism list based on current configuration */
+const char *nickserv_get_sasl_mechanisms(void);
+
 struct handle_info *get_victim_oper(struct userNode *user, const char *target);
 struct handle_info *loc_auth(char *sslfp, char *handle, char *password, char *userhost);
 

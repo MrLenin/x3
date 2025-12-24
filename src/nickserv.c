@@ -2403,6 +2403,25 @@ struct handle_info *loc_auth(char *sslfp, char *handle, char *password, char *us
     return hi;
 }
 
+const char *nickserv_get_sasl_mechanisms(void)
+{
+    static char mechs[128];
+
+    /* Always support PLAIN */
+    strcpy(mechs, "PLAIN");
+
+    /* Add EXTERNAL if SSL is available (client cert auth) */
+    strcat(mechs, ",EXTERNAL");
+
+#ifdef WITH_KEYCLOAK
+    /* Add OAUTHBEARER if Keycloak is enabled */
+    if (nickserv_conf.keycloak_enable)
+        strcat(mechs, ",OAUTHBEARER");
+#endif
+
+    return mechs;
+}
+
 void nickserv_do_autoauth(struct userNode *user)
 {
     struct handle_info *hi;
