@@ -345,6 +345,12 @@ enum nickserv_verify_result nickserv_ircv3_verify(struct userNode *user,
 #define METADATA_VIS_PUBLIC  0  /* Anyone can see */
 #define METADATA_VIS_PRIVATE 1  /* Only owner can see */
 
+/** Maximum length of a metadata key */
+#define METADATA_KEY_LEN 64
+
+/** Maximum length of a metadata value */
+#define METADATA_VALUE_LEN 1024
+
 /**
  * Set user metadata (stored in Keycloak as user attribute if available).
  * @param hi Handle info for the user
@@ -371,6 +377,15 @@ int nickserv_get_user_metadata(struct handle_info *hi, const char *key, char *va
  * @param user The user who just authenticated
  */
 void nickserv_sync_metadata_to_ircd(struct userNode *user);
+
+/**
+ * Sync all metadata for an account to the IRCd by account name.
+ * Similar to nickserv_sync_metadata_to_ircd but uses the account handle
+ * as the target instead of the user's nick. Used for MDQ responses
+ * where the user may be offline.
+ * @param hi The handle_info for the account to sync
+ */
+void nickserv_sync_account_metadata_to_ircd(struct handle_info *hi);
 
 /* IRCv3 draft/webpush support */
 

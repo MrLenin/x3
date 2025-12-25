@@ -130,6 +130,7 @@
 #define CMD_VERIFY_ACCT         "VERIFY"
 #define CMD_REGREPLY            "REGREPLY"
 #define CMD_METADATA            "METADATA"
+#define CMD_METADATAQUERY       "METADATAQUERY"
 #define CMD_WEBPUSH             "WEBPUSH"
 
 /* Tokenized commands. */
@@ -235,6 +236,7 @@
 #define TOK_ZLINE		"ZL"
 #define TOK_REGISTER_ACCT       "RG"
 #define TOK_METADATA            "MD"
+#define TOK_METADATAQUERY       "MDQ"
 #define TOK_WEBPUSH             "WP"
 #define TOK_VERIFY_ACCT         "VF"
 #define TOK_REGREPLY            "RR"
@@ -352,6 +354,7 @@
 #define P10_VERIFY_ACCT         TYPE(VERIFY_ACCT)
 #define P10_REGREPLY            TYPE(REGREPLY)
 #define P10_METADATA            TYPE(METADATA)
+#define P10_METADATAQUERY       TYPE(METADATAQUERY)
 #define P10_WEBPUSH             TYPE(WEBPUSH)
 
 /* Servers claiming to have a boot or link time before PREHISTORY
@@ -653,6 +656,16 @@ irc_metadata(const char *target, const char *key, const char *value, int visibil
         putsock("%s " P10_METADATA " %s %s %s :%s", self->numeric, target, key, vis_token, value);
     else
         putsock("%s " P10_METADATA " %s %s", self->numeric, target, key);
+}
+
+void
+irc_metadataquery(const char *target, const char *key)
+{
+    /* Send MDQ (MetadataQuery) to request metadata for an account/channel.
+     * Format: <server> MDQ <target> <key|*>
+     * The IRCd will respond with MD tokens containing the requested metadata.
+     */
+    putsock("%s " P10_METADATAQUERY " %s %s", self->numeric, target, key ? key : "*");
 }
 
 void
@@ -2930,6 +2943,76 @@ static CMD_FUNC(cmd_metadata)
     return 1;
 }
 
+/** Handle MDQ (METADATAQUERY) command - P10 on-demand metadata query.
+ * Format: <source> MDQ <target> <key|*>
+ *
+ * This is sent by the IRCd when it needs metadata for an account or channel
+ * that it doesn't have in its local cache. X3 looks up the metadata from
+ * its storage (Keycloak/LMDB) and responds with standard MD tokens.
+ *
+ * Examples:
+ *   AB MDQ accountname *       -> Query all metadata for account
+ *   AB MDQ accountname avatar  -> Query specific key for account
+ *   AB MDQ #channel *          -> Query all metadata for channel
+ */
+static CMD_FUNC(cmd_metadataquery)
+{
+    const char *target;
+    const char *key;
+    struct handle_info *hi;
+    char value[METADATA_VALUE_LEN + 1];
+    int visibility;
+
+    if (argc < 3)
+        return 0;
+
+    target = argv[1];
+    key = argv[2];
+
+    log_module(MAIN_LOG, LOG_DEBUG, "MDQ: Query for %s key=%s", target, key);
+
+    /* Check if target is a channel */
+    if (target[0] == '#') {
+        /* Channel metadata query */
+        struct chanNode *channel = GetChannel(target);
+        struct chanData *cData = channel ? channel->channel_info : NULL;
+        if (!cData) {
+            log_module(MAIN_LOG, LOG_DEBUG, "MDQ: Channel %s not registered", target);
+            return 1;
+        }
+
+        if (key[0] == '*' && key[1] == '\0') {
+            /* Query all metadata for channel - iterate through stored keys */
+            chanserv_sync_metadata_to_ircd(cData);
+        } else {
+            /* Single key query */
+            if (chanserv_get_channel_metadata(cData, key, value, &visibility) == 0) {
+                irc_metadata(target, key, value, visibility);
+            }
+        }
+        return 1;
+    }
+
+    /* Account metadata query - look up the handle */
+    hi = get_handle_info(target);
+    if (!hi) {
+        log_module(MAIN_LOG, LOG_DEBUG, "MDQ: Account %s not found", target);
+        return 1;
+    }
+
+    if (key[0] == '*' && key[1] == '\0') {
+        /* Query all metadata for account - sync all stored metadata to IRCd */
+        nickserv_sync_account_metadata_to_ircd(hi);
+    } else {
+        /* Single key query */
+        if (nickserv_get_user_metadata(hi, key, value, &visibility) == 0) {
+            irc_metadata(target, key, value, visibility);
+        }
+    }
+
+    return 1;
+}
+
 /** Simple djb2 hash for endpoint URLs */
 static unsigned long
 webpush_hash(const char *str)
@@ -3208,6 +3291,8 @@ init_parse(void)
     /* IRCv3 metadata-2 support */
     dict_insert(irc_func_dict, CMD_METADATA, cmd_metadata);
     dict_insert(irc_func_dict, TOK_METADATA, cmd_metadata);
+    dict_insert(irc_func_dict, CMD_METADATAQUERY, cmd_metadataquery);
+    dict_insert(irc_func_dict, TOK_METADATAQUERY, cmd_metadataquery);
 
     /* IRCv3 draft/webpush support */
     dict_insert(irc_func_dict, CMD_WEBPUSH, cmd_webpush);

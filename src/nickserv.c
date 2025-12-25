@@ -6226,6 +6226,131 @@ nickserv_sync_metadata_to_ircd(struct userNode *user)
                user->handle_info->handle);
 }
 
+void
+nickserv_sync_account_metadata_to_ircd(struct handle_info *hi)
+{
+    int found_entries = 0;
+
+    if (!hi)
+        return;
+
+    /* This variant uses the account name (handle) as the target,
+     * for MDQ responses where the user may be offline.
+     */
+
+#ifdef WITH_LMDB
+    /* Step 1: Try LMDB cache first */
+    if (x3_lmdb_is_available()) {
+        struct lmdb_metadata_entry *entries = NULL;
+        struct lmdb_metadata_entry *entry;
+        int count;
+
+        count = x3_lmdb_account_list(hi->handle, &entries);
+        if (count > 0) {
+            log_module(NS_LOG, LOG_DEBUG, "nickserv_sync_account_metadata_to_ircd: Found %d LMDB entries for %s",
+                       count, hi->handle);
+
+            for (entry = entries; entry; entry = entry->next) {
+                const char *key = entry->key;
+                const char *value = entry->value;
+                int visibility = METADATA_VIS_PUBLIC;
+
+                /* Parse visibility prefix from stored value (P:value for private) */
+                if (value && value[0] == 'P' && value[1] == ':') {
+                    visibility = METADATA_VIS_PRIVATE;
+                    value += 2;
+                }
+
+                log_module(NS_LOG, LOG_DEBUG, "nickserv_sync_account_metadata_to_ircd: Pushing %s.%s = %s (vis=%d) from LMDB",
+                           hi->handle, key, value, visibility);
+
+                irc_metadata(hi->handle, key, value, visibility);
+                found_entries++;
+            }
+
+            x3_lmdb_free_entries(entries);
+        }
+    }
+#endif
+
+    /* If we found entries in LMDB cache, we're done */
+    if (found_entries > 0)
+        return;
+
+#ifdef WITH_KEYCLOAK
+    /* Step 2: Query Keycloak backend (cache miss or no LMDB) */
+    if (nickserv_conf.keycloak_enable) {
+        struct kc_user kc_user;
+        struct kc_metadata_entry *entries = NULL;
+        struct kc_metadata_entry *entry;
+        int rc;
+
+        if (kc_ensure_token() != KC_SUCCESS) {
+            log_module(NS_LOG, LOG_DEBUG, "nickserv_sync_account_metadata_to_ircd: Failed to get admin token");
+            return;
+        }
+
+        /* Get user ID from Keycloak */
+        rc = keycloak_get_user(kc_realm_config, kc_client_config, hi->handle, &kc_user);
+        if (rc != KC_SUCCESS) {
+            log_module(NS_LOG, LOG_DEBUG, "nickserv_sync_account_metadata_to_ircd: User %s not found in Keycloak",
+                       hi->handle);
+            return;
+        }
+
+        char *user_id = strdup(kc_user.id);
+        keycloak_user_free(&kc_user);
+
+        /* Fetch all metadata.* attributes */
+        rc = keycloak_list_user_attributes(kc_realm_config, kc_client_config,
+                                           user_id, "metadata.", &entries);
+        free(user_id);
+
+        if (rc != KC_SUCCESS) {
+            log_module(NS_LOG, LOG_DEBUG, "nickserv_sync_account_metadata_to_ircd: Failed to list attributes for %s",
+                       hi->handle);
+            return;
+        }
+
+        /* Push each metadata entry to the IRCd and populate LMDB cache */
+        for (entry = entries; entry; entry = entry->next) {
+            /* Strip "metadata." prefix from key */
+            const char *key = entry->key;
+            const char *value = entry->value;
+            const char *original_value = entry->value;
+            int visibility = METADATA_VIS_PUBLIC;
+
+            if (strncmp(key, "metadata.", 9) == 0)
+                key += 9;
+
+            /* Parse visibility prefix from stored value (P:value for private) */
+            if (value && value[0] == 'P' && value[1] == ':') {
+                visibility = METADATA_VIS_PRIVATE;
+                value += 2;
+            }
+
+            log_module(NS_LOG, LOG_DEBUG, "nickserv_sync_account_metadata_to_ircd: Pushing %s.%s = %s (vis=%d) from Keycloak",
+                       hi->handle, key, value, visibility);
+
+            irc_metadata(hi->handle, key, value, visibility);
+
+#ifdef WITH_LMDB
+            /* Populate LMDB cache */
+            if (x3_lmdb_is_available()) {
+                x3_lmdb_account_set(hi->handle, key, original_value);
+            }
+#endif
+        }
+
+        keycloak_free_metadata_entries(entries);
+        return;
+    }
+#endif
+
+    log_module(NS_LOG, LOG_DEBUG, "nickserv_sync_account_metadata_to_ircd: No backend for %s",
+               hi->handle);
+}
+
 int
 nickserv_get_webpush_subscriptions(const char *account_name,
                                    struct kc_metadata_entry **entries_out)
