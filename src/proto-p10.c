@@ -25,6 +25,7 @@
 #include "proto-common.c"
 #include "opserv.h"
 #include "webpush.h"
+#include "x3_lmdb.h"
 
 /* Full commands. */
 #define CMD_ACCOUNT		"ACCOUNT"
@@ -131,6 +132,7 @@
 #define CMD_REGREPLY            "REGREPLY"
 #define CMD_METADATA            "METADATA"
 #define CMD_METADATAQUERY       "METADATAQUERY"
+#define CMD_MARKREAD            "MARKREAD"
 #define CMD_WEBPUSH             "WEBPUSH"
 
 /* Tokenized commands. */
@@ -237,6 +239,7 @@
 #define TOK_REGISTER_ACCT       "RG"
 #define TOK_METADATA            "MD"
 #define TOK_METADATAQUERY       "MDQ"
+#define TOK_MARKREAD            "MR"
 #define TOK_WEBPUSH             "WP"
 #define TOK_VERIFY_ACCT         "VF"
 #define TOK_REGREPLY            "RR"
@@ -355,6 +358,7 @@
 #define P10_REGREPLY            TYPE(REGREPLY)
 #define P10_METADATA            TYPE(METADATA)
 #define P10_METADATAQUERY       TYPE(METADATAQUERY)
+#define P10_MARKREAD            TYPE(MARKREAD)
 #define P10_WEBPUSH             TYPE(WEBPUSH)
 
 /* Servers claiming to have a boot or link time before PREHISTORY
@@ -3133,6 +3137,126 @@ static CMD_FUNC(cmd_webpush)
     return 1;
 }
 
+/** Handle MARKREAD (MR) command - P10 read marker synchronization.
+ * Format from Nefarious:
+ *   MR S <user_numeric> <target> <timestamp>  - Set marker
+ *   MR G <user_numeric> <target>              - Get marker
+ *
+ * X3 stores markers and broadcasts updates:
+ *   MR <account> <target> <timestamp>         - Broadcast to all servers
+ *   MR R <target_server> <user_numeric> <target> <timestamp> - Reply to get
+ */
+static CMD_FUNC(cmd_markread)
+{
+    struct userNode *user;
+    const char *subcmd;
+    const char *target;
+    const char *timestamp;
+    char key[128];
+    char stored_ts[64];
+    int rc;
+
+    if (argc < 3)
+        return 0;
+
+    subcmd = argv[1];
+
+    if (subcmd[0] == 'S' && subcmd[1] == '\0') {
+        /* SET: MR S <user_numeric> <target> <timestamp> */
+        if (argc < 5) {
+            log_module(MAIN_LOG, LOG_WARNING, "MARKREAD SET: Not enough parameters");
+            return 0;
+        }
+
+        /* Find the user by numeric */
+        user = GetUserN(argv[2]);
+        if (!user) {
+            log_module(MAIN_LOG, LOG_DEBUG, "MARKREAD SET: Unknown user numeric %s", argv[2]);
+            return 0;
+        }
+
+        /* Must be authenticated */
+        if (!user->handle_info) {
+            log_module(MAIN_LOG, LOG_DEBUG, "MARKREAD SET: User %s not authenticated", user->nick);
+            return 0;
+        }
+
+        target = argv[3];
+        timestamp = argv[4];
+
+        /* Build key: readmarker.<target> */
+        snprintf(key, sizeof(key), "readmarker.%s", target);
+
+        log_module(MAIN_LOG, LOG_INFO, "MARKREAD SET: %s (%s) %s = %s",
+                   user->nick, user->handle_info->handle, target, timestamp);
+
+        /* Check if existing timestamp is newer (only update if newer) */
+        rc = x3_lmdb_account_get(user->handle_info->handle, key, stored_ts);
+        if (rc == LMDB_SUCCESS) {
+            /* Compare timestamps lexicographically (ISO 8601 sorts correctly) */
+            if (strcmp(timestamp, stored_ts) <= 0) {
+                log_module(MAIN_LOG, LOG_DEBUG, "MARKREAD SET: Existing timestamp %s is newer, ignoring", stored_ts);
+                return 1;
+            }
+        }
+
+        /* Store in LMDB */
+        x3_lmdb_account_set(user->handle_info->handle, key, timestamp);
+
+        /* Also store in Keycloak for persistence */
+        nickserv_set_user_metadata(user->handle_info, key, timestamp, METADATA_VIS_PRIVATE);
+
+        /* Broadcast to all servers: MR <account> <target> <timestamp> */
+        putsock("%s " P10_MARKREAD " %s %s %s",
+                self->numeric, user->handle_info->handle, target, timestamp);
+
+    } else if (subcmd[0] == 'G' && subcmd[1] == '\0') {
+        /* GET: MR G <user_numeric> <target> */
+        if (argc < 4) {
+            log_module(MAIN_LOG, LOG_WARNING, "MARKREAD GET: Not enough parameters");
+            return 0;
+        }
+
+        /* Find the user by numeric */
+        user = GetUserN(argv[2]);
+        if (!user) {
+            log_module(MAIN_LOG, LOG_DEBUG, "MARKREAD GET: Unknown user numeric %s", argv[2]);
+            return 0;
+        }
+
+        /* Must be authenticated */
+        if (!user->handle_info) {
+            log_module(MAIN_LOG, LOG_DEBUG, "MARKREAD GET: User %s not authenticated", user->nick);
+            return 0;
+        }
+
+        target = argv[3];
+
+        /* Build key: readmarker.<target> */
+        snprintf(key, sizeof(key), "readmarker.%s", target);
+
+        log_module(MAIN_LOG, LOG_DEBUG, "MARKREAD GET: %s (%s) %s",
+                   user->nick, user->handle_info->handle, target);
+
+        /* Look up in LMDB */
+        rc = x3_lmdb_account_get(user->handle_info->handle, key, stored_ts);
+        if (rc == LMDB_SUCCESS) {
+            /* Send reply: MR R <target_server> <user_numeric> <target> <timestamp> */
+            putsock("%s " P10_MARKREAD " R %s %s %s %s",
+                    self->numeric, user->uplink->numeric, user->numeric, target, stored_ts);
+        } else {
+            /* Not found - send "*" as timestamp */
+            putsock("%s " P10_MARKREAD " R %s %s %s *",
+                    self->numeric, user->uplink->numeric, user->numeric, target);
+        }
+
+    } else {
+        log_module(MAIN_LOG, LOG_DEBUG, "MARKREAD: Unknown or ignored subcommand %s", subcmd);
+    }
+
+    return 1;
+}
+
 static void
 p10_conf_reload(void) {
     hidden_host_suffix = conf_get_data("server/hidden_host", RECDB_QSTRING);
@@ -3297,6 +3421,10 @@ init_parse(void)
     /* IRCv3 draft/webpush support */
     dict_insert(irc_func_dict, CMD_WEBPUSH, cmd_webpush);
     dict_insert(irc_func_dict, TOK_WEBPUSH, cmd_webpush);
+
+    /* IRCv3 draft/read-marker support */
+    dict_insert(irc_func_dict, CMD_MARKREAD, cmd_markread);
+    dict_insert(irc_func_dict, TOK_MARKREAD, cmd_markread);
 
     /* In P10, DESTRUCT doesn't do anything except be broadcast to servers.
      * Apparently to obliterate channels from any servers that think they

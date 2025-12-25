@@ -10,18 +10,18 @@
 
 #include "config.h"
 
-#ifdef WITH_LMDB
-
-#include <lmdb.h>
-#include <stddef.h>
-
-/* Error codes */
+/* Error codes - always defined so code compiles without LMDB */
 enum lmdb_error {
     LMDB_SUCCESS = 0,
     LMDB_ERROR = -1,
     LMDB_NOT_FOUND = -2,
     LMDB_FULL = -3
 };
+
+#ifdef WITH_LMDB
+
+#include <lmdb.h>
+#include <stddef.h>
 
 /* Database names */
 #define LMDB_DB_ACCOUNTS    "accounts"
