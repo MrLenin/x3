@@ -66,6 +66,7 @@ extern struct nickserv_config nickserv_conf;
 #define KEY_NETWORK_HELPER_EPITHET  "network_helper_epithet"
 #define KEY_SUPPORT_HELPER_EPITHET  "support_helper_epithet"
 #define KEY_KEYCLOAK_ACCESS_SYNC    "keycloak_access_sync"
+#define KEY_KEYCLOAK_HIERARCHICAL   "keycloak_hierarchical_groups"
 #define KEY_KEYCLOAK_GROUP_PREFIX   "keycloak_group_prefix"
 #define KEY_KEYCLOAK_SYNC_FREQUENCY "keycloak_sync_frequency"
 #define KEY_NODELETE_LEVEL          "nodelete_level"
@@ -664,7 +665,8 @@ static struct
 
     /* Keycloak channel access sync */
     unsigned int        keycloak_access_sync : 1;  /* Enable Keycloak group sync */
-    const char          *keycloak_group_prefix;    /* Group name prefix, e.g. "irc-channel-" */
+    unsigned int        keycloak_hierarchical_groups : 1; /* Use hierarchical group paths */
+    const char          *keycloak_group_prefix;    /* Group name prefix, e.g. "irc-channel-" or "irc-channels" */
     unsigned long       keycloak_sync_frequency;   /* Sync interval in seconds (0 = startup only) */
 } chanserv_conf;
 
@@ -9180,8 +9182,16 @@ chanserv_conf_read(void)
     chanserv_conf.support_helper_epithet = str ? str : "a wannabe tyrant";
     str = database_get_data(conf_node, KEY_KEYCLOAK_ACCESS_SYNC, RECDB_QSTRING);
     chanserv_conf.keycloak_access_sync = str ? enabled_string(str) : 0;
+    str = database_get_data(conf_node, KEY_KEYCLOAK_HIERARCHICAL, RECDB_QSTRING);
+    chanserv_conf.keycloak_hierarchical_groups = str ? enabled_string(str) : 0;
     str = database_get_data(conf_node, KEY_KEYCLOAK_GROUP_PREFIX, RECDB_QSTRING);
-    chanserv_conf.keycloak_group_prefix = str ? str : "irc-channel-";
+    /* Default prefix depends on mode: "irc-channels" for hierarchical, "irc-channel-" for flat */
+    if (str) {
+        chanserv_conf.keycloak_group_prefix = str;
+    } else {
+        chanserv_conf.keycloak_group_prefix = chanserv_conf.keycloak_hierarchical_groups
+            ? "irc-channels" : "irc-channel-";
+    }
     str = database_get_data(conf_node, KEY_KEYCLOAK_SYNC_FREQUENCY, RECDB_QSTRING);
     chanserv_conf.keycloak_sync_frequency = str ? ParseInterval(str) : 3600;
     str = database_get_data(conf_node, KEY_GOD_TIMEOUT, RECDB_QSTRING);
@@ -10251,12 +10261,6 @@ chanserv_sync_keycloak_channel_level(const char *channel, unsigned short level)
     if (!suffix)
         return 0;
 
-    /* Build group name: prefix + channel + "-" + suffix
-     * e.g., "irc-channel-#help-owner"
-     */
-    snprintf(group_name, sizeof(group_name), "%s%s-%s",
-             chanserv_conf.keycloak_group_prefix, channel, suffix);
-
     /* Setup Keycloak connection */
     realm.base_uri = (char*)nickserv_conf.keycloak_uri;
     realm.realm = nickserv_conf.keycloak_realm;
@@ -10271,8 +10275,22 @@ chanserv_sync_keycloak_channel_level(const char *channel, unsigned short level)
         return -1;
     }
 
-    /* Look up group */
-    rc = keycloak_get_group_by_name(realm, client, group_name, &group_id);
+    /* Look up group - use hierarchical path or flat name based on config */
+    if (chanserv_conf.keycloak_hierarchical_groups) {
+        /* Hierarchical mode: /irc-channels/#help/owner
+         * Path format: /<prefix>/<channel>/<suffix>
+         */
+        snprintf(group_name, sizeof(group_name), "/%s/%s/%s",
+                 chanserv_conf.keycloak_group_prefix, channel, suffix);
+        rc = keycloak_get_group_by_path(realm, client, group_name, &group_id);
+    } else {
+        /* Flat mode: irc-channel-#help-owner
+         * Name format: <prefix><channel>-<suffix>
+         */
+        snprintf(group_name, sizeof(group_name), "%s%s-%s",
+                 chanserv_conf.keycloak_group_prefix, channel, suffix);
+        rc = keycloak_get_group_by_name(realm, client, group_name, &group_id);
+    }
     if (rc == KC_NOT_FOUND) {
         /* Group doesn't exist - that's OK, no members to sync */
         keycloak_free_access_token(client.access_token);
@@ -10351,7 +10369,9 @@ chanserv_sync_keycloak_access(void *data)
         return;
     }
 
-    log_module(CS_LOG, LOG_INFO, "Starting Keycloak channel access sync...");
+    log_module(CS_LOG, LOG_INFO, "Starting Keycloak channel access sync (%s mode, prefix: %s)...",
+               chanserv_conf.keycloak_hierarchical_groups ? "hierarchical" : "flat",
+               chanserv_conf.keycloak_group_prefix);
 
     /* Iterate through all registered channels */
     for (cData = channelList; cData; cData = cData->next) {

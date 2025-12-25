@@ -1570,6 +1570,98 @@ cleanup:
     return result;
 }
 
+int keycloak_get_group_by_path(struct kc_realm realm, struct kc_client client,
+                               const char* group_path, char** group_id_out)
+{
+    if (!realm.base_uri || !realm.realm || !client.access_token ||
+        !group_path || !group_id_out) {
+        log_module(KC_LOG, LOG_DEBUG, "keycloak_get_group_by_path: Invalid arguments");
+        return KC_ERROR;
+    }
+
+    *group_id_out = NULL;
+    int result = KC_ERROR;
+    char* uri = NULL;
+    char* escaped_path = NULL;
+    struct memory chunk = { .response = NULL, .size = 0 };
+
+    /* URL-encode the path (preserving slashes for Keycloak API) */
+    escaped_path = curl_easy_escape(NULL, group_path, 0);
+    if (!escaped_path) {
+        log_module(KC_LOG, LOG_DEBUG, "keycloak_get_group_by_path: Failed to escape path");
+        goto cleanup;
+    }
+
+    /* Keycloak endpoint: GET /admin/realms/{realm}/group-by-path/{path}
+     * Note: The path should start with /
+     */
+    static const char uri_tmpl[] = "%s/admin/realms/%s/group-by-path%s";
+    int uri_len = snprintf(NULL, 0, uri_tmpl, realm.base_uri, realm.realm, group_path) + 1;
+    uri = malloc(uri_len);
+    if (!uri) {
+        log_module(KC_LOG, LOG_DEBUG, "keycloak_get_group_by_path: Failed to allocate uri");
+        goto cleanup;
+    }
+    snprintf(uri, uri_len, uri_tmpl, realm.base_uri, realm.realm, group_path);
+
+    struct curl_opts opts = {
+        .uri = uri,
+        .method = HTTP_GET,
+        .xoauth2_bearer = client.access_token->access_token,
+        .write_callback = curl_write_cb,
+        .header_count = 0
+    };
+
+    long http_code = curl_perform(opts, &chunk);
+
+    if (http_code == 404) {
+        log_module(KC_LOG, LOG_DEBUG, "keycloak_get_group_by_path: Path '%s' not found", group_path);
+        result = KC_NOT_FOUND;
+        goto cleanup;
+    }
+
+    if (http_code == 200 && chunk.response) {
+        json_error_t error;
+        json_t* root = json_loads(chunk.response, 0, &error);
+        if (!root) {
+            log_module(KC_LOG, LOG_DEBUG, "keycloak_get_group_by_path: Failed to parse JSON: %s", error.text);
+            goto cleanup;
+        }
+
+        /* Response is a single group object with "id" field */
+        if (json_is_object(root)) {
+            json_t* id_val = json_object_get(root, "id");
+            if (id_val && json_is_string(id_val)) {
+                *group_id_out = strdup(json_string_value(id_val));
+                if (*group_id_out) {
+                    result = KC_SUCCESS;
+                    log_module(KC_LOG, LOG_DEBUG, "keycloak_get_group_by_path: Found group at '%s' with ID '%s'",
+                        group_path, *group_id_out);
+                }
+            }
+        }
+
+        json_decref(root);
+    } else {
+        log_module(KC_LOG, LOG_DEBUG, "keycloak_get_group_by_path: Failed with HTTP %ld: %s",
+            http_code, chunk.response ? chunk.response : "no response");
+    }
+
+cleanup:
+    if (chunk.response) {
+        memset(chunk.response, 0, chunk.size);
+        free(chunk.response);
+    }
+    if (escaped_path) {
+        curl_free(escaped_path);
+    }
+    if (uri) {
+        free(uri);
+    }
+
+    return result;
+}
+
 static int json_read_token_info(const char* response, struct kc_token_info** info_out)
 {
     if (!response || !info_out) {

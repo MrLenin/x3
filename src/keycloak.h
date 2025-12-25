@@ -254,6 +254,18 @@ int keycloak_get_group_by_name(struct kc_realm realm, struct kc_client client,
                                const char* group_name, char** group_id_out);
 
 /**
+ * Gets a Keycloak group by hierarchical path
+ * Keycloak paths use forward slashes: /parent/child/grandchild
+ * @param realm        Keycloak realm configuration
+ * @param client       Client with admin access token
+ * @param group_path   Full path to group (e.g., "/irc-channels/#help/owner")
+ * @param group_id_out Output pointer for group ID (caller must free)
+ * @return KC_SUCCESS on success, KC_NOT_FOUND if group doesn't exist, KC_ERROR on failure
+ */
+int keycloak_get_group_by_path(struct kc_realm realm, struct kc_client client,
+                               const char* group_path, char** group_id_out);
+
+/**
  * Group member entry for iteration
  */
 struct kc_group_member {
