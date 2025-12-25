@@ -88,6 +88,7 @@
 #define FLAGS_HIDEOPER          0x08000000 /* user is a hidden IRCop +H */
 #define FLAGS_NOLINK            0x10000000 /* user has opted out of channel redirection +L */
 #define FLAGS_COMMONCHANSONLY   0x20000000 /* user only receives PMs from users on same cahnnels +q */
+#define FLAGS_AWAY_STAR         0x40000000 /* user is away-star (hidden connection) */
 
 #define IsOper(x)               ((x)->modes & FLAGS_OPER)
 #define IsService(x)            ((x)->modes & FLAGS_SERVICE)
@@ -118,6 +119,7 @@
 #define IsHideOper(x)           ((x)->modes & FLAGS_HIDEOPER)
 #define IsNoRedirect(x)         ((x)->modes & FLAGS_NOLINK)
 #define IsCommonChansOnly(x)    ((x)->modes & FLAGS_COMMONCHANSONLY)
+#define IsAwayStar(x)           ((x)->modes & FLAGS_AWAY_STAR)
 
 #define NICKLEN         30
 #define USERLEN         10

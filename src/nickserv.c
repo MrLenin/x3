@@ -103,6 +103,7 @@
 #define KEY_FLAGS "flags"
 #define KEY_REGISTER_ON "register"
 #define KEY_LAST_SEEN "lastseen"
+#define KEY_LAST_PRESENT "last_present"
 #define KEY_INFO "info"
 #define KEY_USERLIST_STYLE "user_style"
 #define KEY_SCREEN_WIDTH "screen_width"
@@ -315,6 +316,12 @@ static const struct message_entry msgtab[] = {
     { "NSMSG_HANDLEINFO_DNR", "Do-not-register (by %s): %s" },
     { "NSMSG_USERINFO_AUTHED_AS", "$b%s$b is authenticated to account $b%s$b." },
     { "NSMSG_USERINFO_NOT_AUTHED", "$b%s$b is not authenticated to any account." },
+    { "NSMSG_PRESENCE_PRESENT", "Account $b%s$b is $bpresent$b (at least one connection is not away)." },
+    { "NSMSG_PRESENCE_AWAY", "Account $b%s$b is $baway$b (all connections are away)." },
+    { "NSMSG_PRESENCE_AWAY_STAR", "Account $b%s$b is $bhidden$b (all connections are away-star)." },
+    { "NSMSG_PRESENCE_LAST_PRESENT", "Last present: %s." },
+    { "NSMSG_PRESENCE_CONNECTIONS", "Online connections: %u." },
+    { "NSMSG_PRESENCE_NO_ACCOUNT", "You must specify an account or be authenticated to check presence." },
     { "NSMSG_NICKINFO_ON", "$bNick Information for %s$b" },
     { "NSMSG_NICKINFO_END", "----------End of Nick Info-----------" },
     { "NSMSG_NICKINFO_REGGED", "Registered on: %s" },
@@ -2038,6 +2045,58 @@ static NICKSERV_FUNC(cmd_userinfo)
 	reply("NSMSG_USERINFO_AUTHED_AS", target->nick, target->handle_info->handle);
     else
 	reply("NSMSG_USERINFO_NOT_AUTHED", target->nick);
+    return 1;
+}
+
+static NICKSERV_FUNC(cmd_presence)
+{
+    struct handle_info *hi;
+    enum presence_state state;
+    struct userNode *online;
+    unsigned int conn_count = 0;
+    char buff[64];
+    struct tm tm;
+
+    if (argc > 1) {
+        hi = get_handle_info(argv[1]);
+        if (!hi) {
+            reply("MSG_HANDLE_UNKNOWN", argv[1]);
+            return 0;
+        }
+    } else if (user->handle_info) {
+        hi = user->handle_info;
+    } else {
+        reply("NSMSG_PRESENCE_NO_ACCOUNT");
+        return 0;
+    }
+
+    /* Count online connections */
+    for (online = hi->users; online; online = online->next_authed)
+        conn_count++;
+
+    /* Get effective presence */
+    state = handle_get_presence(hi);
+
+    switch (state) {
+    case PRESENCE_PRESENT:
+        reply("NSMSG_PRESENCE_PRESENT", hi->handle);
+        break;
+    case PRESENCE_AWAY:
+        reply("NSMSG_PRESENCE_AWAY", hi->handle);
+        break;
+    case PRESENCE_AWAY_STAR:
+        reply("NSMSG_PRESENCE_AWAY_STAR", hi->handle);
+        break;
+    }
+
+    reply("NSMSG_PRESENCE_CONNECTIONS", conn_count);
+
+    if (hi->last_present) {
+        localtime_r(&hi->last_present, &tm);
+        strftime(buff, sizeof(buff), "%a %b %d %H:%M:%S %Y", &tm);
+        reply("NSMSG_PRESENCE_LAST_PRESENT", buff);
+    }
+
     return 1;
 }
 
@@ -4459,6 +4518,8 @@ nickserv_saxdb_write(struct saxdb_context *ctx) {
         if (hi->last_quit_host[0])
             saxdb_write_string(ctx, KEY_LAST_QUIT_HOST, hi->last_quit_host);
         saxdb_write_int(ctx, KEY_LAST_SEEN, hi->lastseen);
+        if (hi->last_present)
+            saxdb_write_int(ctx, KEY_LAST_PRESENT, hi->last_present);
         if (hi->karma != 0)
             saxdb_write_sint(ctx, KEY_KARMA, hi->karma);
         if (hi->masks->used)
@@ -5193,6 +5254,8 @@ nickserv_db_read_handle(char *handle, dict_t obj)
     hi->registered = str ? (time_t)strtoul(str, NULL, 0) : now;
     str = database_get_data(obj, KEY_LAST_SEEN, RECDB_QSTRING);
     hi->lastseen = str ? (time_t)strtoul(str, NULL, 0) : hi->registered;
+    str = database_get_data(obj, KEY_LAST_PRESENT, RECDB_QSTRING);
+    hi->last_present = str ? (time_t)strtoul(str, NULL, 0) : 0;
     str = database_get_data(obj, KEY_KARMA, RECDB_QSTRING);
     hi->karma = str ? strtoul(str, NULL, 0) : 0;
     /* We want to read the nicks even if disable_nicks is set.  This is so
@@ -6061,6 +6124,45 @@ nickserv_get_webpush_subscriptions(const char *account_name,
 #endif
 
     return -1;
+}
+
+/* Presence aggregation implementation */
+
+enum presence_state
+handle_get_presence(struct handle_info *hi)
+{
+    struct userNode *user;
+    enum presence_state state = PRESENCE_AWAY_STAR;
+
+    if (!hi || !hi->users)
+        return PRESENCE_AWAY_STAR;
+
+    for (user = hi->users; user; user = user->next_authed) {
+        if (!IsAway(user) && !IsAwayStar(user)) {
+            /* Present beats everything */
+            return PRESENCE_PRESENT;
+        }
+        if (IsAway(user) && !IsAwayStar(user)) {
+            /* Away beats away-star */
+            state = PRESENCE_AWAY;
+        }
+        /* AWAY_STAR contributes nothing - it's the default */
+    }
+
+    return state;
+}
+
+int
+handle_is_present(struct handle_info *hi)
+{
+    return handle_get_presence(hi) == PRESENCE_PRESENT;
+}
+
+void
+handle_update_last_present(struct handle_info *hi)
+{
+    if (hi)
+        hi->last_present = now;
 }
 
 static void
@@ -7271,6 +7373,7 @@ init_nickserv(const char *nick)
     nickserv_define_func("OSET", cmd_oset, 0, 1, 0);
     nickserv_define_func("ACCOUNTINFO", cmd_handleinfo, -1, 0, 0);
     nickserv_define_func("USERINFO", cmd_userinfo, -1, 1, 0);
+    nickserv_define_func("PRESENCE", cmd_presence, -1, 0, 0);
     nickserv_define_func("RENAME", cmd_rename_handle, -1, 1, 0);
     nickserv_define_func("VACATION", cmd_vacation, -1, 1, 0);
     nickserv_define_func("MERGE", cmd_merge, 750, 1, 0);

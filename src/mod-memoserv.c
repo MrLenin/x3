@@ -462,8 +462,12 @@ static MODCMD_FUNC(cmd_send)
     if (ma->flags & MEMO_NOTIFY_NEW) {
         struct userNode *other;
 
-        for (other = ma->handle->users; other; other = other->next_authed)
+        for (other = ma->handle->users; other; other = other->next_authed) {
+            /* Skip away-star (hidden) connections - they don't want notifications */
+            if (IsAwayStar(other))
+                continue;
             send_message_type((ma->flags & MEMO_USE_PRIVMSG)? MSG_TYPE_PRIVMSG : MSG_TYPE_NOTICE, other, memoserv ? memoserv : cmd->parent->bot, "MSMSG_NEW_MESSAGE", user->nick);
+        }
     }
 
     estr = conf_get_data("services/nickserv/email_enabled", RECDB_QSTRING);
@@ -1285,6 +1289,9 @@ memoserv_check_messages(struct userNode *user, UNUSED_ARG(struct handle_info *ol
     struct memo *memo;
 
     if (!user->uplink->burst) {
+        /* Skip notifications for away-star (hidden) connections */
+        if (IsAwayStar(user))
+            return;
         if (!(ma = memoserv_get_account(user->handle_info))
             || !(ma->flags & MEMO_NOTIFY_LOGIN))
             return;

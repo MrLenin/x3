@@ -108,6 +108,7 @@ struct handle_info {
     char *fakehost;
     time_t registered;
     time_t lastseen;
+    time_t last_present;  /* last time any connection was present (not away) */
     int karma;
     unsigned short flags;
     unsigned short opserv_level;
@@ -382,5 +383,39 @@ void nickserv_sync_metadata_to_ircd(struct userNode *user);
  */
 int nickserv_get_webpush_subscriptions(const char *account_name,
                                        struct kc_metadata_entry **entries_out);
+
+/* Presence aggregation support */
+
+/** Presence states for aggregation */
+enum presence_state {
+    PRESENCE_PRESENT = 0,    /* Not away */
+    PRESENCE_AWAY = 1,       /* Away with message */
+    PRESENCE_AWAY_STAR = 2   /* Hidden connection (AWAY *) */
+};
+
+/**
+ * Compute the effective presence for an account.
+ * Uses "most-present-wins" logic:
+ * - PRESENT beats everything
+ * - AWAY beats AWAY_STAR
+ * - AWAY_STAR only if all connections are AWAY_STAR
+ * @param hi The handle_info to check
+ * @return Effective presence state
+ */
+enum presence_state handle_get_presence(struct handle_info *hi);
+
+/**
+ * Check if any connection for an account is present (not away).
+ * @param hi The handle_info to check
+ * @return 1 if at least one connection is present, 0 otherwise
+ */
+int handle_is_present(struct handle_info *hi);
+
+/**
+ * Update last_present timestamp for an account.
+ * Called when a connection becomes present.
+ * @param hi The handle_info to update
+ */
+void handle_update_last_present(struct handle_info *hi);
 
 #endif

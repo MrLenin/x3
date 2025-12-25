@@ -2610,14 +2610,32 @@ static CMD_FUNC(cmd_notice)
 static CMD_FUNC(cmd_away)
 {
     struct userNode *uNode;
+    int was_present;
 
     uNode = GetUserH(origin);
     if (!uNode)
         return 1;
-    if (argc < 2)
-        uNode->modes &= ~FLAGS_AWAY;
-    else
+
+    /* Track previous presence state for last_present update */
+    was_present = !IsAway(uNode) && !IsAwayStar(uNode);
+
+    if (argc < 2) {
+        /* AWAY with no params = present (back from away) */
+        uNode->modes &= ~(FLAGS_AWAY | FLAGS_AWAY_STAR);
+
+        /* Update last_present when becoming present */
+        if (!was_present && uNode->handle_info) {
+            handle_update_last_present(uNode->handle_info);
+        }
+    } else if (argv[1][0] == '*' && argv[1][1] == '\0') {
+        /* AWAY * = hidden connection (away-star) */
+        uNode->modes |= (FLAGS_AWAY | FLAGS_AWAY_STAR);
+    } else {
+        /* AWAY :message = normal away */
         uNode->modes |= FLAGS_AWAY;
+        uNode->modes &= ~FLAGS_AWAY_STAR;
+    }
+
     return 1;
 }
 
