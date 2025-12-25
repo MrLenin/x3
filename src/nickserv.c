@@ -168,6 +168,15 @@
 #define KEY_KEYCLOAK_EMAIL_POLICY "keycloak_email_policy"
 #endif
 
+/* Metadata TTL configuration keys */
+#define KEY_METADATA_TTL_ENABLED "metadata_ttl_enabled"
+#define KEY_METADATA_DEFAULT_TTL "metadata_default_ttl"
+#define KEY_METADATA_PURGE_FREQUENCY "metadata_purge_frequency"
+#define KEY_METADATA_IMMUTABLE_KEYS "metadata_immutable_keys"
+
+/* Default immutable keys (space-separated) that never expire */
+#define DEFAULT_IMMUTABLE_KEYS "avatar pronouns bot homepage"
+
 #define NICKSERV_VALID_CHARS	"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_"
 
 #define NICKSERV_FUNC(NAME) MODCMD_FUNC(NAME)
@@ -5477,6 +5486,28 @@ expire_nicks(UNUSED_ARG(void *data))
 }
 
 static void
+metadata_purge_expired(UNUSED_ARG(void *data))
+{
+#ifdef WITH_LMDB
+    if (nickserv_conf.metadata_ttl_enabled && x3_lmdb_is_available()) {
+        int deleted = x3_lmdb_metadata_purge_expired();
+        if (deleted > 0) {
+            log_module(NS_LOG, LOG_INFO, "Metadata purge: deleted %d expired entries", deleted);
+        } else if (deleted == 0) {
+            log_module(NS_LOG, LOG_DEBUG, "Metadata purge: no expired entries found");
+        } else {
+            log_module(NS_LOG, LOG_WARNING, "Metadata purge: error during purge operation");
+        }
+    }
+#endif
+
+    /* Reschedule if still enabled */
+    if (nickserv_conf.metadata_ttl_enabled && nickserv_conf.metadata_purge_frequency > 0) {
+        timeq_add(now + nickserv_conf.metadata_purge_frequency, metadata_purge_expired, NULL);
+    }
+}
+
+static void
 nickserv_load_dict(const char *fname)
 {
     FILE *file;
@@ -5885,7 +5916,58 @@ loc_auth_oauth(const char *bearer_token, const char *username_hint, const char *
  * Visibility is stored as a prefix in the value:
  *   - Public values are stored as-is: "value"
  *   - Private values are stored with prefix: "P:value"
+ *
+ * TTL (Time-To-Live) support:
+ *   - Configurable default TTL for metadata entries
+ *   - Immutable keys (e.g., avatar, pronouns) never expire
+ *   - TTL encoded as T:timestamp: prefix in stored value
  */
+
+/**
+ * Check if a metadata key is immutable (should not expire).
+ * @param key The metadata key to check
+ * @return 1 if immutable, 0 if subject to TTL expiry
+ */
+static int
+is_immutable_key(const char *key)
+{
+    const char *immutable_list;
+    const char *p;
+    size_t key_len;
+
+    if (!key || !*key)
+        return 0;
+
+    immutable_list = nickserv_conf.metadata_immutable_keys;
+    if (!immutable_list || !*immutable_list)
+        return 0;
+
+    key_len = strlen(key);
+
+    /* Search for key in space-separated list */
+    p = immutable_list;
+    while (*p) {
+        const char *start = p;
+
+        /* Skip leading spaces */
+        while (*p == ' ')
+            p++;
+        if (!*p)
+            break;
+
+        start = p;
+
+        /* Find end of current word */
+        while (*p && *p != ' ')
+            p++;
+
+        /* Check if this word matches the key */
+        if ((size_t)(p - start) == key_len && strncasecmp(start, key, key_len) == 0)
+            return 1;
+    }
+
+    return 0;
+}
 
 int
 nickserv_set_user_metadata(struct handle_info *hi, const char *key, const char *value, int visibility)
@@ -5921,15 +6003,21 @@ nickserv_set_user_metadata(struct handle_info *hi, const char *key, const char *
         int rc;
 
         if (value && *value) {
-            rc = x3_lmdb_account_set(hi->handle, key, stored_value);
+            /* Determine expiry time based on TTL settings */
+            time_t expires = 0;
+            if (nickserv_conf.metadata_ttl_enabled && !is_immutable_key(key)) {
+                expires = now + nickserv_conf.metadata_default_ttl;
+            }
+            rc = x3_lmdb_account_set_ex(hi->handle, key, stored_value, expires);
         } else {
             rc = x3_lmdb_account_delete(hi->handle, key);
         }
 
         if (rc == LMDB_SUCCESS || rc == LMDB_NOT_FOUND) {
             lmdb_ok = 1;
-            log_module(NS_LOG, LOG_DEBUG, "nickserv_set_user_metadata: LMDB cache set %s.%s = %s (vis=%d)",
-                       hi->handle, key, value ? value : "(deleted)", visibility);
+            log_module(NS_LOG, LOG_DEBUG, "nickserv_set_user_metadata: LMDB cache set %s.%s = %s (vis=%d, ttl=%s)",
+                       hi->handle, key, value ? value : "(deleted)", visibility,
+                       is_immutable_key(key) ? "immutable" : "default");
         } else {
             log_module(NS_LOG, LOG_WARNING, "nickserv_set_user_metadata: LMDB cache failed for %s.%s",
                        hi->handle, key);
@@ -6767,6 +6855,24 @@ nickserv_conf_read(void)
     }
 #endif
 
+    /* Metadata TTL configuration */
+    str = database_get_data(conf_node, KEY_METADATA_TTL_ENABLED, RECDB_QSTRING);
+    nickserv_conf.metadata_ttl_enabled = str ? !disabled_string(str) : 1;  /* Enabled by default */
+
+    str = database_get_data(conf_node, KEY_METADATA_DEFAULT_TTL, RECDB_QSTRING);
+    nickserv_conf.metadata_default_ttl = str ? ParseInterval(str) : 2592000;  /* 30 days default */
+
+    str = database_get_data(conf_node, KEY_METADATA_PURGE_FREQUENCY, RECDB_QSTRING);
+    nickserv_conf.metadata_purge_frequency = str ? ParseInterval(str) : 3600;  /* Hourly default */
+
+    str = database_get_data(conf_node, KEY_METADATA_IMMUTABLE_KEYS, RECDB_QSTRING);
+    nickserv_conf.metadata_immutable_keys = str ? str : DEFAULT_IMMUTABLE_KEYS;
+
+    if (nickserv_conf.metadata_ttl_enabled) {
+        log_module(NS_LOG, LOG_INFO, "Metadata TTL enabled: default=%lu seconds, purge every %lu seconds",
+                   nickserv_conf.metadata_default_ttl, nickserv_conf.metadata_purge_frequency);
+        log_module(NS_LOG, LOG_INFO, "Metadata immutable keys: %s", nickserv_conf.metadata_immutable_keys);
+    }
 }
 
 static void
@@ -7730,6 +7836,8 @@ init_nickserv(const char *nick)
         timeq_add(now + nickserv_conf.handle_expire_frequency, expire_handles, NULL);
     if(nickserv_conf.nick_expire_frequency && nickserv_conf.expire_nicks)
         timeq_add(now + nickserv_conf.nick_expire_frequency, expire_nicks, NULL);
+    if(nickserv_conf.metadata_ttl_enabled && nickserv_conf.metadata_purge_frequency)
+        timeq_add(now + nickserv_conf.metadata_purge_frequency, metadata_purge_expired, NULL);
 
     if(autojoin_channels && nickserv) {
         for (i = 0; i < autojoin_channels->used; i++) {

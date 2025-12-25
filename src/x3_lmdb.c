@@ -558,6 +558,280 @@ int x3_lmdb_channel_clear(const char *channel)
     return count;
 }
 
+/* ========== TTL Helpers ========== */
+
+/**
+ * Encode a value with optional TTL prefix.
+ * Format: [T:timestamp:][P:]value
+ * @param buf Output buffer
+ * @param bufsize Size of output buffer
+ * @param value Original value (may include P: prefix)
+ * @param expires Expiry timestamp (0 = no expiry)
+ * @return Length of encoded string, or -1 on error
+ */
+static int encode_ttl_value(char *buf, size_t bufsize, const char *value, time_t expires)
+{
+    if (!buf || bufsize == 0) {
+        return -1;
+    }
+
+    if (expires > 0) {
+        /* Format: T:<timestamp>:<value> */
+        int len = snprintf(buf, bufsize, "T:%ld:%s", (long)expires, value ? value : "");
+        if (len < 0 || (size_t)len >= bufsize) {
+            return -1;
+        }
+        return len;
+    } else {
+        /* No TTL, just copy value as-is */
+        if (value) {
+            size_t len = strlen(value);
+            if (len >= bufsize) {
+                return -1;
+            }
+            memcpy(buf, value, len + 1);
+            return (int)len;
+        } else {
+            buf[0] = '\0';
+            return 0;
+        }
+    }
+}
+
+/**
+ * Decode a value that may have TTL prefix.
+ * @param stored Stored value from LMDB
+ * @param value_out Buffer for extracted value (without T: prefix)
+ * @param value_size Size of value_out buffer
+ * @param expires_out Output for expiry timestamp (can be NULL, 0 = no expiry)
+ * @return 0 on success, -1 on error
+ */
+static int decode_ttl_value(const char *stored, char *value_out, size_t value_size, time_t *expires_out)
+{
+    if (!stored || !value_out || value_size == 0) {
+        return -1;
+    }
+
+    if (expires_out) {
+        *expires_out = 0;
+    }
+
+    /* Check for T: prefix */
+    if (stored[0] == 'T' && stored[1] == ':') {
+        /* Parse timestamp */
+        const char *ts_start = stored + 2;
+        char *colon = strchr(ts_start, ':');
+        if (colon) {
+            long ts = strtol(ts_start, NULL, 10);
+            if (expires_out) {
+                *expires_out = (time_t)ts;
+            }
+            /* Copy the value after the second colon */
+            const char *value_start = colon + 1;
+            size_t len = strlen(value_start);
+            if (len >= value_size) {
+                len = value_size - 1;
+            }
+            memcpy(value_out, value_start, len);
+            value_out[len] = '\0';
+            return 0;
+        }
+    }
+
+    /* No T: prefix - copy as-is */
+    size_t len = strlen(stored);
+    if (len >= value_size) {
+        len = value_size - 1;
+    }
+    memcpy(value_out, stored, len);
+    value_out[len] = '\0';
+    return 0;
+}
+
+/**
+ * Check if a stored value is expired.
+ * @param stored Stored value from LMDB
+ * @return 1 if expired, 0 if not expired or no TTL
+ */
+static int is_value_expired(const char *stored)
+{
+    time_t expires = 0;
+    char dummy[16];
+
+    if (decode_ttl_value(stored, dummy, sizeof(dummy), &expires) != 0) {
+        return 0;
+    }
+
+    if (expires > 0 && expires <= time(NULL)) {
+        return 1;
+    }
+
+    return 0;
+}
+
+/* ========== Account Metadata with TTL ========== */
+
+int x3_lmdb_account_set_ex(const char *account, const char *key,
+                           const char *value, time_t expires)
+{
+    char encoded[LMDB_MAX_VALUE_SIZE];
+
+    if (!account || !key) {
+        return LMDB_ERROR;
+    }
+
+    if (value) {
+        if (encode_ttl_value(encoded, sizeof(encoded), value, expires) < 0) {
+            return LMDB_ERROR;
+        }
+        return x3_lmdb_account_set(account, key, encoded);
+    } else {
+        return x3_lmdb_account_set(account, key, NULL);
+    }
+}
+
+int x3_lmdb_account_get_ex(const char *account, const char *key,
+                           char *value, time_t *expires_out)
+{
+    char stored[LMDB_MAX_VALUE_SIZE];
+    int rc;
+
+    if (!account || !key || !value) {
+        return LMDB_ERROR;
+    }
+
+    rc = x3_lmdb_account_get(account, key, stored);
+    if (rc != LMDB_SUCCESS) {
+        return rc;
+    }
+
+    /* Check if expired */
+    if (is_value_expired(stored)) {
+        /* Auto-delete expired entry */
+        x3_lmdb_account_delete(account, key);
+        return LMDB_EXPIRED;
+    }
+
+    /* Decode the value */
+    if (decode_ttl_value(stored, value, LMDB_MAX_VALUE_SIZE, expires_out) != 0) {
+        return LMDB_ERROR;
+    }
+
+    return LMDB_SUCCESS;
+}
+
+/* ========== Channel Metadata with TTL ========== */
+
+int x3_lmdb_channel_set_ex(const char *channel, const char *key,
+                           const char *value, time_t expires)
+{
+    char encoded[LMDB_MAX_VALUE_SIZE];
+
+    if (!channel || !key) {
+        return LMDB_ERROR;
+    }
+
+    if (value) {
+        if (encode_ttl_value(encoded, sizeof(encoded), value, expires) < 0) {
+            return LMDB_ERROR;
+        }
+        return x3_lmdb_channel_set(channel, key, encoded);
+    } else {
+        return x3_lmdb_channel_set(channel, key, NULL);
+    }
+}
+
+int x3_lmdb_channel_get_ex(const char *channel, const char *key,
+                           char *value, time_t *expires_out)
+{
+    char stored[LMDB_MAX_VALUE_SIZE];
+    int rc;
+
+    if (!channel || !key || !value) {
+        return LMDB_ERROR;
+    }
+
+    rc = x3_lmdb_channel_get(channel, key, stored);
+    if (rc != LMDB_SUCCESS) {
+        return rc;
+    }
+
+    /* Check if expired */
+    if (is_value_expired(stored)) {
+        /* Auto-delete expired entry */
+        x3_lmdb_channel_delete(channel, key);
+        return LMDB_EXPIRED;
+    }
+
+    /* Decode the value */
+    if (decode_ttl_value(stored, value, LMDB_MAX_VALUE_SIZE, expires_out) != 0) {
+        return LMDB_ERROR;
+    }
+
+    return LMDB_SUCCESS;
+}
+
+/* ========== Purge Expired Entries ========== */
+
+int x3_lmdb_metadata_purge_expired(void)
+{
+    MDB_txn *txn;
+    MDB_cursor *cursor;
+    MDB_val mkey, mdata;
+    int count = 0;
+    int rc;
+
+    if (!x3_lmdb_is_available()) {
+        return LMDB_ERROR;
+    }
+
+    /* Purge accounts database */
+    rc = mdb_txn_begin(lmdb_env, NULL, 0, &txn);
+    if (rc != 0) {
+        return LMDB_ERROR;
+    }
+
+    rc = mdb_cursor_open(txn, dbi_accounts, &cursor);
+    if (rc == 0) {
+        rc = mdb_cursor_get(cursor, &mkey, &mdata, MDB_FIRST);
+        while (rc == 0) {
+            const char *stored = (const char *)mdata.mv_data;
+            if (is_value_expired(stored)) {
+                mdb_cursor_del(cursor, 0);
+                count++;
+            }
+            rc = mdb_cursor_get(cursor, &mkey, &mdata, MDB_NEXT);
+        }
+        mdb_cursor_close(cursor);
+    }
+
+    /* Purge channels database */
+    rc = mdb_cursor_open(txn, dbi_channels, &cursor);
+    if (rc == 0) {
+        rc = mdb_cursor_get(cursor, &mkey, &mdata, MDB_FIRST);
+        while (rc == 0) {
+            const char *stored = (const char *)mdata.mv_data;
+            if (is_value_expired(stored)) {
+                mdb_cursor_del(cursor, 0);
+                count++;
+            }
+            rc = mdb_cursor_get(cursor, &mkey, &mdata, MDB_NEXT);
+        }
+        mdb_cursor_close(cursor);
+    }
+
+    rc = mdb_txn_commit(txn);
+    if (rc != 0) {
+        return LMDB_ERROR;
+    }
+
+    if (count > 0) {
+        log_module(MAIN_LOG, LOG_INFO, "x3_lmdb: Purged %d expired metadata entries", count);
+    }
+
+    return count;
+}
+
 /* ========== Utility Functions ========== */
 
 void x3_lmdb_free_entries(struct lmdb_metadata_entry *entries)

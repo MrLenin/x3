@@ -69,6 +69,10 @@ extern struct nickserv_config nickserv_conf;
 #define KEY_KEYCLOAK_HIERARCHICAL   "keycloak_hierarchical_groups"
 #define KEY_KEYCLOAK_GROUP_PREFIX   "keycloak_group_prefix"
 #define KEY_KEYCLOAK_SYNC_FREQUENCY "keycloak_sync_frequency"
+#define KEY_CHANNEL_METADATA_TTL_ENABLED "channel_metadata_ttl_enabled"
+#define KEY_CHANNEL_METADATA_DEFAULT_TTL "channel_metadata_default_ttl"
+#define KEY_CHANNEL_IMMUTABLE_KEYS  "channel_immutable_keys"
+#define DEFAULT_CHANNEL_IMMUTABLE_KEYS "url website rules description"
 #define KEY_NODELETE_LEVEL          "nodelete_level"
 #define KEY_MAX_USERINFO_LENGTH     "max_userinfo_length"
 #define KEY_GIVEOWNERSHIP_PERIOD    "giveownership_timeout"
@@ -668,6 +672,11 @@ static struct
     unsigned int        keycloak_hierarchical_groups : 1; /* Use hierarchical group paths */
     const char          *keycloak_group_prefix;    /* Group name prefix, e.g. "irc-channel-" or "irc-channels" */
     unsigned long       keycloak_sync_frequency;   /* Sync interval in seconds (0 = startup only) */
+
+    /* Channel metadata TTL configuration */
+    unsigned int        channel_metadata_ttl_enabled : 1;  /* Enable channel metadata expiry */
+    unsigned long       channel_metadata_default_ttl;      /* Default TTL in seconds (2592000 = 30 days) */
+    const char          *channel_immutable_keys;           /* Space-separated keys that never expire */
 } chanserv_conf;
 
 struct listData
@@ -9194,6 +9203,23 @@ chanserv_conf_read(void)
     }
     str = database_get_data(conf_node, KEY_KEYCLOAK_SYNC_FREQUENCY, RECDB_QSTRING);
     chanserv_conf.keycloak_sync_frequency = str ? ParseInterval(str) : 3600;
+
+    /* Channel metadata TTL configuration */
+    str = database_get_data(conf_node, KEY_CHANNEL_METADATA_TTL_ENABLED, RECDB_QSTRING);
+    chanserv_conf.channel_metadata_ttl_enabled = str ? !disabled_string(str) : 1;  /* Enabled by default */
+
+    str = database_get_data(conf_node, KEY_CHANNEL_METADATA_DEFAULT_TTL, RECDB_QSTRING);
+    chanserv_conf.channel_metadata_default_ttl = str ? ParseInterval(str) : 2592000;  /* 30 days default */
+
+    str = database_get_data(conf_node, KEY_CHANNEL_IMMUTABLE_KEYS, RECDB_QSTRING);
+    chanserv_conf.channel_immutable_keys = str ? str : DEFAULT_CHANNEL_IMMUTABLE_KEYS;
+
+    if (chanserv_conf.channel_metadata_ttl_enabled) {
+        log_module(CS_LOG, LOG_INFO, "Channel metadata TTL enabled: default=%lu seconds",
+                   chanserv_conf.channel_metadata_default_ttl);
+        log_module(CS_LOG, LOG_INFO, "Channel immutable keys: %s", chanserv_conf.channel_immutable_keys);
+    }
+
     str = database_get_data(conf_node, KEY_GOD_TIMEOUT, RECDB_QSTRING);
     god_timeout = str ? ParseInterval(str) : 60*15;
     str = database_get_data(conf_node, "default_modes", RECDB_QSTRING);
@@ -10084,7 +10110,58 @@ chanserv_db_cleanup(UNUSED_ARG(void *extra)) {
  * Visibility is stored as a prefix in the value:
  *   - Public values are stored as-is: "value"
  *   - Private values are stored with prefix: "P:value"
+ *
+ * TTL (Time-To-Live) support:
+ *   - Configurable default TTL for channel metadata entries
+ *   - Immutable keys (e.g., url, rules) never expire
+ *   - TTL encoded as T:timestamp: prefix in stored value
  */
+
+/**
+ * Check if a channel metadata key is immutable (should not expire).
+ * @param key The metadata key to check
+ * @return 1 if immutable, 0 if subject to TTL expiry
+ */
+static int
+is_channel_immutable_key(const char *key)
+{
+    const char *immutable_list;
+    const char *p;
+    size_t key_len;
+
+    if (!key || !*key)
+        return 0;
+
+    immutable_list = chanserv_conf.channel_immutable_keys;
+    if (!immutable_list || !*immutable_list)
+        return 0;
+
+    key_len = strlen(key);
+
+    /* Search for key in space-separated list */
+    p = immutable_list;
+    while (*p) {
+        const char *start = p;
+
+        /* Skip leading spaces */
+        while (*p == ' ')
+            p++;
+        if (!*p)
+            break;
+
+        start = p;
+
+        /* Find end of current word */
+        while (*p && *p != ' ')
+            p++;
+
+        /* Check if this word matches the key */
+        if ((size_t)(p - start) == key_len && strncasecmp(start, key, key_len) == 0)
+            return 1;
+    }
+
+    return 0;
+}
 
 int
 chanserv_set_channel_metadata(struct chanData *cData, const char *key, const char *value, int visibility)
@@ -10104,14 +10181,21 @@ chanserv_set_channel_metadata(struct chanData *cData, const char *key, const cha
             } else {
                 snprintf(stored_value, sizeof(stored_value), "%s", value);
             }
-            rc = x3_lmdb_channel_set(cData->channel->name, key, stored_value);
+
+            /* Determine expiry time based on TTL settings */
+            time_t expires = 0;
+            if (chanserv_conf.channel_metadata_ttl_enabled && !is_channel_immutable_key(key)) {
+                expires = now + chanserv_conf.channel_metadata_default_ttl;
+            }
+            rc = x3_lmdb_channel_set_ex(cData->channel->name, key, stored_value, expires);
         } else {
             rc = x3_lmdb_channel_delete(cData->channel->name, key);
         }
 
         if (rc == LMDB_SUCCESS || rc == LMDB_NOT_FOUND) {
-            log_module(CS_LOG, LOG_DEBUG, "chanserv_set_channel_metadata: LMDB set %s.%s = %s (vis=%d)",
-                       cData->channel->name, key, value ? value : "(deleted)", visibility);
+            log_module(CS_LOG, LOG_DEBUG, "chanserv_set_channel_metadata: LMDB set %s.%s = %s (vis=%d, ttl=%s)",
+                       cData->channel->name, key, value ? value : "(deleted)", visibility,
+                       is_channel_immutable_key(key) ? "immutable" : "default");
 
             /* Push to IRCd */
             irc_metadata(cData->channel->name, key, value, visibility);

@@ -230,6 +230,11 @@ struct nickserv_config {
     const char *keycloak_attr_oslevel;      // Attribute name for opserv_level
     unsigned int keycloak_email_policy;     // 0=trust KC, 1=always X3 cookie, 2=check emailVerified
 #endif
+    /* Metadata TTL configuration */
+    unsigned int metadata_ttl_enabled;      // Enable metadata expiry
+    unsigned long metadata_default_ttl;     // Default TTL in seconds (2592000 = 30 days)
+    unsigned long metadata_purge_frequency; // Purge interval in seconds (3600 = hourly)
+    const char *metadata_immutable_keys;    // Space-separated keys that never expire
 };
 
 void init_nickserv(const char *nick);

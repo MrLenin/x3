@@ -15,7 +15,8 @@ enum lmdb_error {
     LMDB_SUCCESS = 0,
     LMDB_ERROR = -1,
     LMDB_NOT_FOUND = -2,
-    LMDB_FULL = -3
+    LMDB_FULL = -3,
+    LMDB_EXPIRED = -4   /* Entry found but expired (auto-deleted) */
 };
 
 #ifdef WITH_LMDB
@@ -122,6 +123,28 @@ int x3_lmdb_account_list(const char *account, struct lmdb_metadata_entry **entri
  */
 int x3_lmdb_account_clear(const char *account);
 
+/**
+ * Set account metadata value with explicit expiry
+ * @param account Account name
+ * @param key Metadata key
+ * @param value Value to set (NULL to delete)
+ * @param expires Expiry timestamp (0 = no expiry)
+ * @return LMDB_SUCCESS on success, LMDB_ERROR on failure
+ */
+int x3_lmdb_account_set_ex(const char *account, const char *key,
+                           const char *value, time_t expires);
+
+/**
+ * Get account metadata value with expiry info
+ * @param account Account name
+ * @param key Metadata key
+ * @param value Buffer for value (must be at least 1024 bytes)
+ * @param expires_out Output for expiry timestamp (can be NULL, 0 = no expiry)
+ * @return LMDB_SUCCESS on success, LMDB_NOT_FOUND if not found, LMDB_EXPIRED if expired
+ */
+int x3_lmdb_account_get_ex(const char *account, const char *key,
+                           char *value, time_t *expires_out);
+
 /* ========== Channel Metadata ========== */
 
 /**
@@ -164,6 +187,34 @@ int x3_lmdb_channel_list(const char *channel, struct lmdb_metadata_entry **entri
  * @return Number of entries deleted, LMDB_ERROR on failure
  */
 int x3_lmdb_channel_clear(const char *channel);
+
+/**
+ * Set channel metadata value with explicit expiry
+ * @param channel Channel name (with #)
+ * @param key Metadata key
+ * @param value Value to set (NULL to delete)
+ * @param expires Expiry timestamp (0 = no expiry)
+ * @return LMDB_SUCCESS on success, LMDB_ERROR on failure
+ */
+int x3_lmdb_channel_set_ex(const char *channel, const char *key,
+                           const char *value, time_t expires);
+
+/**
+ * Get channel metadata value with expiry info
+ * @param channel Channel name (with #)
+ * @param key Metadata key
+ * @param value Buffer for value (must be at least 1024 bytes)
+ * @param expires_out Output for expiry timestamp (can be NULL, 0 = no expiry)
+ * @return LMDB_SUCCESS on success, LMDB_NOT_FOUND if not found, LMDB_EXPIRED if expired
+ */
+int x3_lmdb_channel_get_ex(const char *channel, const char *key,
+                           char *value, time_t *expires_out);
+
+/**
+ * Purge all expired metadata entries from accounts and channels
+ * @return Number of entries deleted, LMDB_ERROR on failure
+ */
+int x3_lmdb_metadata_purge_expired(void);
 
 /* ========== Channel Access (Keycloak Group Sync) ========== */
 
@@ -293,11 +344,16 @@ void init_x3_lmdb(void);
 #define x3_lmdb_account_delete(a, k)    (-2)
 #define x3_lmdb_account_list(a, e)      (-1)
 #define x3_lmdb_account_clear(a)        (-1)
+#define x3_lmdb_account_set_ex(a, k, v, e) (-1)
+#define x3_lmdb_account_get_ex(a, k, v, e) (-2)
 #define x3_lmdb_channel_get(c, k, v)    (-2)
 #define x3_lmdb_channel_set(c, k, v)    (-1)
 #define x3_lmdb_channel_delete(c, k)    (-2)
 #define x3_lmdb_channel_list(c, e)      (-1)
 #define x3_lmdb_channel_clear(c)        (-1)
+#define x3_lmdb_channel_set_ex(c, k, v, e) (-1)
+#define x3_lmdb_channel_get_ex(c, k, v, e) (-2)
+#define x3_lmdb_metadata_purge_expired() (0)
 #define x3_lmdb_chanaccess_get(c, a, o) (-2)
 #define x3_lmdb_chanaccess_set(c, a, l) (-1)
 #define x3_lmdb_chanaccess_delete(c, a) (-2)
