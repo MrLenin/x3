@@ -139,6 +139,16 @@ uplink_insert(const char *key, void *data, UNUSED_ARG(void *extra))
         uplink->bind_addr_len = 0;
     }
 
+    /* SSL/TLS configuration */
+    str = database_get_data(rd->d.object, "ssl", RECDB_QSTRING);
+    uplink->ssl = str ? atoi(str) : 0;
+    uplink->ssl_cert = database_get_data(rd->d.object, "ssl_cert", RECDB_QSTRING);
+    uplink->ssl_key = database_get_data(rd->d.object, "ssl_key", RECDB_QSTRING);
+    uplink->ssl_ca = database_get_data(rd->d.object, "ssl_ca", RECDB_QSTRING);
+    str = database_get_data(rd->d.object, "ssl_verify", RECDB_QSTRING);
+    uplink->ssl_verify = str ? atoi(str) : 0;
+    uplink->ssl_fingerprint = database_get_data(rd->d.object, "ssl_fingerprint", RECDB_QSTRING);
+
     uplink->next = cManager.uplinks;
     uplink->prev = NULL;
 

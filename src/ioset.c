@@ -23,6 +23,7 @@
 #include "timeq.h"
 #include "saxdb.h"
 #include "conf.h"
+#include "x3_ssl.h"
 
 #ifdef HAVE_FCNTL_H
 #include <fcntl.h>
@@ -339,12 +340,25 @@ ioset_try_write(struct io_fd *fd) {
     unsigned int req;
 
     req = ioq_get_avail(&fd->send);
-    res = send(fd->fd, fd->send.buf+fd->send.get, req, 0);
-    if (res < 0) {
-        if (errno != EAGAIN) {
-            log_module(MAIN_LOG, LOG_ERROR, "send() on fd %d error %d: %s", fd->fd, errno, strerror(errno));
+#ifdef WITH_SSL
+    if (fd->ssl) {
+        res = x3_ssl_write(fd->ssl, fd->send.buf+fd->send.get, req);
+        if (res < 0) {
+            if (errno != EAGAIN) {
+                log_module(MAIN_LOG, LOG_ERROR, "SSL write on fd %d error: %s", fd->fd, x3_ssl_error_string());
+            }
         }
-    } else {
+    } else
+#endif
+    {
+        res = send(fd->fd, fd->send.buf+fd->send.get, req, 0);
+        if (res < 0) {
+            if (errno != EAGAIN) {
+                log_module(MAIN_LOG, LOG_ERROR, "send() on fd %d error %d: %s", fd->fd, errno, strerror(errno));
+            }
+        }
+    }
+    if (res > 0) {
         fd->send.get += res;
         if (fd->send.get == fd->send.size)
             fd->send.get = 0;
@@ -360,6 +374,12 @@ ioset_close(struct io_fd *fdp, int os_close) {
         active_fd = NULL;
     if (fdp->destroy_cb)
         fdp->destroy_cb(fdp);
+#ifdef WITH_SSL
+    if (fdp->ssl) {
+        x3_ssl_close(fdp->ssl);
+        fdp->ssl = NULL;
+    }
+#endif
 #if defined(HAVE_WSAEVENTSELECT)
     /* This is one huge kludge.  Sorry! */
     if (fdp->send.get != fdp->send.put && (os_close & 2)) {
@@ -442,9 +462,21 @@ ioset_buffered_read(struct io_fd *fd) {
 
     if (!(put_avail = ioq_put_avail(&fd->recv)))
         put_avail = ioq_grow(&fd->recv);
-    nbr = recv(fd->fd, fd->recv.buf + fd->recv.put, put_avail, 0);
+#ifdef WITH_SSL
+    if (fd->ssl) {
+        nbr = x3_ssl_read(fd->ssl, fd->recv.buf + fd->recv.put, put_avail);
+    } else
+#endif
+    {
+        nbr = recv(fd->fd, fd->recv.buf + fd->recv.put, put_avail, 0);
+    }
     if (nbr < 0) {
         if (errno != EAGAIN) {
+#ifdef WITH_SSL
+            if (fd->ssl)
+                log_module(MAIN_LOG, LOG_ERROR, "SSL read error on fd %d: %s", fd->fd, x3_ssl_error_string());
+            else
+#endif
             log_module(MAIN_LOG, LOG_ERROR, "Unexpected recv() error %d on fd %d: %s", errno, fd->fd, strerror(errno));
             /* Just flag it as EOF and call readable_cb() to notify the fd's owner. */
             fd->state = IO_CLOSED;
@@ -556,6 +588,30 @@ ioset_events(struct io_fd *fd, int readable, int writable)
             break;
         engine->update(fd);
         /* and fall through */
+#ifdef WITH_SSL
+    case IO_SSL_HANDSHAKE:
+        assert(active_fd == NULL || active_fd == fd);
+        if (active_fd && fd->ssl) {
+            int res = x3_ssl_handshake(fd->ssl);
+            if (res == 1) {
+                /* Handshake complete */
+                fd->state = IO_CONNECTED;
+                if (fd->connect_cb)
+                    fd->connect_cb(fd, 0);
+            } else if (res < 0) {
+                /* Handshake error */
+                log_module(MAIN_LOG, LOG_ERROR, "SSL handshake failed on fd %d: %s", fd->fd, x3_ssl_error_string());
+                fd->state = IO_CLOSED;
+                if (fd->connect_cb)
+                    fd->connect_cb(fd, -1);
+            }
+            /* res == 0 means handshake still in progress, wait for more I/O */
+        }
+        if (active_fd != fd)
+            break;
+        engine->update(fd);
+        break;
+#endif
     case IO_CONNECTED:
         assert(active_fd == NULL || active_fd == fd);
         if (active_fd && readable) {

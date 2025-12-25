@@ -27,6 +27,7 @@
 #include "shun.h"
 #include "timeq.h"
 #include "version.h"
+#include "x3_ssl.h"
 #ifdef HAVE_SYS_SOCKET_H
 #include <sys/socket.h>
 #endif
@@ -115,6 +116,11 @@ void replay_event_loop(void)
     }
 }
 
+/* Global SSL context for uplink connections (created once) */
+#ifdef WITH_SSL
+static SSL_CTX *uplink_ssl_ctx = NULL;
+#endif
+
 int
 create_socket_client(struct uplinkNode *target)
 {
@@ -130,7 +136,8 @@ create_socket_client(struct uplinkNode *target)
         return 0;
     }
 
-    log_module(MAIN_LOG, LOG_INFO, "Connecting to %s:%i...", addr, port);
+    log_module(MAIN_LOG, LOG_INFO, "Connecting to %s:%i%s...", addr, port,
+               target->ssl ? " (SSL)" : "");
 
     socket_io_fd = ioset_connect(cManager.uplink->bind_addr, cManager.uplink->bind_addr_len, addr, port, 1, 0, NULL);
     if (!socket_io_fd) {
@@ -142,6 +149,80 @@ create_socket_client(struct uplinkNode *target)
     socket_io_fd->readable_cb = uplink_readable;
     socket_io_fd->destroy_cb = socket_destroyed;
     socket_io_fd->line_reads = 1;
+
+#ifdef WITH_SSL
+    if (target->ssl) {
+        /* Initialize SSL if needed */
+        if (!x3_ssl_is_available()) {
+            if (x3_ssl_init() < 0) {
+                log_module(MAIN_LOG, LOG_ERROR, "Failed to initialize SSL library");
+                ioset_close(socket_io_fd, 1);
+                socket_io_fd = NULL;
+                target->state = DISCONNECTED;
+                target->tries++;
+                return 0;
+            }
+        }
+
+        /* Create or reuse SSL context */
+        if (!uplink_ssl_ctx || target->ssl_cert || target->ssl_key) {
+            if (uplink_ssl_ctx) {
+                x3_ssl_free_ctx(uplink_ssl_ctx);
+            }
+            uplink_ssl_ctx = x3_ssl_create_client_ctx(
+                target->ssl_cert,
+                target->ssl_key,
+                target->ssl_verify,
+                target->ssl_ca
+            );
+            if (!uplink_ssl_ctx) {
+                log_module(MAIN_LOG, LOG_ERROR, "Failed to create SSL context");
+                ioset_close(socket_io_fd, 1);
+                socket_io_fd = NULL;
+                target->state = DISCONNECTED;
+                target->tries++;
+                return 0;
+            }
+        }
+
+        /* Start SSL handshake */
+        socket_io_fd->ssl = x3_ssl_connect(uplink_ssl_ctx, socket_io_fd->fd);
+        if (!socket_io_fd->ssl) {
+            log_module(MAIN_LOG, LOG_ERROR, "Failed to start SSL handshake");
+            ioset_close(socket_io_fd, 1);
+            socket_io_fd = NULL;
+            target->state = DISCONNECTED;
+            target->tries++;
+            return 0;
+        }
+
+        /* Check if handshake is already complete (rare but possible) */
+        if (x3_ssl_get_state(socket_io_fd->ssl) == X3_SSL_CONNECTED) {
+            /* Verify fingerprint if configured */
+            if (target->ssl_fingerprint && target->ssl_fingerprint[0]) {
+                if (x3_ssl_verify_fingerprint(socket_io_fd->ssl, target->ssl_fingerprint) != 1) {
+                    log_module(MAIN_LOG, LOG_ERROR, "SSL certificate fingerprint mismatch!");
+                    ioset_close(socket_io_fd, 1);
+                    socket_io_fd = NULL;
+                    target->state = DISCONNECTED;
+                    target->tries++;
+                    return 0;
+                }
+                log_module(MAIN_LOG, LOG_INFO, "SSL certificate fingerprint verified.");
+            }
+            log_module(MAIN_LOG, LOG_INFO, "SSL connection established: %s using %s",
+                       x3_ssl_get_version(socket_io_fd->ssl),
+                       x3_ssl_get_cipher(socket_io_fd->ssl));
+        } else {
+            /* Handshake still in progress, set state and wait */
+            socket_io_fd->state = IO_SSL_HANDSHAKE;
+            log_module(MAIN_LOG, LOG_DEBUG, "SSL handshake in progress...");
+            /* Don't return yet - the state machine will handle the rest */
+            /* We still need to register callbacks and such */
+        }
+    }
+#endif
+
     log_module(MAIN_LOG, LOG_INFO, "Connection to server established.");
     cManager.uplink = target;
     target->state = AUTHENTICATING;

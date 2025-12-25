@@ -25,16 +25,26 @@
 
 /* Forward declare, since functions take these as arguments. */
 struct sockaddr;
+struct x3_ssl_conn;  /* SSL connection from x3_ssl.h */
 
 struct ioq {
     char *buf;
     unsigned int size, get, put;
 };
 
+/* I/O states - extended for SSL handshake */
+enum io_state {
+    IO_CLOSED,
+    IO_LISTENING,
+    IO_CONNECTING,
+    IO_SSL_HANDSHAKE,  /* SSL handshake in progress */
+    IO_CONNECTED
+};
+
 struct io_fd {
     int fd;
     void *data;
-    enum { IO_CLOSED, IO_LISTENING, IO_CONNECTING, IO_CONNECTED } state;
+    enum io_state state;
     unsigned int line_reads : 1;
     int line_len;
     struct ioq send;
@@ -43,6 +53,8 @@ struct io_fd {
     void (*connect_cb)(struct io_fd *fd, int error);
     void (*readable_cb)(struct io_fd *fd);
     void (*destroy_cb)(struct io_fd *fd);
+    /* SSL/TLS support */
+    struct x3_ssl_conn *ssl;  /* SSL connection (NULL if plaintext) */
 };
 extern int do_write_dbs;
 extern int do_reopen;

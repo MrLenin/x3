@@ -70,6 +70,14 @@ struct uplinkNode
 
     struct uplinkNode	*prev;
     struct uplinkNode	*next;
+
+    /* SSL/TLS configuration */
+    int			ssl;              /* Use SSL for this uplink */
+    char		*ssl_cert;        /* Client certificate path */
+    char		*ssl_key;         /* Client private key path */
+    char		*ssl_ca;          /* CA certificate path for verification */
+    int			ssl_verify;       /* Verify server certificate */
+    char		*ssl_fingerprint; /* Expected server cert fingerprint */
 };
 
 struct cManagerNode
