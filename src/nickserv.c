@@ -41,6 +41,10 @@
 #include "keycloak.h"
 #endif
 
+#ifdef WITH_LMDB
+#include "x3_lmdb.h"
+#endif
+
 #define NICKSERV_CONF_NAME "services/nickserv"
 
 #define KEY_DISABLE_NICKS "disable_nicks"
@@ -5886,66 +5890,108 @@ loc_auth_oauth(const char *bearer_token, const char *username_hint, const char *
 int
 nickserv_set_user_metadata(struct handle_info *hi, const char *key, const char *value, int visibility)
 {
+    char stored_value[2048];
+    int lmdb_ok = 0;
+    int keycloak_ok = 0;
+
     if (!hi || !key)
         return -1;
 
+    /* Encode visibility in stored value: P:value for private, value for public */
+    if (value && *value) {
+        if (visibility == METADATA_VIS_PRIVATE) {
+            snprintf(stored_value, sizeof(stored_value), "P:%s", value);
+        } else {
+            snprintf(stored_value, sizeof(stored_value), "%s", value);
+        }
+    } else {
+        stored_value[0] = '\0';
+    }
+
+    /*
+     * Write-through cache pattern:
+     * 1. Write to LMDB cache first (fast, local)
+     * 2. Write to Keycloak backend (authoritative, may be slow/unavailable)
+     * Success if either succeeds, prefer Keycloak as authoritative.
+     */
+
+#ifdef WITH_LMDB
+    /* Step 1: Write to LMDB cache */
+    if (x3_lmdb_is_available()) {
+        int rc;
+
+        if (value && *value) {
+            rc = x3_lmdb_account_set(hi->handle, key, stored_value);
+        } else {
+            rc = x3_lmdb_account_delete(hi->handle, key);
+        }
+
+        if (rc == LMDB_SUCCESS || rc == LMDB_NOT_FOUND) {
+            lmdb_ok = 1;
+            log_module(NS_LOG, LOG_DEBUG, "nickserv_set_user_metadata: LMDB cache set %s.%s = %s (vis=%d)",
+                       hi->handle, key, value ? value : "(deleted)", visibility);
+        } else {
+            log_module(NS_LOG, LOG_WARNING, "nickserv_set_user_metadata: LMDB cache failed for %s.%s",
+                       hi->handle, key);
+        }
+    }
+#endif
+
 #ifdef WITH_KEYCLOAK
+    /* Step 2: Write to Keycloak backend */
     if (nickserv_conf.keycloak_enable) {
         char attr_name[128];
-        char stored_value[2048];
         struct kc_user user;
         int rc;
 
         if (kc_ensure_token() != KC_SUCCESS) {
             log_module(NS_LOG, LOG_WARNING, "nickserv_set_user_metadata: Failed to get admin token");
-            return -1;
-        }
-
-        /* Get user ID from Keycloak */
-        rc = keycloak_get_user(kc_realm_config, kc_client_config, hi->handle, &user);
-        if (rc != KC_SUCCESS) {
-            log_module(NS_LOG, LOG_WARNING, "nickserv_set_user_metadata: User %s not found in Keycloak", hi->handle);
-            return -1;
-        }
-
-        char *user_id = strdup(user.id);
-        keycloak_user_free(&user);
-
-        /* Prefix metadata keys with "metadata." to avoid conflicts */
-        snprintf(attr_name, sizeof(attr_name), "metadata.%s", key);
-
-        /* Set or delete the attribute */
-        if (value && *value) {
-            /* Encode visibility in stored value: P:value for private, value for public */
-            if (visibility == METADATA_VIS_PRIVATE) {
-                snprintf(stored_value, sizeof(stored_value), "P:%s", value);
-            } else {
-                snprintf(stored_value, sizeof(stored_value), "%s", value);
-            }
-            rc = keycloak_set_user_attribute(kc_realm_config, kc_client_config,
-                                             user_id, attr_name, stored_value);
+            /* Continue - we may have LMDB cache */
         } else {
-            /* Delete by setting to empty string */
-            rc = keycloak_set_user_attribute(kc_realm_config, kc_client_config,
-                                             user_id, attr_name, "");
+            /* Get user ID from Keycloak */
+            rc = keycloak_get_user(kc_realm_config, kc_client_config, hi->handle, &user);
+            if (rc != KC_SUCCESS) {
+                log_module(NS_LOG, LOG_WARNING, "nickserv_set_user_metadata: User %s not found in Keycloak", hi->handle);
+                /* Continue - we may have LMDB cache */
+            } else {
+                char *user_id = strdup(user.id);
+                keycloak_user_free(&user);
+
+                /* Prefix metadata keys with "metadata." to avoid conflicts */
+                snprintf(attr_name, sizeof(attr_name), "metadata.%s", key);
+
+                /* Set or delete the attribute */
+                if (value && *value) {
+                    rc = keycloak_set_user_attribute(kc_realm_config, kc_client_config,
+                                                     user_id, attr_name, stored_value);
+                } else {
+                    /* Delete by setting to empty string */
+                    rc = keycloak_set_user_attribute(kc_realm_config, kc_client_config,
+                                                     user_id, attr_name, "");
+                }
+
+                free(user_id);
+
+                if (rc == KC_SUCCESS) {
+                    keycloak_ok = 1;
+                    log_module(NS_LOG, LOG_DEBUG, "nickserv_set_user_metadata: Keycloak set %s.%s = %s (vis=%d)",
+                               hi->handle, key, value ? value : "(deleted)", visibility);
+                } else {
+                    log_module(NS_LOG, LOG_WARNING, "nickserv_set_user_metadata: Keycloak failed to set %s for %s",
+                               key, hi->handle);
+                }
+            }
         }
-
-        free(user_id);
-
-        if (rc != KC_SUCCESS) {
-            log_module(NS_LOG, LOG_WARNING, "nickserv_set_user_metadata: Failed to set %s for %s", key, hi->handle);
-            return -1;
-        }
-
-        log_module(NS_LOG, LOG_DEBUG, "nickserv_set_user_metadata: Set %s.%s = %s (vis=%d)",
-                   hi->handle, key, value ? value : "(deleted)", visibility);
-        return 0;
     }
 #endif
 
-    /* Without Keycloak, metadata is not persisted */
+    /* Success if either backend succeeded */
+    if (lmdb_ok || keycloak_ok) {
+        return 0;
+    }
+
     log_module(NS_LOG, LOG_DEBUG, "nickserv_set_user_metadata: No backend available for %s.%s", hi->handle, key);
-    return 0;
+    return -1;
 }
 
 int
@@ -5958,7 +6004,41 @@ nickserv_get_user_metadata(struct handle_info *hi, const char *key, char *value_
     if (visibility_out)
         *visibility_out = METADATA_VIS_PUBLIC;
 
+    /*
+     * Read-through cache pattern:
+     * 1. Check LMDB cache first (fast, local)
+     * 2. If cache miss, query Keycloak and populate cache
+     */
+
+#ifdef WITH_LMDB
+    /* Step 1: Check LMDB cache first */
+    if (x3_lmdb_is_available()) {
+        char stored_value[2048];
+        int rc;
+
+        rc = x3_lmdb_account_get(hi->handle, key, stored_value);
+        if (rc == LMDB_SUCCESS) {
+            /* Cache hit! */
+            if (stored_value[0] == 'P' && stored_value[1] == ':') {
+                if (visibility_out)
+                    *visibility_out = METADATA_VIS_PRIVATE;
+                strncpy(value_out, stored_value + 2, 1023);
+            } else {
+                strncpy(value_out, stored_value, 1023);
+            }
+            value_out[1023] = '\0';
+            log_module(NS_LOG, LOG_DEBUG, "nickserv_get_user_metadata: LMDB cache hit for %s.%s",
+                       hi->handle, key);
+            return 0;
+        }
+        /* Cache miss - continue to Keycloak */
+        log_module(NS_LOG, LOG_DEBUG, "nickserv_get_user_metadata: LMDB cache miss for %s.%s",
+                   hi->handle, key);
+    }
+#endif
+
 #ifdef WITH_KEYCLOAK
+    /* Step 2: Query Keycloak backend */
     if (nickserv_conf.keycloak_enable) {
         char attr_name[128];
         struct kc_user user;
@@ -5966,13 +6046,15 @@ nickserv_get_user_metadata(struct handle_info *hi, const char *key, char *value_
         int rc;
 
         if (kc_ensure_token() != KC_SUCCESS) {
+            log_module(NS_LOG, LOG_WARNING, "nickserv_get_user_metadata: Failed to get admin token");
             return -1;
         }
 
         /* Get user ID from Keycloak */
         rc = keycloak_get_user(kc_realm_config, kc_client_config, hi->handle, &user);
         if (rc != KC_SUCCESS) {
-            return -1;
+            log_module(NS_LOG, LOG_DEBUG, "nickserv_get_user_metadata: User %s not found in Keycloak", hi->handle);
+            return 1; /* Not found */
         }
 
         char *user_id = strdup(user.id);
@@ -5986,7 +6068,7 @@ nickserv_get_user_metadata(struct handle_info *hi, const char *key, char *value_
         free(user_id);
 
         if (rc == KC_SUCCESS && attr_value) {
-            /* Check for visibility prefix "P:" for private */
+            /* Found in Keycloak - populate cache and return */
             if (attr_value[0] == 'P' && attr_value[1] == ':') {
                 if (visibility_out)
                     *visibility_out = METADATA_VIS_PRIVATE;
@@ -5995,11 +6077,22 @@ nickserv_get_user_metadata(struct handle_info *hi, const char *key, char *value_
                 strncpy(value_out, attr_value, 1023);
             }
             value_out[1023] = '\0';
+
+#ifdef WITH_LMDB
+            /* Populate LMDB cache with Keycloak data */
+            if (x3_lmdb_is_available()) {
+                x3_lmdb_account_set(hi->handle, key, attr_value);
+                log_module(NS_LOG, LOG_DEBUG, "nickserv_get_user_metadata: Populated LMDB cache for %s.%s",
+                           hi->handle, key);
+            }
+#endif
             free(attr_value);
             return 0;
         } else if (rc == KC_NOT_FOUND) {
+            free(attr_value);
             return 1; /* Not found */
         }
+        free(attr_value);
         return -1;
     }
 #endif
@@ -6010,10 +6103,57 @@ nickserv_get_user_metadata(struct handle_info *hi, const char *key, char *value_
 void
 nickserv_sync_metadata_to_ircd(struct userNode *user)
 {
+    int found_entries = 0;
+
     if (!user || !user->handle_info)
         return;
 
+    /*
+     * Sync pattern: Try LMDB cache first, then Keycloak.
+     * When loading from Keycloak, populate LMDB cache for next time.
+     */
+
+#ifdef WITH_LMDB
+    /* Step 1: Try LMDB cache first */
+    if (x3_lmdb_is_available()) {
+        struct lmdb_metadata_entry *entries = NULL;
+        struct lmdb_metadata_entry *entry;
+        int count;
+
+        count = x3_lmdb_account_list(user->handle_info->handle, &entries);
+        if (count > 0) {
+            log_module(NS_LOG, LOG_DEBUG, "nickserv_sync_metadata_to_ircd: Found %d LMDB entries for %s",
+                       count, user->handle_info->handle);
+
+            for (entry = entries; entry; entry = entry->next) {
+                const char *key = entry->key;
+                const char *value = entry->value;
+                int visibility = METADATA_VIS_PUBLIC;
+
+                /* Parse visibility prefix from stored value (P:value for private) */
+                if (value && value[0] == 'P' && value[1] == ':') {
+                    visibility = METADATA_VIS_PRIVATE;
+                    value += 2;
+                }
+
+                log_module(NS_LOG, LOG_DEBUG, "nickserv_sync_metadata_to_ircd: Pushing %s.%s = %s (vis=%d) from LMDB",
+                           user->nick, key, value, visibility);
+
+                irc_metadata(user->nick, key, value, visibility);
+                found_entries++;
+            }
+
+            x3_lmdb_free_entries(entries);
+        }
+    }
+#endif
+
+    /* If we found entries in LMDB cache, we're done */
+    if (found_entries > 0)
+        return;
+
 #ifdef WITH_KEYCLOAK
+    /* Step 2: Query Keycloak backend (cache miss or no LMDB) */
     if (nickserv_conf.keycloak_enable) {
         struct kc_user kc_user;
         struct kc_metadata_entry *entries = NULL;
@@ -6047,11 +6187,12 @@ nickserv_sync_metadata_to_ircd(struct userNode *user)
             return;
         }
 
-        /* Push each metadata entry to the IRCd */
+        /* Push each metadata entry to the IRCd and populate LMDB cache */
         for (entry = entries; entry; entry = entry->next) {
             /* Strip "metadata." prefix from key */
             const char *key = entry->key;
             const char *value = entry->value;
+            const char *original_value = entry->value;
             int visibility = METADATA_VIS_PUBLIC;
 
             if (strncmp(key, "metadata.", 9) == 0)
@@ -6063,10 +6204,17 @@ nickserv_sync_metadata_to_ircd(struct userNode *user)
                 value += 2;
             }
 
-            log_module(NS_LOG, LOG_DEBUG, "nickserv_sync_metadata_to_ircd: Pushing %s.%s = %s (vis=%d)",
+            log_module(NS_LOG, LOG_DEBUG, "nickserv_sync_metadata_to_ircd: Pushing %s.%s = %s (vis=%d) from Keycloak",
                        user->nick, key, value, visibility);
 
             irc_metadata(user->nick, key, value, visibility);
+
+#ifdef WITH_LMDB
+            /* Populate LMDB cache */
+            if (x3_lmdb_is_available()) {
+                x3_lmdb_account_set(user->handle_info->handle, key, original_value);
+            }
+#endif
         }
 
         keycloak_free_metadata_entries(entries);

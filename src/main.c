@@ -36,6 +36,10 @@
 #include "opserv.h"
 #include "spamserv.h"
 
+#ifdef WITH_LMDB
+#include "x3_lmdb.h"
+#endif
+
 #ifdef HAVE_GETOPT_H
 #include <getopt.h>
 #else

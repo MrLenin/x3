@@ -603,6 +603,49 @@ if test "x$with_keycloak" = "xyes"; then
    fi
 fi
 
+dnl LMDB checking (for metadata persistence)
+AC_ARG_WITH(lmdb,
+[  --with-lmdb[=PATH]     Enable LMDB metadata storage support],
+[with_lmdb=$withval], [with_lmdb=no])
+
+if test "x$with_lmdb" != "xno"; then
+   if test "x$with_lmdb" != "xyes" -a "x$with_lmdb" != "x"; then
+      LMDB_PATH="$with_lmdb"
+      LMDB_CFLAGS="-I$LMDB_PATH/include"
+      LMDB_LIBS="-L$LMDB_PATH/lib -llmdb"
+      CFLAGS="$CFLAGS $LMDB_CFLAGS"
+      LDFLAGS="$LDFLAGS -L$LMDB_PATH/lib"
+   fi
+
+   AC_MSG_RESULT([Checking for LMDB library])
+
+   dnl Check for liblmdb
+   AC_CHECK_LIB(lmdb, mdb_env_create,
+   [
+      LIBS="-llmdb $LIBS"
+      AC_CHECK_HEADERS(lmdb.h,
+      [
+         have_lmdb=yes
+      ],
+      [
+         if test "x$with_lmdb" != "xno"; then
+            AC_MSG_ERROR([lmdb.h not found but required for --with-lmdb])
+         fi
+      ])
+   ],
+   [
+      if test "x$with_lmdb" != "xno"; then
+         AC_MSG_ERROR([liblmdb not found but required for --with-lmdb])
+      fi
+   ])
+
+   if test "x$have_lmdb" = "xyes"; then
+      AC_DEFINE(WITH_LMDB, 1, [Define if LMDB support is enabled])
+      lmdb_message="LMDB support:       enabled"
+      MODULE_OBJS="$MODULE_OBJS x3_lmdb.\$(OBJEXT)"
+   fi
+fi
+
 dnl *********************************************************************
 dnl ** PYTHON ***********************************************************
 dnl *********************************************************************
@@ -691,6 +734,7 @@ X3 is now configured as follows:
   Coredumper Library  Coredumper $core_version
   $ldap_message
   $keycloak_message
+  $lmdb_message
   python: $python
 
   Install to:         $prefix

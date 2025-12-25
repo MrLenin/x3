@@ -26,10 +26,15 @@
 #include "modcmd.h"
 #include "opserv.h" /* for opserv_bad_channel() */
 #include "nickserv.h" /* for oper_outranks() */
+#include "proto.h"  /* for irc_metadata() */
 #include "saxdb.h"
 #include "shun.h"
 #include "spamserv.h"
 #include "timeq.h"
+
+#ifdef WITH_LMDB
+#include "x3_lmdb.h"
+#endif
 
 #define CHANSERV_CONF_NAME  "services/chanserv"
 
@@ -10023,6 +10028,141 @@ chanserv_db_cleanup(UNUSED_ARG(void *extra)) {
         helperList = helperList->next;
         free(helper);
     }
+}
+
+/*
+ * Channel Metadata Support
+ *
+ * Channel metadata is stored in LMDB for fast local caching.
+ * Unlike user metadata (which uses Keycloak as authoritative backend),
+ * channel metadata uses LMDB as the primary store since channels are
+ * IRC-specific entities.
+ *
+ * Visibility is stored as a prefix in the value:
+ *   - Public values are stored as-is: "value"
+ *   - Private values are stored with prefix: "P:value"
+ */
+
+int
+chanserv_set_channel_metadata(struct chanData *cData, const char *key, const char *value, int visibility)
+{
+    if (!cData || !cData->channel || !key)
+        return -1;
+
+#ifdef WITH_LMDB
+    if (x3_lmdb_is_available()) {
+        char stored_value[2048];
+        int rc;
+
+        if (value && *value) {
+            /* Encode visibility in stored value: P:value for private, value for public */
+            if (visibility == METADATA_VIS_PRIVATE) {
+                snprintf(stored_value, sizeof(stored_value), "P:%s", value);
+            } else {
+                snprintf(stored_value, sizeof(stored_value), "%s", value);
+            }
+            rc = x3_lmdb_channel_set(cData->channel->name, key, stored_value);
+        } else {
+            rc = x3_lmdb_channel_delete(cData->channel->name, key);
+        }
+
+        if (rc == LMDB_SUCCESS || rc == LMDB_NOT_FOUND) {
+            log_module(CS_LOG, LOG_DEBUG, "chanserv_set_channel_metadata: LMDB set %s.%s = %s (vis=%d)",
+                       cData->channel->name, key, value ? value : "(deleted)", visibility);
+
+            /* Push to IRCd */
+            irc_metadata(cData->channel->name, key, value, visibility);
+            return 0;
+        }
+
+        log_module(CS_LOG, LOG_WARNING, "chanserv_set_channel_metadata: LMDB failed to set %s.%s",
+                   cData->channel->name, key);
+        return -1;
+    }
+#endif
+
+    log_module(CS_LOG, LOG_DEBUG, "chanserv_set_channel_metadata: No backend available for %s.%s",
+               cData->channel->name, key);
+    return -1;
+}
+
+int
+chanserv_get_channel_metadata(struct chanData *cData, const char *key, char *value_out, int *visibility_out)
+{
+    if (!cData || !cData->channel || !key || !value_out)
+        return -1;
+
+    value_out[0] = '\0';
+    if (visibility_out)
+        *visibility_out = METADATA_VIS_PUBLIC;
+
+#ifdef WITH_LMDB
+    if (x3_lmdb_is_available()) {
+        char stored_value[2048];
+        int rc;
+
+        rc = x3_lmdb_channel_get(cData->channel->name, key, stored_value);
+        if (rc == LMDB_SUCCESS) {
+            /* Check for visibility prefix "P:" for private */
+            if (stored_value[0] == 'P' && stored_value[1] == ':') {
+                if (visibility_out)
+                    *visibility_out = METADATA_VIS_PRIVATE;
+                strncpy(value_out, stored_value + 2, 1023);
+            } else {
+                strncpy(value_out, stored_value, 1023);
+            }
+            value_out[1023] = '\0';
+            log_module(CS_LOG, LOG_DEBUG, "chanserv_get_channel_metadata: LMDB hit for %s.%s",
+                       cData->channel->name, key);
+            return 0;
+        } else if (rc == LMDB_NOT_FOUND) {
+            return 1; /* Not found */
+        }
+        return -1; /* Error */
+    }
+#endif
+
+    return 1; /* Not found - no backend */
+}
+
+void
+chanserv_sync_metadata_to_ircd(struct chanData *cData)
+{
+    if (!cData || !cData->channel)
+        return;
+
+#ifdef WITH_LMDB
+    if (x3_lmdb_is_available()) {
+        struct lmdb_metadata_entry *entries = NULL;
+        struct lmdb_metadata_entry *entry;
+        int count;
+
+        count = x3_lmdb_channel_list(cData->channel->name, &entries);
+        if (count > 0) {
+            log_module(CS_LOG, LOG_DEBUG, "chanserv_sync_metadata_to_ircd: Found %d LMDB entries for %s",
+                       count, cData->channel->name);
+
+            for (entry = entries; entry; entry = entry->next) {
+                const char *key = entry->key;
+                const char *value = entry->value;
+                int visibility = METADATA_VIS_PUBLIC;
+
+                /* Parse visibility prefix from stored value (P:value for private) */
+                if (value && value[0] == 'P' && value[1] == ':') {
+                    visibility = METADATA_VIS_PRIVATE;
+                    value += 2;
+                }
+
+                log_module(CS_LOG, LOG_DEBUG, "chanserv_sync_metadata_to_ircd: Pushing %s.%s = %s (vis=%d)",
+                           cData->channel->name, key, value, visibility);
+
+                irc_metadata(cData->channel->name, key, value, visibility);
+            }
+
+            x3_lmdb_free_entries(entries);
+        }
+    }
+#endif
 }
 
 #if defined(GCC_VARMACROS)

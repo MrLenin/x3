@@ -437,6 +437,11 @@ conf_globals(void)
     const char *info;
     dict_t dict;
 
+#ifdef WITH_LMDB
+    /* Initialize LMDB early so other modules can use it */
+    init_x3_lmdb();
+#endif
+
     info = conf_get_data("services/opserv/nick", RECDB_QSTRING);
     if (info && (info[0] == '.'))
         info = NULL;

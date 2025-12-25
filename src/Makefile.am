@@ -46,7 +46,8 @@ EXTRA_x3_SOURCES = \
 	mod-sockcheck.c \
 	mod-webtv.c \
 	mod-python.c \
-	mod-qserver.c
+	mod-qserver.c \
+	x3_lmdb.c
 
 x3_LDADD = @MODULE_OBJS@
 x3_DEPENDENCIES = @MODULE_OBJS@
@@ -74,6 +75,7 @@ x3_SOURCES = \
 	modules.c modules.h \
 	keycloak.c keycloak.h \
 	nickserv.c nickserv.h \
+	x3_lmdb.h \
 	opserv.c opserv.h \
 	policer.c policer.h \
 	proto.h \
