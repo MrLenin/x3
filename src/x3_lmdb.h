@@ -32,6 +32,7 @@ enum lmdb_error {
 #define LMDB_PREFIX_ACCOUNT  "acct:"
 #define LMDB_PREFIX_CHANNEL  "chan:"
 #define LMDB_PREFIX_META     "meta:"
+#define LMDB_PREFIX_CHANACCESS "chanaccess:"
 
 /* Metadata entry for iteration */
 struct lmdb_metadata_entry {
@@ -47,6 +48,14 @@ struct lmdb_account_entry {
     char *value;
     int visibility;
     unsigned long timestamp;
+};
+
+/* Channel access entry for iteration */
+struct lmdb_chanaccess_entry {
+    char *channel;
+    char *account;
+    unsigned short access;
+    struct lmdb_chanaccess_entry *next;
 };
 
 /* ========== Initialization ========== */
@@ -156,6 +165,63 @@ int x3_lmdb_channel_list(const char *channel, struct lmdb_metadata_entry **entri
  */
 int x3_lmdb_channel_clear(const char *channel);
 
+/* ========== Channel Access (Keycloak Group Sync) ========== */
+
+/**
+ * Get channel access level for an account
+ * @param channel Channel name (with #)
+ * @param account Account name
+ * @param access_out Output for access level
+ * @return LMDB_SUCCESS on success, LMDB_NOT_FOUND if not found, LMDB_ERROR on failure
+ */
+int x3_lmdb_chanaccess_get(const char *channel, const char *account, unsigned short *access_out);
+
+/**
+ * Set channel access level for an account
+ * @param channel Channel name (with #)
+ * @param account Account name
+ * @param access Access level (0 to delete)
+ * @return LMDB_SUCCESS on success, LMDB_ERROR on failure
+ */
+int x3_lmdb_chanaccess_set(const char *channel, const char *account, unsigned short access);
+
+/**
+ * Delete channel access for an account
+ * @param channel Channel name (with #)
+ * @param account Account name
+ * @return LMDB_SUCCESS on success, LMDB_NOT_FOUND if not found, LMDB_ERROR on failure
+ */
+int x3_lmdb_chanaccess_delete(const char *channel, const char *account);
+
+/**
+ * List all access entries for a channel
+ * @param channel Channel name (with #)
+ * @param entries_out Output pointer for linked list (caller must free)
+ * @return Number of entries found, LMDB_ERROR on failure
+ */
+int x3_lmdb_chanaccess_list(const char *channel, struct lmdb_chanaccess_entry **entries_out);
+
+/**
+ * List all channel access entries for an account
+ * @param account Account name
+ * @param entries_out Output pointer for linked list (caller must free)
+ * @return Number of entries found, LMDB_ERROR on failure
+ */
+int x3_lmdb_chanaccess_list_account(const char *account, struct lmdb_chanaccess_entry **entries_out);
+
+/**
+ * Clear all access entries for a channel
+ * @param channel Channel name (with #)
+ * @return Number of entries deleted, LMDB_ERROR on failure
+ */
+int x3_lmdb_chanaccess_clear(const char *channel);
+
+/**
+ * Free a linked list of channel access entries
+ * @param entries Head of the list to free (can be NULL)
+ */
+void x3_lmdb_free_chanaccess_entries(struct lmdb_chanaccess_entry *entries);
+
 /* ========== Generic Key-Value Operations ========== */
 
 /**
@@ -232,6 +298,13 @@ void init_x3_lmdb(void);
 #define x3_lmdb_channel_delete(c, k)    (-2)
 #define x3_lmdb_channel_list(c, e)      (-1)
 #define x3_lmdb_channel_clear(c)        (-1)
+#define x3_lmdb_chanaccess_get(c, a, o) (-2)
+#define x3_lmdb_chanaccess_set(c, a, l) (-1)
+#define x3_lmdb_chanaccess_delete(c, a) (-2)
+#define x3_lmdb_chanaccess_list(c, e)   (-1)
+#define x3_lmdb_chanaccess_list_account(a, e) (-1)
+#define x3_lmdb_chanaccess_clear(c)     (-1)
+#define x3_lmdb_free_chanaccess_entries(e) do {} while(0)
 #define x3_lmdb_free_entries(e)         do {} while(0)
 #define x3_lmdb_sync(f)                 (0)
 #define x3_lmdb_stats(d, e, s)          (-1)

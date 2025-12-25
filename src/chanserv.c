@@ -23,6 +23,7 @@
 #include "global.h"
 #include "gline.h"
 #include "ioset.h"
+#include "keycloak.h"
 #include "modcmd.h"
 #include "opserv.h" /* for opserv_bad_channel() */
 #include "nickserv.h" /* for oper_outranks() */
@@ -32,9 +33,10 @@
 #include "spamserv.h"
 #include "timeq.h"
 
-#ifdef WITH_LMDB
 #include "x3_lmdb.h"
-#endif
+
+/* External access to nickserv configuration for Keycloak settings */
+extern struct nickserv_config nickserv_conf;
 
 #define CHANSERV_CONF_NAME  "services/chanserv"
 
@@ -63,6 +65,9 @@
 #define KEY_IRC_OPERATOR_EPITHET    "irc_operator_epithet"
 #define KEY_NETWORK_HELPER_EPITHET  "network_helper_epithet"
 #define KEY_SUPPORT_HELPER_EPITHET  "support_helper_epithet"
+#define KEY_KEYCLOAK_ACCESS_SYNC    "keycloak_access_sync"
+#define KEY_KEYCLOAK_GROUP_PREFIX   "keycloak_group_prefix"
+#define KEY_KEYCLOAK_SYNC_FREQUENCY "keycloak_sync_frequency"
 #define KEY_NODELETE_LEVEL          "nodelete_level"
 #define KEY_MAX_USERINFO_LENGTH     "max_userinfo_length"
 #define KEY_GIVEOWNERSHIP_PERIOD    "giveownership_timeout"
@@ -656,6 +661,11 @@ static struct
     const char          *irc_operator_epithet;
     const char          *network_helper_epithet;
     const char          *support_helper_epithet;
+
+    /* Keycloak channel access sync */
+    unsigned int        keycloak_access_sync : 1;  /* Enable Keycloak group sync */
+    const char          *keycloak_group_prefix;    /* Group name prefix, e.g. "irc-channel-" */
+    unsigned long       keycloak_sync_frequency;   /* Sync interval in seconds (0 = startup only) */
 } chanserv_conf;
 
 struct listData
@@ -822,6 +832,9 @@ unsigned int chanserv_read_version = 0; /* db version control */
 #define GetChannelAccess(channel, handle) _GetChannelUser(channel, handle, 0, 0)
 #define GetTrueChannelAccess(channel, handle) _GetChannelUser(channel, handle, 0, 1)
 
+/* Forward declaration for LMDB fallback in _GetChannelUser */
+static struct userData *add_channel_user(struct chanData *channel, struct handle_info *handle, unsigned short access_level, time_t seen, const char *info, time_t accessexpiry);
+
 void sputsock(const char *text, ...) PRINTF_LIKE(1, 2);
 
 void
@@ -934,6 +947,20 @@ _GetChannelUser(struct chanData *channel, struct handle_info *handle, int overri
                 break;
 
     head = &(channel->users);
+
+    /* LMDB fallback: Check Keycloak-synced access if not found in SAXDB */
+    if(!uData && handle->handle && x3_lmdb_is_available()) {
+        unsigned short lmdb_access;
+        int rc = x3_lmdb_chanaccess_get(channel->channel->name, handle->handle, &lmdb_access);
+        if(rc == LMDB_SUCCESS && lmdb_access > 0) {
+            /* Found in LMDB - create a userData entry */
+            uData = add_channel_user(channel, handle, lmdb_access, now, NULL, 0);
+            if(uData) {
+                /* Mark as LMDB-sourced so we know it came from Keycloak sync */
+                /* The entry is now in channel->users and will be found on next lookup */
+            }
+        }
+    }
     }
 
     if(uData && (uData != *head))
@@ -9151,6 +9178,12 @@ chanserv_conf_read(void)
     chanserv_conf.network_helper_epithet = str ? str : "a wannabe tyrant";
     str = database_get_data(conf_node, KEY_SUPPORT_HELPER_EPITHET, RECDB_QSTRING);
     chanserv_conf.support_helper_epithet = str ? str : "a wannabe tyrant";
+    str = database_get_data(conf_node, KEY_KEYCLOAK_ACCESS_SYNC, RECDB_QSTRING);
+    chanserv_conf.keycloak_access_sync = str ? enabled_string(str) : 0;
+    str = database_get_data(conf_node, KEY_KEYCLOAK_GROUP_PREFIX, RECDB_QSTRING);
+    chanserv_conf.keycloak_group_prefix = str ? str : "irc-channel-";
+    str = database_get_data(conf_node, KEY_KEYCLOAK_SYNC_FREQUENCY, RECDB_QSTRING);
+    chanserv_conf.keycloak_sync_frequency = str ? ParseInterval(str) : 3600;
     str = database_get_data(conf_node, KEY_GOD_TIMEOUT, RECDB_QSTRING);
     god_timeout = str ? ParseInterval(str) : 60*15;
     str = database_get_data(conf_node, "default_modes", RECDB_QSTRING);
@@ -10165,6 +10198,184 @@ chanserv_sync_metadata_to_ircd(struct chanData *cData)
 #endif
 }
 
+/* ========== Keycloak Channel Access Sync ========== */
+
+#ifdef WITH_KEYCLOAK
+
+/* Access level to group suffix mapping */
+static const struct {
+    unsigned short level;
+    const char *suffix;
+} kc_access_levels[] = {
+    { UL_OWNER, "owner" },
+    { UL_COOWNER, "coowner" },
+    { UL_MANAGER, "manager" },
+    { UL_OP, "op" },
+    { UL_HALFOP, "halfop" },
+    { UL_PEON, "peon" },
+    { 0, NULL }
+};
+
+/**
+ * Sync channel access from a Keycloak group to LMDB
+ * @param channel Channel name (with #)
+ * @param level Access level to sync
+ * @return Number of members synced, or -1 on error
+ */
+static int
+chanserv_sync_keycloak_channel_level(const char *channel, unsigned short level)
+{
+    struct kc_realm realm;
+    struct kc_client client;
+    char group_name[256];
+    char *group_id = NULL;
+    struct kc_group_member *members = NULL;
+    struct kc_group_member *member;
+    const char *suffix = NULL;
+    int count = 0;
+    int i, rc;
+
+    if (!nickserv_conf.keycloak_enable || !chanserv_conf.keycloak_access_sync)
+        return 0;
+
+    if (!x3_lmdb_is_available())
+        return 0;
+
+    /* Find suffix for this level */
+    for (i = 0; kc_access_levels[i].suffix; i++) {
+        if (kc_access_levels[i].level == level) {
+            suffix = kc_access_levels[i].suffix;
+            break;
+        }
+    }
+    if (!suffix)
+        return 0;
+
+    /* Build group name: prefix + channel + "-" + suffix
+     * e.g., "irc-channel-#help-owner"
+     */
+    snprintf(group_name, sizeof(group_name), "%s%s-%s",
+             chanserv_conf.keycloak_group_prefix, channel, suffix);
+
+    /* Setup Keycloak connection */
+    realm.base_uri = (char*)nickserv_conf.keycloak_uri;
+    realm.realm = nickserv_conf.keycloak_realm;
+    client.client_id = (char*)nickserv_conf.keycloak_client_id;
+    client.client_secret = (char*)nickserv_conf.keycloak_client_secret;
+    client.access_token = NULL;
+
+    /* Get client token */
+    rc = keycloak_get_client_token(realm, client, &client.access_token);
+    if (rc != KC_SUCCESS) {
+        log_module(CS_LOG, LOG_DEBUG, "chanserv_sync_keycloak_channel_level: Failed to get token");
+        return -1;
+    }
+
+    /* Look up group */
+    rc = keycloak_get_group_by_name(realm, client, group_name, &group_id);
+    if (rc == KC_NOT_FOUND) {
+        /* Group doesn't exist - that's OK, no members to sync */
+        keycloak_free_access_token(client.access_token);
+        return 0;
+    }
+    if (rc != KC_SUCCESS || !group_id) {
+        keycloak_free_access_token(client.access_token);
+        return -1;
+    }
+
+    /* Get group members */
+    rc = keycloak_get_group_members(realm, client, group_id, &members);
+    if (rc < 0) {
+        free(group_id);
+        keycloak_free_access_token(client.access_token);
+        return -1;
+    }
+
+    /* Store each member in LMDB */
+    for (member = members; member; member = member->next) {
+        rc = x3_lmdb_chanaccess_set(channel, member->username, level);
+        if (rc == LMDB_SUCCESS) {
+            count++;
+            log_module(CS_LOG, LOG_DEBUG, "Synced Keycloak access: %s -> %s level %d",
+                       member->username, channel, level);
+        }
+    }
+
+    /* Cleanup */
+    keycloak_free_group_members(members);
+    free(group_id);
+    keycloak_free_access_token(client.access_token);
+
+    return count;
+}
+
+/**
+ * Sync all access levels for a single channel from Keycloak
+ * @param channel Channel name (with #)
+ * @return Total members synced, or -1 on error
+ */
+static int
+chanserv_sync_keycloak_channel(const char *channel)
+{
+    int total = 0;
+    int i, rc;
+
+    for (i = 0; kc_access_levels[i].suffix; i++) {
+        rc = chanserv_sync_keycloak_channel_level(channel, kc_access_levels[i].level);
+        if (rc > 0)
+            total += rc;
+    }
+
+    return total;
+}
+
+/**
+ * Sync all registered channels from Keycloak groups
+ * This is called on startup and periodically
+ */
+static void
+chanserv_sync_keycloak_access(void *data)
+{
+    struct chanData *cData;
+    int total = 0;
+    int channel_count = 0;
+    time_t start_time = now;
+
+    UNUSED_ARG(data);
+
+    if (!nickserv_conf.keycloak_enable || !chanserv_conf.keycloak_access_sync)
+        return;
+
+    if (!x3_lmdb_is_available()) {
+        log_module(CS_LOG, LOG_WARNING, "Keycloak access sync skipped: LMDB not available");
+        return;
+    }
+
+    log_module(CS_LOG, LOG_INFO, "Starting Keycloak channel access sync...");
+
+    /* Iterate through all registered channels */
+    for (cData = channelList; cData; cData = cData->next) {
+        if (!cData->channel || !cData->channel->name)
+            continue;
+
+        int synced = chanserv_sync_keycloak_channel(cData->channel->name);
+        if (synced > 0) {
+            total += synced;
+            channel_count++;
+        }
+    }
+
+    log_module(CS_LOG, LOG_INFO, "Keycloak access sync complete: %d entries across %d channels in %ld seconds",
+               total, channel_count, (long)(now - start_time));
+
+    /* Schedule next sync if configured */
+    if (chanserv_conf.keycloak_sync_frequency > 0) {
+        timeq_add(now + chanserv_conf.keycloak_sync_frequency, chanserv_sync_keycloak_access, NULL);
+    }
+}
+
+#endif /* WITH_KEYCLOAK */
+
 #if defined(GCC_VARMACROS)
 # define DEFINE_COMMAND(NAME, MIN_ARGC, FLAGS, ARGS...) modcmd_register(chanserv_module, #NAME, cmd_##NAME, MIN_ARGC, FLAGS, ARGS)
 #elif defined(C99_VARMACROS)
@@ -10402,8 +10613,16 @@ init_chanserv(const char *nick)
         for (i = 0; i < autojoin_channels->used; i++) {
             chan = AddChannel(autojoin_channels->list[i], now, "+nt", NULL, NULL);
             AddChannelUser(chanserv, chan)->modes |= MODE_CHANOP;
-        }    
+        }
     }
+
+#ifdef WITH_KEYCLOAK
+    /* Schedule initial Keycloak access sync after startup (delay allows DB to load) */
+    if (chanserv_conf.keycloak_access_sync && nickserv_conf.keycloak_enable) {
+        timeq_add(now + 30, chanserv_sync_keycloak_access, NULL);
+        log_module(CS_LOG, LOG_INFO, "Keycloak channel access sync scheduled");
+    }
+#endif
 
     reg_exit_func(chanserv_db_cleanup, NULL);
     message_register_table(msgtab);

@@ -650,6 +650,312 @@ int x3_lmdb_stats(const char *db, size_t *entries_out, size_t *size_out)
     return LMDB_SUCCESS;
 }
 
+/* ========== Channel Access (Keycloak Group Sync) ========== */
+
+int x3_lmdb_chanaccess_get(const char *channel, const char *account, unsigned short *access_out)
+{
+    MDB_txn *txn;
+    MDB_val mkey, mdata;
+    char keybuf[LMDB_KEY_BUFFER_SIZE];
+    int rc;
+
+    if (!x3_lmdb_is_available() || !channel || !account || !access_out) {
+        return LMDB_ERROR;
+    }
+
+    /* Build composite key: "chanaccess:<channel>\0<account>" */
+    size_t prefix_len = strlen(LMDB_PREFIX_CHANACCESS);
+    size_t channel_len = strlen(channel);
+    size_t account_len = strlen(account);
+
+    if (prefix_len + channel_len + 1 + account_len + 1 > sizeof(keybuf)) {
+        return LMDB_ERROR;
+    }
+
+    memcpy(keybuf, LMDB_PREFIX_CHANACCESS, prefix_len);
+    memcpy(keybuf + prefix_len, channel, channel_len);
+    keybuf[prefix_len + channel_len] = '\0';
+    memcpy(keybuf + prefix_len + channel_len + 1, account, account_len + 1);
+
+    mkey.mv_size = prefix_len + channel_len + 1 + account_len + 1;
+    mkey.mv_data = keybuf;
+
+    rc = mdb_txn_begin(lmdb_env, NULL, MDB_RDONLY, &txn);
+    if (rc != 0) {
+        return LMDB_ERROR;
+    }
+
+    rc = mdb_get(txn, dbi_metadata, &mkey, &mdata);
+    mdb_txn_abort(txn);
+
+    if (rc == MDB_NOTFOUND) {
+        return LMDB_NOT_FOUND;
+    } else if (rc != 0) {
+        return LMDB_ERROR;
+    }
+
+    /* Parse access level from stored value */
+    *access_out = (unsigned short)atoi((const char *)mdata.mv_data);
+    return LMDB_SUCCESS;
+}
+
+int x3_lmdb_chanaccess_set(const char *channel, const char *account, unsigned short access)
+{
+    MDB_txn *txn;
+    MDB_val mkey, mdata;
+    char keybuf[LMDB_KEY_BUFFER_SIZE];
+    char valuebuf[16];
+    int rc;
+
+    if (!x3_lmdb_is_available() || !channel || !account) {
+        return LMDB_ERROR;
+    }
+
+    /* Build composite key: "chanaccess:<channel>\0<account>" */
+    size_t prefix_len = strlen(LMDB_PREFIX_CHANACCESS);
+    size_t channel_len = strlen(channel);
+    size_t account_len = strlen(account);
+
+    if (prefix_len + channel_len + 1 + account_len + 1 > sizeof(keybuf)) {
+        return LMDB_ERROR;
+    }
+
+    memcpy(keybuf, LMDB_PREFIX_CHANACCESS, prefix_len);
+    memcpy(keybuf + prefix_len, channel, channel_len);
+    keybuf[prefix_len + channel_len] = '\0';
+    memcpy(keybuf + prefix_len + channel_len + 1, account, account_len + 1);
+
+    mkey.mv_size = prefix_len + channel_len + 1 + account_len + 1;
+    mkey.mv_data = keybuf;
+
+    rc = mdb_txn_begin(lmdb_env, NULL, 0, &txn);
+    if (rc != 0) {
+        return LMDB_ERROR;
+    }
+
+    if (access > 0) {
+        snprintf(valuebuf, sizeof(valuebuf), "%u", access);
+        mdata.mv_size = strlen(valuebuf) + 1;
+        mdata.mv_data = valuebuf;
+        rc = mdb_put(txn, dbi_metadata, &mkey, &mdata, 0);
+    } else {
+        /* Access 0 means delete */
+        rc = mdb_del(txn, dbi_metadata, &mkey, NULL);
+        if (rc == MDB_NOTFOUND) {
+            rc = 0;
+        }
+    }
+
+    if (rc != 0) {
+        mdb_txn_abort(txn);
+        return LMDB_ERROR;
+    }
+
+    rc = mdb_txn_commit(txn);
+    return rc == 0 ? LMDB_SUCCESS : LMDB_ERROR;
+}
+
+int x3_lmdb_chanaccess_delete(const char *channel, const char *account)
+{
+    return x3_lmdb_chanaccess_set(channel, account, 0);
+}
+
+int x3_lmdb_chanaccess_list(const char *channel, struct lmdb_chanaccess_entry **entries_out)
+{
+    MDB_txn *txn;
+    MDB_cursor *cursor;
+    MDB_val mkey, mdata;
+    char prefix[LMDB_KEY_BUFFER_SIZE];
+    struct lmdb_chanaccess_entry *head = NULL, *tail = NULL;
+    int count = 0;
+    int rc;
+
+    if (!x3_lmdb_is_available() || !channel || !entries_out) {
+        return LMDB_ERROR;
+    }
+
+    *entries_out = NULL;
+
+    /* Build prefix: "chanaccess:<channel>\0" */
+    size_t chanaccess_len = strlen(LMDB_PREFIX_CHANACCESS);
+    size_t channel_len = strlen(channel);
+    size_t prefix_len = chanaccess_len + channel_len + 1;
+
+    if (prefix_len > sizeof(prefix)) {
+        return LMDB_ERROR;
+    }
+
+    memcpy(prefix, LMDB_PREFIX_CHANACCESS, chanaccess_len);
+    memcpy(prefix + chanaccess_len, channel, channel_len);
+    prefix[chanaccess_len + channel_len] = '\0';
+
+    rc = mdb_txn_begin(lmdb_env, NULL, MDB_RDONLY, &txn);
+    if (rc != 0) {
+        return LMDB_ERROR;
+    }
+
+    rc = mdb_cursor_open(txn, dbi_metadata, &cursor);
+    if (rc != 0) {
+        mdb_txn_abort(txn);
+        return LMDB_ERROR;
+    }
+
+    mkey.mv_size = prefix_len;
+    mkey.mv_data = prefix;
+
+    rc = mdb_cursor_get(cursor, &mkey, &mdata, MDB_SET_RANGE);
+    while (rc == 0) {
+        /* Check if key still starts with our prefix */
+        if (mkey.mv_size < prefix_len ||
+            memcmp(mkey.mv_data, prefix, prefix_len) != 0) {
+            break;
+        }
+
+        /* Extract the account part after "chanaccess:<channel>\0" */
+        const char *accountstart = (const char *)mkey.mv_data + prefix_len;
+        size_t accountlen = mkey.mv_size - prefix_len - 1; /* -1 for null terminator */
+
+        /* Create entry */
+        struct lmdb_chanaccess_entry *entry = malloc(sizeof(*entry));
+        if (!entry) {
+            break;
+        }
+
+        entry->channel = strdup(channel);
+        entry->account = strndup(accountstart, accountlen);
+        entry->access = (unsigned short)atoi((const char *)mdata.mv_data);
+        entry->next = NULL;
+
+        if (tail) {
+            tail->next = entry;
+        } else {
+            head = entry;
+        }
+        tail = entry;
+        count++;
+
+        rc = mdb_cursor_get(cursor, &mkey, &mdata, MDB_NEXT);
+    }
+
+    mdb_cursor_close(cursor);
+    mdb_txn_abort(txn);
+
+    *entries_out = head;
+    return count;
+}
+
+int x3_lmdb_chanaccess_list_account(const char *account, struct lmdb_chanaccess_entry **entries_out)
+{
+    MDB_txn *txn;
+    MDB_cursor *cursor;
+    MDB_val mkey, mdata;
+    struct lmdb_chanaccess_entry *head = NULL, *tail = NULL;
+    int count = 0;
+    int rc;
+    size_t chanaccess_len = strlen(LMDB_PREFIX_CHANACCESS);
+
+    if (!x3_lmdb_is_available() || !account || !entries_out) {
+        return LMDB_ERROR;
+    }
+
+    *entries_out = NULL;
+
+    rc = mdb_txn_begin(lmdb_env, NULL, MDB_RDONLY, &txn);
+    if (rc != 0) {
+        return LMDB_ERROR;
+    }
+
+    rc = mdb_cursor_open(txn, dbi_metadata, &cursor);
+    if (rc != 0) {
+        mdb_txn_abort(txn);
+        return LMDB_ERROR;
+    }
+
+    /* Scan all chanaccess entries looking for matching account
+     * Key format: "chanaccess:<channel>\0<account>\0"
+     */
+    mkey.mv_size = chanaccess_len;
+    mkey.mv_data = (void *)LMDB_PREFIX_CHANACCESS;
+
+    rc = mdb_cursor_get(cursor, &mkey, &mdata, MDB_SET_RANGE);
+    while (rc == 0) {
+        /* Check if key starts with "chanaccess:" prefix */
+        if (mkey.mv_size < chanaccess_len ||
+            memcmp(mkey.mv_data, LMDB_PREFIX_CHANACCESS, chanaccess_len) != 0) {
+            break;
+        }
+
+        /* Parse key: find the null separating channel from account */
+        const char *keydata = (const char *)mkey.mv_data;
+        const char *channel_start = keydata + chanaccess_len;
+        const char *null_pos = memchr(channel_start, '\0', mkey.mv_size - chanaccess_len);
+
+        if (null_pos && null_pos < keydata + mkey.mv_size - 1) {
+            const char *account_start = null_pos + 1;
+            size_t channel_len_found = null_pos - channel_start;
+
+            /* Check if account matches */
+            if (strcmp(account_start, account) == 0) {
+                struct lmdb_chanaccess_entry *entry = malloc(sizeof(*entry));
+                if (!entry) {
+                    break;
+                }
+
+                entry->channel = strndup(channel_start, channel_len_found);
+                entry->account = strdup(account);
+                entry->access = (unsigned short)atoi((const char *)mdata.mv_data);
+                entry->next = NULL;
+
+                if (tail) {
+                    tail->next = entry;
+                } else {
+                    head = entry;
+                }
+                tail = entry;
+                count++;
+            }
+        }
+
+        rc = mdb_cursor_get(cursor, &mkey, &mdata, MDB_NEXT);
+    }
+
+    mdb_cursor_close(cursor);
+    mdb_txn_abort(txn);
+
+    *entries_out = head;
+    return count;
+}
+
+int x3_lmdb_chanaccess_clear(const char *channel)
+{
+    struct lmdb_chanaccess_entry *entries, *entry;
+    int count;
+
+    count = x3_lmdb_chanaccess_list(channel, &entries);
+    if (count <= 0) {
+        return count;
+    }
+
+    for (entry = entries; entry; entry = entry->next) {
+        x3_lmdb_chanaccess_delete(channel, entry->account);
+    }
+
+    x3_lmdb_free_chanaccess_entries(entries);
+    return count;
+}
+
+void x3_lmdb_free_chanaccess_entries(struct lmdb_chanaccess_entry *entries)
+{
+    struct lmdb_chanaccess_entry *entry, *next;
+
+    for (entry = entries; entry; entry = next) {
+        next = entry->next;
+        free(entry->channel);
+        free(entry->account);
+        free(entry);
+    }
+}
+
 /* ========== Module Registration ========== */
 
 static void lmdb_exit_handler(UNUSED_ARG(void *extra))

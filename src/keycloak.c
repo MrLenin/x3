@@ -1748,4 +1748,134 @@ void keycloak_free_token_info(struct kc_token_info* info)
     free(info);
 }
 
+int keycloak_get_group_members(struct kc_realm realm, struct kc_client client,
+                               const char* group_id, struct kc_group_member** members_out)
+{
+    if (!realm.base_uri || !realm.realm || !client.access_token ||
+        !group_id || !members_out) {
+        log_module(KC_LOG, LOG_DEBUG, "keycloak_get_group_members: Invalid arguments");
+        return KC_ERROR;
+    }
+
+    *members_out = NULL;
+    int result = KC_ERROR;
+    int member_count = 0;
+    char* uri = NULL;
+    struct memory chunk = { .response = NULL, .size = 0 };
+
+    /* Build URI: /admin/realms/{realm}/groups/{id}/members */
+    static const char uri_tmpl[] = "%s/admin/realms/%s/groups/%s/members?max=1000";
+    int uri_len = snprintf(NULL, 0, uri_tmpl, realm.base_uri, realm.realm, group_id) + 1;
+    uri = malloc(uri_len);
+    if (!uri) {
+        log_module(KC_LOG, LOG_DEBUG, "keycloak_get_group_members: Failed to allocate uri");
+        goto cleanup;
+    }
+    snprintf(uri, uri_len, uri_tmpl, realm.base_uri, realm.realm, group_id);
+
+    struct curl_opts opts = {
+        .uri = uri,
+        .method = HTTP_GET,
+        .xoauth2_bearer = client.access_token->access_token,
+        .write_callback = curl_write_cb,
+        .header_count = 0
+    };
+
+    long http_code = curl_perform(opts, &chunk);
+
+    if (http_code == 404) {
+        log_module(KC_LOG, LOG_DEBUG, "keycloak_get_group_members: Group '%s' not found", group_id);
+        result = KC_NOT_FOUND;
+        goto cleanup;
+    }
+
+    if (http_code == 200 && chunk.response) {
+        json_error_t error;
+        json_t* root = json_loads(chunk.response, 0, &error);
+        if (!root) {
+            log_module(KC_LOG, LOG_DEBUG, "keycloak_get_group_members: Failed to parse JSON: %s", error.text);
+            goto cleanup;
+        }
+
+        if (json_is_array(root)) {
+            size_t array_size = json_array_size(root);
+            struct kc_group_member* head = NULL;
+            struct kc_group_member* tail = NULL;
+
+            for (size_t i = 0; i < array_size; i++) {
+                json_t* user_obj = json_array_get(root, i);
+                json_t* id_val = json_object_get(user_obj, "id");
+                json_t* username_val = json_object_get(user_obj, "username");
+
+                if (id_val && json_is_string(id_val) &&
+                    username_val && json_is_string(username_val)) {
+                    struct kc_group_member* member = malloc(sizeof(struct kc_group_member));
+                    if (!member) {
+                        log_module(KC_LOG, LOG_DEBUG, "keycloak_get_group_members: Failed to allocate member");
+                        continue;
+                    }
+                    memset(member, 0, sizeof(*member));
+
+                    member->user_id = strdup(json_string_value(id_val));
+                    member->username = strdup(json_string_value(username_val));
+                    member->next = NULL;
+
+                    if (!member->user_id || !member->username) {
+                        if (member->user_id) free(member->user_id);
+                        if (member->username) free(member->username);
+                        free(member);
+                        continue;
+                    }
+
+                    /* Append to linked list */
+                    if (!head) {
+                        head = member;
+                        tail = member;
+                    } else {
+                        tail->next = member;
+                        tail = member;
+                    }
+                    member_count++;
+                }
+            }
+
+            *members_out = head;
+            result = member_count;
+            log_module(KC_LOG, LOG_DEBUG, "keycloak_get_group_members: Found %d members in group '%s'",
+                member_count, group_id);
+        }
+
+        json_decref(root);
+    } else {
+        log_module(KC_LOG, LOG_DEBUG, "keycloak_get_group_members: Failed with HTTP %ld: %s",
+            http_code, chunk.response ? chunk.response : "no response");
+    }
+
+cleanup:
+    if (chunk.response) {
+        memset(chunk.response, 0, chunk.size);
+        free(chunk.response);
+    }
+    if (uri) {
+        free(uri);
+    }
+
+    return result;
+}
+
+void keycloak_free_group_members(struct kc_group_member* members)
+{
+    while (members) {
+        struct kc_group_member* next = members->next;
+        if (members->username) {
+            free(members->username);
+        }
+        if (members->user_id) {
+            free(members->user_id);
+        }
+        free(members);
+        members = next;
+    }
+}
+
 #endif /* WITH_KEYCLOAK */

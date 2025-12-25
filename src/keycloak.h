@@ -254,6 +254,32 @@ int keycloak_get_group_by_name(struct kc_realm realm, struct kc_client client,
                                const char* group_name, char** group_id_out);
 
 /**
+ * Group member entry for iteration
+ */
+struct kc_group_member {
+    char* username;
+    char* user_id;
+    struct kc_group_member* next;
+};
+
+/**
+ * Gets members of a Keycloak group
+ * @param realm        Keycloak realm configuration
+ * @param client       Client with admin access token
+ * @param group_id     Group's Keycloak ID (UUID)
+ * @param members_out  Output pointer for linked list of members (caller must free with keycloak_free_group_members)
+ * @return Number of members found (>= 0), KC_NOT_FOUND if group doesn't exist, KC_ERROR on failure
+ */
+int keycloak_get_group_members(struct kc_realm realm, struct kc_client client,
+                               const char* group_id, struct kc_group_member** members_out);
+
+/**
+ * Frees a linked list of group member entries
+ * @param members     Head of the list to free (can be NULL)
+ */
+void keycloak_free_group_members(struct kc_group_member* members);
+
+/**
  * Introspects/validates an OAuth2 bearer token
  * @param realm         Keycloak realm configuration
  * @param client        Client credentials for introspection
