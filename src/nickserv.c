@@ -45,6 +45,10 @@
 #include "x3_lmdb.h"
 #endif
 
+#ifdef WITH_ZSTD
+#include "x3_compress.h"
+#endif
+
 #define NICKSERV_CONF_NAME "services/nickserv"
 
 #define KEY_DISABLE_NICKS "disable_nicks"
@@ -173,6 +177,10 @@
 #define KEY_METADATA_DEFAULT_TTL "metadata_default_ttl"
 #define KEY_METADATA_PURGE_FREQUENCY "metadata_purge_frequency"
 #define KEY_METADATA_IMMUTABLE_KEYS "metadata_immutable_keys"
+
+/* Metadata compression configuration keys */
+#define KEY_METADATA_COMPRESS_THRESHOLD "metadata_compress_threshold"
+#define KEY_METADATA_COMPRESS_LEVEL     "metadata_compress_level"
 
 /* Default immutable keys (space-separated) that never expire */
 #define DEFAULT_IMMUTABLE_KEYS "avatar pronouns bot homepage"
@@ -6873,6 +6881,20 @@ nickserv_conf_read(void)
                    nickserv_conf.metadata_default_ttl, nickserv_conf.metadata_purge_frequency);
         log_module(NS_LOG, LOG_INFO, "Metadata immutable keys: %s", nickserv_conf.metadata_immutable_keys);
     }
+
+    /* Metadata compression configuration */
+#ifdef WITH_ZSTD
+    str = database_get_data(conf_node, KEY_METADATA_COMPRESS_THRESHOLD, RECDB_QSTRING);
+    if (str)
+        x3_compress_set_threshold(strtoul(str, NULL, 10));
+
+    str = database_get_data(conf_node, KEY_METADATA_COMPRESS_LEVEL, RECDB_QSTRING);
+    if (str)
+        x3_compress_set_level(atoi(str));
+
+    log_module(NS_LOG, LOG_INFO, "Metadata compression enabled: threshold=%zu bytes, level=%d",
+               x3_compress_get_threshold(), x3_compress_get_level());
+#endif
 }
 
 static void

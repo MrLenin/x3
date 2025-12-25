@@ -353,8 +353,8 @@ enum nickserv_verify_result nickserv_ircv3_verify(struct userNode *user,
 /** Maximum length of a metadata key */
 #define METADATA_KEY_LEN 64
 
-/** Maximum length of a metadata value */
-#define METADATA_VALUE_LEN 1024
+/** Maximum length of a metadata value (increased for compression support) */
+#define METADATA_VALUE_LEN 4096
 
 /**
  * Set user metadata (stored in Keycloak as user attribute if available).

@@ -10,6 +10,7 @@
 #ifdef WITH_LMDB
 
 #include "x3_lmdb.h"
+#include "x3_compress.h"
 #include "common.h"
 #include "conf.h"
 #include "log.h"
@@ -31,8 +32,8 @@ static int lmdb_initialized = 0;
 static char lmdb_path[MAXLEN];
 static size_t lmdb_mapsize = 100 * 1024 * 1024; /* 100MB default */
 
-/* Maximum value size */
-#define LMDB_MAX_VALUE_SIZE 4096
+/* Maximum value size (increased for compression support) */
+#define LMDB_MAX_VALUE_SIZE 8192
 
 /* Key buffer size */
 #define LMDB_KEY_BUFFER_SIZE 512
@@ -224,10 +225,26 @@ int x3_lmdb_account_get(const char *account, const char *key, char *value)
         return LMDB_ERROR;
     }
 
+    /* Decompress if needed, then copy value */
+#ifdef WITH_ZSTD
+    {
+        unsigned char decompressed[LMDB_MAX_VALUE_SIZE];
+        size_t decompressed_len;
+
+        if (x3_decompress(mdata.mv_data, mdata.mv_size,
+                          decompressed, sizeof(decompressed) - 1, &decompressed_len) >= 0) {
+            memcpy(value, decompressed, decompressed_len);
+            value[decompressed_len] = '\0';
+        } else {
+            return LMDB_ERROR;
+        }
+    }
+#else
     /* Copy value, ensuring null termination */
     size_t copylen = mdata.mv_size < LMDB_MAX_VALUE_SIZE ? mdata.mv_size : LMDB_MAX_VALUE_SIZE - 1;
     memcpy(value, mdata.mv_data, copylen);
     value[copylen] = '\0';
+#endif
 
     return LMDB_SUCCESS;
 }
@@ -258,8 +275,23 @@ int x3_lmdb_account_set(const char *account, const char *key, const char *value)
     }
 
     if (value) {
+#ifdef WITH_ZSTD
+        unsigned char compressed[LMDB_MAX_VALUE_SIZE];
+        size_t compressed_len;
+        size_t value_len = strlen(value) + 1;
+
+        if (x3_compress((const unsigned char *)value, value_len,
+                        compressed, sizeof(compressed), &compressed_len) >= 0) {
+            mdata.mv_size = compressed_len;
+            mdata.mv_data = compressed;
+        } else {
+            mdata.mv_size = value_len;
+            mdata.mv_data = (void *)value;
+        }
+#else
         mdata.mv_size = strlen(value) + 1;
         mdata.mv_data = (void *)value;
+#endif
         rc = mdb_put(txn, dbi_accounts, &mkey, &mdata, 0);
     } else {
         rc = mdb_del(txn, dbi_accounts, &mkey, NULL);
@@ -412,9 +444,25 @@ int x3_lmdb_channel_get(const char *channel, const char *key, char *value)
         return LMDB_ERROR;
     }
 
+    /* Decompress if needed, then copy value */
+#ifdef WITH_ZSTD
+    {
+        unsigned char decompressed[LMDB_MAX_VALUE_SIZE];
+        size_t decompressed_len;
+
+        if (x3_decompress(mdata.mv_data, mdata.mv_size,
+                          decompressed, sizeof(decompressed) - 1, &decompressed_len) >= 0) {
+            memcpy(value, decompressed, decompressed_len);
+            value[decompressed_len] = '\0';
+        } else {
+            return LMDB_ERROR;
+        }
+    }
+#else
     size_t copylen = mdata.mv_size < LMDB_MAX_VALUE_SIZE ? mdata.mv_size : LMDB_MAX_VALUE_SIZE - 1;
     memcpy(value, mdata.mv_data, copylen);
     value[copylen] = '\0';
+#endif
 
     return LMDB_SUCCESS;
 }
@@ -445,8 +493,23 @@ int x3_lmdb_channel_set(const char *channel, const char *key, const char *value)
     }
 
     if (value) {
+#ifdef WITH_ZSTD
+        unsigned char compressed[LMDB_MAX_VALUE_SIZE];
+        size_t compressed_len;
+        size_t value_len = strlen(value) + 1;
+
+        if (x3_compress((const unsigned char *)value, value_len,
+                        compressed, sizeof(compressed), &compressed_len) >= 0) {
+            mdata.mv_size = compressed_len;
+            mdata.mv_data = compressed;
+        } else {
+            mdata.mv_size = value_len;
+            mdata.mv_data = (void *)value;
+        }
+#else
         mdata.mv_size = strlen(value) + 1;
         mdata.mv_data = (void *)value;
+#endif
         rc = mdb_put(txn, dbi_channels, &mkey, &mdata, 0);
     } else {
         rc = mdb_del(txn, dbi_channels, &mkey, NULL);
