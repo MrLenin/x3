@@ -4,7 +4,7 @@ ENV GID=1234
 ENV UID=1234
 
 RUN DEBIAN_FRONTEND=noninteractive RUNLEVEL=1 apt-get update 
-RUN DEBIAN_FRONTEND=noninteractive RUNLEVEL=1 apt-get update && apt-get -y install build-essential libcurl4-openssl-dev libjansson-dev libssl-dev autoconf2.69 automake1.11 flex byacc gawk git vim procps net-tools libtre5 libtre-dev
+RUN DEBIAN_FRONTEND=noninteractive RUNLEVEL=1 apt-get update && apt-get -y install build-essential libcurl4-openssl-dev libjansson-dev libssl-dev autoconf2.69 automake1.11 flex byacc gawk git vim procps net-tools libtre5 libtre-dev liblmdb-dev
 
 RUN mkdir -p /x3
 RUN mkdir -p /x3/x3src
@@ -19,7 +19,7 @@ USER x3
 WORKDIR  /x3/x3src
 
 #RUN ./autogen.sh
-RUN ./configure --prefix=/x3 --enable-modules=snoop,memoserv,helpserv --with-keycloak
+RUN ./configure --prefix=/x3 --enable-modules=snoop,memoserv,helpserv --with-keycloak --with-lmdb
 
 RUN make
 RUN make install
