@@ -7893,8 +7893,9 @@ nickserv_ircv3_verify(struct userNode *user, const char *handle,
 #endif
     safestrncpy(hi->passwd, hi->cookie->data, sizeof(hi->passwd));
 
-    /* Authenticate the user */
-    set_user_handle_info(user, hi, 1);
+    /* Authenticate the user (only if we have a user - pre-reg clients will be authed later) */
+    if (user)
+        set_user_handle_info(user, hi, 1);
 
     /* Clean up the cookie */
     nickserv_eat_cookie(hi->cookie);
