@@ -26,6 +26,7 @@
 #include "opserv.h"
 #include "webpush.h"
 #include "x3_lmdb.h"
+#include "base64.h"
 
 /* Full commands. */
 #define CMD_ACCOUNT		"ACCOUNT"
@@ -660,6 +661,33 @@ irc_metadata(const char *target, const char *key, const char *value, int visibil
         putsock("%s " P10_METADATA " %s %s %s :%s", self->numeric, target, key, vis_token, value);
     else
         putsock("%s " P10_METADATA " %s %s", self->numeric, target, key);
+}
+
+void
+irc_metadata_raw(const char *target, const char *key, const unsigned char *raw_value,
+                 size_t raw_len, int is_compressed, int visibility)
+{
+    const char *vis_token = (visibility == METADATA_VIS_PRIVATE) ? "P" : "*";
+
+    if (!raw_value || raw_len == 0) {
+        /* Delete - same as regular metadata */
+        putsock("%s " P10_METADATA " %s %s", self->numeric, target, key);
+        return;
+    }
+
+    if (is_compressed) {
+        /* Send compressed data with Z flag, base64-encoded */
+        size_t b64_len = BASE64_LENGTH(raw_len) + 1;
+        char *b64_buf = alloca(b64_len);
+
+        base64_encode((const char *)raw_value, raw_len, b64_buf, b64_len);
+
+        /* Format: <server> MD <target> <key> <visibility> Z :<base64_compressed> */
+        putsock("%s " P10_METADATA " %s %s %s Z :%s", self->numeric, target, key, vis_token, b64_buf);
+    } else {
+        /* Not compressed - send as regular metadata (null-terminated string) */
+        putsock("%s " P10_METADATA " %s %s %s :%s", self->numeric, target, key, vis_token, (const char *)raw_value);
+    }
 }
 
 void

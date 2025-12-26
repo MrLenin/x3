@@ -6378,39 +6378,53 @@ nickserv_sync_account_metadata_to_ircd(struct handle_info *hi)
 
     /* This variant uses the account name (handle) as the target,
      * for MDQ responses where the user may be offline.
+     *
+     * Uses compression passthrough: if data in LMDB is already compressed,
+     * send it via irc_metadata_raw() with Z flag to avoid decompression/recompression.
      */
 
 #ifdef WITH_LMDB
-    /* Step 1: Try LMDB cache first */
+    /* Step 1: Try LMDB cache first with raw passthrough */
     if (x3_lmdb_is_available()) {
-        struct lmdb_metadata_entry *entries = NULL;
-        struct lmdb_metadata_entry *entry;
+        struct lmdb_raw_metadata_entry *entries = NULL;
+        struct lmdb_raw_metadata_entry *entry;
         int count;
 
-        count = x3_lmdb_account_list(hi->handle, &entries);
+        count = x3_lmdb_account_list_raw(hi->handle, &entries);
         if (count > 0) {
-            log_module(NS_LOG, LOG_DEBUG, "nickserv_sync_account_metadata_to_ircd: Found %d LMDB entries for %s",
+            log_module(NS_LOG, LOG_DEBUG, "nickserv_sync_account_metadata_to_ircd: Found %d LMDB entries for %s (raw passthrough)",
                        count, hi->handle);
 
             for (entry = entries; entry; entry = entry->next) {
                 const char *key = entry->key;
-                const char *value = entry->value;
                 int visibility = METADATA_VIS_PUBLIC;
 
-                /* Parse visibility prefix from stored value (P:value for private) */
-                if (value && value[0] == 'P' && value[1] == ':') {
-                    visibility = METADATA_VIS_PRIVATE;
-                    value += 2;
+                /* For compressed data, check visibility prefix in raw data */
+                if (entry->is_compressed) {
+                    /* Compressed data - use raw passthrough
+                     * Note: visibility prefix is part of the compressed payload,
+                     * so we send as-is and let the receiver handle it */
+                    log_module(NS_LOG, LOG_DEBUG, "nickserv_sync_account_metadata_to_ircd: Pushing %s.%s raw (%zu bytes, compressed) from LMDB",
+                               hi->handle, key, entry->raw_len);
+
+                    irc_metadata_raw(hi->handle, key, entry->raw_value, entry->raw_len, 1, visibility);
+                } else {
+                    /* Not compressed - treat as string and check visibility prefix */
+                    const char *value = (const char *)entry->raw_value;
+                    if (entry->raw_len > 0 && value[0] == 'P' && entry->raw_len > 1 && value[1] == ':') {
+                        visibility = METADATA_VIS_PRIVATE;
+                        value += 2;
+                    }
+
+                    log_module(NS_LOG, LOG_DEBUG, "nickserv_sync_account_metadata_to_ircd: Pushing %s.%s = %s (vis=%d) from LMDB",
+                               hi->handle, key, value, visibility);
+
+                    irc_metadata(hi->handle, key, value, visibility);
                 }
-
-                log_module(NS_LOG, LOG_DEBUG, "nickserv_sync_account_metadata_to_ircd: Pushing %s.%s = %s (vis=%d) from LMDB",
-                           hi->handle, key, value, visibility);
-
-                irc_metadata(hi->handle, key, value, visibility);
                 found_entries++;
             }
 
-            x3_lmdb_free_entries(entries);
+            x3_lmdb_free_raw_entries(entries);
         }
     }
 #endif

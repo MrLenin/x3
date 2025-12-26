@@ -178,6 +178,8 @@ void irc_account(struct userNode *user, const char *stamp, time_t timestamp);
 void irc_regnick(struct userNode *user);
 void irc_fakehost(struct userNode *user, const char *host);
 void irc_metadata(const char *target, const char *key, const char *value, int visibility);
+void irc_metadata_raw(const char *target, const char *key, const unsigned char *raw_value,
+                      size_t raw_len, int is_compressed, int visibility);
 void irc_metadataquery(const char *target, const char *key);
 void irc_mark(struct userNode *user, char *mark);
 void irc_sno(unsigned int mask, char const* format, ...);

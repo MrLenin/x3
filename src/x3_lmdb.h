@@ -59,6 +59,15 @@ struct lmdb_chanaccess_entry {
     struct lmdb_chanaccess_entry *next;
 };
 
+/* Raw metadata entry for compression passthrough */
+struct lmdb_raw_metadata_entry {
+    char *key;
+    unsigned char *raw_value;
+    size_t raw_len;
+    int is_compressed;
+    struct lmdb_raw_metadata_entry *next;
+};
+
 /* ========== Initialization ========== */
 
 /**
@@ -144,6 +153,44 @@ int x3_lmdb_account_set_ex(const char *account, const char *key,
  */
 int x3_lmdb_account_get_ex(const char *account, const char *key,
                            char *value, time_t *expires_out);
+
+/**
+ * Get account metadata value without decompressing (for compression passthrough)
+ * @param account Account name
+ * @param key Metadata key
+ * @param raw_value Buffer for raw (possibly compressed) value
+ * @param raw_len Output for actual data length
+ * @param is_compressed Output flag: 1 if data is compressed, 0 if not
+ * @return LMDB_SUCCESS on success, LMDB_NOT_FOUND if not found, LMDB_ERROR on failure
+ */
+int x3_lmdb_account_get_raw(const char *account, const char *key,
+                            unsigned char *raw_value, size_t *raw_len,
+                            int *is_compressed);
+
+/**
+ * Set account metadata value without compressing (for compression passthrough)
+ * @param account Account name
+ * @param key Metadata key
+ * @param raw_value Raw (possibly compressed) value
+ * @param raw_len Length of raw data
+ * @return LMDB_SUCCESS on success, LMDB_ERROR on failure
+ */
+int x3_lmdb_account_set_raw(const char *account, const char *key,
+                            const unsigned char *raw_value, size_t raw_len);
+
+/**
+ * List all metadata for an account without decompressing (for compression passthrough)
+ * @param account Account name
+ * @param entries_out Output pointer for linked list (caller must free with x3_lmdb_free_raw_entries)
+ * @return Number of entries found, LMDB_ERROR on failure
+ */
+int x3_lmdb_account_list_raw(const char *account, struct lmdb_raw_metadata_entry **entries_out);
+
+/**
+ * Free raw metadata entry list returned by list_raw functions
+ * @param entries List to free
+ */
+void x3_lmdb_free_raw_entries(struct lmdb_raw_metadata_entry *entries);
 
 /* ========== Channel Metadata ========== */
 
@@ -346,6 +393,10 @@ void init_x3_lmdb(void);
 #define x3_lmdb_account_clear(a)        (-1)
 #define x3_lmdb_account_set_ex(a, k, v, e) (-1)
 #define x3_lmdb_account_get_ex(a, k, v, e) (-2)
+#define x3_lmdb_account_get_raw(a, k, v, l, c) (-2)
+#define x3_lmdb_account_set_raw(a, k, v, l) (-1)
+#define x3_lmdb_account_list_raw(a, e)  (-1)
+#define x3_lmdb_free_raw_entries(e)     do {} while(0)
 #define x3_lmdb_channel_get(c, k, v)    (-2)
 #define x3_lmdb_channel_set(c, k, v)    (-1)
 #define x3_lmdb_channel_delete(c, k)    (-2)

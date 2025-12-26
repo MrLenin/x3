@@ -314,6 +314,100 @@ int x3_lmdb_account_delete(const char *account, const char *key)
     return x3_lmdb_account_set(account, key, NULL);
 }
 
+int x3_lmdb_account_get_raw(const char *account, const char *key,
+                            unsigned char *raw_value, size_t *raw_len,
+                            int *is_compressed)
+{
+    MDB_txn *txn;
+    MDB_val mkey, mdata;
+    char keybuf[LMDB_KEY_BUFFER_SIZE];
+    int rc;
+
+    if (!x3_lmdb_is_available() || !account || !key || !raw_value || !raw_len || !is_compressed) {
+        return LMDB_ERROR;
+    }
+
+    /* Build composite key: "account\0key" */
+    snprintf(keybuf, sizeof(keybuf), "%s", account);
+    size_t account_len = strlen(account);
+    keybuf[account_len] = '\0';
+    strncpy(keybuf + account_len + 1, key, sizeof(keybuf) - account_len - 2);
+
+    mkey.mv_size = account_len + 1 + strlen(key) + 1;
+    mkey.mv_data = keybuf;
+
+    rc = mdb_txn_begin(lmdb_env, NULL, MDB_RDONLY, &txn);
+    if (rc != 0) {
+        return LMDB_ERROR;
+    }
+
+    rc = mdb_get(txn, dbi_accounts, &mkey, &mdata);
+    mdb_txn_abort(txn);
+
+    if (rc == MDB_NOTFOUND) {
+        return LMDB_NOT_FOUND;
+    } else if (rc != 0) {
+        return LMDB_ERROR;
+    }
+
+    /* Return raw data without decompression */
+    if (mdata.mv_size > LMDB_MAX_VALUE_SIZE) {
+        return LMDB_ERROR;
+    }
+
+    memcpy(raw_value, mdata.mv_data, mdata.mv_size);
+    *raw_len = mdata.mv_size;
+
+    /* Check if data is compressed (has magic byte) */
+#ifdef WITH_ZSTD
+    *is_compressed = x3_is_compressed(mdata.mv_data, mdata.mv_size);
+#else
+    *is_compressed = 0;
+#endif
+
+    return LMDB_SUCCESS;
+}
+
+int x3_lmdb_account_set_raw(const char *account, const char *key,
+                            const unsigned char *raw_value, size_t raw_len)
+{
+    MDB_txn *txn;
+    MDB_val mkey, mdata;
+    char keybuf[LMDB_KEY_BUFFER_SIZE];
+    int rc;
+
+    if (!x3_lmdb_is_available() || !account || !key || !raw_value || raw_len == 0) {
+        return LMDB_ERROR;
+    }
+
+    /* Build composite key: "account\0key" */
+    snprintf(keybuf, sizeof(keybuf), "%s", account);
+    size_t account_len = strlen(account);
+    keybuf[account_len] = '\0';
+    strncpy(keybuf + account_len + 1, key, sizeof(keybuf) - account_len - 2);
+
+    mkey.mv_size = account_len + 1 + strlen(key) + 1;
+    mkey.mv_data = keybuf;
+
+    rc = mdb_txn_begin(lmdb_env, NULL, 0, &txn);
+    if (rc != 0) {
+        return LMDB_ERROR;
+    }
+
+    /* Store raw value without compression (it's already compressed or we want it as-is) */
+    mdata.mv_size = raw_len;
+    mdata.mv_data = (void *)raw_value;
+
+    rc = mdb_put(txn, dbi_accounts, &mkey, &mdata, 0);
+    if (rc != 0) {
+        mdb_txn_abort(txn);
+        return LMDB_ERROR;
+    }
+
+    rc = mdb_txn_commit(txn);
+    return rc == 0 ? LMDB_SUCCESS : LMDB_ERROR;
+}
+
 int x3_lmdb_account_list(const char *account, struct lmdb_metadata_entry **entries_out)
 {
     MDB_txn *txn;
@@ -406,6 +500,108 @@ int x3_lmdb_account_clear(const char *account)
 
     x3_lmdb_free_entries(entries);
     return count;
+}
+
+int x3_lmdb_account_list_raw(const char *account, struct lmdb_raw_metadata_entry **entries_out)
+{
+    MDB_txn *txn;
+    MDB_cursor *cursor;
+    MDB_val mkey, mdata;
+    char prefix[LMDB_KEY_BUFFER_SIZE];
+    struct lmdb_raw_metadata_entry *head = NULL, *tail = NULL;
+    int count = 0;
+    int rc;
+
+    if (!x3_lmdb_is_available() || !account || !entries_out) {
+        return LMDB_ERROR;
+    }
+
+    *entries_out = NULL;
+
+    /* Build prefix: "account\0" */
+    size_t prefix_len = strlen(account) + 1;
+    snprintf(prefix, sizeof(prefix), "%s", account);
+    prefix[prefix_len - 1] = '\0';
+
+    rc = mdb_txn_begin(lmdb_env, NULL, MDB_RDONLY, &txn);
+    if (rc != 0) {
+        return LMDB_ERROR;
+    }
+
+    rc = mdb_cursor_open(txn, dbi_accounts, &cursor);
+    if (rc != 0) {
+        mdb_txn_abort(txn);
+        return LMDB_ERROR;
+    }
+
+    /* Position cursor at prefix */
+    mkey.mv_size = prefix_len;
+    mkey.mv_data = prefix;
+
+    rc = mdb_cursor_get(cursor, &mkey, &mdata, MDB_SET_RANGE);
+    while (rc == 0) {
+        /* Check if key still starts with our prefix */
+        if (mkey.mv_size < prefix_len ||
+            memcmp(mkey.mv_data, prefix, prefix_len - 1) != 0) {
+            break;
+        }
+
+        /* Extract the key part after "account\0" */
+        const char *keystart = (const char *)mkey.mv_data + prefix_len;
+        size_t keylen = mkey.mv_size - prefix_len;
+
+        /* Create entry with raw data */
+        struct lmdb_raw_metadata_entry *entry = malloc(sizeof(*entry));
+        if (!entry) {
+            break;
+        }
+
+        entry->key = strndup(keystart, keylen);
+        entry->raw_len = mdata.mv_size;
+        entry->raw_value = malloc(mdata.mv_size);
+        if (!entry->raw_value) {
+            free(entry->key);
+            free(entry);
+            break;
+        }
+        memcpy(entry->raw_value, mdata.mv_data, mdata.mv_size);
+
+        /* Check if data is compressed (ZSTD magic bytes) */
+#ifdef WITH_ZSTD
+        entry->is_compressed = x3_is_compressed(entry->raw_value, entry->raw_len);
+#else
+        entry->is_compressed = 0;
+#endif
+        entry->next = NULL;
+
+        if (tail) {
+            tail->next = entry;
+        } else {
+            head = entry;
+        }
+        tail = entry;
+        count++;
+
+        rc = mdb_cursor_get(cursor, &mkey, &mdata, MDB_NEXT);
+    }
+
+    mdb_cursor_close(cursor);
+    mdb_txn_abort(txn);
+
+    *entries_out = head;
+    return count;
+}
+
+void x3_lmdb_free_raw_entries(struct lmdb_raw_metadata_entry *entries)
+{
+    struct lmdb_raw_metadata_entry *entry, *next;
+
+    for (entry = entries; entry; entry = next) {
+        next = entry->next;
+        free(entry->key);
+        free(entry->raw_value);
+        free(entry);
+    }
 }
 
 /* ========== Channel Metadata ========== */
