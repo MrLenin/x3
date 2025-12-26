@@ -40,6 +40,8 @@
 #include "x3_lmdb.h"
 #endif
 
+#include "x3_ssl.h"
+
 #ifdef HAVE_GETOPT_H
 #include <getopt.h>
 #else

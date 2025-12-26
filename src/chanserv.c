@@ -10436,14 +10436,12 @@ chanserv_sync_keycloak_channel(const char *channel)
  * This is called on startup and periodically
  */
 static void
-chanserv_sync_keycloak_access(void *data)
+chanserv_sync_keycloak_access(UNUSED_ARG(void *data))
 {
     struct chanData *cData;
     int total = 0;
     int channel_count = 0;
     time_t start_time = now;
-
-    UNUSED_ARG(data);
 
     if (!nickserv_conf.keycloak_enable || !chanserv_conf.keycloak_access_sync)
         return;

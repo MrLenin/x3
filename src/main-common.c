@@ -447,6 +447,9 @@ conf_globals(void)
     const char *info;
     dict_t dict;
 
+    /* Initialize SSL library early (needed for crypto operations like webpush) */
+    x3_ssl_init();
+
 #ifdef WITH_LMDB
     /* Initialize LMDB early so other modules can use it */
     init_x3_lmdb();

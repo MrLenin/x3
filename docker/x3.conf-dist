@@ -567,11 +567,16 @@
     "global" {
         "nick" "Global";
         // should users get community announcements by default or not?
-        // community announcements are a type of global that users may 
+        // community announcements are a type of global that users may
         // opt into (or out of, depending on this setting)
         "announcements_default" "on";
     };
 
+    /* X3 core settings */
+    "x3" {
+        // Path to LMDB database for channel metadata and access persistence
+        "lmdb_path" "/x3/data/lmdb";
+    };
 
     "spamserv" {
         // You may enable this service by removing the double slashes from the config

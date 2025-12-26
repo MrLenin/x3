@@ -1,4 +1,4 @@
-AM_CPPFLAGS = @RX_INCLUDES@
+AM_CPPFLAGS = @RX_INCLUDES@ -DPREFIX=\"@prefix@\"
 LIBS = @LIBS@ @RX_LIBS@
 TRACK = @TRACK@
 pythonpath = @pythonpath@
@@ -86,7 +86,9 @@ x3_SOURCES = \
 	shun.c shun.h \
 	timeq.c timeq.h \
 	tools.c x3ldap.c x3ldap.h \
-	keycloak.c keycloak.h \
+	x3_ssl.c x3_ssl.h \
+	x3_compress.c x3_compress.h \
+	webpush.c webpush.h \
 	version.c version.h
 
 checkdb_SOURCES = checkdb.c common.h compat.c compat.h dict-splay.c dict.h recdb.c recdb.h saxdb.c saxdb.h tools.c conf.h log.h modcmd.h saxdb.h timeq.h

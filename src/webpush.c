@@ -40,6 +40,7 @@
 #include "log.h"
 #include "nickserv.h"
 #include "keycloak.h"
+#include "x3_ssl.h"
 
 #include <string.h>
 #include <stdlib.h>
@@ -173,6 +174,9 @@ webpush_init(void)
 {
     if (vapid_key)
         return 0;  /* Already initialized */
+
+    /* Ensure OpenSSL is initialized (needed for EVP crypto functions) */
+    x3_ssl_init();
 
     if (generate_vapid_key() < 0) {
         log_module(MAIN_LOG, LOG_ERROR, "WEBPUSH: Failed to generate VAPID key");

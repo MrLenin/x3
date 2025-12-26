@@ -789,6 +789,7 @@ with_coredumper
 with_ssl
 with_ldap
 with_keycloak
+with_lmdb
 '
       ac_precious_vars='build_alias
 host_alias
@@ -1462,6 +1463,7 @@ Optional Packages:
   --with-ldap=PATH    Base path to where the ldap library and headers are installed,
                       such that PATH/include/ldap.h and PATH/lib/libldap.so exist.
   --with-keycloak        Enable Keycloak authentication support (requires libcurl and libjansson)
+  --with-lmdb=PATH     Enable LMDB metadata storage support
 
 Some influential environment variables:
   CC          C compiler command
@@ -8919,6 +8921,115 @@ printf "%s\n" "#define WITH_KEYCLOAK 1" >>confdefs.h
 fi
 
 
+# Check whether --with-lmdb was given.
+if test ${with_lmdb+y}
+then :
+  withval=$with_lmdb; with_lmdb=$withval
+else case e in #(
+  e) with_lmdb=no ;;
+esac
+fi
+
+
+if test "x$with_lmdb" != "xno"; then
+   if test "x$with_lmdb" != "xyes" -a "x$with_lmdb" != "x"; then
+      LMDB_PATH="$with_lmdb"
+      LMDB_CFLAGS="-I$LMDB_PATH/include"
+      LMDB_LIBS="-L$LMDB_PATH/lib -llmdb"
+      CFLAGS="$CFLAGS $LMDB_CFLAGS"
+      LDFLAGS="$LDFLAGS -L$LMDB_PATH/lib"
+   fi
+
+   { printf "%s\n" "$as_me:${as_lineno-$LINENO}: result: Checking for LMDB library" >&5
+printf "%s\n" "Checking for LMDB library" >&6; }
+
+      { printf "%s\n" "$as_me:${as_lineno-$LINENO}: checking for mdb_env_create in -llmdb" >&5
+printf %s "checking for mdb_env_create in -llmdb... " >&6; }
+if test ${ac_cv_lib_lmdb_mdb_env_create+y}
+then :
+  printf %s "(cached) " >&6
+else case e in #(
+  e) ac_check_lib_save_LIBS=$LIBS
+LIBS="-llmdb  $LIBS"
+cat confdefs.h - <<_ACEOF >conftest.$ac_ext
+/* end confdefs.h.  */
+
+/* Override any GCC internal prototype to avoid an error.
+   Use char because int might match the return type of a GCC
+   builtin and then its argument prototype would still apply.
+   The 'extern "C"' is for builds by C++ compilers;
+   although this is not generally supported in C code supporting it here
+   has little cost and some practical benefit (sr 110532).  */
+#ifdef __cplusplus
+extern "C"
+#endif
+char mdb_env_create (void);
+int
+main (void)
+{
+return mdb_env_create ();
+  ;
+  return 0;
+}
+_ACEOF
+if ac_fn_c_try_link "$LINENO"
+then :
+  ac_cv_lib_lmdb_mdb_env_create=yes
+else case e in #(
+  e) ac_cv_lib_lmdb_mdb_env_create=no ;;
+esac
+fi
+rm -f core conftest.err conftest.$ac_objext conftest.beam \
+    conftest$ac_exeext conftest.$ac_ext
+LIBS=$ac_check_lib_save_LIBS ;;
+esac
+fi
+{ printf "%s\n" "$as_me:${as_lineno-$LINENO}: result: $ac_cv_lib_lmdb_mdb_env_create" >&5
+printf "%s\n" "$ac_cv_lib_lmdb_mdb_env_create" >&6; }
+if test "x$ac_cv_lib_lmdb_mdb_env_create" = xyes
+then :
+
+      LIBS="-llmdb $LIBS"
+             for ac_header in lmdb.h
+do :
+  ac_fn_c_check_header_compile "$LINENO" "lmdb.h" "ac_cv_header_lmdb_h" "$ac_includes_default"
+if test "x$ac_cv_header_lmdb_h" = xyes
+then :
+  printf "%s\n" "#define HAVE_LMDB_H 1" >>confdefs.h
+
+         have_lmdb=yes
+
+else case e in #(
+  e)
+         if test "x$with_lmdb" != "xno"; then
+            as_fn_error $? "lmdb.h not found but required for --with-lmdb" "$LINENO" 5
+         fi
+       ;;
+esac
+fi
+
+done
+
+else case e in #(
+  e)
+      if test "x$with_lmdb" != "xno"; then
+         as_fn_error $? "liblmdb not found but required for --with-lmdb" "$LINENO" 5
+      fi
+    ;;
+esac
+fi
+
+
+   if test "x$have_lmdb" = "xyes"; then
+
+printf "%s\n" "#define WITH_LMDB 1" >>confdefs.h
+
+      lmdb_message="LMDB support:       enabled"
+      MODULE_OBJS="$MODULE_OBJS x3_lmdb.\$(OBJEXT)"
+   fi
+fi
+
+
 if test "$python" = yes; then
         # Extract the first word of "python2", so it can be a program name with args.
 set dummy python2; ac_word=$2
@@ -10588,6 +10699,7 @@ X3 is now configured as follows:
   Coredumper Library  Coredumper $core_version
   $ldap_message
   $keycloak_message
+  $lmdb_message
   python: $python
 
   Install to:         $prefix
