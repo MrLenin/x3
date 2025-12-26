@@ -135,6 +135,7 @@
 #define CMD_METADATAQUERY       "METADATAQUERY"
 #define CMD_MARKREAD            "MARKREAD"
 #define CMD_WEBPUSH             "WEBPUSH"
+#define CMD_TAGMSG              "TAGMSG"
 
 /* Tokenized commands. */
 #define TOK_ACCOUNT		"AC"
@@ -242,6 +243,7 @@
 #define TOK_METADATAQUERY       "MDQ"
 #define TOK_MARKREAD            "MR"
 #define TOK_WEBPUSH             "WP"
+#define TOK_TAGMSG              "TM"
 #define TOK_VERIFY_ACCT         "VF"
 #define TOK_REGREPLY            "RR"
 
@@ -3315,6 +3317,23 @@ static CMD_FUNC(cmd_markread)
     return 1;
 }
 
+/** Handle TM (TAGMSG) command - P10 client-only tag message.
+ * Format: <source> TM @<tags> <target>
+ * TAGMSG delivers client-only tags without a message body.
+ * X3 doesn't need to process these - just acknowledge receipt.
+ */
+static CMD_FUNC(cmd_tagmsg)
+{
+    /* TAGMSG is a client-only tag delivery mechanism.
+     * X3 doesn't need to do anything with these messages,
+     * but we need to acknowledge them to prevent parse errors.
+     */
+    (void)origin;
+    (void)argc;
+    (void)argv;
+    return 1;
+}
+
 static void
 p10_conf_reload(void) {
     hidden_host_suffix = conf_get_data("server/hidden_host", RECDB_QSTRING);
@@ -3483,6 +3502,10 @@ init_parse(void)
     /* IRCv3 draft/read-marker support */
     dict_insert(irc_func_dict, CMD_MARKREAD, cmd_markread);
     dict_insert(irc_func_dict, TOK_MARKREAD, cmd_markread);
+
+    /* IRCv3 message-tags TAGMSG support - just acknowledge, don't process */
+    dict_insert(irc_func_dict, CMD_TAGMSG, cmd_tagmsg);
+    dict_insert(irc_func_dict, TOK_TAGMSG, cmd_tagmsg);
 
     /* In P10, DESTRUCT doesn't do anything except be broadcast to servers.
      * Apparently to obliterate channels from any servers that think they
