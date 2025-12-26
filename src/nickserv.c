@@ -959,22 +959,55 @@ is_secure_password(const char *handle, const char *pass, struct userNode *user)
     unsigned int cnt_digits = 0, cnt_upper = 0, cnt_lower = 0;
     int p;
 
+    log_module(NS_LOG, LOG_DEBUG, "is_secure_password: ENTER handle=%s pass=%p user=%p", handle, (void*)pass, (void*)user);
+    if (!pass) {
+        log_module(NS_LOG, LOG_ERROR, "is_secure_password: pass is NULL!");
+        return 0;
+    }
+    log_module(NS_LOG, LOG_DEBUG, "is_secure_password: pass='%s'", pass);
     len = strlen(pass);
+    log_module(NS_LOG, LOG_DEBUG, "is_secure_password: len=%u min=%lu", len, nickserv_conf.password_min_length);
     if (len < nickserv_conf.password_min_length) {
+        log_module(NS_LOG, LOG_DEBUG, "is_secure_password: too short");
         if (user)
             send_message(user, nickserv, "NSMSG_PASSWORD_SHORT", nickserv_conf.password_min_length);
         return 0;
     }
+    log_module(NS_LOG, LOG_DEBUG, "is_secure_password: checking if matches handle");
     if (!irccasecmp(pass, handle)) {
+        log_module(NS_LOG, LOG_DEBUG, "is_secure_password: matches handle");
         if (user)
             send_message(user, nickserv, "NSMSG_PASSWORD_ACCOUNT");
         return 0;
     }
-    dict_find(nickserv_conf.weak_password_dict, pass, &p);
-    if (p) {
-        if (user)
-            send_message(user, nickserv, "NSMSG_PASSWORD_DICTIONARY");
-        return 0;
+    log_module(NS_LOG, LOG_DEBUG, "is_secure_password: checking weak_password_dict=%p", (void*)nickserv_conf.weak_password_dict);
+    if (nickserv_conf.weak_password_dict) {
+        char *sanity = dict_sanity_check(nickserv_conf.weak_password_dict);
+        if (sanity) {
+            log_module(NS_LOG, LOG_ERROR, "is_secure_password: dict sanity check FAILED: %s", sanity);
+            free(sanity);
+            p = 0;
+        } else {
+            log_module(NS_LOG, LOG_DEBUG, "is_secure_password: dict sanity check passed, count=%d root=%p",
+                       dict_size(nickserv_conf.weak_password_dict),
+                       (void*)(nickserv_conf.weak_password_dict->root));
+            if (nickserv_conf.weak_password_dict->root) {
+                log_module(NS_LOG, LOG_DEBUG, "is_secure_password: root->key=%p '%s'",
+                           (void*)nickserv_conf.weak_password_dict->root->key,
+                           nickserv_conf.weak_password_dict->root->key ? nickserv_conf.weak_password_dict->root->key : "(null)");
+            }
+            log_module(NS_LOG, LOG_DEBUG, "is_secure_password: calling dict_find with pass='%s'", pass);
+            dict_find(nickserv_conf.weak_password_dict, pass, &p);
+            log_module(NS_LOG, LOG_DEBUG, "is_secure_password: dict_find returned p=%d", p);
+            if (p) {
+                if (user)
+                    send_message(user, nickserv, "NSMSG_PASSWORD_DICTIONARY");
+                return 0;
+            }
+        }
+    } else {
+        log_module(NS_LOG, LOG_DEBUG, "is_secure_password: skipping dict check (dict is NULL)");
+        p = 0;
     }
     for (i=0; i<len; i++) {
 	if (isdigit(pass[i]))
@@ -1259,7 +1292,7 @@ nickserv_register(struct userNode *user, struct userNode *settee, const char *ha
     if (nickserv_conf.keycloak_enable) {
         int rc;
         rc = kc_do_add(handle, (no_auth || !passwd ? NULL : passwd), NULL);
-        if (rc != KC_SUCCESS && rc != KC_ALREADY_EXISTS) {
+        if (rc != KC_SUCCESS && rc != KC_USER_EXISTS) {
             if (user)
                 send_message(user, nickserv, "NSMSG_LDAP_FAIL", "keycloak error");
             return 0;
@@ -1350,7 +1383,8 @@ nickserv_make_cookie(struct userNode *user, struct handle_info *hi, enum cookie_
     int first_time = 0;
 
     if (hi->cookie) {
-        send_message(user, nickserv, "NSMSG_COOKIE_LIVE", hi->handle);
+        if (user)
+            send_message(user, nickserv, "NSMSG_COOKIE_LIVE", hi->handle);
         return;
     }
 
@@ -1373,7 +1407,8 @@ nickserv_make_cookie(struct userNode *user, struct handle_info *hi, enum cookie_
     switch (cookie->type) {
     case ACTIVATION:
         hi->passwd[0] = 0; /* invalidate password */
-        send_message(user, nickserv, "NSMSG_USE_COOKIE_REGISTER");
+        if (user)
+            send_message(user, nickserv, "NSMSG_USE_COOKIE_REGISTER");
         fmt = handle_find_message(hi, "NSEMAIL_ACTIVATION_SUBJECT");
         snprintf(subject, sizeof(subject), fmt, netname);
 
@@ -1386,7 +1421,8 @@ nickserv_make_cookie(struct userNode *user, struct handle_info *hi, enum cookie_
         first_time = 1;
         break;
     case PASSWORD_CHANGE:
-        send_message(user, nickserv, "NSMSG_USE_COOKIE_RESETPASS");
+        if (user)
+            send_message(user, nickserv, "NSMSG_USE_COOKIE_RESETPASS");
         fmt = handle_find_message(hi, "NSEMAIL_PASSWORD_CHANGE_SUBJECT");
         snprintf(subject, sizeof(subject), fmt, netname);
         if(weblink)
@@ -1399,9 +1435,10 @@ nickserv_make_cookie(struct userNode *user, struct handle_info *hi, enum cookie_
     case EMAIL_CHANGE:
         misc = hi->email_addr;
         hi->email_addr = cookie->data;
-#ifdef stupid_verify_old_email        
+#ifdef stupid_verify_old_email
         if (misc) {
-            send_message(user, nickserv, "NSMSG_USE_COOKIE_EMAIL_2");
+            if (user)
+                send_message(user, nickserv, "NSMSG_USE_COOKIE_EMAIL_2");
             fmt = handle_find_message(hi, "NSEMAIL_EMAIL_CHANGE_SUBJECT");
             snprintf(subject, sizeof(subject), fmt, netname);
             fmt = handle_find_message(hi, "NSEMAIL_EMAIL_CHANGE_BODY_NEW");
@@ -1412,7 +1449,8 @@ nickserv_make_cookie(struct userNode *user, struct handle_info *hi, enum cookie_
             first_time = 1;
         } else {
 #endif
-            send_message(user, nickserv, "NSMSG_USE_COOKIE_EMAIL_1");
+            if (user)
+                send_message(user, nickserv, "NSMSG_USE_COOKIE_EMAIL_1");
             fmt = handle_find_message(hi, "NSEMAIL_EMAIL_VERIFY_SUBJECT");
             snprintf(subject, sizeof(subject), fmt, netname);
             fmt = handle_find_message(hi, "NSEMAIL_EMAIL_VERIFY_BODY");
@@ -1429,12 +1467,18 @@ nickserv_make_cookie(struct userNode *user, struct handle_info *hi, enum cookie_
         snprintf(subject, sizeof(subject), fmt, netname);
         fmt = handle_find_message(hi, "NSEMAIL_ALLOWAUTH_BODY");
         snprintf(body, sizeof(body), fmt, netname, cookie->cookie, nickserv->nick, self->name, hi->handle);
-        send_message(user, nickserv, "NSMSG_USE_COOKIE_AUTH");
+        if (user)
+            send_message(user, nickserv, "NSMSG_USE_COOKIE_AUTH");
         break;
     default:
         log_module(NS_LOG, LOG_ERROR, "Bad cookie type %d in nickserv_make_cookie.", cookie->type);
         break;
     }
+
+    /* Log cookie for debugging/testing (remove in production) */
+    log_module(NS_LOG, LOG_INFO, "Created cookie type=%d for %s: %s",
+               cookie->type, hi->handle, cookie->cookie);
+
     if (subject[0])
         mail_send(nickserv, hi, subject, body, first_time);
     nickserv_bake_cookie(cookie);
@@ -4012,7 +4056,7 @@ oper_try_set_access(struct userNode *user, struct userNode *bot, struct handle_i
             rc = kc_add2group(target->handle, nickserv_conf.keycloak_oper_group);
         else
             rc = kc_delfromgroup(target->handle, nickserv_conf.keycloak_oper_group);
-        if (rc != KC_SUCCESS && rc != KC_ALREADY_EXISTS && rc != KC_NOT_FOUND) {
+        if (rc != KC_SUCCESS && rc != KC_USER_EXISTS && rc != KC_NOT_FOUND) {
             send_message(user, bot, "NSMSG_LDAP_FAIL", "keycloak error");
             return 0;
         }
@@ -5931,6 +5975,7 @@ loc_auth_oauth(const char *bearer_token, const char *username_hint, const char *
  *   - TTL encoded as T:timestamp: prefix in stored value
  */
 
+#ifdef WITH_LMDB
 /**
  * Check if a metadata key is immutable (should not expire).
  * @param key The metadata key to check
@@ -5976,6 +6021,7 @@ is_immutable_key(const char *key)
 
     return 0;
 }
+#endif /* WITH_LMDB */
 
 int
 nickserv_set_user_metadata(struct handle_info *hi, const char *key, const char *value, int visibility)
@@ -6855,7 +6901,7 @@ nickserv_conf_read(void)
     if (nickserv_conf.keycloak_enable) {
         memset(&kc_realm_config, 0, sizeof(kc_realm_config));
         memset(&kc_client_config, 0, sizeof(kc_client_config));
-        kc_realm_config.base_url = nickserv_conf.keycloak_uri;
+        kc_realm_config.base_uri = nickserv_conf.keycloak_uri;
         kc_realm_config.realm = nickserv_conf.keycloak_realm;
         kc_client_config.client_id = nickserv_conf.keycloak_client_id;
         kc_client_config.client_secret = nickserv_conf.keycloak_client_secret;
@@ -7211,12 +7257,29 @@ sasl_packet(struct SASLSession *session)
 
     if (!session->mech[0])
     {
+        int mech_valid = 0;
         log_module(NS_LOG, LOG_DEBUG, "SASL: No mechanism stored yet, using %s", session->buf);
-        if (strcmp(session->buf, "PLAIN") && (strcmp(session->buf, "EXTERNAL") || !session->sslclifp)) {
-            if (!session->sslclifp)
-                irc_sasl(session->source, session->uid, "M", "PLAIN");
-            else
-                irc_sasl(session->source, session->uid, "M", "PLAIN,EXTERNAL");
+
+        /* Check if the requested mechanism is valid */
+        if (!strcmp(session->buf, "PLAIN"))
+            mech_valid = 1;
+        else if (!strcmp(session->buf, "EXTERNAL") && session->sslclifp)
+            mech_valid = 1;
+#ifdef WITH_KEYCLOAK
+        else if (!strcmp(session->buf, "OAUTHBEARER") && nickserv_conf.keycloak_enable)
+            mech_valid = 1;
+#endif
+
+        if (!mech_valid) {
+            /* Build list of available mechanisms */
+            char mechs[64] = "PLAIN";
+            if (session->sslclifp)
+                strcat(mechs, ",EXTERNAL");
+#ifdef WITH_KEYCLOAK
+            if (nickserv_conf.keycloak_enable)
+                strcat(mechs, ",OAUTHBEARER");
+#endif
+            irc_sasl(session->source, session->uid, "M", mechs);
             irc_sasl(session->source, session->uid, "D", "F");
             sasl_delete_session(session);
             return;
@@ -7263,7 +7326,98 @@ sasl_packet(struct SASLSession *session)
         free(raw);
         return;
     }
-    else
+#ifdef WITH_KEYCLOAK
+    else if (!strcmp(session->mech, "OAUTHBEARER"))
+    {
+        /* OAUTHBEARER mechanism - RFC 7628
+         * Client sends: n,a=<authzid>,^Aauth=Bearer <token>^A^A
+         * We extract the bearer token and validate it via Keycloak
+         */
+        char *raw = NULL;
+        size_t rawlen = 0;
+        struct handle_info *hi = NULL;
+        static char buffer[256];
+        char *token_start = NULL;
+        char *authzid = NULL;
+
+        base64_decode_alloc(session->buf, session->buflen, &raw, &rawlen);
+
+        if (!raw || rawlen == 0) {
+            log_module(NS_LOG, LOG_DEBUG, "SASL OAUTHBEARER: Failed to decode payload");
+            irc_sasl(session->source, session->uid, "D", "F");
+            sasl_delete_session(session);
+            return;
+        }
+
+        raw = (char *)realloc(raw, rawlen + 1);
+        raw[rawlen] = '\0';
+
+        log_module(NS_LOG, LOG_DEBUG, "SASL OAUTHBEARER: Decoded payload length %zu", rawlen);
+
+        /* Parse OAUTHBEARER format: n,a=<authzid>,^Aauth=Bearer <token>^A^A
+         * or: n,,^Aauth=Bearer <token>^A^A (no authzid)
+         */
+        if (raw[0] == 'n' && raw[1] == ',') {
+            char *p = raw + 2;
+            /* Check for authzid: a=<authzid>, */
+            if (p[0] == 'a' && p[1] == '=') {
+                authzid = p + 2;
+                while (*p && *p != ',')
+                    p++;
+                if (*p == ',') {
+                    *p = '\0';  /* Null terminate authzid */
+                    p++;
+                }
+            } else if (*p == ',') {
+                /* No authzid */
+                p++;
+            }
+            /* Now look for ^Aauth=Bearer <token> */
+            if (*p == '\x01') {
+                p++;
+                if (strncmp(p, "auth=Bearer ", 12) == 0) {
+                    token_start = p + 12;
+                    /* Find end of token (next ^A or end) */
+                    char *token_end = strchr(token_start, '\x01');
+                    if (token_end)
+                        *token_end = '\0';
+                }
+            }
+        }
+
+        if (!token_start || !*token_start) {
+            log_module(NS_LOG, LOG_DEBUG, "SASL OAUTHBEARER: No bearer token found");
+            /* Send error per RFC 7628 */
+            irc_sasl(session->source, session->uid, "C", "eyJzdGF0dXMiOiJpbnZhbGlkX3Rva2VuIn0=");
+            irc_sasl(session->source, session->uid, "D", "F");
+            sasl_delete_session(session);
+            free(raw);
+            return;
+        }
+
+        log_module(NS_LOG, LOG_DEBUG, "SASL OAUTHBEARER: Validating token for authzid=%s",
+                   authzid ? authzid : "(none)");
+
+        hi = loc_auth_oauth(token_start, authzid, session->hostmask);
+
+        if (!hi) {
+            log_module(NS_LOG, LOG_DEBUG, "SASL OAUTHBEARER: Authentication failed");
+            /* Send error response per RFC 7628 */
+            irc_sasl(session->source, session->uid, "C", "eyJzdGF0dXMiOiJpbnZhbGlkX3Rva2VuIn0=");
+            irc_sasl(session->source, session->uid, "D", "F");
+        } else {
+            log_module(NS_LOG, LOG_DEBUG, "SASL OAUTHBEARER: Authentication succeeded for %s", hi->handle);
+            snprintf(buffer, sizeof(buffer), "%s "FMT_TIME_T, hi->handle, hi->registered);
+            irc_sasl(session->source, session->uid, "L", buffer);
+            irc_sasl(session->source, session->uid, "D", "S");
+        }
+
+        sasl_delete_session(session);
+        free(raw);
+        return;
+    }
+#endif /* WITH_KEYCLOAK */
+    else if (!strcmp(session->mech, "PLAIN"))
     {
         char *raw = NULL;
         size_t rawlen = 0;
@@ -7347,6 +7501,14 @@ sasl_packet(struct SASLSession *session)
         sasl_delete_session(session);
 
         free(raw);
+        return;
+    }
+    else
+    {
+        /* Unknown mechanism - should not happen as we validated above */
+        log_module(NS_LOG, LOG_WARNING, "SASL: Unknown mechanism %s", session->mech);
+        irc_sasl(session->source, session->uid, "D", "F");
+        sasl_delete_session(session);
         return;
     }
 
@@ -7503,34 +7665,49 @@ nickserv_ircv3_register(struct userNode *user, const char *handle,
     const char *actual_handle;
 
     /* Default empty result message */
+    log_module(NS_LOG, LOG_DEBUG, "nickserv_ircv3_register: handle=%s email=%s user=%p", handle, email, (void*)user);
     result_msg[0] = '\0';
 
-    /* Check if user is already authenticated */
-    if (user->handle_info) {
+    /* Check if user is already authenticated (only if user is known) */
+    if (user && user->handle_info) {
         snprintf(result_msg, 256, "You are already authenticated as %s", user->handle_info->handle);
         return NSREG_ALREADY_AUTHED;
     }
 
     /* Resolve handle ("*" means use current nick) */
-    actual_handle = (handle[0] == '*' && handle[1] == '\0') ? user->nick : handle;
+    if (handle[0] == '*' && handle[1] == '\0') {
+        if (user) {
+            actual_handle = user->nick;
+        } else {
+            snprintf(result_msg, 256, "Cannot use '*' for account name in pre-registration");
+            return NSREG_INVALID_HANDLE;
+        }
+    } else {
+        actual_handle = handle;
+    }
+    log_module(NS_LOG, LOG_DEBUG, "nickserv_ircv3_register: actual_handle=%s", actual_handle);
 
     /* Validate handle length */
     if (strlen(actual_handle) > NICKSERV_HANDLE_LEN) {
+        log_module(NS_LOG, LOG_DEBUG, "nickserv_ircv3_register: handle too long");
         snprintf(result_msg, 256, "Account name too long (max %d characters)", NICKSERV_HANDLE_LEN);
         return NSREG_INVALID_HANDLE;
     }
 
     /* Check if account already exists */
     if (get_handle_info(actual_handle)) {
+        log_module(NS_LOG, LOG_DEBUG, "nickserv_ircv3_register: account exists");
         snprintf(result_msg, 256, "Account '%s' already exists", actual_handle);
         return NSREG_ACCOUNT_EXISTS;
     }
+    log_module(NS_LOG, LOG_DEBUG, "nickserv_ircv3_register: checking email");
 
     /* Determine if email is required and whether user provided one */
     use_email = !(email[0] == '*' && email[1] == '\0');
     email_required = nickserv_conf.email_required;
 
     if (email_required && !use_email) {
+        log_module(NS_LOG, LOG_DEBUG, "nickserv_ircv3_register: email required but not provided");
         snprintf(result_msg, 256, "Email address is required for registration");
         return NSREG_INVALID_EMAIL;
     }
@@ -7540,11 +7717,13 @@ nickserv_ircv3_register(struct userNode *user, const char *handle,
         const char *prohibited_reason;
 
         if (!valid_email(email)) {
+            log_module(NS_LOG, LOG_DEBUG, "nickserv_ircv3_register: invalid email format");
             snprintf(result_msg, 256, "Invalid email address format");
             return NSREG_INVALID_EMAIL;
         }
 
         if ((prohibited_reason = mail_prohibited_address(email))) {
+            log_module(NS_LOG, LOG_DEBUG, "nickserv_ircv3_register: email prohibited");
             snprintf(result_msg, 256, "Email address not allowed: %s", prohibited_reason);
             return NSREG_EMAIL_PROHIBITED;
         }
@@ -7552,14 +7731,18 @@ nickserv_ircv3_register(struct userNode *user, const char *handle,
         /* Check handles per email limit */
         if ((hil = dict_find(nickserv_email_dict, email, NULL))) {
             if (hil->used >= nickserv_conf.handles_per_email) {
+                log_module(NS_LOG, LOG_DEBUG, "nickserv_ircv3_register: email limit");
                 snprintf(result_msg, 256, "Too many accounts registered with this email");
                 return NSREG_EMAIL_LIMIT;
             }
         }
     }
+    log_module(NS_LOG, LOG_DEBUG, "nickserv_ircv3_register: checking password '%s'", password);
 
     /* Validate password strength */
+    log_module(NS_LOG, LOG_DEBUG, "nickserv_ircv3_register: calling is_secure_password");
     if (!is_secure_password(actual_handle, password, NULL)) {
+        log_module(NS_LOG, LOG_DEBUG, "nickserv_ircv3_register: weak password");
         snprintf(result_msg, 256, "Password does not meet requirements "
                  "(min %lu chars, %lu digits, %lu uppercase, %lu lowercase)",
                  nickserv_conf.password_min_length,
@@ -7584,16 +7767,17 @@ nickserv_ircv3_register(struct userNode *user, const char *handle,
 #ifdef WITH_KEYCLOAK
     if (nickserv_conf.keycloak_enable) {
         int rc = kc_do_add(actual_handle, password, use_email ? email : NULL);
-        if (rc != KC_SUCCESS && rc != KC_ALREADY_EXISTS) {
+        if (rc != KC_SUCCESS && rc != KC_USER_EXISTS) {
             snprintf(result_msg, 256, "Keycloak error");
             return NSREG_INTERNAL_ERROR;
         }
     }
 #endif
 
-    /* Create the account - with email verification if email was provided */
+    /* Create the account - with email verification if email was provided and email is enabled */
     if (use_email && nickserv_conf.email_enabled) {
-        /* Create account but require email verification */
+        /* Create account but require email verification.
+         * For pre-registration clients (user=NULL), they will use VERIFY command. */
         hi = register_handle(actual_handle, "", 0); /* Empty password initially */
         if (!hi) {
             snprintf(result_msg, 256, "Failed to create account");
@@ -7617,7 +7801,8 @@ nickserv_ircv3_register(struct userNode *user, const char *handle,
         snprintf(result_msg, 256, "Verification email sent to %s", email);
         return NSREG_VERIFY_REQUIRED;
     } else {
-        /* No email verification needed - create and authenticate immediately */
+        /* No email verification needed - create account immediately
+         * For pre-registration clients (user=NULL), just create the account */
         hi = register_handle(actual_handle, crypted, 0);
         if (!hi) {
             snprintf(result_msg, 256, "Failed to create account");
@@ -7637,15 +7822,17 @@ nickserv_ircv3_register(struct userNode *user, const char *handle,
             nickserv_set_email_addr(hi, email);
         }
 
-        /* Authenticate the user */
-        set_user_handle_info(user, hi, 1);
+        /* Authenticate and register nick - only for connected users */
+        if (user) {
+            set_user_handle_info(user, hi, 1);
 
-        /* Register the nick if possible */
-        if (!nickserv_conf.disable_nicks && is_registerable_nick(user->nick)) {
-            register_nick(user->nick, hi);
+            /* Register the nick if possible */
+            if (!nickserv_conf.disable_nicks && is_registerable_nick(user->nick)) {
+                register_nick(user->nick, hi);
+            }
         }
 
-        snprintf(result_msg, 256, "Account '%s' created and authenticated", actual_handle);
+        snprintf(result_msg, 256, "Account '%s' created", actual_handle);
         return NSREG_SUCCESS;
     }
 }
