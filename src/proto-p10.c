@@ -1340,7 +1340,37 @@ void irc_sno(unsigned int mask, char const* format, ...) {
 void
 irc_sasl(struct server* dest, const char *identifier, const char *subcmd, const char *data)
 {
-    putsock("%s " P10_SASL " %s %s %s %s", self->numeric, dest->numeric, identifier, subcmd, data);
+    size_t datalen = data ? strlen(data) : 0;
+
+    /* SASL responses with "C" (client data) subcmd need chunking if >400 bytes */
+    if (strcmp(subcmd, "C") == 0 && datalen > 400) {
+        size_t offset = 0;
+        char chunk[401];
+
+        while (offset < datalen) {
+            size_t chunklen = datalen - offset;
+            if (chunklen > 400)
+                chunklen = 400;
+
+            memcpy(chunk, data + offset, chunklen);
+            chunk[chunklen] = '\0';
+
+            putsock("%s " P10_SASL " %s %s %s :%s", self->numeric, dest->numeric, identifier, subcmd, chunk);
+            offset += chunklen;
+        }
+
+        /* If the last chunk was exactly 400 bytes, send '+' to signal end */
+        if (datalen % 400 == 0) {
+            putsock("%s " P10_SASL " %s %s %s :+", self->numeric, dest->numeric, identifier, subcmd);
+        }
+    } else {
+        /* Short data or non-C subcmd - send directly */
+        if (data && *data) {
+            putsock("%s " P10_SASL " %s %s %s :%s", self->numeric, dest->numeric, identifier, subcmd, data);
+        } else {
+            putsock("%s " P10_SASL " %s %s %s", self->numeric, dest->numeric, identifier, subcmd);
+        }
+    }
 }
 
 void

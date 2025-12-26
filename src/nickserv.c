@@ -5883,11 +5883,21 @@ loc_auth_oauth(const char *bearer_token, const char *username_hint, const char *
     hi = get_handle_info(username);
 
     if (!hi && nickserv_conf.keycloak_autocreate) {
-        /* Auto-create local account from Keycloak user */
+        /* Auto-create local account from Keycloak user.
+         * Skip nickserv_register() as that would try to create the user in Keycloak again.
+         * The user already exists in Keycloak (they just authenticated with a Keycloak token).
+         */
         char *mask;
         char *email = NULL;
 
         log_module(NS_LOG, LOG_INFO, "loc_auth_oauth: Auto-creating account for %s", username);
+
+        /* Check if handle already exists */
+        if (dict_find(nickserv_handle_dict, username, NULL)) {
+            log_module(NS_LOG, LOG_WARNING, "loc_auth_oauth: Account %s already exists", username);
+            keycloak_free_token_info(token_info);
+            return NULL;
+        }
 
         /* Get email from token or Keycloak */
         if (token_info->email && *token_info->email) {
@@ -5896,12 +5906,28 @@ loc_auth_oauth(const char *bearer_token, const char *username_hint, const char *
             kc_get_user_info(username, &email);
         }
 
-        /* Create the account (without password - OAuth only) */
-        if (!(hi = nickserv_register(NULL, NULL, username, NULL, 0))) {
+        /* Create the local handle directly, bypassing Keycloak creation */
+        hi = register_handle(username, "", 0);  /* Empty password - OAuth only */
+        if (!hi) {
             log_module(NS_LOG, LOG_WARNING, "loc_auth_oauth: Failed to create account for %s", username);
             keycloak_free_token_info(token_info);
             free(email);
             return NULL;
+        }
+
+        /* Initialize handle fields */
+        hi->masks = alloc_string_list(1);
+        hi->sslfps = alloc_string_list(1);
+        hi->ignores = alloc_string_list(1);
+        hi->users = NULL;
+        hi->language = lang_C;
+        hi->registered = now;
+        hi->lastseen = now;
+        hi->flags = HI_DEFAULT_FLAGS;
+
+        /* Register nick if enabled */
+        if (!nickserv_conf.disable_nicks && is_registerable_nick(username)) {
+            register_nick(username, hi);
         }
 
         /* Add a *@* mask for OAuth users */
@@ -7165,7 +7191,7 @@ struct SASLSession
     char *buf, *p;
     int buflen;
     char uid[128];
-    char mech[10];
+    char mech[16];  /* Increased from 10 to hold "OAUTHBEARER" + null */
     char *sslclifp;
     char *hostmask;
     int flags;
@@ -7299,7 +7325,8 @@ sasl_packet(struct SASLSession *session)
             return;
         }
 
-        strncpy(session->mech, session->buf, 10);
+        strncpy(session->mech, session->buf, sizeof(session->mech) - 1);
+        session->mech[sizeof(session->mech) - 1] = '\0';
         irc_sasl(session->source, session->uid, "C", "+");
     }
     else if (!strcmp(session->mech, "EXTERNAL"))
@@ -7577,7 +7604,7 @@ handle_sasl_input(struct server* source ,const char *uid, const char *subcmd, co
     }
 
     memcpy(sess->p, data, len);
-    sess->buf[len] = '\0';
+    sess->buf[sess->buflen] = '\0';
 
     if (ext != NULL)
         sess->sslclifp = strdup(ext);
