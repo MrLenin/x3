@@ -5983,6 +5983,176 @@ loc_auth_oauth(const char *bearer_token, const char *username_hint, const char *
     keycloak_free_token_info(token_info);
     return hi;
 }
+
+/**
+ * Authenticate via certificate fingerprint with Keycloak lookup (SASL EXTERNAL)
+ *
+ * This implements Scenario 1 of SASL EXTERNAL:
+ * 1. Query Keycloak Admin API for user with matching x509_fingerprints attribute
+ * 2. If found, authenticate as that user (auto-create local account if needed)
+ * 3. If not found in Keycloak, fall back to local fingerprint lookup
+ *
+ * @param fingerprint  SHA-256 certificate fingerprint (with colons)
+ * @param authzid      Optional authorization identity hint (from SASL payload)
+ * @param hostmask     User's hostmask for validation
+ * @return handle_info on success, NULL on failure
+ */
+static struct handle_info *
+loc_auth_external(const char *fingerprint, const char *authzid, const char *hostmask)
+{
+    struct handle_info *hi = NULL;
+    char *kc_username = NULL;
+    int rc;
+
+    if (!fingerprint || !*fingerprint) {
+        log_module(NS_LOG, LOG_DEBUG, "loc_auth_external: No fingerprint provided");
+        return NULL;
+    }
+
+    log_module(NS_LOG, LOG_DEBUG, "loc_auth_external: Looking up fingerprint %s", fingerprint);
+
+    /* Step 1: Try Keycloak fingerprint lookup */
+    if (nickserv_conf.keycloak_enable) {
+        if (kc_ensure_token() != KC_SUCCESS) {
+            log_module(NS_LOG, LOG_WARNING, "loc_auth_external: Failed to get admin token");
+            /* Fall through to local lookup */
+        } else {
+            rc = keycloak_find_user_by_fingerprint(kc_realm_config, kc_client_config,
+                                                    fingerprint, &kc_username);
+
+            if (rc == KC_COLLISION) {
+                /* Security error - multiple users have this fingerprint */
+                log_module(NS_LOG, LOG_ERROR,
+                    "loc_auth_external: Fingerprint collision detected - refusing auth");
+                return NULL;
+            }
+
+            if (rc == KC_SUCCESS && kc_username) {
+                log_module(NS_LOG, LOG_DEBUG,
+                    "loc_auth_external: Keycloak returned user '%s' for fingerprint",
+                    kc_username);
+
+                /* If authzid was provided, verify it matches */
+                if (authzid && *authzid && strcasecmp(kc_username, authzid) != 0) {
+                    log_module(NS_LOG, LOG_WARNING,
+                        "loc_auth_external: authzid mismatch - client claimed '%s' but cert belongs to '%s'",
+                        authzid, kc_username);
+                    free(kc_username);
+                    return NULL;
+                }
+
+                /* Look up or create local account */
+                hi = get_handle_info(kc_username);
+
+                if (!hi && nickserv_conf.keycloak_autocreate) {
+                    /* Auto-create local account from Keycloak user */
+                    char *mask;
+                    char *email = NULL;
+
+                    log_module(NS_LOG, LOG_INFO,
+                        "loc_auth_external: Auto-creating account for Keycloak user %s",
+                        kc_username);
+
+                    /* Check if handle already exists (race condition check) */
+                    if (dict_find(nickserv_handle_dict, kc_username, NULL)) {
+                        log_module(NS_LOG, LOG_WARNING,
+                            "loc_auth_external: Account %s already exists", kc_username);
+                        free(kc_username);
+                        return NULL;
+                    }
+
+                    /* Get email from Keycloak */
+                    kc_get_user_info(kc_username, &email);
+
+                    /* Create the local handle */
+                    hi = register_handle(kc_username, "", 0);  /* No password for cert auth */
+                    if (!hi) {
+                        log_module(NS_LOG, LOG_WARNING,
+                            "loc_auth_external: Failed to create account for %s", kc_username);
+                        free(kc_username);
+                        free(email);
+                        return NULL;
+                    }
+
+                    /* Initialize handle fields */
+                    hi->masks = alloc_string_list(1);
+                    hi->sslfps = alloc_string_list(1);
+                    hi->ignores = alloc_string_list(1);
+                    hi->users = NULL;
+                    hi->language = lang_C;
+                    hi->registered = now;
+                    hi->lastseen = now;
+                    hi->flags = HI_DEFAULT_FLAGS;
+
+                    /* Register nick if enabled */
+                    if (!nickserv_conf.disable_nicks && is_registerable_nick(kc_username)) {
+                        register_nick(kc_username, hi);
+                    }
+
+                    /* Add a *@* mask for EXTERNAL users */
+                    if (nickserv_conf.default_hostmask)
+                        mask = "*@*";
+                    else
+                        mask = NULL;
+
+                    if (mask) {
+                        char *mask_canonicalized = canonicalize_hostmask(strdup(mask));
+                        string_list_append(hi->masks, mask_canonicalized);
+                    }
+
+                    /* Store the fingerprint locally too */
+                    string_list_append(hi->sslfps, strdup(fingerprint));
+
+                    if (email) {
+                        nickserv_set_email_addr(hi, email);
+                        free(email);
+                    }
+
+                    if (nickserv_conf.sync_log)
+                        SyncLog("REGISTER %s %s %s %s", hi->handle,
+                                hi->passwd ? hi->passwd : "*", "@", "external");
+                }
+
+                free(kc_username);
+
+                if (hi) {
+                    /* Check if account is suspended */
+                    if (HANDLE_FLAGGED(hi, SUSPENDED)) {
+                        log_module(NS_LOG, LOG_DEBUG,
+                            "loc_auth_external: Account %s is suspended", hi->handle);
+                        return NULL;
+                    }
+
+                    /* Check maxlogins */
+                    int used = 0;
+                    int maxlogins = hi->maxlogins ? hi->maxlogins : nickserv_conf.default_maxlogins;
+                    struct userNode *other;
+                    for (other = hi->users; other; other = other->next_authed) {
+                        if (++used >= maxlogins) {
+                            log_module(NS_LOG, LOG_DEBUG,
+                                "loc_auth_external: Account %s at max logins", hi->handle);
+                            return NULL;
+                        }
+                    }
+
+                    return hi;
+                }
+            } else if (rc == KC_NOT_FOUND) {
+                log_module(NS_LOG, LOG_DEBUG,
+                    "loc_auth_external: Fingerprint not found in Keycloak, trying local lookup");
+            } else {
+                log_module(NS_LOG, LOG_DEBUG,
+                    "loc_auth_external: Keycloak lookup failed (rc=%d), trying local lookup", rc);
+            }
+        }
+    }
+
+    /* Step 2: Fall back to local fingerprint lookup (original loc_auth behavior) */
+    log_module(NS_LOG, LOG_DEBUG, "loc_auth_external: Falling back to local fingerprint lookup");
+    hi = loc_auth((char*)fingerprint, (char*)authzid, NULL, (char*)hostmask);
+
+    return hi;
+}
 #endif /* WITH_KEYCLOAK */
 
 /*
@@ -7342,21 +7512,28 @@ sasl_packet(struct SASLSession *session)
         if (rawlen != 0)
             authzid = raw;
 
-        log_module(NS_LOG, LOG_DEBUG, "SASL: Checking supplied credentials");
+        log_module(NS_LOG, LOG_DEBUG, "SASL EXTERNAL: Checking certificate fingerprint");
 
         if (!session->sslclifp) {
-            log_module(NS_LOG, LOG_DEBUG, "SASL: Incomplete credentials supplied");
+            log_module(NS_LOG, LOG_DEBUG, "SASL EXTERNAL: No certificate fingerprint provided");
             irc_sasl(session->source, session->uid, "D", "F");
         } else {
-            if (!(hi = loc_auth(session->sslclifp, authzid, NULL, session->hostmask)))
+#ifdef WITH_KEYCLOAK
+            /* Use Keycloak fingerprint lookup with fallback to local */
+            hi = loc_auth_external(session->sslclifp, authzid, session->hostmask);
+#else
+            /* Local fingerprint lookup only */
+            hi = loc_auth(session->sslclifp, authzid, NULL, session->hostmask);
+#endif
+            if (!hi)
             {
-                log_module(NS_LOG, LOG_DEBUG, "SASL: Invalid credentials supplied");
+                log_module(NS_LOG, LOG_DEBUG, "SASL EXTERNAL: No matching account for fingerprint");
                 irc_sasl(session->source, session->uid, "D", "F");
             }
             else
             {
                 snprintf(buffer, sizeof(buffer), "%s "FMT_TIME_T, hi->handle, hi->registered);
-                log_module(NS_LOG, LOG_DEBUG, "SASL: Valid credentials supplied");
+                log_module(NS_LOG, LOG_DEBUG, "SASL EXTERNAL: Authenticated as %s", hi->handle);
                 irc_sasl(session->source, session->uid, "L", buffer);
                 irc_sasl(session->source, session->uid, "D", "S");
             }

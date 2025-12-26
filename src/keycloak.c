@@ -1970,4 +1970,120 @@ void keycloak_free_group_members(struct kc_group_member* members)
     }
 }
 
+int keycloak_find_user_by_fingerprint(struct kc_realm realm, struct kc_client client,
+                                       const char* fingerprint, char** username_out)
+{
+    if (!realm.base_uri || !realm.realm || !client.access_token ||
+        !fingerprint || !username_out) {
+        log_module(KC_LOG, LOG_DEBUG, "keycloak_find_user_by_fingerprint: Invalid arguments");
+        return KC_ERROR;
+    }
+
+    *username_out = NULL;
+    int result = KC_ERROR;
+    char* uri = NULL;
+    char* escaped_fp = NULL;
+    struct memory chunk = { .response = NULL, .size = 0 };
+
+    /* URL-encode the fingerprint for the query parameter
+     * Keycloak's Admin API supports q= for attribute search:
+     * GET /admin/realms/{realm}/users?q=x509_fingerprints:{fingerprint}
+     */
+    escaped_fp = curl_easy_escape(NULL, fingerprint, 0);
+    if (!escaped_fp) {
+        log_module(KC_LOG, LOG_DEBUG, "keycloak_find_user_by_fingerprint: Failed to escape fingerprint");
+        goto cleanup;
+    }
+
+    /* Build the search URI */
+    static const char uri_tmpl[] = "%s/admin/realms/%s/users?q=x509_fingerprints:%s";
+    int uri_len = snprintf(NULL, 0, uri_tmpl, realm.base_uri, realm.realm, escaped_fp) + 1;
+    uri = malloc(uri_len);
+    if (!uri) {
+        log_module(KC_LOG, LOG_DEBUG, "keycloak_find_user_by_fingerprint: Failed to allocate uri");
+        goto cleanup;
+    }
+    snprintf(uri, uri_len, uri_tmpl, realm.base_uri, realm.realm, escaped_fp);
+
+    struct curl_opts opts = {
+        .uri = uri,
+        .method = HTTP_GET,
+        .xoauth2_bearer = client.access_token->access_token,
+        .write_callback = curl_write_cb,
+        .header_count = 0
+    };
+
+    long http_code = curl_perform(opts, &chunk);
+
+    if (http_code != 200 || !chunk.response) {
+        log_module(KC_LOG, LOG_DEBUG, "keycloak_find_user_by_fingerprint: Failed with HTTP %ld",
+            http_code);
+        goto cleanup;
+    }
+
+    /* Parse JSON array response */
+    json_error_t error;
+    json_t* root = json_loads(chunk.response, 0, &error);
+    if (!root) {
+        log_module(KC_LOG, LOG_DEBUG, "keycloak_find_user_by_fingerprint: Failed to parse JSON: %s",
+            error.text);
+        goto cleanup;
+    }
+
+    if (!json_is_array(root)) {
+        log_module(KC_LOG, LOG_DEBUG, "keycloak_find_user_by_fingerprint: Response is not an array");
+        json_decref(root);
+        goto cleanup;
+    }
+
+    size_t count = json_array_size(root);
+
+    if (count == 0) {
+        /* Fingerprint not registered to any user */
+        log_module(KC_LOG, LOG_DEBUG, "keycloak_find_user_by_fingerprint: Fingerprint not found");
+        result = KC_NOT_FOUND;
+        json_decref(root);
+        goto cleanup;
+    }
+
+    if (count > 1) {
+        /* Fingerprint collision! This should never happen if uniqueness is enforced */
+        log_module(KC_LOG, LOG_ERROR,
+                   "SECURITY: Fingerprint %s registered to %zu users!",
+                   fingerprint, count);
+        result = KC_COLLISION;
+        json_decref(root);
+        goto cleanup;
+    }
+
+    /* Exactly one user - extract username */
+    json_t* user = json_array_get(root, 0);
+    const char* username = json_string_value(json_object_get(user, "username"));
+
+    if (username) {
+        *username_out = strdup(username);
+        if (*username_out) {
+            result = KC_SUCCESS;
+            log_module(KC_LOG, LOG_DEBUG, "keycloak_find_user_by_fingerprint: Found user '%s'",
+                *username_out);
+        }
+    }
+
+    json_decref(root);
+
+cleanup:
+    if (chunk.response) {
+        memset(chunk.response, 0, chunk.size);
+        free(chunk.response);
+    }
+    if (escaped_fp) {
+        curl_free(escaped_fp);
+    }
+    if (uri) {
+        free(uri);
+    }
+
+    return result;
+}
+
 #endif /* WITH_KEYCLOAK */

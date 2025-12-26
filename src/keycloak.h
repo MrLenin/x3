@@ -17,7 +17,8 @@ enum kc_error {
     KC_ERROR = -1,
     KC_USER_EXISTS = -2,
     KC_FORBIDDEN = -3,
-    KC_NOT_FOUND = -4
+    KC_NOT_FOUND = -4,
+    KC_COLLISION = -5   // Multiple users matched (e.g., fingerprint collision)
 };
 
 // Data structures
@@ -308,6 +309,24 @@ int keycloak_introspect_token(struct kc_realm realm, struct kc_client client,
  * @param info      Pointer to token info (can be NULL)
  */
 void keycloak_free_token_info(struct kc_token_info* info);
+
+/**
+ * Find a Keycloak user by certificate fingerprint
+ *
+ * Searches for users with the given fingerprint in their x509_fingerprints
+ * attribute. This is used for SASL EXTERNAL authentication (Scenario 1).
+ *
+ * @param realm         Keycloak realm configuration
+ * @param client        Client with admin access token
+ * @param fingerprint   SHA-256 certificate fingerprint (with colons, e.g. "AA:BB:CC:...")
+ * @param username_out  Output pointer for username (caller must free)
+ * @return KC_SUCCESS if exactly one user found
+ *         KC_NOT_FOUND if no user has this fingerprint
+ *         KC_COLLISION if multiple users have this fingerprint (security error!)
+ *         KC_ERROR on failure
+ */
+int keycloak_find_user_by_fingerprint(struct kc_realm realm, struct kc_client client,
+                                       const char* fingerprint, char** username_out);
 
 /**
  * Initialize keycloak module
