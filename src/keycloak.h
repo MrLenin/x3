@@ -126,7 +126,15 @@ int keycloak_get_user(struct kc_realm realm, struct kc_client client, const char
 int keycloak_create_user(struct kc_realm realm, struct kc_client client, const char* username, const char* email, const char* passwd);
 
 /**
+ * Frees only the internal fields of a kc_user structure (not the struct itself)
+ * Use this for stack-allocated kc_user structs
+ * @param user      Pointer to user (can be NULL)
+ */
+void keycloak_user_free_fields(struct kc_user* user);
+
+/**
  * Frees memory allocated for a kc_user structure and its fields
+ * Use this only for heap-allocated (malloc'd) kc_user structs
  * @param user      Pointer to user (can be NULL)
  */
 void keycloak_user_free(struct kc_user* user);

@@ -41,7 +41,7 @@ struct curl_opts {
     enum http_method method;
 };
 
-static void kc_user_free_fields(struct kc_user* user)
+void keycloak_user_free_fields(struct kc_user* user)
 {
     if (!user) {
         return;
@@ -67,7 +67,7 @@ void keycloak_user_free(struct kc_user* user)
         return;
     }
 
-    kc_user_free_fields(user);
+    keycloak_user_free_fields(user);
     free(user);
 }
 
@@ -789,7 +789,8 @@ int keycloak_create_user(struct kc_realm realm, struct kc_client client, const c
         .post_fields = user_repr,
         .xoauth2_bearer = client.access_token->access_token,
         .write_callback = curl_write_cb,
-        .header_count = 0
+        .header_list = { "Content-Type: application/json" },
+        .header_count = 1
     };
 
     long http_code = curl_perform(opts, &chunk);
@@ -851,7 +852,7 @@ void keycloak_free_users(struct kc_user* users, size_t count)
     }
 
     for (size_t i = 0; i < count; i++) {
-        kc_user_free_fields(&users[i]);
+        keycloak_user_free_fields(&users[i]);
     }
 
     free(users);

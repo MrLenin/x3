@@ -5669,7 +5669,7 @@ kc_get_user_info(const char *handle, char **email_out)
         if (user.email) {
             *email_out = strdup(user.email);
         }
-        keycloak_user_free(&user);
+        keycloak_user_free_fields(&user);
         return KC_SUCCESS;
     }
 
@@ -5704,7 +5704,7 @@ kc_do_modify(const char *handle, const char *password, const char *email)
     }
 
     char *user_id = strdup(user.id);
-    keycloak_user_free(&user);
+    keycloak_user_free_fields(&user);
 
     rc = keycloak_update_user(kc_realm_config, kc_client_config,
                               user_id, password, email);
@@ -5728,7 +5728,7 @@ kc_delete_account(const char *handle)
     }
 
     char *user_id = strdup(user.id);
-    keycloak_user_free(&user);
+    keycloak_user_free_fields(&user);
 
     rc = keycloak_delete_user(kc_realm_config, kc_client_config, user_id);
     free(user_id);
@@ -5751,7 +5751,7 @@ kc_do_oslevel(const char *handle, int level, int oldlevel)
     }
 
     char *user_id = strdup(user.id);
-    keycloak_user_free(&user);
+    keycloak_user_free_fields(&user);
 
     /* Set the opserv_level attribute */
     char level_str[16];
@@ -5779,7 +5779,7 @@ kc_add2group(const char *handle, const char *group_name)
         return rc;
     }
     char *user_id = strdup(user.id);
-    keycloak_user_free(&user);
+    keycloak_user_free_fields(&user);
 
     /* Get group ID */
     char *group_id = NULL;
@@ -5812,7 +5812,7 @@ kc_delfromgroup(const char *handle, const char *group_name)
         return rc;
     }
     char *user_id = strdup(user.id);
-    keycloak_user_free(&user);
+    keycloak_user_free_fields(&user);
 
     /* Get group ID */
     char *group_id = NULL;
@@ -6293,7 +6293,7 @@ nickserv_set_user_metadata(struct handle_info *hi, const char *key, const char *
                 /* Continue - we may have LMDB cache */
             } else {
                 char *user_id = strdup(user.id);
-                keycloak_user_free(&user);
+                keycloak_user_free_fields(&user);
 
                 /* Prefix metadata keys with "metadata." to avoid conflicts */
                 snprintf(attr_name, sizeof(attr_name), "metadata.%s", key);
@@ -6396,7 +6396,7 @@ nickserv_get_user_metadata(struct handle_info *hi, const char *key, char *value_
         }
 
         char *user_id = strdup(user.id);
-        keycloak_user_free(&user);
+        keycloak_user_free_fields(&user);
 
         /* Prefix metadata keys with "metadata." */
         snprintf(attr_name, sizeof(attr_name), "metadata.%s", key);
@@ -6512,7 +6512,7 @@ nickserv_sync_metadata_to_ircd(struct userNode *user)
         }
 
         char *user_id = strdup(kc_user.id);
-        keycloak_user_free(&kc_user);
+        keycloak_user_free_fields(&kc_user);
 
         /* Fetch all metadata.* attributes */
         rc = keycloak_list_user_attributes(kc_realm_config, kc_client_config,
@@ -6651,7 +6651,7 @@ nickserv_sync_account_metadata_to_ircd(struct handle_info *hi)
         }
 
         char *user_id = strdup(kc_user.id);
-        keycloak_user_free(&kc_user);
+        keycloak_user_free_fields(&kc_user);
 
         /* Fetch all metadata.* attributes */
         rc = keycloak_list_user_attributes(kc_realm_config, kc_client_config,
@@ -6731,7 +6731,7 @@ nickserv_get_webpush_subscriptions(const char *account_name,
         }
 
         char *user_id = strdup(kc_user.id);
-        keycloak_user_free(&kc_user);
+        keycloak_user_free_fields(&kc_user);
 
         /* Fetch all webpush.* attributes */
         rc = keycloak_list_user_attributes(kc_realm_config, kc_client_config,
@@ -8132,6 +8132,9 @@ init_nickserv(const char *nick)
     struct chanNode *chan;
     unsigned int i;
     NS_LOG = log_register_type("NickServ", "file:nickserv.log");
+#ifdef WITH_KEYCLOAK
+    init_keycloak();
+#endif
     reg_new_user_func(new_user_event, NULL);
     reg_nick_change_func(handle_nick_change, NULL);
     reg_del_user_func(nickserv_remove_user, NULL);
