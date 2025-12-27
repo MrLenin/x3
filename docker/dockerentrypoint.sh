@@ -5,14 +5,7 @@
 # variable values, and writes out x3.conf
 #
 # If x3.conf already exists (e.g., bind-mounted), skip generation and use it as-is.
-
-# Fix ownership of mounted volumes (runs as root, will drop to x3 later)
-if [ "$(id -u)" = "0" ]; then
-    # Fix data directory permissions for LMDB and logs
-    if [ -d /x3/data ]; then
-        chown -R x3:x3 /x3/data
-    fi
-fi
+# Volume permissions are handled by init container in docker-compose.
 
 BASECONFDIST=/x3/x3.conf-dist
 BASECONF=/x3/x3.conf
@@ -20,12 +13,7 @@ BASECONF=/x3/x3.conf
 # If config already exists, use it as-is
 if [ -f "$BASECONF" ] && [ -s "$BASECONF" ]; then
     echo "Using existing $BASECONF (bind-mounted or pre-configured)"
-    # Drop privileges to x3 user if running as root
-    if [ "$(id -u)" = "0" ]; then
-        exec gosu x3 "$@"
-    else
-        exec "$@"
-    fi
+    exec "$@"
 fi
 
 # Set defaults for required variables (can be overridden by environment)
@@ -63,9 +51,4 @@ done
 echo "Generated $BASECONF from template"
 
 # Run the command passed to docker (CMD from Dockerfile)
-# Drop privileges to x3 user if running as root
-if [ "$(id -u)" = "0" ]; then
-    exec gosu x3 "$@"
-else
-    exec "$@"
-fi
+exec "$@"

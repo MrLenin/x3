@@ -31,13 +31,13 @@ USER root
 #Clean up build
 #RUN apt-get remove -y build-essential && apt-get autoremove -y
 #RUN apt-get clean
-# Install gosu for dropping privileges after fixing volume permissions
-RUN apt-get update && apt-get install -y gosu && apt-get clean
 
 COPY docker/x3.conf-dist /x3/x3.conf-dist
 COPY docker/dockerentrypoint.sh /dockerentrypoint.sh
 
-# Run entrypoint as root (it will fix permissions and drop to x3)
+USER x3
+
+# Run entrypoint (volume permissions fixed by init container in docker-compose)
 ENTRYPOINT ["/dockerentrypoint.sh"]
 
 CMD ["/x3/x3", "-f", "-d"]
