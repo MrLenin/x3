@@ -67,8 +67,11 @@ extern struct nickserv_config nickserv_conf;
 #define KEY_SUPPORT_HELPER_EPITHET  "support_helper_epithet"
 #define KEY_KEYCLOAK_ACCESS_SYNC    "keycloak_access_sync"
 #define KEY_KEYCLOAK_HIERARCHICAL   "keycloak_hierarchical_groups"
+#define KEY_KEYCLOAK_USE_GROUP_ATTRS "keycloak_use_group_attributes"
 #define KEY_KEYCLOAK_GROUP_PREFIX   "keycloak_group_prefix"
+#define KEY_KEYCLOAK_ACCESS_LEVEL_ATTR "keycloak_access_level_attr"
 #define KEY_KEYCLOAK_SYNC_FREQUENCY "keycloak_sync_frequency"
+#define KEY_KEYCLOAK_BIDIRECTIONAL  "keycloak_bidirectional_sync"
 #define KEY_CHANNEL_METADATA_TTL_ENABLED "channel_metadata_ttl_enabled"
 #define KEY_CHANNEL_METADATA_DEFAULT_TTL "channel_metadata_default_ttl"
 #define KEY_CHANNEL_IMMUTABLE_KEYS  "channel_immutable_keys"
@@ -670,7 +673,10 @@ static struct
     /* Keycloak channel access sync */
     unsigned int        keycloak_access_sync : 1;  /* Enable Keycloak group sync */
     unsigned int        keycloak_hierarchical_groups : 1; /* Use hierarchical group paths */
+    unsigned int        keycloak_use_group_attributes : 1; /* Use x3_access_level group attribute instead of suffix */
+    unsigned int        keycloak_bidirectional : 1; /* Enable bidirectional sync (X3 -> Keycloak) */
     const char          *keycloak_group_prefix;    /* Group name prefix, e.g. "irc-channel-" or "irc-channels" */
+    const char          *keycloak_access_level_attr; /* Attribute name for access level (default: x3_access_level) */
     unsigned long       keycloak_sync_frequency;   /* Sync interval in seconds (0 = startup only) */
 
     /* Channel metadata TTL configuration */
@@ -845,6 +851,12 @@ unsigned int chanserv_read_version = 0; /* db version control */
 
 /* Forward declaration for LMDB fallback in _GetChannelUser */
 static struct userData *add_channel_user(struct chanData *channel, struct handle_info *handle, unsigned short access_level, time_t seen, const char *info, time_t accessexpiry);
+
+#ifdef WITH_KEYCLOAK
+/* Forward declarations for Keycloak bidirectional sync */
+static int chanserv_push_keycloak_access(const char *channel, const char *username, unsigned short access);
+static int chanserv_delete_keycloak_channel(const char *channel);
+#endif
 
 void sputsock(const char *text, ...) PRINTF_LIKE(1, 2);
 
@@ -1832,6 +1844,12 @@ unregister_channel(struct chanData *channel, const char *reason)
     if(!IsSuspended(channel))
         DelChannelUser(chanserv, channel->channel, msgbuf, 0);
     global_message(MESSAGE_RECIPIENT_OPERS | MESSAGE_RECIPIENT_HELPERS, msgbuf);
+
+#ifdef WITH_KEYCLOAK
+    /* Delete channel group from Keycloak if bidirectional sync enabled */
+    chanserv_delete_keycloak_channel(channel->channel->name);
+#endif
+
     UnlockChannel(channel->channel);
     free(channel);
     registered_channels--;
@@ -3243,6 +3261,11 @@ static CHANSERV_FUNC(cmd_adduser)
     if (duration > 0)
         timeq_add(accessexpiry, chanserv_expire_tempuser, actee);
 
+#ifdef WITH_KEYCLOAK
+    /* Push access change to Keycloak if bidirectional sync enabled */
+    chanserv_push_keycloak_access(channel->name, handle->handle, access_level);
+#endif
+
     reply("CSMSG_ADDED_USER", handle->handle, channel->name, user_level_name_from_level(access_level), access_level);
     return 1 | override;
 }
@@ -3323,6 +3346,12 @@ static CHANSERV_FUNC(cmd_clvl)
      * If they lower their own access it's not a big problem. 
      */
     victim->access = new_access;
+
+#ifdef WITH_KEYCLOAK
+    /* Push access change to Keycloak if bidirectional sync enabled */
+    chanserv_push_keycloak_access(channel->name, handle->handle, new_access);
+#endif
+
     reply("CSMSG_CHANGED_ACCESS", handle->handle, user_level_name_from_level(new_access), new_access, channel->name);
     return 1 | override;
 }
@@ -3382,6 +3411,12 @@ static CHANSERV_FUNC(cmd_deluser)
         override = CMD_LOG_OVERRIDE;
 
     chan_name = strdup(channel->name);
+
+#ifdef WITH_KEYCLOAK
+    /* Remove user from Keycloak group if bidirectional sync enabled */
+    chanserv_push_keycloak_access(channel->name, handle->handle, 0);
+#endif
+
     del_channel_user(victim, 1);
     reply("CSMSG_DELETED_USER", handle->handle, access_level, chan_name);
     free(chan_name);
@@ -9201,8 +9236,14 @@ chanserv_conf_read(void)
         chanserv_conf.keycloak_group_prefix = chanserv_conf.keycloak_hierarchical_groups
             ? "irc-channels" : "irc-channel-";
     }
+    str = database_get_data(conf_node, KEY_KEYCLOAK_USE_GROUP_ATTRS, RECDB_QSTRING);
+    chanserv_conf.keycloak_use_group_attributes = str ? enabled_string(str) : 0;
+    str = database_get_data(conf_node, KEY_KEYCLOAK_ACCESS_LEVEL_ATTR, RECDB_QSTRING);
+    chanserv_conf.keycloak_access_level_attr = str ? str : "x3_access_level";
     str = database_get_data(conf_node, KEY_KEYCLOAK_SYNC_FREQUENCY, RECDB_QSTRING);
     chanserv_conf.keycloak_sync_frequency = str ? ParseInterval(str) : 3600;
+    str = database_get_data(conf_node, KEY_KEYCLOAK_BIDIRECTIONAL, RECDB_QSTRING);
+    chanserv_conf.keycloak_bidirectional = str ? enabled_string(str) : 0;
 
     /* Channel metadata TTL configuration */
     str = database_get_data(conf_node, KEY_CHANNEL_METADATA_TTL_ENABLED, RECDB_QSTRING);
@@ -10412,6 +10453,120 @@ chanserv_sync_keycloak_channel_level(const char *channel, unsigned short level)
 }
 
 /**
+ * Sync channel access from a single Keycloak group using x3_access_level attribute
+ * @param channel Channel name (with #)
+ * @param group_id Keycloak group ID
+ * @return Number of members synced, or -1 on error
+ */
+static int
+chanserv_sync_keycloak_group_with_attribute(const char *channel, const char *group_id,
+                                             struct kc_realm realm, struct kc_client client)
+{
+    struct kc_group_member *members = NULL;
+    struct kc_group_member *member;
+    int count = 0;
+    int rc;
+
+    /* Get group members with access level from attribute */
+    rc = keycloak_get_group_members_with_level(realm, client, group_id, &members);
+    if (rc < 0) {
+        return -1;
+    }
+
+    /* Store each member in LMDB */
+    for (member = members; member; member = member->next) {
+        if (member->access_level == 0) {
+            /* Skip members with no access level (attribute not set on group) */
+            log_module(CS_LOG, LOG_DEBUG,
+                       "chanserv_sync_keycloak_group_with_attribute: Skipping %s - no access_level",
+                       member->username);
+            continue;
+        }
+
+        rc = x3_lmdb_chanaccess_set(channel, member->username, member->access_level);
+        if (rc == LMDB_SUCCESS) {
+            count++;
+            log_module(CS_LOG, LOG_DEBUG, "Synced Keycloak access: %s -> %s level %d (from attribute)",
+                       member->username, channel, member->access_level);
+        }
+    }
+
+    keycloak_free_group_members(members);
+    return count;
+}
+
+/**
+ * Sync channel using attribute-based groups (single group per channel)
+ * Looks for groups like: irc-channel-#help with x3_access_level attribute
+ * @param channel Channel name (with #)
+ * @return Number of members synced, or -1 on error
+ */
+static int
+chanserv_sync_keycloak_channel_attribute_mode(const char *channel)
+{
+    struct kc_realm realm;
+    struct kc_client client;
+    char group_name[256];
+    char *group_id = NULL;
+    int total = 0;
+    int rc;
+
+    if (!nickserv_conf.keycloak_enable || !chanserv_conf.keycloak_access_sync)
+        return 0;
+
+    if (!x3_lmdb_is_available())
+        return 0;
+
+    /* Setup Keycloak connection */
+    realm.base_uri = (char*)nickserv_conf.keycloak_uri;
+    realm.realm = nickserv_conf.keycloak_realm;
+    client.client_id = (char*)nickserv_conf.keycloak_client_id;
+    client.client_secret = (char*)nickserv_conf.keycloak_client_secret;
+    client.access_token = NULL;
+
+    /* Get client token */
+    rc = keycloak_get_client_token(realm, client, &client.access_token);
+    if (rc != KC_SUCCESS) {
+        log_module(CS_LOG, LOG_DEBUG, "chanserv_sync_keycloak_channel_attribute_mode: Failed to get token");
+        return -1;
+    }
+
+    /* In attribute mode, we look for a single group per channel
+     * e.g., /irc-channels/#help (hierarchical) or irc-channel-#help (flat)
+     * Each group has x3_access_level attribute defining the access level
+     */
+    if (chanserv_conf.keycloak_hierarchical_groups) {
+        /* Hierarchical mode: /irc-channels/#help */
+        snprintf(group_name, sizeof(group_name), "/%s/%s",
+                 chanserv_conf.keycloak_group_prefix, channel);
+        rc = keycloak_get_group_by_path(realm, client, group_name, &group_id);
+    } else {
+        /* Flat mode: irc-channel-#help */
+        snprintf(group_name, sizeof(group_name), "%s%s",
+                 chanserv_conf.keycloak_group_prefix, channel);
+        rc = keycloak_get_group_by_name(realm, client, group_name, &group_id);
+    }
+
+    if (rc == KC_NOT_FOUND) {
+        /* No group for this channel - that's OK */
+        keycloak_free_access_token(client.access_token);
+        return 0;
+    }
+    if (rc != KC_SUCCESS || !group_id) {
+        keycloak_free_access_token(client.access_token);
+        return -1;
+    }
+
+    /* Sync members from this group */
+    total = chanserv_sync_keycloak_group_with_attribute(channel, group_id, realm, client);
+
+    free(group_id);
+    keycloak_free_access_token(client.access_token);
+
+    return total;
+}
+
+/**
  * Sync all access levels for a single channel from Keycloak
  * @param channel Channel name (with #)
  * @return Total members synced, or -1 on error
@@ -10422,6 +10577,12 @@ chanserv_sync_keycloak_channel(const char *channel)
     int total = 0;
     int i, rc;
 
+    /* Use attribute-based mode if enabled */
+    if (chanserv_conf.keycloak_use_group_attributes) {
+        return chanserv_sync_keycloak_channel_attribute_mode(channel);
+    }
+
+    /* Legacy mode: iterate through predefined access levels */
     for (i = 0; kc_access_levels[i].suffix; i++) {
         rc = chanserv_sync_keycloak_channel_level(channel, kc_access_levels[i].level);
         if (rc > 0)
@@ -10429,6 +10590,168 @@ chanserv_sync_keycloak_channel(const char *channel)
     }
 
     return total;
+}
+
+/**
+ * Push a user's access level change to Keycloak (bidirectional sync: X3 -> Keycloak)
+ * Creates the channel group if it doesn't exist, then adds/updates user membership.
+ *
+ * @param channel    Channel name (with #)
+ * @param username   Account name of user
+ * @param access     New access level (0 to remove)
+ * @return KC_SUCCESS on success, KC_ERROR on failure
+ */
+static int
+chanserv_push_keycloak_access(const char *channel, const char *username, unsigned short access)
+{
+    struct kc_realm realm;
+    struct kc_client client;
+    struct kc_user kc_user;
+    char *group_id = NULL;
+    char group_path[256];
+    char level_str[16];
+    int rc;
+
+    if (!nickserv_conf.keycloak_enable || !chanserv_conf.keycloak_access_sync ||
+        !chanserv_conf.keycloak_bidirectional)
+        return KC_SUCCESS; /* Silently succeed if not enabled */
+
+    if (!channel || !username)
+        return KC_ERROR;
+
+    log_module(CS_LOG, LOG_DEBUG, "chanserv_push_keycloak_access: %s -> %s level %d",
+               username, channel, access);
+
+    /* Setup Keycloak connection */
+    realm.base_uri = (char*)nickserv_conf.keycloak_uri;
+    realm.realm = nickserv_conf.keycloak_realm;
+    client.client_id = (char*)nickserv_conf.keycloak_client_id;
+    client.client_secret = (char*)nickserv_conf.keycloak_client_secret;
+    client.access_token = NULL;
+
+    /* Get client token */
+    rc = keycloak_get_client_token(realm, client, &client.access_token);
+    if (rc != KC_SUCCESS) {
+        log_module(CS_LOG, LOG_DEBUG, "chanserv_push_keycloak_access: Failed to get token");
+        return KC_ERROR;
+    }
+
+    /* Look up the Keycloak user by username */
+    memset(&kc_user, 0, sizeof(kc_user));
+    rc = keycloak_get_user(realm, client, username, &kc_user);
+    if (rc != KC_SUCCESS) {
+        log_module(CS_LOG, LOG_DEBUG, "chanserv_push_keycloak_access: User '%s' not found in Keycloak",
+                   username);
+        keycloak_free_access_token(client.access_token);
+        return KC_SUCCESS; /* Not an error - user may not have Keycloak account */
+    }
+
+    /* If access is 0, we need to remove user from the group */
+    if (access == 0) {
+        /* Find and remove from channel group */
+        snprintf(group_path, sizeof(group_path), "/irc-channels/%s", channel);
+        rc = keycloak_get_group_by_path(realm, client, group_path, &group_id);
+        if (rc == KC_SUCCESS && group_id) {
+            keycloak_remove_user_from_group(realm, client, kc_user.id, group_id);
+            free(group_id);
+        }
+        keycloak_user_free_fields(&kc_user);
+        keycloak_free_access_token(client.access_token);
+        return KC_SUCCESS;
+    }
+
+    /* Create or get the channel group with the new access level */
+    rc = keycloak_create_channel_group(realm, client, channel, access, &group_id);
+    if (rc != KC_SUCCESS || !group_id) {
+        log_module(CS_LOG, LOG_DEBUG, "chanserv_push_keycloak_access: Failed to create/get channel group");
+        keycloak_user_free_fields(&kc_user);
+        keycloak_free_access_token(client.access_token);
+        return KC_ERROR;
+    }
+
+    /* Update the group's access level attribute (in case it changed) */
+    snprintf(level_str, sizeof(level_str), "%u", access);
+    keycloak_set_group_attribute(realm, client, group_id,
+                                 chanserv_conf.keycloak_access_level_attr, level_str);
+
+    /* Add user to the group */
+    rc = keycloak_add_user_to_group(realm, client, kc_user.id, group_id);
+    if (rc != KC_SUCCESS) {
+        log_module(CS_LOG, LOG_DEBUG, "chanserv_push_keycloak_access: Failed to add user to group");
+    } else {
+        log_module(CS_LOG, LOG_DEBUG, "chanserv_push_keycloak_access: Added %s to %s group with level %d",
+                   username, channel, access);
+    }
+
+    /* Cleanup */
+    free(group_id);
+    keycloak_user_free_fields(&kc_user);
+    keycloak_free_access_token(client.access_token);
+
+    return rc;
+}
+
+/**
+ * Remove channel group from Keycloak when channel is unregistered
+ *
+ * @param channel    Channel name (with #)
+ * @return KC_SUCCESS on success, KC_ERROR on failure
+ */
+static int
+chanserv_delete_keycloak_channel(const char *channel)
+{
+    struct kc_realm realm;
+    struct kc_client client;
+    char *group_id = NULL;
+    char group_path[256];
+    int rc;
+
+    if (!nickserv_conf.keycloak_enable || !chanserv_conf.keycloak_access_sync ||
+        !chanserv_conf.keycloak_bidirectional)
+        return KC_SUCCESS;
+
+    if (!channel)
+        return KC_ERROR;
+
+    log_module(CS_LOG, LOG_DEBUG, "chanserv_delete_keycloak_channel: %s", channel);
+
+    /* Setup Keycloak connection */
+    realm.base_uri = (char*)nickserv_conf.keycloak_uri;
+    realm.realm = nickserv_conf.keycloak_realm;
+    client.client_id = (char*)nickserv_conf.keycloak_client_id;
+    client.client_secret = (char*)nickserv_conf.keycloak_client_secret;
+    client.access_token = NULL;
+
+    /* Get client token */
+    rc = keycloak_get_client_token(realm, client, &client.access_token);
+    if (rc != KC_SUCCESS) {
+        log_module(CS_LOG, LOG_DEBUG, "chanserv_delete_keycloak_channel: Failed to get token");
+        return KC_ERROR;
+    }
+
+    /* Find the channel group */
+    snprintf(group_path, sizeof(group_path), "/irc-channels/%s", channel);
+    rc = keycloak_get_group_by_path(realm, client, group_path, &group_id);
+    if (rc == KC_NOT_FOUND) {
+        /* Group doesn't exist - that's fine */
+        keycloak_free_access_token(client.access_token);
+        return KC_SUCCESS;
+    }
+    if (rc != KC_SUCCESS || !group_id) {
+        keycloak_free_access_token(client.access_token);
+        return KC_ERROR;
+    }
+
+    /* Delete the group */
+    rc = keycloak_delete_group(realm, client, group_id);
+    if (rc == KC_SUCCESS) {
+        log_module(CS_LOG, LOG_DEBUG, "chanserv_delete_keycloak_channel: Deleted group for %s", channel);
+    }
+
+    free(group_id);
+    keycloak_free_access_token(client.access_token);
+
+    return rc;
 }
 
 /**
@@ -10451,8 +10774,9 @@ chanserv_sync_keycloak_access(UNUSED_ARG(void *data))
         return;
     }
 
-    log_module(CS_LOG, LOG_INFO, "Starting Keycloak channel access sync (%s mode, prefix: %s)...",
+    log_module(CS_LOG, LOG_INFO, "Starting Keycloak channel access sync (%s%s, prefix: %s)...",
                chanserv_conf.keycloak_hierarchical_groups ? "hierarchical" : "flat",
+               chanserv_conf.keycloak_use_group_attributes ? "+attribute" : "",
                chanserv_conf.keycloak_group_prefix);
 
     /* Iterate through all registered channels */

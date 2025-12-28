@@ -1971,6 +1971,231 @@ void keycloak_free_group_members(struct kc_group_member* members)
     }
 }
 
+void keycloak_free_group_info(struct kc_group_info* info)
+{
+    if (!info)
+        return;
+
+    if (info->id)
+        free(info->id);
+    if (info->name)
+        free(info->name);
+    if (info->path)
+        free(info->path);
+    if (info->attributes)
+        keycloak_free_metadata_entries(info->attributes);
+
+    free(info);
+}
+
+int keycloak_get_group_info(struct kc_realm realm, struct kc_client client,
+                            const char* group_id, struct kc_group_info** info_out)
+{
+    if (!realm.base_uri || !realm.realm || !client.access_token ||
+        !group_id || !info_out) {
+        log_module(KC_LOG, LOG_DEBUG, "keycloak_get_group_info: Invalid arguments");
+        return KC_ERROR;
+    }
+
+    *info_out = NULL;
+    int result = KC_ERROR;
+    char* uri = NULL;
+    struct memory chunk = { .response = NULL, .size = 0 };
+
+    /* Build URI: GET /admin/realms/{realm}/groups/{group_id} */
+    static const char uri_tmpl[] = "%s/admin/realms/%s/groups/%s";
+    int uri_len = snprintf(NULL, 0, uri_tmpl, realm.base_uri, realm.realm, group_id) + 1;
+    uri = malloc(uri_len);
+    if (!uri) {
+        log_module(KC_LOG, LOG_DEBUG, "keycloak_get_group_info: Failed to allocate uri");
+        return KC_ERROR;
+    }
+    snprintf(uri, uri_len, uri_tmpl, realm.base_uri, realm.realm, group_id);
+
+    struct curl_opts opts = {
+        .uri = uri,
+        .method = HTTP_GET,
+        .xoauth2_bearer = client.access_token->access_token,
+        .write_callback = curl_write_cb,
+        .header_count = 0
+    };
+
+    long http_code = curl_perform(opts, &chunk);
+
+    if (http_code == 404) {
+        result = KC_NOT_FOUND;
+        goto cleanup;
+    }
+
+    if (http_code != 200 || !chunk.response) {
+        log_module(KC_LOG, LOG_DEBUG, "keycloak_get_group_info: Failed with HTTP %ld", http_code);
+        goto cleanup;
+    }
+
+    /* Parse JSON response */
+    json_error_t error;
+    json_t* root = json_loads(chunk.response, 0, &error);
+    if (!root) {
+        log_module(KC_LOG, LOG_DEBUG, "keycloak_get_group_info: Failed to parse JSON: %s", error.text);
+        goto cleanup;
+    }
+
+    if (!json_is_object(root)) {
+        log_module(KC_LOG, LOG_DEBUG, "keycloak_get_group_info: Response is not an object");
+        json_decref(root);
+        goto cleanup;
+    }
+
+    /* Allocate group info struct */
+    struct kc_group_info* info = calloc(1, sizeof(struct kc_group_info));
+    if (!info) {
+        json_decref(root);
+        goto cleanup;
+    }
+
+    /* Extract basic fields */
+    const char* id_val = json_string_value(json_object_get(root, "id"));
+    const char* name_val = json_string_value(json_object_get(root, "name"));
+    const char* path_val = json_string_value(json_object_get(root, "path"));
+
+    if (id_val) info->id = strdup(id_val);
+    if (name_val) info->name = strdup(name_val);
+    if (path_val) info->path = strdup(path_val);
+
+    /* Parse attributes */
+    json_t* attrs = json_object_get(root, "attributes");
+    if (attrs && json_is_object(attrs)) {
+        const char* key;
+        json_t* value;
+        struct kc_metadata_entry* head = NULL;
+        struct kc_metadata_entry* tail = NULL;
+
+        json_object_foreach(attrs, key, value) {
+            /* Attributes are arrays, get first element */
+            const char* val_str = NULL;
+            if (json_is_array(value) && json_array_size(value) > 0) {
+                val_str = json_string_value(json_array_get(value, 0));
+            } else if (json_is_string(value)) {
+                val_str = json_string_value(value);
+            }
+
+            if (key && val_str) {
+                struct kc_metadata_entry* entry = calloc(1, sizeof(*entry));
+                if (entry) {
+                    entry->key = strdup(key);
+                    entry->value = strdup(val_str);
+                    entry->next = NULL;
+
+                    if (!head) {
+                        head = tail = entry;
+                    } else {
+                        tail->next = entry;
+                        tail = entry;
+                    }
+
+                    /* Check for x3_access_level */
+                    if (strcmp(key, "x3_access_level") == 0) {
+                        info->access_level = (unsigned short)atoi(val_str);
+                        log_module(KC_LOG, LOG_DEBUG,
+                                   "keycloak_get_group_info: Found x3_access_level=%d",
+                                   info->access_level);
+                    }
+                }
+            }
+        }
+        info->attributes = head;
+    }
+
+    *info_out = info;
+    result = KC_SUCCESS;
+    json_decref(root);
+
+cleanup:
+    if (chunk.response) {
+        memset(chunk.response, 0, chunk.size);
+        free(chunk.response);
+    }
+    if (uri) {
+        free(uri);
+    }
+
+    return result;
+}
+
+int keycloak_get_group_attribute(struct kc_realm realm, struct kc_client client,
+                                 const char* group_id, const char* attr_name,
+                                 char** value_out)
+{
+    if (!realm.base_uri || !realm.realm || !client.access_token ||
+        !group_id || !attr_name || !value_out) {
+        log_module(KC_LOG, LOG_DEBUG, "keycloak_get_group_attribute: Invalid arguments");
+        return KC_ERROR;
+    }
+
+    *value_out = NULL;
+
+    /* Fetch full group info */
+    struct kc_group_info* info = NULL;
+    int rc = keycloak_get_group_info(realm, client, group_id, &info);
+    if (rc != KC_SUCCESS) {
+        return rc;
+    }
+
+    /* Search for the attribute */
+    int result = KC_NOT_FOUND;
+    for (struct kc_metadata_entry* e = info->attributes; e; e = e->next) {
+        if (strcmp(e->key, attr_name) == 0) {
+            *value_out = strdup(e->value);
+            if (*value_out) {
+                result = KC_SUCCESS;
+            } else {
+                result = KC_ERROR;
+            }
+            break;
+        }
+    }
+
+    keycloak_free_group_info(info);
+    return result;
+}
+
+int keycloak_get_group_members_with_level(struct kc_realm realm, struct kc_client client,
+                                          const char* group_id, struct kc_group_member** members_out)
+{
+    if (!realm.base_uri || !realm.realm || !client.access_token ||
+        !group_id || !members_out) {
+        log_module(KC_LOG, LOG_DEBUG, "keycloak_get_group_members_with_level: Invalid arguments");
+        return KC_ERROR;
+    }
+
+    *members_out = NULL;
+
+    /* First, get the group info to get the access level */
+    struct kc_group_info* info = NULL;
+    int rc = keycloak_get_group_info(realm, client, group_id, &info);
+    if (rc != KC_SUCCESS) {
+        return rc;
+    }
+
+    unsigned short access_level = info->access_level;
+    keycloak_free_group_info(info);
+
+    /* Now get the group members */
+    struct kc_group_member* members = NULL;
+    rc = keycloak_get_group_members(realm, client, group_id, &members);
+    if (rc < 0) {
+        return rc;
+    }
+
+    /* Set access_level on all members */
+    for (struct kc_group_member* m = members; m; m = m->next) {
+        m->access_level = access_level;
+    }
+
+    *members_out = members;
+    return rc; /* Returns count of members */
+}
+
 int keycloak_find_user_by_fingerprint(struct kc_realm realm, struct kc_client client,
                                        const char* fingerprint, char** username_out)
 {
@@ -2082,6 +2307,461 @@ cleanup:
     }
     if (uri) {
         free(uri);
+    }
+
+    return result;
+}
+
+int keycloak_create_group(struct kc_realm realm, struct kc_client client,
+                          const char* group_name, char** group_id_out)
+{
+    if (!realm.base_uri || !realm.realm || !client.access_token || !group_name) {
+        log_module(KC_LOG, LOG_DEBUG, "keycloak_create_group: Invalid arguments");
+        return KC_ERROR;
+    }
+
+    if (group_id_out)
+        *group_id_out = NULL;
+
+    int result = KC_ERROR;
+    char* uri = NULL;
+    char* json_body = NULL;
+    struct memory chunk = { .response = NULL, .size = 0 };
+
+    /* Build URI: POST /admin/realms/{realm}/groups */
+    static const char uri_tmpl[] = "%s/admin/realms/%s/groups";
+    int uri_len = snprintf(NULL, 0, uri_tmpl, realm.base_uri, realm.realm) + 1;
+    uri = malloc(uri_len);
+    if (!uri) {
+        log_module(KC_LOG, LOG_DEBUG, "keycloak_create_group: Failed to allocate uri");
+        goto cleanup;
+    }
+    snprintf(uri, uri_len, uri_tmpl, realm.base_uri, realm.realm);
+
+    /* Build JSON: { "name": "group_name" } */
+    json_t* group_obj = json_object();
+    json_object_set_new(group_obj, "name", json_string(group_name));
+    json_body = json_dumps(group_obj, JSON_COMPACT);
+    json_decref(group_obj);
+
+    if (!json_body) {
+        log_module(KC_LOG, LOG_DEBUG, "keycloak_create_group: Failed to build JSON");
+        goto cleanup;
+    }
+
+    struct curl_opts opts = {
+        .uri = uri,
+        .method = HTTP_POST,
+        .post_fields = json_body,
+        .xoauth2_bearer = client.access_token->access_token,
+        .write_callback = curl_write_cb,
+        .header_list = { "Content-Type: application/json" },
+        .header_count = 1
+    };
+
+    long http_code = curl_perform(opts, &chunk);
+
+    if (http_code == 201) {
+        log_module(KC_LOG, LOG_DEBUG, "keycloak_create_group: Group '%s' created (HTTP 201)",
+            group_name);
+        result = KC_SUCCESS;
+
+        /* Try to get the group ID - need to look it up since Keycloak doesn't return it */
+        if (group_id_out) {
+            keycloak_get_group_by_name(realm, client, group_name, group_id_out);
+        }
+    } else if (http_code == 409) {
+        log_module(KC_LOG, LOG_DEBUG, "keycloak_create_group: Group '%s' already exists (HTTP 409)",
+            group_name);
+        result = KC_USER_EXISTS;
+
+        /* Still get the ID if requested */
+        if (group_id_out) {
+            keycloak_get_group_by_name(realm, client, group_name, group_id_out);
+        }
+    } else {
+        log_module(KC_LOG, LOG_DEBUG, "keycloak_create_group: Failed with HTTP %ld: %s",
+            http_code, chunk.response ? chunk.response : "no response");
+    }
+
+cleanup:
+    if (chunk.response) {
+        memset(chunk.response, 0, chunk.size);
+        free(chunk.response);
+    }
+    if (json_body) {
+        free(json_body);
+    }
+    if (uri) {
+        free(uri);
+    }
+
+    return result;
+}
+
+int keycloak_create_subgroup(struct kc_realm realm, struct kc_client client,
+                             const char* parent_id, const char* group_name,
+                             char** group_id_out)
+{
+    if (!realm.base_uri || !realm.realm || !client.access_token ||
+        !parent_id || !group_name) {
+        log_module(KC_LOG, LOG_DEBUG, "keycloak_create_subgroup: Invalid arguments");
+        return KC_ERROR;
+    }
+
+    if (group_id_out)
+        *group_id_out = NULL;
+
+    int result = KC_ERROR;
+    char* uri = NULL;
+    char* json_body = NULL;
+    struct memory chunk = { .response = NULL, .size = 0 };
+
+    /* Build URI: POST /admin/realms/{realm}/groups/{parent_id}/children */
+    static const char uri_tmpl[] = "%s/admin/realms/%s/groups/%s/children";
+    int uri_len = snprintf(NULL, 0, uri_tmpl, realm.base_uri, realm.realm, parent_id) + 1;
+    uri = malloc(uri_len);
+    if (!uri) {
+        log_module(KC_LOG, LOG_DEBUG, "keycloak_create_subgroup: Failed to allocate uri");
+        goto cleanup;
+    }
+    snprintf(uri, uri_len, uri_tmpl, realm.base_uri, realm.realm, parent_id);
+
+    /* Build JSON: { "name": "group_name" } */
+    json_t* group_obj = json_object();
+    json_object_set_new(group_obj, "name", json_string(group_name));
+    json_body = json_dumps(group_obj, JSON_COMPACT);
+    json_decref(group_obj);
+
+    if (!json_body) {
+        log_module(KC_LOG, LOG_DEBUG, "keycloak_create_subgroup: Failed to build JSON");
+        goto cleanup;
+    }
+
+    struct curl_opts opts = {
+        .uri = uri,
+        .method = HTTP_POST,
+        .post_fields = json_body,
+        .xoauth2_bearer = client.access_token->access_token,
+        .write_callback = curl_write_cb,
+        .header_list = { "Content-Type: application/json" },
+        .header_count = 1
+    };
+
+    long http_code = curl_perform(opts, &chunk);
+
+    if (http_code == 201) {
+        log_module(KC_LOG, LOG_DEBUG, "keycloak_create_subgroup: Subgroup '%s' created (HTTP 201)",
+            group_name);
+        result = KC_SUCCESS;
+
+        /* Get the group ID by looking up by path */
+        if (group_id_out) {
+            /* We need to get parent info to build the path */
+            struct kc_group_info* parent_info = NULL;
+            if (keycloak_get_group_info(realm, client, parent_id, &parent_info) == KC_SUCCESS) {
+                /* Build child path: parent_path + "/" + group_name */
+                char* child_path = NULL;
+                int path_len = snprintf(NULL, 0, "%s/%s", parent_info->path, group_name) + 1;
+                child_path = malloc(path_len);
+                if (child_path) {
+                    snprintf(child_path, path_len, "%s/%s", parent_info->path, group_name);
+                    keycloak_get_group_by_path(realm, client, child_path, group_id_out);
+                    free(child_path);
+                }
+                keycloak_free_group_info(parent_info);
+            }
+        }
+    } else if (http_code == 409) {
+        log_module(KC_LOG, LOG_DEBUG, "keycloak_create_subgroup: Subgroup '%s' already exists (HTTP 409)",
+            group_name);
+        result = KC_USER_EXISTS;
+    } else if (http_code == 404) {
+        log_module(KC_LOG, LOG_DEBUG, "keycloak_create_subgroup: Parent group not found (HTTP 404)");
+        result = KC_NOT_FOUND;
+    } else {
+        log_module(KC_LOG, LOG_DEBUG, "keycloak_create_subgroup: Failed with HTTP %ld: %s",
+            http_code, chunk.response ? chunk.response : "no response");
+    }
+
+cleanup:
+    if (chunk.response) {
+        memset(chunk.response, 0, chunk.size);
+        free(chunk.response);
+    }
+    if (json_body) {
+        free(json_body);
+    }
+    if (uri) {
+        free(uri);
+    }
+
+    return result;
+}
+
+int keycloak_set_group_attribute(struct kc_realm realm, struct kc_client client,
+                                 const char* group_id, const char* attr_name,
+                                 const char* attr_value)
+{
+    if (!realm.base_uri || !realm.realm || !client.access_token ||
+        !group_id || !attr_name || !attr_value) {
+        log_module(KC_LOG, LOG_DEBUG, "keycloak_set_group_attribute: Invalid arguments");
+        return KC_ERROR;
+    }
+
+    int result = KC_ERROR;
+    char* uri = NULL;
+    char* json_body = NULL;
+    struct memory chunk = { .response = NULL, .size = 0 };
+
+    /* First, get the existing group to preserve its current state */
+    struct kc_group_info* info = NULL;
+    int rc = keycloak_get_group_info(realm, client, group_id, &info);
+    if (rc == KC_NOT_FOUND) {
+        return KC_NOT_FOUND;
+    }
+    if (rc != KC_SUCCESS || !info) {
+        return KC_ERROR;
+    }
+
+    /* Build URI: PUT /admin/realms/{realm}/groups/{group_id} */
+    static const char uri_tmpl[] = "%s/admin/realms/%s/groups/%s";
+    int uri_len = snprintf(NULL, 0, uri_tmpl, realm.base_uri, realm.realm, group_id) + 1;
+    uri = malloc(uri_len);
+    if (!uri) {
+        log_module(KC_LOG, LOG_DEBUG, "keycloak_set_group_attribute: Failed to allocate uri");
+        keycloak_free_group_info(info);
+        goto cleanup;
+    }
+    snprintf(uri, uri_len, uri_tmpl, realm.base_uri, realm.realm, group_id);
+
+    /* Build JSON with existing attributes + new attribute */
+    json_t* group_obj = json_object();
+    json_t* attrs = json_object();
+
+    /* Copy existing attributes */
+    for (struct kc_metadata_entry* e = info->attributes; e; e = e->next) {
+        json_t* values = json_array();
+        json_array_append_new(values, json_string(e->value));
+        json_object_set_new(attrs, e->key, values);
+    }
+
+    /* Add/update the new attribute */
+    json_t* new_values = json_array();
+    json_array_append_new(new_values, json_string(attr_value));
+    json_object_set_new(attrs, attr_name, new_values);
+
+    json_object_set_new(group_obj, "name", json_string(info->name));
+    json_object_set_new(group_obj, "attributes", attrs);
+
+    json_body = json_dumps(group_obj, JSON_COMPACT);
+    json_decref(group_obj);
+    keycloak_free_group_info(info);
+
+    if (!json_body) {
+        log_module(KC_LOG, LOG_DEBUG, "keycloak_set_group_attribute: Failed to build JSON");
+        goto cleanup;
+    }
+
+    struct curl_opts opts = {
+        .uri = uri,
+        .method = HTTP_PUT,
+        .post_fields = json_body,
+        .xoauth2_bearer = client.access_token->access_token,
+        .write_callback = curl_write_cb,
+        .header_list = { "Content-Type: application/json" },
+        .header_count = 1
+    };
+
+    long http_code = curl_perform(opts, &chunk);
+
+    if (http_code == 204) {
+        log_module(KC_LOG, LOG_DEBUG, "keycloak_set_group_attribute: Attribute '%s' set on group (HTTP 204)",
+            attr_name);
+        result = KC_SUCCESS;
+    } else if (http_code == 404) {
+        log_module(KC_LOG, LOG_DEBUG, "keycloak_set_group_attribute: Group not found (HTTP 404)");
+        result = KC_NOT_FOUND;
+    } else {
+        log_module(KC_LOG, LOG_DEBUG, "keycloak_set_group_attribute: Failed with HTTP %ld: %s",
+            http_code, chunk.response ? chunk.response : "no response");
+    }
+
+cleanup:
+    if (chunk.response) {
+        memset(chunk.response, 0, chunk.size);
+        free(chunk.response);
+    }
+    if (json_body) {
+        free(json_body);
+    }
+    if (uri) {
+        free(uri);
+    }
+
+    return result;
+}
+
+int keycloak_delete_group(struct kc_realm realm, struct kc_client client,
+                          const char* group_id)
+{
+    if (!realm.base_uri || !realm.realm || !client.access_token || !group_id) {
+        log_module(KC_LOG, LOG_DEBUG, "keycloak_delete_group: Invalid arguments");
+        return KC_ERROR;
+    }
+
+    int result = KC_ERROR;
+    char* uri = NULL;
+    struct memory chunk = { .response = NULL, .size = 0 };
+
+    /* Build URI: DELETE /admin/realms/{realm}/groups/{group_id} */
+    static const char uri_tmpl[] = "%s/admin/realms/%s/groups/%s";
+    int uri_len = snprintf(NULL, 0, uri_tmpl, realm.base_uri, realm.realm, group_id) + 1;
+    uri = malloc(uri_len);
+    if (!uri) {
+        log_module(KC_LOG, LOG_DEBUG, "keycloak_delete_group: Failed to allocate uri");
+        goto cleanup;
+    }
+    snprintf(uri, uri_len, uri_tmpl, realm.base_uri, realm.realm, group_id);
+
+    struct curl_opts opts = {
+        .uri = uri,
+        .method = HTTP_DELETE,
+        .xoauth2_bearer = client.access_token->access_token,
+        .write_callback = curl_write_cb,
+        .header_count = 0
+    };
+
+    long http_code = curl_perform(opts, &chunk);
+
+    if (http_code == 204) {
+        log_module(KC_LOG, LOG_DEBUG, "keycloak_delete_group: Group deleted (HTTP 204)");
+        result = KC_SUCCESS;
+    } else if (http_code == 404) {
+        log_module(KC_LOG, LOG_DEBUG, "keycloak_delete_group: Group not found (HTTP 404)");
+        result = KC_NOT_FOUND;
+    } else {
+        log_module(KC_LOG, LOG_DEBUG, "keycloak_delete_group: Failed with HTTP %ld: %s",
+            http_code, chunk.response ? chunk.response : "no response");
+    }
+
+cleanup:
+    if (chunk.response) {
+        memset(chunk.response, 0, chunk.size);
+        free(chunk.response);
+    }
+    if (uri) {
+        free(uri);
+    }
+
+    return result;
+}
+
+int keycloak_ensure_channels_parent(struct kc_realm realm, struct kc_client client,
+                                    char** group_id_out)
+{
+    if (!realm.base_uri || !realm.realm || !client.access_token || !group_id_out) {
+        log_module(KC_LOG, LOG_DEBUG, "keycloak_ensure_channels_parent: Invalid arguments");
+        return KC_ERROR;
+    }
+
+    *group_id_out = NULL;
+
+    /* Try to find existing "irc-channels" group */
+    static const char parent_name[] = "irc-channels";
+    int rc = keycloak_get_group_by_name(realm, client, parent_name, group_id_out);
+
+    if (rc == KC_SUCCESS && *group_id_out) {
+        log_module(KC_LOG, LOG_DEBUG, "keycloak_ensure_channels_parent: Found existing parent group");
+        return KC_SUCCESS;
+    }
+
+    /* Create the parent group */
+    log_module(KC_LOG, LOG_DEBUG, "keycloak_ensure_channels_parent: Creating parent group '%s'",
+        parent_name);
+
+    rc = keycloak_create_group(realm, client, parent_name, group_id_out);
+    if (rc == KC_SUCCESS || rc == KC_USER_EXISTS) {
+        return KC_SUCCESS;
+    }
+
+    return KC_ERROR;
+}
+
+int keycloak_create_channel_group(struct kc_realm realm, struct kc_client client,
+                                  const char* channel_name, unsigned short access_level,
+                                  char** group_id_out)
+{
+    if (!realm.base_uri || !realm.realm || !client.access_token || !channel_name) {
+        log_module(KC_LOG, LOG_DEBUG, "keycloak_create_channel_group: Invalid arguments");
+        return KC_ERROR;
+    }
+
+    if (group_id_out)
+        *group_id_out = NULL;
+
+    int result = KC_ERROR;
+    char* parent_id = NULL;
+    char* channel_group_id = NULL;
+
+    /* Step 1: Ensure parent "irc-channels" group exists */
+    int rc = keycloak_ensure_channels_parent(realm, client, &parent_id);
+    if (rc != KC_SUCCESS || !parent_id) {
+        log_module(KC_LOG, LOG_DEBUG, "keycloak_create_channel_group: Failed to ensure parent group");
+        goto cleanup;
+    }
+
+    /* Step 2: Create or get the channel group */
+    rc = keycloak_create_subgroup(realm, client, parent_id, channel_name, &channel_group_id);
+    if (rc != KC_SUCCESS && rc != KC_USER_EXISTS) {
+        log_module(KC_LOG, LOG_DEBUG, "keycloak_create_channel_group: Failed to create channel group");
+        goto cleanup;
+    }
+
+    /* If group already existed, we need to look up its ID */
+    if (!channel_group_id) {
+        char* path = NULL;
+        int path_len = snprintf(NULL, 0, "/irc-channels/%s", channel_name) + 1;
+        path = malloc(path_len);
+        if (path) {
+            snprintf(path, path_len, "/irc-channels/%s", channel_name);
+            keycloak_get_group_by_path(realm, client, path, &channel_group_id);
+            free(path);
+        }
+    }
+
+    if (!channel_group_id) {
+        log_module(KC_LOG, LOG_DEBUG, "keycloak_create_channel_group: Failed to get channel group ID");
+        goto cleanup;
+    }
+
+    /* Step 3: Set the access level attribute */
+    char level_str[16];
+    snprintf(level_str, sizeof(level_str), "%u", access_level);
+
+    rc = keycloak_set_group_attribute(realm, client, channel_group_id,
+                                      "x3_access_level", level_str);
+    if (rc != KC_SUCCESS) {
+        log_module(KC_LOG, LOG_DEBUG, "keycloak_create_channel_group: Failed to set access_level attribute");
+        goto cleanup;
+    }
+
+    log_module(KC_LOG, LOG_DEBUG, "keycloak_create_channel_group: Created/updated group for %s with level %u",
+        channel_name, access_level);
+
+    result = KC_SUCCESS;
+
+    if (group_id_out) {
+        *group_id_out = channel_group_id;
+        channel_group_id = NULL; /* Don't free it */
+    }
+
+cleanup:
+    if (parent_id) {
+        free(parent_id);
+    }
+    if (channel_group_id) {
+        free(channel_group_id);
     }
 
     return result;

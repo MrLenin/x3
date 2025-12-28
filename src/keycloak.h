@@ -280,7 +280,19 @@ int keycloak_get_group_by_path(struct kc_realm realm, struct kc_client client,
 struct kc_group_member {
     char* username;
     char* user_id;
+    unsigned short access_level;   /* Access level from group attribute (0 if not set) */
     struct kc_group_member* next;
+};
+
+/**
+ * Group information including attributes
+ */
+struct kc_group_info {
+    char* id;
+    char* name;
+    char* path;
+    unsigned short access_level;   /* Parsed from x3_access_level attribute */
+    struct kc_metadata_entry* attributes;
 };
 
 /**
@@ -299,6 +311,49 @@ int keycloak_get_group_members(struct kc_realm realm, struct kc_client client,
  * @param members     Head of the list to free (can be NULL)
  */
 void keycloak_free_group_members(struct kc_group_member* members);
+
+/**
+ * Gets a Keycloak group by ID with full attributes
+ * @param realm        Keycloak realm configuration
+ * @param client       Client with admin access token
+ * @param group_id     Group's Keycloak ID (UUID)
+ * @param info_out     Output pointer for group info (caller must free with keycloak_free_group_info)
+ * @return KC_SUCCESS on success, KC_NOT_FOUND if group doesn't exist, KC_ERROR on failure
+ */
+int keycloak_get_group_info(struct kc_realm realm, struct kc_client client,
+                            const char* group_id, struct kc_group_info** info_out);
+
+/**
+ * Gets a custom attribute from a Keycloak group
+ * @param realm        Keycloak realm configuration
+ * @param client       Client with admin access token
+ * @param group_id     Group's Keycloak ID (UUID)
+ * @param attr_name    Attribute name (e.g., "x3_access_level")
+ * @param value_out    Output pointer for attribute value (caller must free)
+ * @return KC_SUCCESS on success, KC_NOT_FOUND if group or attr doesn't exist, KC_ERROR on failure
+ */
+int keycloak_get_group_attribute(struct kc_realm realm, struct kc_client client,
+                                 const char* group_id, const char* attr_name,
+                                 char** value_out);
+
+/**
+ * Gets group members with access level from group attribute
+ * Convenience function that fetches group info first to get access_level,
+ * then fetches members and populates their access_level field
+ * @param realm        Keycloak realm configuration
+ * @param client       Client with admin access token
+ * @param group_id     Group's Keycloak ID (UUID)
+ * @param members_out  Output pointer for linked list of members with access_level populated
+ * @return Number of members found (>= 0), KC_NOT_FOUND if group doesn't exist, KC_ERROR on failure
+ */
+int keycloak_get_group_members_with_level(struct kc_realm realm, struct kc_client client,
+                                          const char* group_id, struct kc_group_member** members_out);
+
+/**
+ * Frees memory allocated for a kc_group_info structure
+ * @param info      Pointer to group info (can be NULL)
+ */
+void keycloak_free_group_info(struct kc_group_info* info);
 
 /**
  * Introspects/validates an OAuth2 bearer token
@@ -335,6 +390,78 @@ void keycloak_free_token_info(struct kc_token_info* info);
  */
 int keycloak_find_user_by_fingerprint(struct kc_realm realm, struct kc_client client,
                                        const char* fingerprint, char** username_out);
+
+/**
+ * Creates a new top-level group in Keycloak
+ * @param realm        Keycloak realm configuration
+ * @param client       Client with admin access token
+ * @param group_name   Name of the group to create
+ * @param group_id_out Output pointer for created group's ID (caller must free, can be NULL)
+ * @return KC_SUCCESS on success, KC_USER_EXISTS if group already exists, KC_ERROR on failure
+ */
+int keycloak_create_group(struct kc_realm realm, struct kc_client client,
+                          const char* group_name, char** group_id_out);
+
+/**
+ * Creates a new subgroup under an existing parent group
+ * @param realm          Keycloak realm configuration
+ * @param client         Client with admin access token
+ * @param parent_id      Parent group's Keycloak ID (UUID)
+ * @param group_name     Name of the subgroup to create
+ * @param group_id_out   Output pointer for created group's ID (caller must free, can be NULL)
+ * @return KC_SUCCESS on success, KC_USER_EXISTS if group already exists,
+ *         KC_NOT_FOUND if parent doesn't exist, KC_ERROR on failure
+ */
+int keycloak_create_subgroup(struct kc_realm realm, struct kc_client client,
+                             const char* parent_id, const char* group_name,
+                             char** group_id_out);
+
+/**
+ * Sets a custom attribute on a Keycloak group
+ * @param realm        Keycloak realm configuration
+ * @param client       Client with admin access token
+ * @param group_id     Group's Keycloak ID (UUID)
+ * @param attr_name    Attribute name (e.g., "x3_access_level")
+ * @param attr_value   Attribute value as string
+ * @return KC_SUCCESS on success, KC_NOT_FOUND if group doesn't exist, KC_ERROR on failure
+ */
+int keycloak_set_group_attribute(struct kc_realm realm, struct kc_client client,
+                                 const char* group_id, const char* attr_name,
+                                 const char* attr_value);
+
+/**
+ * Deletes a Keycloak group
+ * @param realm     Keycloak realm configuration
+ * @param client    Client with admin access token
+ * @param group_id  Group's Keycloak ID (UUID)
+ * @return KC_SUCCESS on success, KC_NOT_FOUND if group doesn't exist, KC_ERROR on failure
+ */
+int keycloak_delete_group(struct kc_realm realm, struct kc_client client,
+                          const char* group_id);
+
+/**
+ * Creates a group hierarchy for a channel with a specific access level
+ * Convenience function that creates /irc-channels/#channelname and sets x3_access_level
+ * @param realm          Keycloak realm configuration
+ * @param client         Client with admin access token
+ * @param channel_name   IRC channel name (e.g., "#help")
+ * @param access_level   Access level to set (1-500)
+ * @param group_id_out   Output pointer for created channel group's ID (caller must free, can be NULL)
+ * @return KC_SUCCESS on success, KC_ERROR on failure
+ */
+int keycloak_create_channel_group(struct kc_realm realm, struct kc_client client,
+                                  const char* channel_name, unsigned short access_level,
+                                  char** group_id_out);
+
+/**
+ * Ensures the parent "irc-channels" group exists, creating it if needed
+ * @param realm          Keycloak realm configuration
+ * @param client         Client with admin access token
+ * @param group_id_out   Output pointer for parent group's ID (caller must free)
+ * @return KC_SUCCESS on success, KC_ERROR on failure
+ */
+int keycloak_ensure_channels_parent(struct kc_realm realm, struct kc_client client,
+                                    char** group_id_out);
 
 /**
  * Initialize keycloak module
