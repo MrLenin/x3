@@ -10672,6 +10672,17 @@ chanserv_push_keycloak_access(const char *channel, const char *username, unsigne
         if (rc == KC_SUCCESS && group_id) {
             keycloak_remove_user_from_group(realm, client, kc_user.id, group_id);
             free(group_id);
+            log_module(CS_LOG, LOG_DEBUG, "chanserv_push_keycloak_access: Removed %s from %s group",
+                       username, channel);
+
+#ifdef WITH_LMDB
+            /* Remove from LMDB cache */
+            if (x3_lmdb_is_available()) {
+                x3_lmdb_chanaccess_delete(channel, username);
+                log_module(CS_LOG, LOG_DEBUG, "chanserv_push_keycloak_access: Removed LMDB cache for %s/%s",
+                           channel, username);
+            }
+#endif
         }
         keycloak_user_free_fields(&kc_user);
         keycloak_free_access_token(client.access_token);
@@ -10699,6 +10710,17 @@ chanserv_push_keycloak_access(const char *channel, const char *username, unsigne
     } else {
         log_module(CS_LOG, LOG_DEBUG, "chanserv_push_keycloak_access: Added %s to %s group with level %d",
                    username, channel, access);
+
+#ifdef WITH_LMDB
+        /* Update LMDB cache to keep it in sync with Keycloak */
+        if (x3_lmdb_is_available()) {
+            int lmdb_rc = x3_lmdb_chanaccess_set(channel, username, access);
+            if (lmdb_rc == LMDB_SUCCESS) {
+                log_module(CS_LOG, LOG_DEBUG, "chanserv_push_keycloak_access: Updated LMDB cache for %s/%s level %d",
+                           channel, username, access);
+            }
+        }
+#endif
     }
 
     /* Cleanup */
@@ -10764,6 +10786,17 @@ chanserv_delete_keycloak_channel(const char *channel)
     rc = keycloak_delete_group(realm, client, group_id);
     if (rc == KC_SUCCESS) {
         log_module(CS_LOG, LOG_DEBUG, "chanserv_delete_keycloak_channel: Deleted group for %s", channel);
+
+#ifdef WITH_LMDB
+        /* Clear all LMDB cache entries for this channel */
+        if (x3_lmdb_is_available()) {
+            int cleared = x3_lmdb_chanaccess_clear(channel);
+            if (cleared >= 0) {
+                log_module(CS_LOG, LOG_DEBUG, "chanserv_delete_keycloak_channel: Cleared %d LMDB entries for %s",
+                           cleared, channel);
+            }
+        }
+#endif
     }
 
     free(group_id);
