@@ -6325,6 +6325,15 @@ nickserv_set_user_metadata(struct handle_info *hi, const char *key, const char *
 
     /* Success if either backend succeeded */
     if (lmdb_ok || keycloak_ok) {
+        /* Push metadata to Nefarious for online users
+         * This proactively updates the IRCd's cache when metadata changes in X3.
+         */
+        struct userNode *user;
+        for (user = hi->users; user; user = user->next_authed) {
+            irc_metadata(user->nick, key, value, visibility);
+            log_module(NS_LOG, LOG_DEBUG, "nickserv_set_user_metadata: Pushed %s.%s to IRCd for online user %s",
+                       hi->handle, key, user->nick);
+        }
         return 0;
     }
 
