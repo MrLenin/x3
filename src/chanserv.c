@@ -2701,7 +2701,11 @@ static CHANSERV_FUNC(cmd_register)
 
     if(handle != user->handle_info)
         reply("CSMSG_PROXY_SUCCESS", handle->handle, channel->name);
-    else
+
+#ifdef WITH_KEYCLOAK
+    /* Push owner access to Keycloak when channel is registered */
+    chanserv_push_keycloak_access(channel->name, handle->handle, UL_OWNER);
+#endif
 
     sprintf(reason, "%s registered to %s by %s.", channel->name, handle->handle, user->handle_info->handle);
     global_message_args(MESSAGE_RECIPIENT_OPERS | MESSAGE_RECIPIENT_HELPERS, "CSMSG_REGISTERED_TO", channel->name, 
@@ -9217,6 +9221,7 @@ chanserv_conf_read(void)
     str = database_get_data(conf_node, KEY_CTCP_LONG_BAN_DURATION, RECDB_QSTRING);
     chanserv_conf.ctcp_long_ban_duration = str ? str : "1h";
     str = database_get_data(conf_node, KEY_MAX_OWNED, RECDB_QSTRING);
+    log_module(CS_LOG, LOG_DEBUG, "max_owned raw value: '%s'", str ? str : "(null)");
     chanserv_conf.max_owned = str ? atoi(str) : 5;
     str = database_get_data(conf_node, KEY_IRC_OPERATOR_EPITHET, RECDB_QSTRING);
     chanserv_conf.irc_operator_epithet = str ? str : "a megalomaniacal power hungry tyrant";
@@ -9225,6 +9230,7 @@ chanserv_conf_read(void)
     str = database_get_data(conf_node, KEY_SUPPORT_HELPER_EPITHET, RECDB_QSTRING);
     chanserv_conf.support_helper_epithet = str ? str : "a wannabe tyrant";
     str = database_get_data(conf_node, KEY_KEYCLOAK_ACCESS_SYNC, RECDB_QSTRING);
+    log_module(CS_LOG, LOG_DEBUG, "keycloak_access_sync raw value: '%s'", str ? str : "(null)");
     chanserv_conf.keycloak_access_sync = str ? enabled_string(str) : 0;
     str = database_get_data(conf_node, KEY_KEYCLOAK_HIERARCHICAL, RECDB_QSTRING);
     chanserv_conf.keycloak_hierarchical_groups = str ? enabled_string(str) : 0;
@@ -9244,6 +9250,13 @@ chanserv_conf_read(void)
     chanserv_conf.keycloak_sync_frequency = str ? ParseInterval(str) : 3600;
     str = database_get_data(conf_node, KEY_KEYCLOAK_BIDIRECTIONAL, RECDB_QSTRING);
     chanserv_conf.keycloak_bidirectional = str ? enabled_string(str) : 0;
+
+    /* Log Keycloak sync configuration */
+    log_module(CS_LOG, LOG_INFO, "Keycloak access sync config: access_sync=%d, bidirectional=%d, hierarchical=%d, prefix=%s",
+               chanserv_conf.keycloak_access_sync,
+               chanserv_conf.keycloak_bidirectional,
+               chanserv_conf.keycloak_hierarchical_groups,
+               chanserv_conf.keycloak_group_prefix);
 
     /* Channel metadata TTL configuration */
     str = database_get_data(conf_node, KEY_CHANNEL_METADATA_TTL_ENABLED, RECDB_QSTRING);
@@ -10611,6 +10624,11 @@ chanserv_push_keycloak_access(const char *channel, const char *username, unsigne
     char group_path[256];
     char level_str[16];
     int rc;
+
+    log_module(CS_LOG, LOG_DEBUG, "chanserv_push_keycloak_access: called for %s/%s level %d (kc_enable=%d, access_sync=%d, bidirectional=%d)",
+               channel ? channel : "(null)", username ? username : "(null)", access,
+               nickserv_conf.keycloak_enable, chanserv_conf.keycloak_access_sync,
+               chanserv_conf.keycloak_bidirectional);
 
     if (!nickserv_conf.keycloak_enable || !chanserv_conf.keycloak_access_sync ||
         !chanserv_conf.keycloak_bidirectional)

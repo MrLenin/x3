@@ -536,7 +536,7 @@
         "support_channel" ("#Operations", "#Help");
 
         // maximum number of channels a user may have. ( FORCE can override )
-        "max_owned" "2";
+        "max_owned" "50";
 
         // how long between automatic topic and userlist refreshes with TopicRefresh/Resync
         "refresh_period" "10h";
@@ -556,9 +556,17 @@
         "god_timeout" "30m";
 
         // What should valid registered channels look like?
-        // Be very carefull changing these. This default is 
+        // Be very carefull changing these. This default is
         // basically limited to letters, numbers, dash and underscore.
         "valid_channel_regex" "^#[-_a-z][-_a-z0-9]*$";
+
+        // Keycloak channel access sync
+        // Sync channel access levels to Keycloak groups for external visibility/management
+        // Uses hierarchical groups: /irc-channels/#channel/owner, /irc-channels/#channel/coowner, etc.
+        //"keycloak_access_sync" "0";  // 1=enable Keycloak group sync for channel access
+        //"keycloak_bidirectional_sync" "0";  // 1=push channel access changes to Keycloak groups
+        //"keycloak_hierarchical_groups" "1";  // Use hierarchical group paths (recommended)
+        //"keycloak_group_prefix" "irc-channels";  // Parent group for channel access
     };
 
     /* Global is a service bot that can send out network-wide messages for you. I
