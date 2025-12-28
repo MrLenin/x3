@@ -136,6 +136,7 @@
 #define CMD_MARKREAD            "MARKREAD"
 #define CMD_WEBPUSH             "WEBPUSH"
 #define CMD_TAGMSG              "TAGMSG"
+#define CMD_CHATHISTORY         "CHATHISTORY"
 
 /* Tokenized commands. */
 #define TOK_ACCOUNT		"AC"
@@ -246,6 +247,7 @@
 #define TOK_TAGMSG              "TM"
 #define TOK_VERIFY_ACCT         "VF"
 #define TOK_REGREPLY            "RR"
+#define TOK_CHATHISTORY         "CH"
 
 /* Protocol messages; aliased to full commands or tokens depending
    on compile-time configuration. ircu prefers tokens WITH THE
@@ -363,6 +365,7 @@
 #define P10_METADATAQUERY       TYPE(METADATAQUERY)
 #define P10_MARKREAD            TYPE(MARKREAD)
 #define P10_WEBPUSH             TYPE(WEBPUSH)
+#define P10_CHATHISTORY         TYPE(CHATHISTORY)
 
 /* Servers claiming to have a boot or link time before PREHISTORY
  * trigger errors to the log.  We hope no server has been running
@@ -3334,6 +3337,56 @@ static CMD_FUNC(cmd_tagmsg)
     return 1;
 }
 
+/** Handle CH (CHATHISTORY) command - P10 chathistory federation.
+ * Format from Nefarious:
+ *   [SERVER] CH Q <target> <subcmd> <ref> <limit> <reqid>   - Query
+ *   [SERVER] CH R <reqid> <msgid> <ts> <type> <sender> <account> :<content>  - Response
+ *   [SERVER] CH E <reqid> <count>   - End response
+ *
+ * X3 doesn't store chat history, so for queries we respond immediately
+ * with an end response indicating 0 messages.
+ */
+static CMD_FUNC(cmd_chathistory)
+{
+    const char *subcmd;
+    const char *reqid;
+
+    (void)origin;
+
+    if (argc < 2)
+        return 0;
+
+    subcmd = argv[1];
+
+    if (subcmd[0] == 'Q' && subcmd[1] == '\0') {
+        /* Query: CH Q <target> <subcmd> <ref> <limit> <reqid> */
+        if (argc < 7) {
+            log_module(MAIN_LOG, LOG_DEBUG, "CHATHISTORY Q: Not enough parameters (%d)", argc);
+            return 0;
+        }
+
+        reqid = argv[6];
+
+        /* X3 doesn't store chat history - respond with end (0 messages) */
+        putsock("%s " P10_CHATHISTORY " E %s 0", self->numeric, reqid);
+
+        log_module(MAIN_LOG, LOG_DEBUG, "CHATHISTORY: Responded to query %s with 0 messages", reqid);
+
+    } else if (subcmd[0] == 'R' && subcmd[1] == '\0') {
+        /* Response: ignore - we don't initiate queries */
+        log_module(MAIN_LOG, LOG_DEBUG, "CHATHISTORY: Ignoring response");
+
+    } else if (subcmd[0] == 'E' && subcmd[1] == '\0') {
+        /* End: ignore - we don't initiate queries */
+        log_module(MAIN_LOG, LOG_DEBUG, "CHATHISTORY: Ignoring end marker");
+
+    } else {
+        log_module(MAIN_LOG, LOG_DEBUG, "CHATHISTORY: Unknown subcommand %s", subcmd);
+    }
+
+    return 1;
+}
+
 static void
 p10_conf_reload(void) {
     hidden_host_suffix = conf_get_data("server/hidden_host", RECDB_QSTRING);
@@ -3557,6 +3610,10 @@ init_parse(void)
     dict_insert(irc_func_dict, TOK_TRACE, cmd_dummy);
     dict_insert(irc_func_dict, TOK_MOTD, cmd_dummy);
     dict_insert(irc_func_dict, TOK_UPING, cmd_dummy);
+
+    /* CHATHISTORY federation - respond with end marker (X3 has no history) */
+    dict_insert(irc_func_dict, CMD_CHATHISTORY, cmd_chathistory);
+    dict_insert(irc_func_dict, TOK_CHATHISTORY, cmd_chathistory);
 
     /* handle topics */
     dict_insert(irc_func_dict, "331", cmd_num_topic);
