@@ -1196,9 +1196,13 @@ sar_getaddr_request(struct sar_request *req)
     state = (struct sar_getaddr_state*)(req + 1);
 
     /* If we can and should, append the current search domain. */
-    if (state->search_pos < conf.sar_search->used)
+    if (state->search_pos < conf.sar_search->used) {
+        /* DNS names are limited to DNS_NAME_LENGTH; truncation is correct per RFC */
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wformat-truncation"
         snprintf(full_name, sizeof(full_name), "%s.%s", state->full_name, conf.sar_search->list[state->search_pos]);
-    else if (state->search_pos == conf.sar_search->used)
+#pragma GCC diagnostic pop
+    } else if (state->search_pos == conf.sar_search->used)
         safestrncpy(full_name, state->full_name, sizeof(full_name));
     else {
         log_module(sar_log, LOG_DEBUG, "sar_getaddr_request({id=%d}): failed", req->id);

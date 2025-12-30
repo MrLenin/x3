@@ -65,13 +65,13 @@ struct kc_token_info {
 };
 
 struct kc_realm {
-    char* base_uri;
+    const char* base_uri;
     const char* realm;
 };
 
 struct kc_client {
-    char* client_id;
-    char* client_secret;
+    const char* client_id;
+    const char* client_secret;
     struct access_token* access_token;
 };
 

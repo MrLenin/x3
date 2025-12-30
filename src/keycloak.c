@@ -30,13 +30,13 @@ enum http_method {
 };
 
 struct curl_opts {
-    char* uri;
+    const char* uri;
     const char* header_list[10];
     size_t header_count;
-    char* post_fields;
-    char* auth_user;
-    char* auth_passwd;
-    char* xoauth2_bearer;
+    const char* post_fields;
+    const char* auth_user;
+    const char* auth_passwd;
+    const char* xoauth2_bearer;
     curl_write_cb_ptr write_callback;
     enum http_method method;
 };

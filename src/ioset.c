@@ -587,8 +587,8 @@ ioset_events(struct io_fd *fd, int readable, int writable)
         if (active_fd != fd)
             break;
         engine->update(fd);
-        /* FALLTHRU */
 #ifdef WITH_SSL
+        /* fallthrough */
     case IO_SSL_HANDSHAKE:
         assert(active_fd == NULL || active_fd == fd);
         if (active_fd && fd->ssl) {
@@ -610,8 +610,8 @@ ioset_events(struct io_fd *fd, int readable, int writable)
         if (active_fd != fd)
             break;
         engine->update(fd);
-        break;
 #endif
+        break;
     case IO_CONNECTED:
         assert(active_fd == NULL || active_fd == fd);
         if (active_fd && readable) {

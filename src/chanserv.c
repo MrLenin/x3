@@ -8244,7 +8244,7 @@ static CHANSERV_FUNC(cmd_8ball)
         if(channel)
         {
             char response[MAXLEN];
-            sprintf(response, "\002%s\002: %s", user->nick, resp);
+            snprintf(response, sizeof(response), "\002%s\002: %s", user->nick, resp);
             irc_privmsg(cmd->parent->bot, channel->name, response);
         }
         else
@@ -8255,7 +8255,11 @@ static CHANSERV_FUNC(cmd_8ball)
   if(channel)
   {
         char response[MAXLEN];
-        sprintf(response, "\002%s\002: %s", user->nick, eb);
+        /* IRC messages are limited to MAXLEN anyway; truncation is acceptable */
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wformat-truncation"
+        snprintf(response, sizeof(response), "\002%s\002: %s", user->nick, eb);
+#pragma GCC diagnostic pop
         irc_privmsg(cmd->parent->bot, channel->name, response);
   }
   else
@@ -10833,7 +10837,7 @@ chanserv_sync_keycloak_access(UNUSED_ARG(void *data))
 
     /* Iterate through all registered channels */
     for (cData = channelList; cData; cData = cData->next) {
-        if (!cData->channel || !cData->channel->name)
+        if (!cData->channel || !cData->channel->name[0])
             continue;
 
         int synced = chanserv_sync_keycloak_channel(cData->channel->name);

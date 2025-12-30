@@ -2841,9 +2841,9 @@ static CMD_FUNC(cmd_register_acct)
     char result_msg[256];
     enum nickserv_register_result result;
 
-    log_module(MAIN_LOG, LOG_DEBUG, "cmd_register_acct: argc=%d", argc);
-    for (int i = 0; i < argc; i++) {
-        log_module(MAIN_LOG, LOG_DEBUG, "cmd_register_acct: argv[%d]='%s'", i, argv[i] ? argv[i] : "(null)");
+    log_module(MAIN_LOG, LOG_DEBUG, "cmd_register_acct: argc=%u", argc);
+    for (unsigned int i = 0; i < argc; i++) {
+        log_module(MAIN_LOG, LOG_DEBUG, "cmd_register_acct: argv[%u]='%s'", i, argv[i] ? argv[i] : "(null)");
     }
 
     if (argc < 6)
@@ -3783,7 +3783,8 @@ make_numeric(struct server *svr, int local_num, char *outbuf)
         slen = 1;
         llen = (local_num < 64*64) ? 2 : 3;
     }
-    strncpy(outbuf, svr->numeric, slen);
+    /* Intentionally copy only the server portion (1-2 chars) of the numeric */
+    memcpy(outbuf, svr->numeric, slen);
     inttobase64(outbuf+slen, local_num, llen);
     outbuf[slen+llen] = 0;
 }
@@ -3995,8 +3996,8 @@ AddUser(struct server* uplink, const char *nick, const char *ident, const char *
     safestrncpy(uNode->numeric, numeric, sizeof(uNode->numeric));
     irc_p10_pton(&uNode->ip, realip);
 
-    if (!uNode->crypthost && uNode->cryptip)
-        snprintf(uNode->crypthost, sizeof(uNode->crypthost), "%s", strdup(uNode->cryptip));
+    if (!uNode->crypthost[0] && uNode->cryptip[0])
+        snprintf(uNode->crypthost, sizeof(uNode->crypthost), "%s", uNode->cryptip);
     uNode->idle_since = timestamp;
     uNode->timestamp = timestamp;
     modeList_init(&uNode->channels);

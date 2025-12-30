@@ -1094,9 +1094,13 @@ generate_fakehost(struct handle_info *handle)
             for (target = handle->users; target; target = target->next_authed)
                break;
 
-            if (target)
+            if (target) {
+               /* crypthost may exceed HOSTLEN; truncation to HOSTLEN is correct */
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wformat-truncation"
                snprintf(buffer, sizeof(buffer), "%s", target->crypthost);
-            else
+#pragma GCC diagnostic pop
+            } else
                strncpy(buffer, "none", sizeof(buffer));
         }
         return buffer;
@@ -5098,7 +5102,7 @@ static void
 search_add2ldap_func (struct userNode *source, struct handle_info *match, UNUSED_ARG(struct nickserv_discrim *discrim))
 {
     int rc;
-    if(match->email_addr && match->passwd && match->handle) {
+    if(match->email_addr && match->passwd[0] && match->handle) {
 	    rc  = ldap_do_add(match->handle, match->passwd, match->email_addr);
 	    if(rc != LDAP_SUCCESS) {
 	       send_message(source, nickserv, "NSMSG_LDAP_FAIL_ADD", match->handle, ldap_err2string(rc));
@@ -5956,7 +5960,7 @@ loc_auth_oauth(const char *bearer_token, const char *username_hint, const char *
         }
 
         if (nickserv_conf.sync_log)
-            SyncLog("REGISTER %s %s %s %s", hi->handle, hi->passwd ? hi->passwd : "*", "@", "oauth");
+            SyncLog("REGISTER %s %s %s %s", hi->handle, hi->passwd[0] ? hi->passwd : "*", "@", "oauth");
     }
 
     if (!hi) {
@@ -6114,7 +6118,7 @@ loc_auth_external(const char *fingerprint, const char *authzid, const char *host
 
                     if (nickserv_conf.sync_log)
                         SyncLog("REGISTER %s %s %s %s", hi->handle,
-                                hi->passwd ? hi->passwd : "*", "@", "external");
+                                hi->passwd[0] ? hi->passwd : "*", "@", "external");
                 }
 
                 free(kc_username);
@@ -7459,7 +7463,7 @@ sasl_get_session(const char *uid)
     sess = malloc(sizeof(struct SASLSession));
     memset(sess, 0, sizeof(struct SASLSession));
 
-    strncpy(sess->uid, uid, 128);
+    safestrncpy(sess->uid, uid, sizeof(sess->uid));
 
     if (!saslsessions)
         timeq_add(now + 30, sasl_delete_stale, NULL);

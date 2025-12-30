@@ -519,7 +519,7 @@ int ldap_do_oslevel(const char *account, int level, int oldlevel)
 
   snprintf(dn, MAXLEN-1, nickserv_conf.ldap_dn_fmt, account);
 
-  mods = ( LDAPMod ** ) malloc(( 1 ) * sizeof( LDAPMod * ));
+  mods = ( LDAPMod ** ) malloc(( 2 ) * sizeof( LDAPMod * ));
   mods[0] = (LDAPMod *) malloc(sizeof(LDAPMod));
   memset(mods[0], 0, sizeof(LDAPMod));
 
