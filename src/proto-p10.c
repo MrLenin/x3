@@ -3208,6 +3208,8 @@ static CMD_FUNC(cmd_webpush)
  * X3 stores markers and broadcasts updates:
  *   MR <account> <target> <timestamp>         - Broadcast to all servers
  *   MR R <target_server> <user_numeric> <target> <timestamp> - Reply to get
+ *
+ * Timestamps are Unix format: seconds.milliseconds (e.g., "1735689600.123")
  */
 static CMD_FUNC(cmd_markread)
 {
@@ -3256,7 +3258,7 @@ static CMD_FUNC(cmd_markread)
         /* Check if existing timestamp is newer (only update if newer) */
         rc = x3_lmdb_account_get(user->handle_info->handle, key, stored_ts);
         if (rc == LMDB_SUCCESS) {
-            /* Compare timestamps lexicographically (ISO 8601 sorts correctly) */
+            /* Compare timestamps lexicographically (Unix timestamps sort correctly) */
             if (strcmp(timestamp, stored_ts) <= 0) {
                 log_module(MAIN_LOG, LOG_DEBUG, "MARKREAD SET: Existing timestamp %s is newer, ignoring", stored_ts);
                 return 1;
@@ -3342,6 +3344,8 @@ static CMD_FUNC(cmd_tagmsg)
  *   [SERVER] CH Q <target> <subcmd> <ref> <limit> <reqid>   - Query
  *   [SERVER] CH R <reqid> <msgid> <ts> <type> <sender> <account> :<content>  - Response
  *   [SERVER] CH E <reqid> <count>   - End response
+ *
+ * Timestamps (<ts>, <ref>) are Unix format: seconds.milliseconds (e.g., "1735689600.123")
  *
  * X3 doesn't store chat history, so for queries we respond immediately
  * with an end response indicating 0 messages.
