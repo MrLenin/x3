@@ -427,7 +427,7 @@ split_line(char *line, int irc_colon, int argv_size, char *argv[])
             line++;
     }
 #ifdef NDEBUG
-    n = 0;
+    (void)n; /* unused in release builds */
 #else
     for (n=argc; n<argv_size; n++)
         argv[n] = (char*)0xFEEDBEEF;
@@ -584,7 +584,7 @@ match_ircglob(const char *text, const char *glob)
                 for (n_tmp = n; *n && tolower(*n) != tolower(*m); n++) ;
             }
         }
-        /* and fall through */
+        /* fallthrough */
     default:
         if (!*n)
             return *m == '\0';
@@ -1304,7 +1304,7 @@ char *
 x3_msnprintf(const int size, const char *format, ...)
 {
     va_list ap;
-    char* buff = calloc(sizeof(char *), size+1);
+    char* buff = calloc(size+1, sizeof(char));
 
     va_start(ap, format);
     vsnprintf(buff, size, format, ap);

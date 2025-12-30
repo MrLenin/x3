@@ -562,6 +562,7 @@ vsend_message(const char *dest, struct userNode *src, struct handle_info *handle
         /* Literal '$' or end of string. */
 	case 0:
 	    ipos--;
+	    /* fallthrough */
 	case '$':
 	    value = "$";
 	    break;
@@ -614,7 +615,7 @@ vsend_message(const char *dest, struct userNode *src, struct handle_info *handle
 	    break;
         case '!':  /* Command Char for chanserv */
             if(!trigger)
-               trigger = calloc(sizeof(*trigger), 2);
+               trigger = calloc(2, sizeof(*trigger));
             if(chanserv && (service = service_find(chanserv->nick)))
                 trigger[0] = service->trigger;
             else

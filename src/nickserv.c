@@ -2484,12 +2484,13 @@ struct handle_info *loc_auth(char *sslfp, char *handle, char *password, char *us
             }
         }
 
-        log_module(NS_LOG, LOG_DEBUG, "LOC: ident=%s host=%s ip=%s", ident, realhost, ip);
-
         if(!ip || !realhost || !ident) {
+            log_module(NS_LOG, LOG_DEBUG, "LOC: Invalid AC request (ident=%s host=%s ip=%s)",
+                       ident ? ident : "(null)", realhost ? realhost : "(null)", ip ? ip : "(null)");
             free(buf);
             return NULL; /* Invalid AC request, just quit */
         }
+        log_module(NS_LOG, LOG_DEBUG, "LOC: ident=%s host=%s ip=%s", ident, realhost, ip);
         uh = malloc(strlen(userhost));
         ui = malloc(strlen(userhost));
         sprintf(uh, "%s@%s", ident, realhost);
@@ -5739,6 +5740,7 @@ kc_delete_account(const char *handle)
 static int
 kc_do_oslevel(const char *handle, int level, int oldlevel)
 {
+    (void)oldlevel; /* reserved for future use */
     if (kc_ensure_token() != KC_SUCCESS) {
         return KC_ERROR;
     }
@@ -5840,6 +5842,8 @@ loc_auth_oauth(const char *bearer_token, const char *username_hint, const char *
     struct handle_info *hi = NULL;
     const char *username;
     int rc;
+
+    (void)hostmask; /* reserved for future use - e.g., hostmask validation */
 
     if (!nickserv_conf.keycloak_enable || !bearer_token) {
         return NULL;

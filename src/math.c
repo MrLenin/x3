@@ -572,6 +572,7 @@ void do_math(char *Buffer, char *Math)
 						break;
 					case otSinH:
 						TheValues->Value = sinh(TheValues->Value);
+						break;
 					case otCos:
 						TheValues->Value = cos(TheValues->Value);
 						break;

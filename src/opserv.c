@@ -3495,7 +3495,7 @@ void routing_delete_connect_timer(char *server)
 void
 routing_connect_server(char *server, int port, struct server *to)
 {
-    struct waitingConnection *wc = calloc(sizeof(*wc), 1);
+    struct waitingConnection *wc = calloc(1, sizeof(*wc));
 
     wc->server = strdup(server);
     wc->target = strdup(to->name);
@@ -6923,7 +6923,7 @@ alert_check_user(const char *key, void *data, void *extra)
         break;
     default:
         log_module(OS_LOG, LOG_ERROR, "Invalid reaction type %d for alert %s.", alert->reaction, key);
-        /* fall through to REACT_NOTICE case */
+        /* fallthrough */
     case REACT_NOTICE:
         opserv_custom_alert(alert->discrim->notice_target, "Alert $b%s$b triggered by user $b%s$b!%s@%s (%s).", key, user->nick, user->ident, user->hostname, alert->discrim->reason);
         break;

@@ -5254,7 +5254,7 @@ conform_topic(char* topic_mask, char* topic, char *new_topic)
             dpos += len;
             starpos = pos;
             break;
-        case '\\': tchar = topic_mask[pos++]; /* and fall through */
+        case '\\': tchar = topic_mask[pos++]; /* fallthrough */
         default: new_topic[dpos++] = tchar; break;
         }
     }
@@ -7105,11 +7105,12 @@ channel_multiple_option(enum charOption option, struct userNode *user, struct ch
     }
     else
     {
-    /* Find current option value. */
+        /* Find current option value. */
       find_value:
-    for(idx = 0;
+        for(idx = 0;
             (idx < count) && (cData->chOpts[option] != charOptions[option].values[idx].value);
-            idx++);
+            idx++)
+            ; /* empty loop body */
         if(idx == count)
         {
             /* Somehow, the option value is corrupt; reset it to the default. */
@@ -8776,8 +8777,8 @@ handle_auth(struct userNode *user, UNUSED_ARG(struct handle_info *old_handle), U
             continue;
         }
 
-    if(channel->access >= UL_PRESENT)
-        channel->channel->visited = now;
+        if(channel->access >= UL_PRESENT)
+            channel->channel->visited = now;
 
         if(IsUserAutoOp(channel) && cData->chOpts[chAutomode] != 'n')
         {

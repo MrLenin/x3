@@ -40,19 +40,6 @@ static size_t lmdb_mapsize = 100 * 1024 * 1024; /* 100MB default */
 #define LMDB_KEY_BUFFER_SIZE 512
 
 /**
- * Build a composite key from prefix and parts
- */
-static void build_key(char *buf, size_t bufsize, const char *prefix,
-                      const char *part1, const char *part2)
-{
-    if (part2) {
-        snprintf(buf, bufsize, "%s%s\x00%s", prefix, part1, part2);
-    } else {
-        snprintf(buf, bufsize, "%s%s", prefix, part1);
-    }
-}
-
-/**
  * Open a named database within the environment
  */
 static int open_database(MDB_txn *txn, const char *name, MDB_dbi *dbi)

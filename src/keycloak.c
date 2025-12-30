@@ -221,17 +221,6 @@ cleanup:
     return result;
 }
 
-// Convenience wrapper for calls without response body
-static long curl_perform_simple(struct curl_opts opts)
-{
-    if (!opts.uri) {
-        log_module(KC_LOG, LOG_DEBUG, "curl_perform: Invalid arguments");
-        return KC_ERROR;
-    }
-
-    return curl_perform(opts, NULL);
-}
-
 static size_t curl_write_cb(char* data, size_t size, size_t nmemb, void* clientp)
 {
     size_t realsize = size * nmemb;
@@ -682,6 +671,8 @@ cleanup:
 
 int keycloak_get_users(struct kc_realm realm, struct kc_client client, const char* user, const char* filter, bool exact, struct kc_user** user_out)
 {
+    (void)filter; /* TODO: implement additional filtering */
+
     if (!realm.base_uri || !realm.realm || !client.access_token || !user || !user_out) {
         log_module(KC_LOG, LOG_DEBUG, "keycloak_get_users: Invalid arguments");
         return KC_ERROR;

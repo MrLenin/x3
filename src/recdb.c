@@ -665,6 +665,7 @@ parse_database(const char *filename)
 #ifdef HAVE_MMAP
             munmap(recdb.s, recdb.length);
 #endif
+            /* fallthrough */
         case RECDB_FILE:
             fclose(recdb.f);
             break;

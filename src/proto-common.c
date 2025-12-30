@@ -738,8 +738,8 @@ mod_chanmode_apply(struct userNode *who, struct chanNode *channel, struct mod_ch
                 bn = channel->banlist.list[jj];
                 if (strcmp(bn->ban, change->args[ii].u.hostmask))
                     continue;
-                free(bn);
                 banList_remove(&channel->banlist, bn);
+                free(bn);
                 break;
             }
             break;
@@ -750,8 +750,9 @@ mod_chanmode_apply(struct userNode *who, struct chanNode *channel, struct mod_ch
              */
             for (jj=0; jj<channel->exemptlist.used; ++jj) {
                 if (match_ircglobs(change->args[ii].u.hostmask, channel->exemptlist.list[jj]->exempt)) {
-                    exemptList_remove(&channel->exemptlist, channel->exemptlist.list[jj]);
-                    free(channel->exemptlist.list[jj]);
+                    en = channel->exemptlist.list[jj];
+                    exemptList_remove(&channel->exemptlist, en);
+                    free(en);
                     jj--;
                 }
             }
@@ -766,10 +767,11 @@ mod_chanmode_apply(struct userNode *who, struct chanNode *channel, struct mod_ch
             break;
         case MODE_REMOVE|MODE_EXEMPT:
             for (jj=0; jj<channel->exemptlist.used; ++jj) {
-                if (strcmp(channel->exemptlist.list[jj]->exempt, change->args[ii].u.hostmask))
+                en = channel->exemptlist.list[jj];
+                if (strcmp(en->exempt, change->args[ii].u.hostmask))
                     continue;
-                free(channel->exemptlist.list[jj]);
-                exemptList_remove(&channel->exemptlist, channel->exemptlist.list[jj]);
+                exemptList_remove(&channel->exemptlist, en);
+                free(en);
                 break;
             }
             break;
