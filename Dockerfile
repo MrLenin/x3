@@ -21,7 +21,8 @@ USER x3
 WORKDIR  /x3/x3src
 
 # configure script already regenerated with LMDB support - no autogen.sh needed
-RUN ./configure --prefix=/x3 --enable-modules=snoop,memoserv,helpserv --with-keycloak --with-lmdb
+# Use gnu11 standard to avoid glibc 2.38+ __isoc23_strtol compatibility issues
+RUN CFLAGS="-std=gnu11" ./configure --prefix=/x3 --enable-modules=snoop,memoserv,helpserv --with-keycloak --with-lmdb
 
 RUN make
 RUN make install
