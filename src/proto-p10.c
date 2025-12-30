@@ -3341,12 +3341,12 @@ static CMD_FUNC(cmd_tagmsg)
 
 /** Handle CH (CHATHISTORY) command - P10 chathistory federation.
  * Format from Nefarious (optimized for efficiency):
- *   [SERVER] CH Q <target> <subcmd:1char> <ref:T/M/*> <limit> <reqid>   - Query
+ *   [SERVER] CH Q <target> <subcmd:1char> <ref> <limit> <reqid>   - Query
  *   [SERVER] CH R <reqid> <msgid> <ts> <type> <sender> <account> :<content>  - Response
  *   [SERVER] CH E <reqid> <count>   - End response
  *
  * Subcmd codes: L=LATEST, B=BEFORE, A=AFTER, R=AROUND, W=BETWEEN, T=TARGETS
- * Ref format: T<timestamp>, M<msgid>, or * for none
+ * Ref format: <timestamp> (starts with digit), <msgid> (starts with letter), or *
  * Timestamps (<ts>) are Unix format: seconds.milliseconds (e.g., "1735689600.123")
  *
  * X3 doesn't store chat history, so for queries we respond immediately
