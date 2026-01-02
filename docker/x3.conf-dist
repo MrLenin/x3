@@ -23,6 +23,13 @@
         "enabled"        "1";   // Set to 0 to disable connecting to this server
         "max_tries"      "10";  // How many times to attemt reconnect before quitting
         "bind_address"   "%X3_GENERAL_BIND_ADDRESS%";  // LOCAL IP address we want to connect FROM
+        // SSL/TLS configuration (requires X3 compiled --with-ssl)
+        "ssl"            "%X3_UPLINK_SSL%";           // Set to 1 to use SSL/TLS for uplink
+        "ssl_verify"     "%X3_UPLINK_SSL_VERIFY%";    // Set to 1 to verify server certificate
+        //"ssl_ca"       "/path/to/ca.crt";           // CA certificate for verification (optional)
+        //"ssl_cert"     "/path/to/client.crt";       // Client certificate (optional)
+        //"ssl_key"      "/path/to/client.key";       // Client private key (optional)
+        //"ssl_fingerprint" "AA:BB:CC:...";           // Expected server cert fingerprint (optional)
     };
 };
 

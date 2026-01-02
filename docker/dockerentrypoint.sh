@@ -25,6 +25,8 @@ fi
 : "${X3_UPLINK_ADDRESS:=127.0.0.1}"
 : "${X3_UPLINK_PORT:=8888}"
 : "${X3_UPLINK_PASSWORD:=changeme}"
+: "${X3_UPLINK_SSL:=0}"
+: "${X3_UPLINK_SSL_VERIFY:=0}"
 
 # Copy the template to the output location
 cp "$BASECONFDIST" "$BASECONF"
