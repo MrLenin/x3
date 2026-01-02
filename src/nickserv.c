@@ -1295,7 +1295,11 @@ nickserv_register(struct userNode *user, struct userNode *settee, const char *ha
 #ifdef WITH_KEYCLOAK
     if (nickserv_conf.keycloak_enable) {
         int rc;
-        rc = kc_do_add(handle, (no_auth || !passwd ? NULL : passwd), NULL);
+        /* Unlike LDAP, we always set the password immediately for Keycloak.
+         * Reason: Cookie activation only has the hashed password, but Keycloak
+         * needs plaintext to do its own hashing. X3 cookie verification still
+         * enforces email verification before allowing IRC authentication. */
+        rc = kc_do_add(handle, passwd, NULL);
         if (rc != KC_SUCCESS && rc != KC_USER_EXISTS) {
             if (user)
                 send_message(user, nickserv, "NSMSG_LDAP_FAIL", "keycloak error");
@@ -1658,6 +1662,11 @@ static NICKSERV_FUNC(cmd_register)
 #else
         nickserv_set_email_addr(hi, email_addr);
 #endif
+#ifdef WITH_KEYCLOAK
+        if (nickserv_conf.keycloak_enable) {
+            kc_do_modify(hi->handle, NULL, email_addr);
+        }
+#endif
     }
 
     /* If they need to do email verification, tell them. */
@@ -1770,6 +1779,11 @@ static NICKSERV_FUNC(cmd_oregister)
         }
 #else
         nickserv_set_email_addr(hi, email);
+#endif
+#ifdef WITH_KEYCLOAK
+        if (nickserv_conf.keycloak_enable) {
+            kc_do_modify(hi->handle, NULL, email);
+        }
 #endif
     }
     if (mask) {
@@ -2836,12 +2850,26 @@ static NICKSERV_FUNC(cmd_auth)
             sslfpauth = 1; /* reuse sslfpauth flag for successful keycloak auth */
     }
 #endif
-#ifdef WITH_LDAP
-    if(( ( nickserv_conf.ldap_enable && ldap_result == LDAP_INVALID_CREDENTIALS )  ||
-        ( (!nickserv_conf.ldap_enable) && (!checkpass(passwd, hi->passwd)) ) ) && !sslfpauth) {
-#else
-    if (!checkpass(passwd, hi->passwd) && !sslfpauth) {
+
+    /* Check for invalid password - handle Keycloak, LDAP, and local cases */
+    {
+        int password_invalid = 0;
+#ifdef WITH_KEYCLOAK
+        if (nickserv_conf.keycloak_enable && kc_result == KC_FORBIDDEN)
+            password_invalid = 1;
+        else
 #endif
+#ifdef WITH_LDAP
+        if (nickserv_conf.ldap_enable && ldap_result == LDAP_INVALID_CREDENTIALS)
+            password_invalid = 1;
+        else if (!nickserv_conf.ldap_enable && !checkpass(passwd, hi->passwd))
+            password_invalid = 1;
+#else
+        if (!checkpass(passwd, hi->passwd))
+            password_invalid = 1;
+#endif
+
+        if (password_invalid && !sslfpauth) {
         unsigned int n;
         send_message_type(4, user, cmd->parent->bot,
                           handle_find_message(hi, "NSMSG_PASSWORD_INVALID"));
@@ -2863,6 +2891,7 @@ static NICKSERV_FUNC(cmd_auth)
             }
         }
         return 1;
+        }
     }
     if (HANDLE_FLAGGED(hi, SUSPENDED)) {
         send_message_type(4, user, cmd->parent->bot,
@@ -3170,13 +3199,15 @@ static NICKSERV_FUNC(cmd_cookie)
         if(nickserv_conf.ldap_enable && nickserv_conf.ldap_admin_dn) {
             int rc;
             if((rc = ldap_do_modify(hi->handle, hi->cookie->data, NULL)) != LDAP_SUCCESS) {
-                /* Falied to update email in ldap, but still 
+                /* Falied to update email in ldap, but still
                  * updated it here.. what should we do? */
                reply("NSMSG_LDAP_FAIL", ldap_err2string(rc));
                return 0;
             }
         }
 #endif
+        /* Note: Keycloak password was already set during registration (we need
+         * plaintext which is only available then, not the hash stored in cookie) */
         safestrncpy(hi->passwd, hi->cookie->data, sizeof(hi->passwd));
         set_user_handle_info(user, hi, 1);
         reply("NSMSG_HANDLE_ACTIVATED");

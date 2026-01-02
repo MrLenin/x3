@@ -377,17 +377,15 @@ static int json_read_kc_user(json_t* user_object, struct kc_user* user_out)
         return KC_ERROR;
     }
 
+    /* Email may be absent during user creation - make it optional */
     if (json_read_object_string(user_object, "email", &user_out->email, &user_out->email_size) != KC_SUCCESS) {
-        free(user_out->id);
-        free(user_out->username);
-        return KC_ERROR;
+        user_out->email = NULL;
+        user_out->email_size = 0;
     }
 
+    /* emailVerified defaults to false if absent */
     if (json_read_object_boolean(user_object, "emailVerified", &user_out->emailVerified) != KC_SUCCESS) {
-        free(user_out->id);
-        free(user_out->username);
-        free(user_out->email);
-        return KC_ERROR;
+        user_out->emailVerified = 0;
     }
 
     return KC_SUCCESS;
@@ -636,13 +634,17 @@ int keycloak_get_user_token(struct kc_realm realm, struct kc_client client, cons
 
     long http_code = curl_perform(opts, &chunk);
 
-    if (http_code != 200 || !chunk.response) {
-        log_module(KC_LOG, LOG_DEBUG, "keycloak_get_user_token: Failed with HTTP %ld: %s",
-            http_code, chunk.response ? chunk.response : "no response");
-        goto cleanup;
-    } else {
+    if (http_code == 200 && chunk.response) {
         log_module(KC_LOG, LOG_DEBUG, "keycloak_get_user_token: Token retrieved successfully (HTTP 200)");
         result = json_read_kc_access_token(chunk.response, user_access_token);
+    } else if (http_code == 401) {
+        /* 401 Unauthorized = invalid credentials */
+        log_module(KC_LOG, LOG_DEBUG, "keycloak_get_user_token: Invalid credentials (HTTP 401)");
+        result = KC_FORBIDDEN;
+    } else {
+        log_module(KC_LOG, LOG_DEBUG, "keycloak_get_user_token: Failed with HTTP %ld: %s",
+            http_code, chunk.response ? chunk.response : "no response");
+        /* result stays KC_ERROR */
     }
 
 cleanup:
