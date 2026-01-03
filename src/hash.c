@@ -360,29 +360,46 @@ GetUserH(const char *nick)
     return dict_find(clients, nick, NULL);
 }
 
-static account_func_t account_func;
+static account_func_t *account_func_list;
+static void **account_func_list_extra;
+static unsigned int account_func_size = 0, account_func_used = 0;
 
 void
 reg_account_func(account_func_t handler)
 {
-    if (account_func) {
-        log_module(MAIN_LOG, LOG_WARNING, "Reregistering ACCOUNT handler.");
+    /* Backwards compatibility - register with NULL extra data */
+    reg_account_func_ex(handler, NULL);
+}
+
+void
+reg_account_func_ex(account_func_t handler, void *extra)
+{
+    if (account_func_used == account_func_size) {
+        if (account_func_size) {
+            account_func_size <<= 1;
+            account_func_list = realloc(account_func_list, account_func_size * sizeof(account_func_t));
+            account_func_list_extra = realloc(account_func_list_extra, account_func_size * sizeof(void*));
+        } else {
+            account_func_size = 8;
+            account_func_list = malloc(account_func_size * sizeof(account_func_t));
+            account_func_list_extra = malloc(account_func_size * sizeof(void*));
+        }
     }
-    account_func = handler;
+    account_func_list[account_func_used] = handler;
+    account_func_list_extra[account_func_used++] = extra;
 }
 
 void
 call_account_func(struct userNode *user, const char *stamp)
 {
-    /* We've received an account stamp for a user; notify
-       NickServ, which registers the sole account_func
-       right now.  TODO: This is a bug. This needs to register 
-       a proper list not just kill with each call!! -Rubin
-
+    /* We've received an account stamp for a user; notify all registered
+       handlers. NickServ registers the primary handler.
        P10 Protocol violation if (user->modes & FLAGS_STAMPED) here.
     */
-    if (account_func)
-        account_func(user, stamp);
+    unsigned int i;
+    for (i = 0; i < account_func_used; i++) {
+        account_func_list[i](user, stamp);
+    }
 
 #ifdef WITH_PROTOCOL_P10
     /* Mark the user so we don't stamp it again. */

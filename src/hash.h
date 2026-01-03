@@ -434,6 +434,7 @@ void SVSNickChange(struct userNode* user, const char *new_nick);
 
 typedef void (*account_func_t) (struct userNode *user, const char *stamp);
 void reg_account_func(account_func_t handler);
+void reg_account_func_ex(account_func_t handler, void *extra);
 void call_account_func(struct userNode *user, const char *stamp);
 void StampUser(struct userNode *user, const char *stamp, time_t timestamp);
 void assign_fakehost(struct userNode *user, const char *host, int announce);
