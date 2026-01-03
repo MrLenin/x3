@@ -7898,15 +7898,21 @@ sasl_async_auth_callback(void *ctx_ptr, int result)
     if (result == KC_SUCCESS && session->authcid) {
         /* Get or create handle_info */
         hi = get_handle_info(session->authcid);
-        if (!hi && nickserv_conf.keycloak_autocreate) {
-            /* Auto-create account for Keycloak user */
-            log_module(NS_LOG, LOG_INFO, "SASL async: Auto-creating account for %s", session->authcid);
-            hi = register_handle(session->authcid, "", 0);
-            if (hi) {
-                hi->masks = alloc_string_list(1);
-                hi->sslfps = alloc_string_list(1);
-                hi->ignores = alloc_string_list(1);
-                /* Note: No hostmask generated here - we don't have user context during SASL. */
+        if (!hi) {
+            if (nickserv_conf.keycloak_autocreate) {
+                /* Auto-create account for Keycloak user */
+                log_module(NS_LOG, LOG_INFO, "SASL async: Auto-creating account for %s", session->authcid);
+                hi = register_handle(session->authcid, "", 0);
+                if (hi) {
+                    hi->masks = alloc_string_list(1);
+                    hi->sslfps = alloc_string_list(1);
+                    hi->ignores = alloc_string_list(1);
+                    /* Note: No hostmask generated here - we don't have user context during SASL. */
+                } else {
+                    log_module(NS_LOG, LOG_ERROR, "SASL async: Failed to auto-create account for %s (register_handle returned NULL)", session->authcid);
+                }
+            } else {
+                log_module(NS_LOG, LOG_DEBUG, "SASL async: Account %s not found and autocreate disabled", session->authcid);
             }
         }
     }
@@ -7968,16 +7974,23 @@ sasl_async_auth_callback(void *ctx_ptr, int result)
         irc_sasl(session->source, session->uid, "D", "S");
         log_module(NS_LOG, LOG_DEBUG, "SASL async: Success for %s", hi->handle);
     } else {
-        /* Auth failed */
-        log_module(NS_LOG, LOG_DEBUG, "SASL async: Auth failed for %s (result=%d, hi=%p)",
-                   session->authcid ? session->authcid : "(null)", result, (void*)hi);
-
+        /* Auth failed - distinguish between failure modes for debugging */
+        if (result != KC_SUCCESS) {
+            log_module(NS_LOG, LOG_DEBUG, "SASL async: Keycloak auth failed for %s (result=%d)",
+                       session->authcid ? session->authcid : "(null)", result);
 #ifdef WITH_LMDB
-        /* Cache the failure to avoid hitting Keycloak again for same bad creds */
-        if (session->cred_hash[0]) {
-            cache_authfail(session->cred_hash);
-        }
+            /* Only cache credential failures for actual auth failures, not account issues */
+            if (session->cred_hash[0]) {
+                cache_authfail(session->cred_hash);
+            }
 #endif
+        } else if (!session->authcid) {
+            log_module(NS_LOG, LOG_DEBUG, "SASL async: Auth succeeded but no authcid available");
+        } else {
+            /* Auth succeeded but no account - either autocreate disabled or failed */
+            log_module(NS_LOG, LOG_DEBUG, "SASL async: Auth succeeded for %s but no local account (autocreate=%d)",
+                       session->authcid, nickserv_conf.keycloak_autocreate);
+        }
 
         irc_sasl(session->source, session->uid, "D", "F");
     }
@@ -8045,16 +8058,22 @@ sasl_async_fingerprint_callback(void *ctx_ptr, int result, char *username)
 
         /* Look up or auto-create account */
         hi = get_handle_info(username);
-        if (!hi && nickserv_conf.keycloak_autocreate) {
-            log_module(NS_LOG, LOG_INFO, "SASL EXTERNAL: Auto-creating account for %s", username);
-            hi = register_handle(username, "", 0);
-            if (hi) {
-                hi->masks = alloc_string_list(1);
-                hi->sslfps = alloc_string_list(1);
-                hi->ignores = alloc_string_list(1);
-                /* Add fingerprint */
-                if (session->sslclifp)
-                    string_list_append(hi->sslfps, strdup(session->sslclifp));
+        if (!hi) {
+            if (nickserv_conf.keycloak_autocreate) {
+                log_module(NS_LOG, LOG_INFO, "SASL EXTERNAL: Auto-creating account for %s", username);
+                hi = register_handle(username, "", 0);
+                if (hi) {
+                    hi->masks = alloc_string_list(1);
+                    hi->sslfps = alloc_string_list(1);
+                    hi->ignores = alloc_string_list(1);
+                    /* Add fingerprint */
+                    if (session->sslclifp)
+                        string_list_append(hi->sslfps, strdup(session->sslclifp));
+                } else {
+                    log_module(NS_LOG, LOG_ERROR, "SASL EXTERNAL: Failed to auto-create account for %s (register_handle returned NULL)", username);
+                }
+            } else {
+                log_module(NS_LOG, LOG_DEBUG, "SASL EXTERNAL: Account %s not found and autocreate disabled", username);
             }
         }
         free(username);
@@ -8168,15 +8187,21 @@ sasl_async_introspect_callback(void *ctx_ptr, int result, struct kc_token_info *
 
     /* Look up or auto-create account */
     hi = get_handle_info(username);
-    if (!hi && nickserv_conf.keycloak_autocreate) {
-        log_module(NS_LOG, LOG_INFO, "SASL OAUTHBEARER: Auto-creating account for %s", username);
-        hi = register_handle(username, "", 0);
-        if (hi) {
-            hi->masks = alloc_string_list(1);
-            hi->sslfps = alloc_string_list(1);
-            hi->ignores = alloc_string_list(1);
-            /* Note: No hostmask generated here - we don't have user context during SASL.
-             * The account works fine without masks, and user can add masks later. */
+    if (!hi) {
+        if (nickserv_conf.keycloak_autocreate) {
+            log_module(NS_LOG, LOG_INFO, "SASL OAUTHBEARER: Auto-creating account for %s", username);
+            hi = register_handle(username, "", 0);
+            if (hi) {
+                hi->masks = alloc_string_list(1);
+                hi->sslfps = alloc_string_list(1);
+                hi->ignores = alloc_string_list(1);
+                /* Note: No hostmask generated here - we don't have user context during SASL.
+                 * The account works fine without masks, and user can add masks later. */
+            } else {
+                log_module(NS_LOG, LOG_ERROR, "SASL OAUTHBEARER: Failed to auto-create account for %s (register_handle returned NULL)", username);
+            }
+        } else {
+            log_module(NS_LOG, LOG_DEBUG, "SASL OAUTHBEARER: Account %s not found and autocreate disabled", username);
         }
     }
 
@@ -8188,7 +8213,7 @@ sasl_async_introspect_callback(void *ctx_ptr, int result, struct kc_token_info *
         irc_sasl(session->source, session->uid, "L", buffer);
         irc_sasl(session->source, session->uid, "D", "S");
     } else {
-        log_module(NS_LOG, LOG_DEBUG, "SASL OAUTHBEARER: No matching account");
+        log_module(NS_LOG, LOG_DEBUG, "SASL OAUTHBEARER: No local account for %s (autocreate=%d)", username, nickserv_conf.keycloak_autocreate);
         irc_sasl(session->source, session->uid, "D", "F");
     }
 
@@ -8422,14 +8447,20 @@ sasl_packet(struct SASLSession *session)
 
                 /* Look up or auto-create account */
                 hi = get_handle_info(username);
-                if (!hi && nickserv_conf.keycloak_autocreate) {
-                    log_module(NS_LOG, LOG_INFO, "SASL OAUTHBEARER: Auto-creating account for %s", username);
-                    hi = register_handle(username, "", 0);
-                    if (hi) {
-                        hi->masks = alloc_string_list(1);
-                        hi->sslfps = alloc_string_list(1);
-                        hi->ignores = alloc_string_list(1);
-                        /* Note: No hostmask generated here - we don't have user context during SASL. */
+                if (!hi) {
+                    if (nickserv_conf.keycloak_autocreate) {
+                        log_module(NS_LOG, LOG_INFO, "SASL OAUTHBEARER: Auto-creating account for %s", username);
+                        hi = register_handle(username, "", 0);
+                        if (hi) {
+                            hi->masks = alloc_string_list(1);
+                            hi->sslfps = alloc_string_list(1);
+                            hi->ignores = alloc_string_list(1);
+                            /* Note: No hostmask generated here - we don't have user context during SASL. */
+                        } else {
+                            log_module(NS_LOG, LOG_ERROR, "SASL OAUTHBEARER: Failed to auto-create account for %s (register_handle returned NULL)", username);
+                        }
+                    } else {
+                        log_module(NS_LOG, LOG_DEBUG, "SASL OAUTHBEARER: Account %s not found and autocreate disabled", username);
                     }
                 }
 
@@ -8441,7 +8472,7 @@ sasl_packet(struct SASLSession *session)
                     irc_sasl(session->source, session->uid, "L", buffer);
                     irc_sasl(session->source, session->uid, "D", "S");
                 } else {
-                    log_module(NS_LOG, LOG_DEBUG, "SASL OAUTHBEARER: No matching account for %s", username);
+                    log_module(NS_LOG, LOG_DEBUG, "SASL OAUTHBEARER: No local account for %s (autocreate=%d)", username, nickserv_conf.keycloak_autocreate);
                     irc_sasl(session->source, session->uid, "D", "F");
                 }
 
