@@ -55,6 +55,9 @@ static char *base64url_decode_alloc(const char *input, size_t *out_len);
 static int jwt_verify_signature(const char *token, EVP_PKEY *pkey);
 static int jwt_parse_claims(const char *payload_b64, struct kc_token_info *info);
 
+/* Forward declaration for JSON helpers used by async functions */
+static char* json_build_user_representation(const char *username, const char *email, const char *passwd);
+
 /* Forward declaration for exit handler */
 static void keycloak_exit_handler(void *extra);
 
@@ -542,7 +545,10 @@ keycloak_validate_jwt_local(struct kc_realm realm, const char *token,
 
     /* Parse JWT header to get kid */
     const char *dot1 = strchr(token, '.');
-    if (!dot1) return KC_ERROR;
+    if (!dot1) {
+        log_module(KC_LOG, LOG_DEBUG, "Malformed JWT: no header separator");
+        return KC_FORBIDDEN;  /* Not a valid JWT format - reject immediately */
+    }
 
     size_t header_b64_len = dot1 - token;
     char *header_b64 = malloc(header_b64_len + 1);
@@ -570,8 +576,8 @@ keycloak_validate_jwt_local(struct kc_realm realm, const char *token,
     free(header_json);
 
     if (!hdr) {
-        log_module(KC_LOG, LOG_DEBUG, "Failed to parse JWT header: %s", error.text);
-        return KC_ERROR;
+        log_module(KC_LOG, LOG_DEBUG, "Malformed JWT header JSON: %s", error.text);
+        return KC_FORBIDDEN;  /* Definitely not a valid JWT - reject immediately */
     }
 
     const char *alg = json_string_value(json_object_get(hdr, "alg"));
@@ -1118,7 +1124,8 @@ enum kc_async_type {
     KC_ASYNC_SET_ATTR,      /* Set user attribute */
     KC_ASYNC_GROUP_ADD,     /* Add user to group */
     KC_ASYNC_GROUP_REMOVE,  /* Remove user from group */
-    KC_ASYNC_WEBPUSH        /* WebPush notification delivery */
+    KC_ASYNC_WEBPUSH,       /* WebPush notification delivery */
+    KC_ASYNC_CREATE_USER    /* User creation */
 };
 
 /* Async request tracking */
@@ -1141,6 +1148,8 @@ struct kc_async_request {
     /* WebPush-specific: copy of binary POST data for async request */
     void *post_data_copy;
     size_t post_data_len;
+    /* Timeout tracking (Phase 5.3) */
+    time_t started;               /* When request was initiated */
 };
 
 /* Called by curl when socket state changes */
@@ -1365,12 +1374,22 @@ kc_curl_check_completed(void)
             /* Get request_id for logging */
             const char *req_id = req->request_id ? req->request_id : "-";
 
+            /* Check elapsed time (Phase 5.3 timeout tracking) */
+            time_t elapsed = 0;
+            if (req->started > 0) {
+                elapsed = time(NULL) - req->started;
+                if (elapsed >= 5) {
+                    log_module(KC_LOG, LOG_WARNING, "[%s] kc_async: Request took %ld seconds (type=%d)",
+                               req_id, (long)elapsed, req->type);
+                }
+            }
+
             /* Get HTTP response code */
             if (msg->data.result == CURLE_OK) {
                 curl_easy_getinfo(easy, CURLINFO_RESPONSE_CODE, &http_code);
             } else {
-                log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async: CURL error: %s",
-                           req_id, curl_easy_strerror(msg->data.result));
+                log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async: CURL error: %s (after %lds)",
+                           req_id, curl_easy_strerror(msg->data.result), (long)elapsed);
             }
 
             /* Dispatch based on request type */
@@ -1449,9 +1468,21 @@ kc_curl_check_completed(void)
                 if (req->cb.webpush) {
                     req->cb.webpush(req->session, result, http_code);
                 }
-                /* Free the binary POST data copy if present */
-                if (req->post_data_copy) {
-                    free(req->post_data_copy);
+                break;
+            }
+            case KC_ASYNC_CREATE_USER: {
+                int result = KC_ERROR;
+                if (http_code == 201) {
+                    result = KC_SUCCESS;
+                    log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async create_user: User created (HTTP 201)", req_id);
+                } else if (http_code == 409) {
+                    result = KC_USER_EXISTS;
+                    log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async create_user: User exists (HTTP 409)", req_id);
+                } else {
+                    log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async create_user: Error (HTTP %ld)", req_id, http_code);
+                }
+                if (req->cb.generic) {
+                    req->cb.generic(req->session, result);
                 }
                 break;
             }
@@ -1469,6 +1500,7 @@ kc_curl_check_completed(void)
                 memset(req->post_fields, 0, strlen(req->post_fields));
                 free(req->post_fields);
             }
+            if (req->post_data_copy) free(req->post_data_copy);
             if (req->header_list) curl_slist_free_all(req->header_list);
             if (req->request_id) free(req->request_id);
             free(req);
@@ -1542,6 +1574,9 @@ curl_perform_async(struct kc_async_request *req, struct curl_opts opts)
     if (opts.request_id) {
         req->request_id = strdup(opts.request_id);
     }
+
+    /* Record start time for timeout tracking */
+    req->started = time(NULL);
 
     /* Get handle from pool (or create new one) */
     easy = kc_handle_pool_get();
@@ -1924,6 +1959,90 @@ error:
 }
 
 /**
+ * Set emailVerified flag on a Keycloak user asynchronously.
+ * Used to sync X3's cookie-based email verification to Keycloak.
+ */
+int
+keycloak_set_email_verified_async(struct kc_realm realm, struct kc_client client,
+                                   const char *user_id, int verified,
+                                   void *session, kc_async_callback callback)
+{
+    struct kc_async_request *req = NULL;
+    char *json_body = NULL;
+
+    /* Validate inputs */
+    if (!realm.base_uri || !realm.realm || !client.access_token ||
+        !user_id || !callback) {
+        log_module(KC_LOG, LOG_DEBUG, "set_email_verified_async: Invalid arguments");
+        return -1;
+    }
+
+    /* Allocate request structure */
+    req = calloc(1, sizeof(*req));
+    if (!req) {
+        log_module(KC_LOG, LOG_ERROR, "set_email_verified_async: Out of memory");
+        return -1;
+    }
+    req->session = session;
+    req->type = KC_ASYNC_SET_ATTR;  /* Reuse generic attr type */
+    req->cb.generic = callback;
+
+    /* Build URI */
+    req->uri = kc_build_user_endpoint(realm, user_id);
+    if (!req->uri) {
+        log_module(KC_LOG, LOG_ERROR, "set_email_verified_async: Failed to build URI");
+        goto error;
+    }
+
+    /* Build JSON body - update emailVerified boolean */
+    json_t *user_obj = json_object();
+    json_object_set_new(user_obj, "emailVerified", verified ? json_true() : json_false());
+    json_body = json_dumps(user_obj, JSON_COMPACT);
+    json_decref(user_obj);
+
+    if (!json_body) {
+        log_module(KC_LOG, LOG_ERROR, "set_email_verified_async: Failed to build JSON");
+        goto error;
+    }
+
+    /* Store post fields in request for cleanup */
+    req->post_fields = json_body;
+    json_body = NULL;  /* Transferred ownership */
+
+    /* Use unified async API */
+    struct curl_opts opts = CURL_OPTS_INIT;
+    opts.uri = req->uri;
+    opts.method = HTTP_PUT;
+    opts.post_fields = req->post_fields;
+    opts.xoauth2_bearer = client.access_token->access_token;
+    opts.header_list[0] = "Content-Type: application/json";
+    opts.header_count = 1;
+
+    if (curl_perform_async(req, opts) < 0) {
+        log_module(KC_LOG, LOG_ERROR, "set_email_verified_async: curl_perform_async failed");
+        goto error;
+    }
+
+    log_module(KC_LOG, LOG_DEBUG, "set_email_verified_async: Started for user %s (verified=%d)",
+               user_id, verified);
+    return 0;
+
+error:
+    if (json_body) free(json_body);
+    if (req) {
+        if (req->easy) curl_easy_cleanup(req->easy);
+        if (req->uri) free(req->uri);
+        if (req->post_fields) {
+            memset(req->post_fields, 0, strlen(req->post_fields));
+            free(req->post_fields);
+        }
+        if (req->response.response) free(req->response.response);
+        free(req);
+    }
+    return -1;
+}
+
+/**
  * Add a user to a group asynchronously.
  * Useful for non-blocking channel access sync.
  */
@@ -2126,6 +2245,97 @@ error:
         if (req->post_data_copy) free(req->post_data_copy);
         if (req->response.response) free(req->response.response);
         free(req);
+    }
+    return -1;
+}
+
+/**
+ * Create a user in Keycloak asynchronously.
+ * Uses the async curl_multi infrastructure for non-blocking HTTP.
+ *
+ * @param realm     Keycloak realm configuration
+ * @param client    Client with admin access token
+ * @param username  New user's username
+ * @param email     New user's email (or empty string)
+ * @param password  New user's password
+ * @param session   Opaque session pointer (passed to callback)
+ * @param callback  Function to call when request completes
+ * @return 0 on success (request started), -1 on error
+ */
+int
+keycloak_create_user_async(struct kc_realm realm, struct kc_client client,
+                           const char *username, const char *email,
+                           const char *password, void *session,
+                           kc_create_user_callback callback)
+{
+    struct kc_async_request *req = NULL;
+    char *user_repr = NULL;
+
+    /* Validate inputs */
+    if (!realm.base_uri || !realm.realm || !client.access_token || !username || !password || !callback) {
+        log_module(KC_LOG, LOG_DEBUG, "create_user_async: Invalid arguments");
+        return -1;
+    }
+
+    /* Allocate request structure */
+    req = calloc(1, sizeof(*req));
+    if (!req) {
+        log_module(KC_LOG, LOG_ERROR, "create_user_async: Out of memory");
+        return -1;
+    }
+    req->session = session;
+    req->type = KC_ASYNC_CREATE_USER;
+    req->cb.generic = callback;
+
+    /* Build users endpoint URI */
+    req->uri = kc_build_users_endpoint(realm);
+    if (!req->uri) {
+        log_module(KC_LOG, LOG_ERROR, "create_user_async: Failed to build URI");
+        goto error;
+    }
+
+    /* Build user JSON representation */
+    user_repr = json_build_user_representation(username, email ? email : "", password);
+    if (!user_repr) {
+        log_module(KC_LOG, LOG_ERROR, "create_user_async: Failed to build user JSON");
+        goto error;
+    }
+
+    /* Copy POST data */
+    req->post_fields = user_repr;
+    user_repr = NULL;  /* Transfer ownership to req */
+
+    /* Build curl options */
+    struct curl_opts opts = CURL_OPTS_INIT;
+    opts.uri = req->uri;
+    opts.method = HTTP_POST;
+    opts.xoauth2_bearer = client.access_token->access_token;
+    opts.post_fields = req->post_fields;
+    opts.header_list[0] = "Content-Type: application/json";
+    opts.header_count = 1;
+
+    if (curl_perform_async(req, opts) < 0) {
+        log_module(KC_LOG, LOG_ERROR, "create_user_async: curl_perform_async failed");
+        goto error;
+    }
+
+    log_module(KC_LOG, LOG_DEBUG, "create_user_async: Started user creation for %s", username);
+    return 0;
+
+error:
+    if (req) {
+        if (req->easy) curl_easy_cleanup(req->easy);
+        if (req->uri) free(req->uri);
+        if (req->post_fields) {
+            memset(req->post_fields, 0, strlen(req->post_fields));
+            free(req->post_fields);
+        }
+        if (req->response.response) free(req->response.response);
+        free(req);
+    }
+    if (user_repr) {
+        memset(user_repr, 0, strlen(user_repr));
+        free(user_repr);
     }
     return -1;
 }

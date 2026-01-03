@@ -1397,7 +1397,7 @@ int x3_lmdb_chanaccess_get(const char *channel, const char *account, unsigned sh
     }
 
     /* Parse access level from stored value */
-    *access_out = (unsigned short)atoi((const char *)mdata.mv_data);
+    *access_out = (unsigned short)strtol((const char *)mdata.mv_data, NULL, 10);
     return LMDB_SUCCESS;
 }
 
@@ -1525,7 +1525,7 @@ int x3_lmdb_chanaccess_list(const char *channel, struct lmdb_chanaccess_entry **
 
         entry->channel = strdup(channel);
         entry->account = strndup(accountstart, accountlen);
-        entry->access = (unsigned short)atoi((const char *)mdata.mv_data);
+        entry->access = (unsigned short)strtol((const char *)mdata.mv_data, NULL, 10);
         entry->next = NULL;
 
         if (tail) {
@@ -1605,7 +1605,7 @@ int x3_lmdb_chanaccess_list_account(const char *account, struct lmdb_chanaccess_
 
                 entry->channel = strndup(channel_start, channel_len_found);
                 entry->account = strdup(account);
-                entry->access = (unsigned short)atoi((const char *)mdata.mv_data);
+                entry->access = (unsigned short)strtol((const char *)mdata.mv_data, NULL, 10);
                 entry->next = NULL;
 
                 if (tail) {

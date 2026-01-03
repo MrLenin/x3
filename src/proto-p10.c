@@ -2838,8 +2838,6 @@ static CMD_FUNC(cmd_register_acct)
     const char *account;
     const char *email;
     const char *password;
-    char result_msg[256];
-    enum nickserv_register_result result;
 
     log_module(MAIN_LOG, LOG_DEBUG, "cmd_register_acct: argc=%u", argc);
     for (unsigned int i = 0; i < argc; i++) {
@@ -2854,45 +2852,11 @@ static CMD_FUNC(cmd_register_acct)
     email = argv[4];
     password = argv[argc - 1]; /* Password is last param (may have spaces) */
 
-    log_module(MAIN_LOG, LOG_INFO, "RG (REGISTER) request: account=%s email=%s password='%s' from %s",
-               account, email, password ? password : "(null)", client_id);
+    log_module(MAIN_LOG, LOG_INFO, "RG (REGISTER) request: account=%s email=%s from %s",
+               account, email, client_id);
 
-    /* Call NickServ to register the account (pass NULL for user since pre-reg) */
-    log_module(MAIN_LOG, LOG_DEBUG, "RG: Calling nickserv_ircv3_register");
-    result = nickserv_ircv3_register(NULL, account, email, password, result_msg);
-    log_module(MAIN_LOG, LOG_INFO, "RG: nickserv_ircv3_register returned %d, msg='%s'", result, result_msg);
-
-    /* Map result to REGREPLY status */
-    switch (result) {
-    case NSREG_SUCCESS:
-        log_module(MAIN_LOG, LOG_INFO, "RG: Sending SUCCESS reply");
-        irc_regreply(client_id, 'S', account, result_msg);
-        break;
-    case NSREG_VERIFY_REQUIRED:
-        irc_regreply(client_id, 'V', account, result_msg);
-        break;
-    case NSREG_ACCOUNT_EXISTS:
-        irc_regreply(client_id, 'F', account, result_msg[0] ? result_msg : "ACCOUNT_EXISTS");
-        break;
-    case NSREG_WEAK_PASSWORD:
-        irc_regreply(client_id, 'F', account, result_msg[0] ? result_msg : "WEAK_PASSWORD");
-        break;
-    case NSREG_INVALID_EMAIL:
-    case NSREG_EMAIL_PROHIBITED:
-    case NSREG_EMAIL_LIMIT:
-        irc_regreply(client_id, 'F', account, result_msg[0] ? result_msg : "INVALID_EMAIL");
-        break;
-    case NSREG_INVALID_HANDLE:
-        irc_regreply(client_id, 'F', account, result_msg[0] ? result_msg : "BAD_ACCOUNT_NAME");
-        break;
-    case NSREG_ALREADY_AUTHED:
-        irc_regreply(client_id, 'F', account, result_msg[0] ? result_msg : "ALREADY_AUTHENTICATED");
-        break;
-    case NSREG_INTERNAL_ERROR:
-    default:
-        irc_regreply(client_id, 'F', account, result_msg[0] ? result_msg : "TEMPORARILY_UNAVAILABLE");
-        break;
-    }
+    /* Call NickServ to process registration (handles async Keycloak and sends reply) */
+    nickserv_ircv3_register_p10(client_id, account, email, password);
 
     return 1;
 }

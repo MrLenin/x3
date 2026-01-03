@@ -21,9 +21,9 @@ USER x3
 WORKDIR  /x3/x3src
 
 # configure script already regenerated with LMDB support - no autogen.sh needed
-# Use gnu11 standard to avoid glibc 2.38+ __isoc23_strtol compatibility issues
 # Enable SSL for encrypted uplink connections to IRCd
-RUN CFLAGS="-std=gnu11" ./configure --prefix=/x3 --enable-modules=snoop,memoserv,helpserv --with-keycloak --with-lmdb --with-ssl
+# Disable glibc C23 features to avoid __isoc23_strtol linker errors on Debian 12
+RUN CFLAGS="-D__USE_ISOC23=0" ./configure --prefix=/x3 --enable-modules=snoop,memoserv,helpserv --with-keycloak --with-lmdb --with-ssl
 
 RUN make
 RUN make install

@@ -334,6 +334,18 @@ enum nickserv_register_result nickserv_ircv3_register(struct userNode *user,
     const char *handle, const char *email, const char *password, char *result_msg);
 
 /**
+ * Process a registration request from P10 RG command (draft/account-registration).
+ * This handles the async Keycloak flow and sends replies via irc_regreply.
+ * @param uid      The server!fd.cookie identifier for the pre-registration client
+ * @param handle   Account name to register
+ * @param email    Email address (or "*" if not provided)
+ * @param password Plaintext password
+ * @return 0 if processing started (async or sync), -1 on immediate error
+ */
+int nickserv_ircv3_register_p10(const char *uid, const char *handle,
+    const char *email, const char *password);
+
+/**
  * Verify a pending account via IRCv3 VERIFY command.
  * @param user The user requesting verification
  * @param handle Account name to verify

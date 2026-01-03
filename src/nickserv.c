@@ -239,6 +239,9 @@ static int kc_delete_account(const char *handle);
 static int kc_do_oslevel(const char *handle, int level, int oldlevel);
 static int kc_add2group(const char *handle, const char *group);
 static int kc_delfromgroup(const char *handle, const char *group);
+static void kc_sync_email_verified(const char *handle, int verified);
+static int kc_check_email_verified(const char *handle, int *verified_out);
+static int kc_try_auto_activate(struct handle_info *hi);
 static struct handle_info *loc_auth_oauth(const char *bearer_token, const char *username_hint, const char *hostmask);
 #endif
 
@@ -3214,6 +3217,10 @@ static NICKSERV_FUNC(cmd_cookie)
         reply("NSMSG_HANDLE_ACTIVATED");
         if (nickserv_conf.sync_log)
           SyncLog("ACCOUNTACC %s", hi->handle);
+#ifdef WITH_KEYCLOAK
+        /* Sync email verification to Keycloak (fire-and-forget) */
+        kc_sync_email_verified(hi->handle, 1);
+#endif
         break;
     case PASSWORD_CHANGE:
 #ifdef WITH_LDAP
@@ -3258,6 +3265,10 @@ static NICKSERV_FUNC(cmd_cookie)
         reply("NSMSG_EMAIL_CHANGED");
         if (nickserv_conf.sync_log)
           SyncLog("EMAILCHANGE %s %s", hi->handle, hi->cookie->data);
+#ifdef WITH_KEYCLOAK
+        /* Sync email verification to Keycloak (fire-and-forget) */
+        kc_sync_email_verified(hi->handle, 1);
+#endif
         break;
     case ALLOWAUTH: {
         char *mask = generate_hostmask(user, GENMASK_OMITNICK|GENMASK_NO_HIDING|GENMASK_ANY_IDENT);
@@ -5802,6 +5813,149 @@ kc_do_oslevel(const char *handle, int level, int oldlevel)
     return rc;
 }
 
+/* Fire-and-forget callback for email verification sync */
+static void
+kc_email_verified_callback(void *session, int result)
+{
+    (void)session;
+    if (result == KC_SUCCESS) {
+        log_module(NS_LOG, LOG_DEBUG, "Keycloak emailVerified sync succeeded");
+    } else {
+        log_module(NS_LOG, LOG_DEBUG, "Keycloak emailVerified sync failed: %d", result);
+    }
+}
+
+/**
+ * Sync email verification state to Keycloak (fire-and-forget).
+ * Used after successful X3 cookie verification to update Keycloak's emailVerified.
+ *
+ * @param handle  Account name
+ * @param verified 1 for verified, 0 for unverified
+ */
+static void
+kc_sync_email_verified(const char *handle, int verified)
+{
+    if (!nickserv_conf.keycloak_enable) {
+        return;
+    }
+
+    if (kc_ensure_token() != KC_SUCCESS) {
+        log_module(NS_LOG, LOG_DEBUG, "kc_sync_email_verified: Failed to get admin token");
+        return;
+    }
+
+    /* Get user ID from Keycloak */
+    struct kc_user user;
+    int rc = keycloak_get_user(kc_realm_config, kc_client_config, handle, &user);
+    if (rc != KC_SUCCESS) {
+        log_module(NS_LOG, LOG_DEBUG, "kc_sync_email_verified: User %s not found in Keycloak", handle);
+        return;
+    }
+
+    char *user_id = strdup(user.id);
+    keycloak_user_free_fields(&user);
+
+    /* Fire-and-forget async sync */
+    rc = keycloak_set_email_verified_async(kc_realm_config, kc_client_config,
+                                            user_id, verified,
+                                            NULL, kc_email_verified_callback);
+    if (rc < 0) {
+        log_module(NS_LOG, LOG_WARNING, "kc_sync_email_verified: Failed to start async sync for %s", handle);
+    }
+
+    free(user_id);
+}
+
+/**
+ * Check if Keycloak says user is email verified.
+ * Used during SASL auth to trust Keycloak's verification state.
+ *
+ * @param handle        Account name
+ * @param verified_out  Output: 1 if verified, 0 otherwise
+ * @return KC_SUCCESS on success, error code otherwise
+ */
+static int
+kc_check_email_verified(const char *handle, int *verified_out)
+{
+    *verified_out = 0;
+
+    if (!nickserv_conf.keycloak_enable) {
+        return KC_ERROR;
+    }
+
+    if (kc_ensure_token() != KC_SUCCESS) {
+        return KC_ERROR;
+    }
+
+    struct kc_user user;
+    int rc = keycloak_get_user(kc_realm_config, kc_client_config, handle, &user);
+    if (rc == KC_SUCCESS) {
+        *verified_out = user.emailVerified ? 1 : 0;
+        keycloak_user_free_fields(&user);
+        return KC_SUCCESS;
+    }
+
+    return rc;
+}
+
+/**
+ * Try to auto-activate account based on Keycloak's emailVerified.
+ * Used during SASL auth success when user has a pending ACTIVATION cookie.
+ * If Keycloak says the user is email verified, we trust that and complete
+ * the activation (eating the cookie).
+ *
+ * @param hi  Handle info to potentially auto-activate
+ * @return 1 if auto-activated, 0 otherwise
+ */
+static int
+kc_try_auto_activate(struct handle_info *hi)
+{
+    int verified = 0;
+
+    /* Must have Keycloak enabled */
+    if (!nickserv_conf.keycloak_enable) {
+        return 0;
+    }
+
+    /* Must have pending ACTIVATION cookie */
+    if (!hi->cookie || hi->cookie->type != ACTIVATION) {
+        return 0;
+    }
+
+    /* Policy must allow trusting Keycloak verification (0 = trust KC) */
+    if (nickserv_conf.keycloak_email_policy != 0) {
+        return 0;
+    }
+
+    /* Check Keycloak emailVerified */
+    if (kc_check_email_verified(hi->handle, &verified) != KC_SUCCESS) {
+        log_module(NS_LOG, LOG_DEBUG, "kc_try_auto_activate: Failed to check emailVerified for %s", hi->handle);
+        return 0;
+    }
+
+    if (!verified) {
+        log_module(NS_LOG, LOG_DEBUG, "kc_try_auto_activate: Keycloak says %s not verified", hi->handle);
+        return 0;
+    }
+
+    /* Keycloak says verified - auto-complete activation */
+    log_module(NS_LOG, LOG_INFO, "kc_try_auto_activate: Auto-activating %s based on Keycloak emailVerified", hi->handle);
+
+    /* Apply the password hash from the cookie */
+    if (hi->cookie->data) {
+        safestrncpy(hi->passwd, hi->cookie->data, sizeof(hi->passwd));
+    }
+
+    /* Eat the cookie */
+    nickserv_eat_cookie(hi->cookie);
+
+    if (nickserv_conf.sync_log) {
+        SyncLog("ACCOUNTACC %s", hi->handle);
+    }
+
+    return 1;
+}
+
 /* Add user to Keycloak group */
 static int
 kc_add2group(const char *handle, const char *group_name)
@@ -7485,6 +7639,490 @@ nickserv_define_func(const char *name, modcmd_func_t func, int min_level, int mu
     }
 }
 
+/* =============================================================================
+ * Registration Session Management (draft/account-registration)
+ * Similar to SASL sessions but for async account registration with Keycloak
+ * ============================================================================= */
+
+/* Registration session states */
+enum reg_state {
+    REG_STATE_NONE = 0,           /* Not initialized */
+    REG_STATE_VALIDATING,         /* Validating request */
+    REG_STATE_KC_CREATING,        /* Creating user in Keycloak (async) */
+    REG_STATE_CREATING_ACCOUNT,   /* Creating X3 account */
+    REG_STATE_COMPLETE,           /* Successfully registered */
+    REG_STATE_FAILED,             /* Registration failed */
+    REG_STATE_CANCELLED           /* Client disconnected */
+};
+
+/* Registration session - tracks async registration requests */
+struct RegSession {
+    struct RegSession *next;
+    struct RegSession *prev;
+    char uid[128];                /* server!fd.cookie identifier */
+    char account[NICKSERV_HANDLE_LEN + 1];
+    char email[256];
+    char password_hash[MD5_CRYPT_LENGTH];  /* Hashed password for X3 account */
+    char result_msg[256];         /* Error/status message */
+    time_t created;
+    enum reg_state state;
+    uint32_t sequence;            /* For async callback validation */
+    int use_email;                /* Whether email was provided */
+};
+
+static struct RegSession *reg_sessions = NULL;
+static dict_t reg_session_dict = NULL;
+static uint32_t reg_sequence_counter = 0;
+
+/* Registration session stale timeout in seconds */
+#define REG_STALE_TIMEOUT 120
+
+/**
+ * Async callback context for registration
+ */
+struct reg_async_ctx {
+    struct RegSession *session;
+    uint32_t sequence;
+    char uid[128];
+};
+
+/**
+ * Create async callback context for a registration session
+ */
+static struct reg_async_ctx *
+reg_async_ctx_new(struct RegSession *session)
+{
+    struct reg_async_ctx *ctx = calloc(1, sizeof(*ctx));
+    if (!ctx) return NULL;
+    ctx->session = session;
+    ctx->sequence = session->sequence;
+    safestrncpy(ctx->uid, session->uid, sizeof(ctx->uid));
+    return ctx;
+}
+
+/**
+ * Validate async callback context and return session if still valid
+ */
+static struct RegSession *
+reg_async_ctx_validate(struct reg_async_ctx *ctx)
+{
+    struct RegSession *session;
+    int found = 0;
+
+    if (!ctx) return NULL;
+
+    if (!reg_session_dict) {
+        log_module(NS_LOG, LOG_DEBUG, "REG async: No session dict");
+        return NULL;
+    }
+
+    session = dict_find(reg_session_dict, ctx->uid, &found);
+    if (!found || !session) {
+        log_module(NS_LOG, LOG_DEBUG, "REG async: Session for %s no longer exists", ctx->uid);
+        return NULL;
+    }
+
+    if (session->sequence != ctx->sequence) {
+        log_module(NS_LOG, LOG_WARNING, "REG async: Sequence mismatch for %s (expected %u, got %u)",
+                   ctx->uid, ctx->sequence, session->sequence);
+        return NULL;
+    }
+
+    return session;
+}
+
+/**
+ * Check if registration session is in terminal state
+ */
+static int
+reg_session_is_terminal(struct RegSession *session)
+{
+    if (!session) return 1;
+    switch (session->state) {
+        case REG_STATE_CANCELLED:
+        case REG_STATE_FAILED:
+        case REG_STATE_COMPLETE:
+            return 1;
+        default:
+            return 0;
+    }
+}
+
+/**
+ * Delete a registration session
+ */
+static void
+reg_delete_session(struct RegSession *session)
+{
+    if (!session) return;
+
+    if (reg_session_dict && session->uid[0])
+        dict_remove(reg_session_dict, session->uid);
+
+    if (session->next)
+        session->next->prev = session->prev;
+    if (session->prev)
+        session->prev->next = session->next;
+    else
+        reg_sessions = session->next;
+
+    /* Secure cleanup of sensitive data */
+    memset(session->password_hash, 0, sizeof(session->password_hash));
+    free(session);
+}
+
+/**
+ * Get or create a registration session
+ */
+static struct RegSession *
+reg_get_session(const char *uid)
+{
+    struct RegSession *session;
+    int found = 0;
+
+    if (reg_session_dict) {
+        session = dict_find(reg_session_dict, uid, &found);
+        if (found && session) {
+            log_module(NS_LOG, LOG_DEBUG, "REG: Found existing session for %s", uid);
+            return session;
+        }
+    }
+
+    /* Create new session */
+    session = calloc(1, sizeof(*session));
+    if (!session) return NULL;
+
+    safestrncpy(session->uid, uid, sizeof(session->uid));
+    session->created = now;
+    session->sequence = ++reg_sequence_counter;
+    session->state = REG_STATE_VALIDATING;
+
+    /* Add to linked list */
+    if (reg_sessions)
+        reg_sessions->prev = session;
+    session->next = reg_sessions;
+    reg_sessions = session;
+
+    /* Add to dict for O(1) lookup */
+    if (!reg_session_dict)
+        reg_session_dict = dict_new();
+    if (reg_session_dict)
+        dict_insert(reg_session_dict, session->uid, session);
+
+    log_module(NS_LOG, LOG_DEBUG, "REG: Created new session for %s (seq=%u)", uid, session->sequence);
+    return session;
+}
+
+/**
+ * Delete stale registration sessions (called periodically)
+ */
+static void
+reg_delete_stale(UNUSED_ARG(void *data))
+{
+    struct RegSession *sess, *next;
+    time_t cutoff = now - REG_STALE_TIMEOUT;
+    int deleted = 0, remaining = 0;
+
+    for (sess = reg_sessions; sess; sess = next) {
+        next = sess->next;
+        if (sess->created < cutoff) {
+            if (sess->state == REG_STATE_KC_CREATING) {
+                /* Async in progress - mark as cancelled, callback will clean up */
+                sess->state = REG_STATE_CANCELLED;
+                remaining++;
+            } else {
+                reg_delete_session(sess);
+                deleted++;
+            }
+        } else {
+            remaining++;
+        }
+    }
+
+    if (deleted || remaining)
+        log_module(NS_LOG, LOG_DEBUG, "REG: Stale check - deleted %d, active %d", deleted, remaining);
+}
+
+/* Forward declaration for async completion */
+static void reg_complete_registration(struct RegSession *session);
+
+#ifdef WITH_KEYCLOAK
+/**
+ * Async callback for Keycloak user creation
+ */
+static void
+reg_async_kc_callback(void *ctx_ptr, int result)
+{
+    struct reg_async_ctx *ctx = (struct reg_async_ctx *)ctx_ptr;
+    struct RegSession *session;
+
+    if (!ctx) {
+        log_module(NS_LOG, LOG_ERROR, "REG async callback: NULL context");
+        return;
+    }
+
+    session = reg_async_ctx_validate(ctx);
+    if (!session) {
+        log_module(NS_LOG, LOG_DEBUG, "REG async callback: Session invalid for uid=%s", ctx->uid);
+        free(ctx);
+        return;
+    }
+    free(ctx);
+
+    log_module(NS_LOG, LOG_DEBUG, "REG async callback: uid=%s result=%d state=%d",
+               session->uid, result, session->state);
+
+    /* Check if session was cancelled while waiting */
+    if (reg_session_is_terminal(session)) {
+        log_module(NS_LOG, LOG_DEBUG, "REG async callback: Session in terminal state, cleaning up");
+        reg_delete_session(session);
+        return;
+    }
+
+    if (result == KC_SUCCESS || result == KC_USER_EXISTS) {
+        /* Keycloak user created (or already exists) - proceed to X3 account creation */
+        session->state = REG_STATE_CREATING_ACCOUNT;
+        reg_complete_registration(session);
+    } else {
+        /* Keycloak failed - send error reply */
+        session->state = REG_STATE_FAILED;
+        snprintf(session->result_msg, sizeof(session->result_msg), "TEMPORARILY_UNAVAILABLE");
+        irc_regreply(session->uid, 'F', session->account, session->result_msg);
+        reg_delete_session(session);
+    }
+}
+#endif /* WITH_KEYCLOAK */
+
+/**
+ * Complete registration after Keycloak (or immediately if no Keycloak)
+ * Creates the X3 account and sends the reply
+ */
+static void
+reg_complete_registration(struct RegSession *session)
+{
+    struct handle_info *hi;
+
+    log_module(NS_LOG, LOG_DEBUG, "REG: Completing registration for %s (account=%s, email=%s)",
+               session->uid, session->account, session->use_email ? session->email : "(none)");
+
+    /* Create the account - with email verification if email was provided and email is enabled */
+    if (session->use_email && nickserv_conf.email_enabled) {
+        /* Create account but require email verification */
+        hi = register_handle(session->account, "", 0);  /* Empty password initially */
+        if (!hi) {
+            log_module(NS_LOG, LOG_ERROR, "REG: Failed to create account %s", session->account);
+            session->state = REG_STATE_FAILED;
+            irc_regreply(session->uid, 'F', session->account, "TEMPORARILY_UNAVAILABLE");
+            reg_delete_session(session);
+            return;
+        }
+        hi->masks = alloc_string_list(1);
+        hi->sslfps = alloc_string_list(1);
+        hi->ignores = alloc_string_list(1);
+        hi->users = NULL;
+        hi->language = lang_C;
+        hi->registered = now;
+        hi->lastseen = now;
+        hi->flags = HI_DEFAULT_FLAGS;
+
+        nickserv_set_email_addr(hi, session->email);
+
+        /* Create activation cookie with hashed password */
+        nickserv_make_cookie(NULL, hi, ACTIVATION, session->password_hash, 0);
+
+        session->state = REG_STATE_COMPLETE;
+        snprintf(session->result_msg, sizeof(session->result_msg),
+                 "Verification email sent to %s", session->email);
+        irc_regreply(session->uid, 'V', session->account, session->result_msg);
+    } else {
+        /* No email verification needed - create account immediately */
+        hi = register_handle(session->account, session->password_hash, 0);
+        if (!hi) {
+            log_module(NS_LOG, LOG_ERROR, "REG: Failed to create account %s", session->account);
+            session->state = REG_STATE_FAILED;
+            irc_regreply(session->uid, 'F', session->account, "TEMPORARILY_UNAVAILABLE");
+            reg_delete_session(session);
+            return;
+        }
+        hi->masks = alloc_string_list(1);
+        hi->sslfps = alloc_string_list(1);
+        hi->ignores = alloc_string_list(1);
+        hi->users = NULL;
+        hi->language = lang_C;
+        hi->registered = now;
+        hi->lastseen = now;
+        hi->flags = HI_DEFAULT_FLAGS;
+
+        if (session->use_email)
+            nickserv_set_email_addr(hi, session->email);
+
+        session->state = REG_STATE_COMPLETE;
+        snprintf(session->result_msg, sizeof(session->result_msg),
+                 "Account %s registered successfully", session->account);
+        irc_regreply(session->uid, 'S', session->account, session->result_msg);
+    }
+
+    reg_delete_session(session);
+}
+
+/**
+ * Process a registration request from draft/account-registration (P10 RG command)
+ * This is the main entry point called from proto-p10.c cmd_register_acct
+ *
+ * @param uid      The server!fd.cookie identifier for the pre-registration client
+ * @param handle   Account name to register
+ * @param email    Email address (or "*" if not provided)
+ * @param password Plain text password
+ * @return 0 if processing started (async or sync), -1 on immediate error
+ */
+int
+nickserv_ircv3_register_p10(const char *uid, const char *handle,
+                            const char *email, const char *password)
+{
+    struct RegSession *session;
+    struct handle_info_list *hil;
+    char crypted[MD5_CRYPT_LENGTH] = "";
+    int email_required;
+    int use_email;
+    const char *actual_handle;
+
+    log_module(NS_LOG, LOG_DEBUG, "nickserv_ircv3_register_p10: uid=%s handle=%s email=%s",
+               uid, handle, email);
+
+    /* Resolve handle ("*" means invalid for pre-registration) */
+    if (handle[0] == '*' && handle[1] == '\0') {
+        irc_regreply(uid, 'F', handle, "BAD_ACCOUNT_NAME :Cannot use '*' for account name");
+        return 0;
+    }
+    actual_handle = handle;
+
+    /* Validate handle length */
+    if (strlen(actual_handle) > NICKSERV_HANDLE_LEN) {
+        char msg[128];
+        snprintf(msg, sizeof(msg), "BAD_ACCOUNT_NAME :Account name too long (max %d characters)", NICKSERV_HANDLE_LEN);
+        irc_regreply(uid, 'F', actual_handle, msg);
+        return 0;
+    }
+
+    /* Check if account already exists */
+    if (get_handle_info(actual_handle)) {
+        irc_regreply(uid, 'F', actual_handle, "ACCOUNT_EXISTS :Account already exists");
+        return 0;
+    }
+
+    /* Determine if email is required */
+    use_email = !(email[0] == '*' && email[1] == '\0');
+    email_required = nickserv_conf.email_required;
+
+    if (email_required && !use_email) {
+        irc_regreply(uid, 'F', actual_handle, "INVALID_EMAIL :Email address is required");
+        return 0;
+    }
+
+    /* Validate email if provided */
+    if (use_email) {
+        const char *prohibited_reason;
+
+        if (!valid_email(email)) {
+            irc_regreply(uid, 'F', actual_handle, "INVALID_EMAIL :Invalid email address format");
+            return 0;
+        }
+
+        if ((prohibited_reason = mail_prohibited_address(email))) {
+            char msg[256];
+            snprintf(msg, sizeof(msg), "INVALID_EMAIL :Email not allowed: %s", prohibited_reason);
+            irc_regreply(uid, 'F', actual_handle, msg);
+            return 0;
+        }
+
+        /* Check handles per email limit */
+        if ((hil = dict_find(nickserv_email_dict, email, NULL))) {
+            if (hil->used >= nickserv_conf.handles_per_email) {
+                irc_regreply(uid, 'F', actual_handle, "INVALID_EMAIL :Too many accounts with this email");
+                return 0;
+            }
+        }
+    }
+
+    /* Validate password strength */
+    if (!is_secure_password(actual_handle, password, NULL)) {
+        char msg[256];
+        snprintf(msg, sizeof(msg), "WEAK_PASSWORD :Password must have %lu+ chars, %lu digits, %lu upper, %lu lower",
+                 nickserv_conf.password_min_length,
+                 nickserv_conf.password_min_digits,
+                 nickserv_conf.password_min_upper,
+                 nickserv_conf.password_min_lower);
+        irc_regreply(uid, 'F', actual_handle, msg);
+        return 0;
+    }
+
+    /* Hash the password */
+    cryptpass(password, crypted);
+
+    /* Create registration session */
+    session = reg_get_session(uid);
+    if (!session) {
+        irc_regreply(uid, 'F', actual_handle, "TEMPORARILY_UNAVAILABLE :Internal error");
+        return -1;
+    }
+
+    /* Store session data */
+    safestrncpy(session->account, actual_handle, sizeof(session->account));
+    safestrncpy(session->email, use_email ? email : "", sizeof(session->email));
+    safestrncpy(session->password_hash, crypted, sizeof(session->password_hash));
+    session->use_email = use_email;
+
+    /* Clear password from stack */
+    memset(crypted, 0, sizeof(crypted));
+
+#ifdef WITH_KEYCLOAK
+    if (nickserv_conf.keycloak_enable) {
+        /* Start async Keycloak user creation */
+        struct reg_async_ctx *ctx = reg_async_ctx_new(session);
+        if (!ctx) {
+            session->state = REG_STATE_FAILED;
+            irc_regreply(uid, 'F', actual_handle, "TEMPORARILY_UNAVAILABLE :Internal error");
+            reg_delete_session(session);
+            return -1;
+        }
+
+        session->state = REG_STATE_KC_CREATING;
+        log_module(NS_LOG, LOG_DEBUG, "REG: Starting async Keycloak user creation for %s", actual_handle);
+
+        int rc = keycloak_create_user_async(
+            kc_realm_config,
+            kc_client_config,
+            actual_handle,
+            use_email ? email : NULL,
+            password,  /* Keycloak needs plain password */
+            ctx,
+            reg_async_kc_callback
+        );
+
+        if (rc < 0) {
+            log_module(NS_LOG, LOG_ERROR, "REG: Failed to start async Keycloak user creation");
+            free(ctx);
+            session->state = REG_STATE_FAILED;
+            irc_regreply(uid, 'F', actual_handle, "TEMPORARILY_UNAVAILABLE :Keycloak error");
+            reg_delete_session(session);
+            return -1;
+        }
+
+        /* Async request started - reply will be sent in callback */
+        return 0;
+    }
+#endif
+
+    /* No Keycloak - complete registration synchronously */
+    session->state = REG_STATE_CREATING_ACCOUNT;
+    reg_complete_registration(session);
+    return 0;
+}
+
+/* =============================================================================
+ * End of Registration Session Management
+ * ============================================================================= */
+
 /* SASL session states for async auth */
 enum sasl_state {
     SASL_STATE_NONE = 0,          /* Not initialized / invalid */
@@ -7960,6 +8598,9 @@ sasl_async_auth_callback(void *ctx_ptr, int result)
             }
         }
 
+        /* Try to auto-activate if user has pending activation and Keycloak says verified */
+        kc_try_auto_activate(hi);
+
         /* Success! Send login info */
         char buffer[256];
         if (hii) {
@@ -8084,6 +8725,9 @@ sasl_async_fingerprint_callback(void *ctx_ptr, int result, char *username)
     }
 
     if (hi) {
+        /* Try to auto-activate if user has pending activation and Keycloak says verified */
+        kc_try_auto_activate(hi);
+
         snprintf(buffer, sizeof(buffer), "%s " FMT_TIME_T, hi->handle, hi->registered);
         log_module(NS_LOG, LOG_DEBUG, "SASL EXTERNAL: Authenticated as %s", hi->handle);
         irc_sasl(session->source, session->uid, "L", buffer);
@@ -8208,6 +8852,9 @@ sasl_async_introspect_callback(void *ctx_ptr, int result, struct kc_token_info *
     keycloak_free_token_info(token_info);
 
     if (hi) {
+        /* Try to auto-activate if user has pending activation and Keycloak says verified */
+        kc_try_auto_activate(hi);
+
         snprintf(buffer, sizeof(buffer), "%s " FMT_TIME_T, hi->handle, hi->registered);
         log_module(NS_LOG, LOG_DEBUG, "SASL OAUTHBEARER: Authenticated as %s", hi->handle);
         irc_sasl(session->source, session->uid, "L", buffer);
@@ -8342,6 +8989,10 @@ sasl_packet(struct SASLSession *session)
         }
         else
         {
+#ifdef WITH_KEYCLOAK
+            /* Try to auto-activate if user has pending activation and Keycloak says verified */
+            kc_try_auto_activate(hi);
+#endif
             snprintf(buffer, sizeof(buffer), "%s "FMT_TIME_T, hi->handle, hi->registered);
             log_module(NS_LOG, LOG_DEBUG, "SASL EXTERNAL: Authenticated as %s", hi->handle);
             irc_sasl(session->source, session->uid, "L", buffer);
@@ -8467,6 +9118,9 @@ sasl_packet(struct SASLSession *session)
                 keycloak_free_token_info(token_info);
 
                 if (hi) {
+                    /* Try to auto-activate if user has pending activation and Keycloak says verified */
+                    kc_try_auto_activate(hi);
+
                     log_module(NS_LOG, LOG_DEBUG, "SASL OAUTHBEARER: JWT validated locally, user=%s", hi->handle);
                     snprintf(buffer, sizeof(buffer), "%s " FMT_TIME_T, hi->handle, hi->registered);
                     irc_sasl(session->source, session->uid, "L", buffer);

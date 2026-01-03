@@ -575,6 +575,22 @@ int keycloak_set_user_attribute_async(struct kc_realm realm, struct kc_client cl
                                        kc_async_callback callback);
 
 /**
+ * Set emailVerified flag on a Keycloak user asynchronously.
+ * Used to sync X3's cookie-based email verification to Keycloak.
+ *
+ * @param realm    Keycloak realm info
+ * @param client   Client with valid access_token
+ * @param user_id  Keycloak user UUID
+ * @param verified 1 for true, 0 for false
+ * @param session  Opaque session pointer (passed to callback, can be NULL)
+ * @param callback Function to call when operation completes
+ * @return 0 on success (request started), -1 on error
+ */
+int keycloak_set_email_verified_async(struct kc_realm realm, struct kc_client client,
+                                       const char *user_id, int verified,
+                                       void *session, kc_async_callback callback);
+
+/**
  * Add a user to a group asynchronously.
  * Useful for non-blocking channel access sync.
  *
@@ -632,6 +648,31 @@ int kc_webpush_send_async(const char *endpoint,
                           const void *body, size_t body_len,
                           void *session,
                           kc_webpush_callback callback);
+
+/**
+ * Callback type for async user creation.
+ * @param session   Opaque session pointer (registration context)
+ * @param result    KC_SUCCESS, KC_USER_EXISTS, or KC_ERROR
+ */
+typedef void (*kc_create_user_callback)(void *session, int result);
+
+/**
+ * Create a user in Keycloak asynchronously.
+ * Uses the async curl_multi infrastructure for non-blocking HTTP.
+ *
+ * @param realm     Keycloak realm configuration
+ * @param client    Client with admin access token
+ * @param username  New user's username
+ * @param email     New user's email (or empty string)
+ * @param password  New user's password
+ * @param session   Opaque session pointer (passed to callback)
+ * @param callback  Function to call when request completes
+ * @return 0 on success (request started), -1 on error
+ */
+int keycloak_create_user_async(struct kc_realm realm, struct kc_client client,
+                               const char *username, const char *email,
+                               const char *password, void *session,
+                               kc_create_user_callback callback);
 
 #endif /* WITH_KEYCLOAK */
 

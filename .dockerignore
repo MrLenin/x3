@@ -1,0 +1,28 @@
+# Build artifacts - never copy these into the container
+*.o
+*.a
+*.so
+*.lo
+*.la
+.deps/
+.libs/
+autom4te.cache/
+
+# Compiled binaries
+src/x3
+src/slab-read
+
+# Config files (mounted separately)
+*.conf
+!*.conf.example
+!docker/*.conf*
+
+# Git
+.git/
+.gitignore
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*~
