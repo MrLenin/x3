@@ -43,6 +43,7 @@
 
 #ifdef WITH_LMDB
 #include "x3_lmdb.h"
+#include "md5.h"  /* For negative auth cache hash */
 #endif
 
 #ifdef WITH_ZSTD
@@ -5867,6 +5868,16 @@ kc_delfromgroup(const char *handle, const char *group_name)
     return rc;
 }
 
+/* Fire-and-forget callback for async attribute updates (just logs result) */
+static void
+ns_attr_async_callback(void *session, int result)
+{
+    (void)session;
+    if (result != KC_SUCCESS) {
+        log_module(NS_LOG, LOG_DEBUG, "ns_attr_async: Attribute update failed (result=%d)", result);
+    }
+}
+
 /**
  * Authenticate via OAuth2 bearer token (for SASL OAUTHBEARER)
  */
@@ -5904,16 +5915,24 @@ loc_auth_oauth(const char *bearer_token, const char *username_hint, const char *
         return NULL;
     }
 
-    /* Use username from token, or fall back to hint */
-    username = token_info->username;
+    /* Use authzid hint if provided (per RFC 7628), otherwise use token username */
+    username = username_hint;
     if (!username || !*username) {
-        username = username_hint;
+        username = token_info->username;
     }
 
     if (!username || !*username) {
-        log_module(NS_LOG, LOG_DEBUG, "loc_auth_oauth: No username in token or hint");
+        log_module(NS_LOG, LOG_DEBUG, "loc_auth_oauth: No username in authzid or token");
         keycloak_free_token_info(token_info);
         return NULL;
+    }
+
+    /* Warn if authzid differs from token owner */
+    if (username_hint && *username_hint && token_info->username && *token_info->username) {
+        if (strcasecmp(username_hint, token_info->username) != 0) {
+            log_module(NS_LOG, LOG_WARNING, "loc_auth_oauth: authzid '%s' differs from token owner '%s'",
+                       username_hint, token_info->username);
+        }
     }
 
     log_module(NS_LOG, LOG_DEBUG, "loc_auth_oauth: Token valid for user %s", username);
@@ -6042,6 +6061,8 @@ loc_auth_external(const char *fingerprint, const char *authzid, const char *host
     struct handle_info *hi = NULL;
     char *kc_username = NULL;
     int rc;
+    char lmdb_key[256];
+    char cached_username[128];
 
     if (!fingerprint || !*fingerprint) {
         log_module(NS_LOG, LOG_DEBUG, "loc_auth_external: No fingerprint provided");
@@ -6050,147 +6071,212 @@ loc_auth_external(const char *fingerprint, const char *authzid, const char *host
 
     log_module(NS_LOG, LOG_DEBUG, "loc_auth_external: Looking up fingerprint %s", fingerprint);
 
-    /* Step 1: Try Keycloak fingerprint lookup */
-    if (nickserv_conf.keycloak_enable) {
-        if (kc_ensure_token() != KC_SUCCESS) {
-            log_module(NS_LOG, LOG_WARNING, "loc_auth_external: Failed to get admin token");
-            /* Fall through to local lookup */
-        } else {
-            rc = keycloak_find_user_by_fingerprint(kc_realm_config, kc_client_config,
-                                                    fingerprint, &kc_username);
+    /* Step 1: Check LMDB fingerprint cache (instant, with TTL) */
+    snprintf(lmdb_key, sizeof(lmdb_key), "%s%s", LMDB_PREFIX_FINGERPRINT, fingerprint);
+    if (x3_lmdb_get(LMDB_DB_METADATA, lmdb_key, cached_username, sizeof(cached_username)) == LMDB_SUCCESS) {
+        /* Cache format: "timestamp:username" - check TTL (1 hour default) */
+        char *colon = strchr(cached_username, ':');
+        if (colon) {
+            time_t cached_time = (time_t)strtoul(cached_username, NULL, 10);
+            char *username = colon + 1;
+            time_t fp_cache_ttl = 3600;  /* 1 hour TTL for fingerprint cache */
 
-            if (rc == KC_COLLISION) {
-                /* Security error - multiple users have this fingerprint */
-                log_module(NS_LOG, LOG_ERROR,
-                    "loc_auth_external: Fingerprint collision detected - refusing auth");
-                return NULL;
-            }
+            if (now - cached_time < fp_cache_ttl) {
+                log_module(NS_LOG, LOG_DEBUG, "loc_auth_external: LMDB cache hit: %s -> %s",
+                           fingerprint, username);
 
-            if (rc == KC_SUCCESS && kc_username) {
-                log_module(NS_LOG, LOG_DEBUG,
-                    "loc_auth_external: Keycloak returned user '%s' for fingerprint",
-                    kc_username);
-
-                /* If authzid was provided, verify it matches */
-                if (authzid && *authzid && strcasecmp(kc_username, authzid) != 0) {
+                /* Verify authzid if provided */
+                if (authzid && *authzid && strcasecmp(username, authzid) != 0) {
                     log_module(NS_LOG, LOG_WARNING,
                         "loc_auth_external: authzid mismatch - client claimed '%s' but cert belongs to '%s'",
-                        authzid, kc_username);
-                    free(kc_username);
+                        authzid, username);
                     return NULL;
                 }
 
-                /* Look up or create local account */
-                hi = get_handle_info(kc_username);
-
-                if (!hi && nickserv_conf.keycloak_autocreate) {
-                    /* Auto-create local account from Keycloak user */
-                    char *mask;
-                    char *email = NULL;
-
-                    log_module(NS_LOG, LOG_INFO,
-                        "loc_auth_external: Auto-creating account for Keycloak user %s",
-                        kc_username);
-
-                    /* Check if handle already exists (race condition check) */
-                    if (dict_find(nickserv_handle_dict, kc_username, NULL)) {
-                        log_module(NS_LOG, LOG_WARNING,
-                            "loc_auth_external: Account %s already exists", kc_username);
-                        free(kc_username);
-                        return NULL;
-                    }
-
-                    /* Get email from Keycloak */
-                    kc_get_user_info(kc_username, &email);
-
-                    /* Create the local handle */
-                    hi = register_handle(kc_username, "", 0);  /* No password for cert auth */
-                    if (!hi) {
-                        log_module(NS_LOG, LOG_WARNING,
-                            "loc_auth_external: Failed to create account for %s", kc_username);
-                        free(kc_username);
-                        free(email);
-                        return NULL;
-                    }
-
-                    /* Initialize handle fields */
-                    hi->masks = alloc_string_list(1);
-                    hi->sslfps = alloc_string_list(1);
-                    hi->ignores = alloc_string_list(1);
-                    hi->users = NULL;
-                    hi->language = lang_C;
-                    hi->registered = now;
-                    hi->lastseen = now;
-                    hi->flags = HI_DEFAULT_FLAGS;
-
-                    /* Register nick if enabled */
-                    if (!nickserv_conf.disable_nicks && is_registerable_nick(kc_username)) {
-                        register_nick(kc_username, hi);
-                    }
-
-                    /* Add a *@* mask for EXTERNAL users */
-                    if (nickserv_conf.default_hostmask)
-                        mask = "*@*";
-                    else
-                        mask = NULL;
-
-                    if (mask) {
-                        char *mask_canonicalized = canonicalize_hostmask(strdup(mask));
-                        string_list_append(hi->masks, mask_canonicalized);
-                    }
-
-                    /* Store the fingerprint locally too */
-                    string_list_append(hi->sslfps, strdup(fingerprint));
-
-                    if (email) {
-                        nickserv_set_email_addr(hi, email);
-                        free(email);
-                    }
-
-                    if (nickserv_conf.sync_log)
-                        SyncLog("REGISTER %s %s %s %s", hi->handle,
-                                hi->passwd[0] ? hi->passwd : "*", "@", "external");
-                }
-
-                free(kc_username);
-
+                hi = get_handle_info(username);
                 if (hi) {
-                    /* Check if account is suspended */
+                    /* Verify account isn't suspended and maxlogins */
                     if (HANDLE_FLAGGED(hi, SUSPENDED)) {
-                        log_module(NS_LOG, LOG_DEBUG,
-                            "loc_auth_external: Account %s is suspended", hi->handle);
+                        log_module(NS_LOG, LOG_DEBUG, "loc_auth_external: Account %s is suspended", hi->handle);
                         return NULL;
                     }
-
-                    /* Check maxlogins */
                     int used = 0;
                     int maxlogins = hi->maxlogins ? hi->maxlogins : nickserv_conf.default_maxlogins;
                     struct userNode *other;
                     for (other = hi->users; other; other = other->next_authed) {
                         if (++used >= maxlogins) {
-                            log_module(NS_LOG, LOG_DEBUG,
-                                "loc_auth_external: Account %s at max logins", hi->handle);
+                            log_module(NS_LOG, LOG_DEBUG, "loc_auth_external: Account %s at max logins", hi->handle);
                             return NULL;
                         }
                     }
-
                     return hi;
                 }
-            } else if (rc == KC_NOT_FOUND) {
-                log_module(NS_LOG, LOG_DEBUG,
-                    "loc_auth_external: Fingerprint not found in Keycloak, trying local lookup");
+                /* Cache entry exists but account doesn't - stale cache, continue to lookup */
+                log_module(NS_LOG, LOG_DEBUG, "loc_auth_external: Stale cache entry for %s", username);
             } else {
-                log_module(NS_LOG, LOG_DEBUG,
-                    "loc_auth_external: Keycloak lookup failed (rc=%d), trying local lookup", rc);
+                log_module(NS_LOG, LOG_DEBUG, "loc_auth_external: Cache expired for fingerprint (age=%lu)",
+                           (unsigned long)(now - cached_time));
+                /* Delete expired entry */
+                x3_lmdb_delete(LMDB_DB_METADATA, lmdb_key);
             }
         }
     }
 
-    /* Step 2: Fall back to local fingerprint lookup (original loc_auth behavior) */
-    log_module(NS_LOG, LOG_DEBUG, "loc_auth_external: Falling back to local fingerprint lookup");
+    /* Step 2: Check local X3 fingerprint storage (in-memory, instant) */
     hi = loc_auth((char*)fingerprint, (char*)authzid, NULL, (char*)hostmask);
+    if (hi) {
+        char cache_value[256];
+        log_module(NS_LOG, LOG_DEBUG, "loc_auth_external: Local lookup found %s", hi->handle);
+        /* Cache in LMDB for future lookups with timestamp */
+        snprintf(cache_value, sizeof(cache_value), "%lu:%s", (unsigned long)now, hi->handle);
+        x3_lmdb_set(LMDB_DB_METADATA, lmdb_key, cache_value);
+        return hi;
+    }
 
-    return hi;
+    /* Step 3: Query Keycloak (HTTP call) */
+    if (nickserv_conf.keycloak_enable) {
+        if (kc_ensure_token() != KC_SUCCESS) {
+            log_module(NS_LOG, LOG_WARNING, "loc_auth_external: Failed to get admin token");
+            return NULL;
+        }
+
+        rc = keycloak_find_user_by_fingerprint(kc_realm_config, kc_client_config,
+                                                fingerprint, &kc_username);
+
+        if (rc == KC_COLLISION) {
+            /* Security error - multiple users have this fingerprint */
+            log_module(NS_LOG, LOG_ERROR,
+                "loc_auth_external: Fingerprint collision detected - refusing auth");
+            return NULL;
+        }
+
+        if (rc == KC_SUCCESS && kc_username) {
+            char cache_value[256];
+            log_module(NS_LOG, LOG_DEBUG,
+                "loc_auth_external: Keycloak returned user '%s' for fingerprint",
+                kc_username);
+
+            /* Cache in LMDB for future lookups with timestamp */
+            snprintf(cache_value, sizeof(cache_value), "%lu:%s", (unsigned long)now, kc_username);
+            x3_lmdb_set(LMDB_DB_METADATA, lmdb_key, cache_value);
+
+            /* If authzid was provided, verify it matches */
+            if (authzid && *authzid && strcasecmp(kc_username, authzid) != 0) {
+                log_module(NS_LOG, LOG_WARNING,
+                    "loc_auth_external: authzid mismatch - client claimed '%s' but cert belongs to '%s'",
+                    authzid, kc_username);
+                free(kc_username);
+                return NULL;
+            }
+
+            /* Look up or create local account */
+            hi = get_handle_info(kc_username);
+
+            if (!hi && nickserv_conf.keycloak_autocreate) {
+                /* Auto-create local account from Keycloak user */
+                char *mask;
+                char *email = NULL;
+
+                log_module(NS_LOG, LOG_INFO,
+                    "loc_auth_external: Auto-creating account for Keycloak user %s",
+                    kc_username);
+
+                /* Check if handle already exists (race condition check) */
+                if (dict_find(nickserv_handle_dict, kc_username, NULL)) {
+                    log_module(NS_LOG, LOG_WARNING,
+                        "loc_auth_external: Account %s already exists", kc_username);
+                    free(kc_username);
+                    return NULL;
+                }
+
+                /* Get email from Keycloak */
+                kc_get_user_info(kc_username, &email);
+
+                /* Create the local handle */
+                hi = register_handle(kc_username, "", 0);  /* No password for cert auth */
+                if (!hi) {
+                    log_module(NS_LOG, LOG_WARNING,
+                        "loc_auth_external: Failed to create account for %s", kc_username);
+                    free(kc_username);
+                    free(email);
+                    return NULL;
+                }
+
+                /* Initialize handle fields */
+                hi->masks = alloc_string_list(1);
+                hi->sslfps = alloc_string_list(1);
+                hi->ignores = alloc_string_list(1);
+                hi->users = NULL;
+                hi->language = lang_C;
+                hi->registered = now;
+                hi->lastseen = now;
+                hi->flags = HI_DEFAULT_FLAGS;
+
+                /* Register nick if enabled */
+                if (!nickserv_conf.disable_nicks && is_registerable_nick(kc_username)) {
+                    register_nick(kc_username, hi);
+                }
+
+                /* Add a *@* mask for EXTERNAL users */
+                if (nickserv_conf.default_hostmask)
+                    mask = "*@*";
+                else
+                    mask = NULL;
+
+                if (mask) {
+                    char *mask_canonicalized = canonicalize_hostmask(strdup(mask));
+                    string_list_append(hi->masks, mask_canonicalized);
+                }
+
+                /* Store the fingerprint locally too */
+                string_list_append(hi->sslfps, strdup(fingerprint));
+
+                if (email) {
+                    nickserv_set_email_addr(hi, email);
+                    free(email);
+                }
+
+                if (nickserv_conf.sync_log)
+                    SyncLog("REGISTER %s %s %s %s", hi->handle,
+                            hi->passwd[0] ? hi->passwd : "*", "@", "external");
+            }
+
+            free(kc_username);
+
+            if (hi) {
+                /* Check if account is suspended */
+                if (HANDLE_FLAGGED(hi, SUSPENDED)) {
+                    log_module(NS_LOG, LOG_DEBUG,
+                        "loc_auth_external: Account %s is suspended", hi->handle);
+                    return NULL;
+                }
+
+                /* Check maxlogins */
+                int used = 0;
+                int maxlogins = hi->maxlogins ? hi->maxlogins : nickserv_conf.default_maxlogins;
+                struct userNode *other;
+                for (other = hi->users; other; other = other->next_authed) {
+                    if (++used >= maxlogins) {
+                        log_module(NS_LOG, LOG_DEBUG,
+                            "loc_auth_external: Account %s at max logins", hi->handle);
+                        return NULL;
+                    }
+                }
+
+                return hi;
+            }
+        } else if (rc == KC_NOT_FOUND) {
+                log_module(NS_LOG, LOG_DEBUG,
+                    "loc_auth_external: Fingerprint not found in Keycloak");
+        } else {
+                log_module(NS_LOG, LOG_DEBUG,
+                    "loc_auth_external: Keycloak lookup failed (rc=%d)", rc);
+        }
+    }
+
+    /* Fingerprint not found anywhere */
+    log_module(NS_LOG, LOG_DEBUG, "loc_auth_external: Fingerprint not found in cache, local, or Keycloak");
+    return NULL;
 }
 #endif /* WITH_KEYCLOAK */
 
@@ -6315,7 +6401,7 @@ nickserv_set_user_metadata(struct handle_info *hi, const char *key, const char *
 #endif
 
 #ifdef WITH_KEYCLOAK
-    /* Step 2: Write to Keycloak backend */
+    /* Step 2: Write to Keycloak backend (async fire-and-forget) */
     if (nickserv_conf.keycloak_enable) {
         char attr_name[128];
         struct kc_user user;
@@ -6337,26 +6423,26 @@ nickserv_set_user_metadata(struct handle_info *hi, const char *key, const char *
                 /* Prefix metadata keys with "metadata." to avoid conflicts */
                 snprintf(attr_name, sizeof(attr_name), "metadata.%s", key);
 
-                /* Set or delete the attribute */
-                if (value && *value) {
-                    rc = keycloak_set_user_attribute(kc_realm_config, kc_client_config,
-                                                     user_id, attr_name, stored_value);
+                /* Fire-and-forget async update - LMDB is authoritative, this is just sync */
+                const char *attr_value = (value && *value) ? stored_value : "";
+                if (keycloak_set_user_attribute_async(kc_realm_config, kc_client_config,
+                                                       user_id, attr_name, attr_value,
+                                                       NULL, ns_attr_async_callback) == 0) {
+                    /* Async started - consider it optimistically successful */
+                    keycloak_ok = 1;
+                    log_module(NS_LOG, LOG_DEBUG, "nickserv_set_user_metadata: Keycloak async set %s.%s = %s (vis=%d)",
+                               hi->handle, key, value ? value : "(deleted)", visibility);
                 } else {
-                    /* Delete by setting to empty string */
+                    /* Async failed to start - fall back to sync */
+                    log_module(NS_LOG, LOG_DEBUG, "nickserv_set_user_metadata: Async failed, using sync");
                     rc = keycloak_set_user_attribute(kc_realm_config, kc_client_config,
-                                                     user_id, attr_name, "");
+                                                     user_id, attr_name, attr_value);
+                    if (rc == KC_SUCCESS) {
+                        keycloak_ok = 1;
+                    }
                 }
 
                 free(user_id);
-
-                if (rc == KC_SUCCESS) {
-                    keycloak_ok = 1;
-                    log_module(NS_LOG, LOG_DEBUG, "nickserv_set_user_metadata: Keycloak set %s.%s = %s (vis=%d)",
-                               hi->handle, key, value ? value : "(deleted)", visibility);
-                } else {
-                    log_module(NS_LOG, LOG_WARNING, "nickserv_set_user_metadata: Keycloak failed to set %s for %s",
-                               key, hi->handle);
-                }
             }
         }
     }
@@ -7399,6 +7485,13 @@ nickserv_define_func(const char *name, modcmd_func_t func, int min_level, int mu
     }
 }
 
+/* SASL session states for async auth */
+enum sasl_state {
+    SASL_STATE_INIT,              /* Initial state */
+    SASL_STATE_WAITING_KEYCLOAK,  /* Async Keycloak auth in progress */
+    SASL_STATE_CANCELLED          /* Client disconnected mid-auth */
+};
+
 struct SASLSession
 {
     struct SASLSession *next;
@@ -7412,10 +7505,88 @@ struct SASLSession
     char *hostmask;
     time_t created;       /* When session was created */
     time_t last_activity; /* Last packet received - used for stale detection */
+    enum sasl_state state;  /* Async auth state */
+    char *authcid;          /* Stored username for async callback */
+    char *authzid;          /* Authorization identity for impersonation */
+    char cred_hash[33];     /* MD5 hash of credentials for negative cache (hex string) */
 };
 
 struct SASLSession *saslsessions = NULL;
 static dict_t sasl_session_dict = NULL;  /* Hash table for O(1) session lookup by UID */
+
+/* Negative auth cache TTL - how long to remember failed auths */
+#define AUTHFAIL_CACHE_TTL 60  /* 60 seconds */
+
+#ifdef WITH_LMDB
+/**
+ * Compute MD5 hash of credentials for negative cache lookup
+ * Format: MD5(username + ":" + password) as hex string
+ * @param username The username
+ * @param password The password
+ * @param hash_out Buffer for hex hash (at least 33 bytes)
+ */
+static void
+compute_cred_hash(const char *username, const char *password, char *hash_out)
+{
+    md5_context ctx;
+    uint8 digest[16];
+    int i;
+
+    md5_starts(&ctx);
+    md5_update(&ctx, (uint8 *)username, strlen(username));
+    md5_update(&ctx, (uint8 *)":", 1);
+    md5_update(&ctx, (uint8 *)password, strlen(password));
+    md5_finish(&ctx, digest);
+
+    /* Convert to hex string */
+    for (i = 0; i < 16; i++) {
+        sprintf(hash_out + (i * 2), "%02x", digest[i]);
+    }
+    hash_out[32] = '\0';
+}
+
+/**
+ * Check if credentials are in the negative auth cache
+ * @param cred_hash The MD5 hash of credentials
+ * @return 1 if cached (auth should fail), 0 if not cached (proceed with auth)
+ */
+static int
+check_authfail_cache(const char *cred_hash)
+{
+    char lmdb_key[64];
+    char cached_value[32];
+
+    snprintf(lmdb_key, sizeof(lmdb_key), "%s%s", LMDB_PREFIX_AUTHFAIL, cred_hash);
+
+    if (x3_lmdb_get(LMDB_DB_METADATA, lmdb_key, cached_value, sizeof(cached_value)) == LMDB_SUCCESS) {
+        time_t cached_time = (time_t)strtoul(cached_value, NULL, 10);
+        if (now - cached_time < AUTHFAIL_CACHE_TTL) {
+            log_module(NS_LOG, LOG_DEBUG, "Negative auth cache hit (age=%lu)",
+                       (unsigned long)(now - cached_time));
+            return 1;  /* Cache hit - credentials known bad */
+        }
+        /* Expired - delete stale entry */
+        x3_lmdb_delete(LMDB_DB_METADATA, lmdb_key);
+    }
+    return 0;  /* Not in cache */
+}
+
+/**
+ * Add credentials to the negative auth cache
+ * @param cred_hash The MD5 hash of credentials
+ */
+static void
+cache_authfail(const char *cred_hash)
+{
+    char lmdb_key[64];
+    char cache_value[32];
+
+    snprintf(lmdb_key, sizeof(lmdb_key), "%s%s", LMDB_PREFIX_AUTHFAIL, cred_hash);
+    snprintf(cache_value, sizeof(cache_value), "%lu", (unsigned long)now);
+    x3_lmdb_set(LMDB_DB_METADATA, lmdb_key, cache_value);
+    log_module(NS_LOG, LOG_DEBUG, "Cached auth failure for hash %s", cred_hash);
+}
+#endif /* WITH_LMDB */
 
 void
 sasl_delete_session(struct SASLSession *session)
@@ -7438,6 +7609,14 @@ sasl_delete_session(struct SASLSession *session)
     if (session->hostmask)
         free(session->hostmask);
     session->hostmask = NULL;
+
+    if (session->authcid)
+        free(session->authcid);
+    session->authcid = NULL;
+
+    if (session->authzid)
+        free(session->authzid);
+    session->authzid = NULL;
 
     if (session->next)
         session->next->prev = session->prev;
@@ -7533,6 +7712,304 @@ sasl_get_session(const char *uid)
     return sess;
 }
 
+#ifdef WITH_KEYCLOAK
+/*
+ * Async auth callback - invoked when Keycloak auth completes
+ */
+static void
+sasl_async_auth_callback(void *session_ptr, int result)
+{
+    struct SASLSession *session = (struct SASLSession *)session_ptr;
+    struct handle_info *hi = NULL;
+    struct handle_info *hii = NULL;  /* Impersonator's handle_info */
+
+    if (!session) {
+        log_module(NS_LOG, LOG_ERROR, "SASL async callback: NULL session");
+        return;
+    }
+
+    log_module(NS_LOG, LOG_DEBUG, "SASL async callback: uid=%s result=%d state=%d",
+               session->uid, result, session->state);
+
+    /* Check if client disconnected while auth was in progress */
+    if (session->state == SASL_STATE_CANCELLED) {
+        log_module(NS_LOG, LOG_DEBUG, "SASL async callback: Session was cancelled, cleaning up");
+        sasl_delete_session(session);
+        return;
+    }
+
+    /* Process result */
+    if (result == KC_SUCCESS && session->authcid) {
+        /* Get or create handle_info */
+        hi = get_handle_info(session->authcid);
+        if (!hi && nickserv_conf.keycloak_autocreate) {
+            /* Auto-create account for Keycloak user */
+            log_module(NS_LOG, LOG_INFO, "SASL async: Auto-creating account for %s", session->authcid);
+            hi = register_handle(session->authcid, "", 0);
+            if (hi) {
+                char *mask = generate_hostmask(NULL, GENMASK_OMITNICK|GENMASK_NO_HIDING|GENMASK_ANY_IDENT);
+                if (mask) {
+                    string_list_append(hi->masks, mask);
+                }
+            }
+        }
+    }
+
+    if (result == KC_SUCCESS && hi) {
+        /* Check if suspended */
+        if (HANDLE_FLAGGED(hi, SUSPENDED)) {
+            log_module(NS_LOG, LOG_DEBUG, "SASL async: Account %s is suspended", hi->handle);
+            irc_sasl(session->source, session->uid, "D", "F");
+            sasl_delete_session(session);
+            return;
+        }
+
+        /* Check max logins */
+        int used = 0;
+        int maxlogins = hi->maxlogins ? hi->maxlogins : nickserv_conf.default_maxlogins;
+        struct userNode *other;
+        for (other = hi->users; other; other = other->next_authed) {
+            if (++used >= maxlogins) {
+                log_module(NS_LOG, LOG_DEBUG, "SASL async: Account %s at max logins", hi->handle);
+                irc_sasl(session->source, session->uid, "D", "F");
+                sasl_delete_session(session);
+                return;
+            }
+        }
+
+        /* Check for impersonation (authzid != authcid) */
+        if (session->authzid && irccasecmp(session->authzid, session->authcid)) {
+            if (HANDLE_FLAGGED(hi, IMPERSONATE)) {
+                hii = hi;  /* Save the impersonator's handle_info */
+                hi = get_handle_info(session->authzid);
+                if (!hi) {
+                    log_module(NS_LOG, LOG_DEBUG, "SASL async: Impersonation target %s not found",
+                               session->authzid);
+                    irc_sasl(session->source, session->uid, "D", "F");
+                    sasl_delete_session(session);
+                    return;
+                }
+            } else {
+                log_module(NS_LOG, LOG_DEBUG, "SASL async: Impersonation unauthorized for %s",
+                           session->authcid);
+                irc_sasl(session->source, session->uid, "D", "F");
+                sasl_delete_session(session);
+                return;
+            }
+        }
+
+        /* Success! Send login info */
+        char buffer[256];
+        if (hii) {
+            /* Send impersonator info first */
+            log_module(NS_LOG, LOG_DEBUG, "SASL async: %s is impersonating %s",
+                       hii->handle, hi->handle);
+            snprintf(buffer, sizeof(buffer), "%s " FMT_TIME_T, hii->handle, hii->registered);
+            irc_sasl(session->source, session->uid, "I", buffer);
+        }
+        snprintf(buffer, sizeof(buffer), "%s " FMT_TIME_T, hi->handle, hi->registered);
+        irc_sasl(session->source, session->uid, "L", buffer);
+        irc_sasl(session->source, session->uid, "D", "S");
+        log_module(NS_LOG, LOG_DEBUG, "SASL async: Success for %s", hi->handle);
+    } else {
+        /* Auth failed */
+        log_module(NS_LOG, LOG_DEBUG, "SASL async: Auth failed for %s (result=%d, hi=%p)",
+                   session->authcid ? session->authcid : "(null)", result, (void*)hi);
+
+#ifdef WITH_LMDB
+        /* Cache the failure to avoid hitting Keycloak again for same bad creds */
+        if (session->cred_hash[0]) {
+            cache_authfail(session->cred_hash);
+        }
+#endif
+
+        irc_sasl(session->source, session->uid, "D", "F");
+    }
+
+    sasl_delete_session(session);
+}
+
+/*
+ * Async fingerprint lookup callback - invoked when Keycloak fingerprint search completes
+ */
+static void
+sasl_async_fingerprint_callback(void *session_ptr, int result, char *username)
+{
+    struct SASLSession *session = (struct SASLSession *)session_ptr;
+    struct handle_info *hi = NULL;
+    char buffer[256];
+
+    if (!session) {
+        log_module(NS_LOG, LOG_ERROR, "SASL fingerprint callback: NULL session");
+        if (username) free(username);
+        return;
+    }
+
+    log_module(NS_LOG, LOG_DEBUG, "SASL fingerprint callback: uid=%s result=%d username=%s",
+               session->uid, result, username ? username : "(null)");
+
+    /* Check if client disconnected while lookup was in progress */
+    if (session->state == SASL_STATE_CANCELLED) {
+        log_module(NS_LOG, LOG_DEBUG, "SASL fingerprint callback: Session was cancelled");
+        if (username) free(username);
+        sasl_delete_session(session);
+        return;
+    }
+
+    if (result == KC_COLLISION) {
+        log_module(NS_LOG, LOG_ERROR, "SASL EXTERNAL: Fingerprint collision - refusing auth");
+        irc_sasl(session->source, session->uid, "D", "F");
+        if (username) free(username);
+        sasl_delete_session(session);
+        return;
+    }
+
+    if (result == KC_SUCCESS && username) {
+        /* Verify authzid if provided */
+        if (session->authzid && *session->authzid && strcasecmp(username, session->authzid) != 0) {
+            log_module(NS_LOG, LOG_WARNING, "SASL EXTERNAL: authzid mismatch - '%s' vs '%s'",
+                       session->authzid, username);
+            irc_sasl(session->source, session->uid, "D", "F");
+            free(username);
+            sasl_delete_session(session);
+            return;
+        }
+
+        /* Look up or auto-create account */
+        hi = get_handle_info(username);
+        if (!hi && nickserv_conf.keycloak_autocreate) {
+            log_module(NS_LOG, LOG_INFO, "SASL EXTERNAL: Auto-creating account for %s", username);
+            hi = register_handle(username, "", 0);
+            if (hi) {
+                hi->masks = alloc_string_list(1);
+                hi->sslfps = alloc_string_list(1);
+                hi->ignores = alloc_string_list(1);
+                /* Add fingerprint */
+                if (session->sslclifp)
+                    string_list_append(hi->sslfps, strdup(session->sslclifp));
+            }
+        }
+        free(username);
+    } else if (result == KC_NOT_FOUND && session->sslclifp) {
+        /* Fall back to local fingerprint lookup */
+        log_module(NS_LOG, LOG_DEBUG, "SASL EXTERNAL: Keycloak not found, trying local lookup");
+        hi = loc_auth(session->sslclifp, session->authzid, NULL, session->hostmask);
+    }
+
+    if (hi) {
+        snprintf(buffer, sizeof(buffer), "%s " FMT_TIME_T, hi->handle, hi->registered);
+        log_module(NS_LOG, LOG_DEBUG, "SASL EXTERNAL: Authenticated as %s", hi->handle);
+        irc_sasl(session->source, session->uid, "L", buffer);
+        irc_sasl(session->source, session->uid, "D", "S");
+    } else {
+        log_module(NS_LOG, LOG_DEBUG, "SASL EXTERNAL: No matching account for fingerprint");
+        irc_sasl(session->source, session->uid, "D", "F");
+    }
+
+    sasl_delete_session(session);
+}
+
+/*
+ * Async token introspection callback - invoked when Keycloak token validation completes
+ */
+static void
+sasl_async_introspect_callback(void *session_ptr, int result, struct kc_token_info *token_info)
+{
+    struct SASLSession *session = (struct SASLSession *)session_ptr;
+    struct handle_info *hi = NULL;
+    char buffer[256];
+    const char *username;
+
+    if (!session) {
+        log_module(NS_LOG, LOG_ERROR, "SASL introspect callback: NULL session");
+        if (token_info) keycloak_free_token_info(token_info);
+        return;
+    }
+
+    log_module(NS_LOG, LOG_DEBUG, "SASL introspect callback: uid=%s result=%d",
+               session->uid, result);
+
+    /* Check if client disconnected while lookup was in progress */
+    if (session->state == SASL_STATE_CANCELLED) {
+        log_module(NS_LOG, LOG_DEBUG, "SASL introspect callback: Session was cancelled");
+        if (token_info) keycloak_free_token_info(token_info);
+        sasl_delete_session(session);
+        return;
+    }
+
+    if (result != KC_SUCCESS || !token_info) {
+        log_module(NS_LOG, LOG_DEBUG, "SASL OAUTHBEARER: Token introspection failed");
+        irc_sasl(session->source, session->uid, "C", "eyJzdGF0dXMiOiJpbnZhbGlkX3Rva2VuIn0=");
+        irc_sasl(session->source, session->uid, "D", "F");
+        if (token_info) keycloak_free_token_info(token_info);
+        sasl_delete_session(session);
+        return;
+    }
+
+    if (!token_info->active) {
+        log_module(NS_LOG, LOG_DEBUG, "SASL OAUTHBEARER: Token is not active");
+        irc_sasl(session->source, session->uid, "C", "eyJzdGF0dXMiOiJpbnZhbGlkX3Rva2VuIn0=");
+        irc_sasl(session->source, session->uid, "D", "F");
+        keycloak_free_token_info(token_info);
+        sasl_delete_session(session);
+        return;
+    }
+
+    /* Get username: authzid takes priority per RFC 7628, token username is fallback */
+    username = session->authzid;
+    if (!username || !*username) {
+        username = token_info->username;  /* preferred_username from token */
+    }
+
+    if (!username || !*username) {
+        log_module(NS_LOG, LOG_DEBUG, "SASL OAUTHBEARER: No username in authzid or token");
+        irc_sasl(session->source, session->uid, "D", "F");
+        keycloak_free_token_info(token_info);
+        sasl_delete_session(session);
+        return;
+    }
+
+    /* If authzid was provided, verify the token owner is authorized to use it.
+     * The token's subject/username should match the authzid, or be allowed to
+     * impersonate it. For now, log a warning if they differ.
+     */
+    if (session->authzid && *session->authzid && token_info->username && *token_info->username) {
+        if (strcasecmp(session->authzid, token_info->username) != 0) {
+            log_module(NS_LOG, LOG_WARNING, "SASL OAUTHBEARER: authzid '%s' differs from token owner '%s'",
+                       session->authzid, token_info->username);
+            /* For now we allow this, but could enforce a match or check impersonation rights */
+        }
+    }
+
+    /* Look up or auto-create account */
+    hi = get_handle_info(username);
+    if (!hi && nickserv_conf.keycloak_autocreate) {
+        log_module(NS_LOG, LOG_INFO, "SASL OAUTHBEARER: Auto-creating account for %s", username);
+        hi = register_handle(username, "", 0);
+        if (hi) {
+            char *mask = generate_hostmask(NULL, GENMASK_OMITNICK|GENMASK_NO_HIDING|GENMASK_ANY_IDENT);
+            if (mask) {
+                string_list_append(hi->masks, mask);
+            }
+        }
+    }
+
+    keycloak_free_token_info(token_info);
+
+    if (hi) {
+        snprintf(buffer, sizeof(buffer), "%s " FMT_TIME_T, hi->handle, hi->registered);
+        log_module(NS_LOG, LOG_DEBUG, "SASL OAUTHBEARER: Authenticated as %s", hi->handle);
+        irc_sasl(session->source, session->uid, "L", buffer);
+        irc_sasl(session->source, session->uid, "D", "S");
+    } else {
+        log_module(NS_LOG, LOG_DEBUG, "SASL OAUTHBEARER: No matching account");
+        irc_sasl(session->source, session->uid, "D", "F");
+    }
+
+    sasl_delete_session(session);
+}
+#endif /* WITH_KEYCLOAK */
+
 void
 sasl_packet(struct SASLSession *session)
 {
@@ -7590,26 +8067,57 @@ sasl_packet(struct SASLSession *session)
         if (!session->sslclifp) {
             log_module(NS_LOG, LOG_DEBUG, "SASL EXTERNAL: No certificate fingerprint provided");
             irc_sasl(session->source, session->uid, "D", "F");
-        } else {
+            sasl_delete_session(session);
+            free(raw);
+            return;
+        }
+
 #ifdef WITH_KEYCLOAK
-            /* Use Keycloak fingerprint lookup with fallback to local */
+        if (nickserv_conf.keycloak_enable && kc_ensure_token() == KC_SUCCESS) {
+            /* Use async Keycloak fingerprint lookup */
+            log_module(NS_LOG, LOG_DEBUG, "SASL EXTERNAL: Starting async fingerprint lookup");
+
+            /* Store authzid for callback */
+            if (authzid && *authzid)
+                session->authzid = strdup(authzid);
+            session->state = SASL_STATE_WAITING_KEYCLOAK;
+
+            if (keycloak_find_user_by_fingerprint_async(kc_realm_config, kc_client_config,
+                                                         session->sslclifp, session,
+                                                         sasl_async_fingerprint_callback) == 0) {
+                /* Request started - callback will handle cleanup */
+                free(raw);
+                return;
+            }
+
+            /* Async failed - fall back to sync */
+            log_module(NS_LOG, LOG_WARNING, "SASL EXTERNAL: Async lookup failed, using sync");
+            session->state = SASL_STATE_INIT;
+            if (session->authzid) {
+                free(session->authzid);
+                session->authzid = NULL;
+            }
             hi = loc_auth_external(session->sslclifp, authzid, session->hostmask);
+        } else {
+            /* Keycloak not available - use sync path */
+            hi = loc_auth_external(session->sslclifp, authzid, session->hostmask);
+        }
 #else
-            /* Local fingerprint lookup only */
-            hi = loc_auth(session->sslclifp, authzid, NULL, session->hostmask);
+        /* Local fingerprint lookup only */
+        hi = loc_auth(session->sslclifp, authzid, NULL, session->hostmask);
 #endif
-            if (!hi)
-            {
-                log_module(NS_LOG, LOG_DEBUG, "SASL EXTERNAL: No matching account for fingerprint");
-                irc_sasl(session->source, session->uid, "D", "F");
-            }
-            else
-            {
-                snprintf(buffer, sizeof(buffer), "%s "FMT_TIME_T, hi->handle, hi->registered);
-                log_module(NS_LOG, LOG_DEBUG, "SASL EXTERNAL: Authenticated as %s", hi->handle);
-                irc_sasl(session->source, session->uid, "L", buffer);
-                irc_sasl(session->source, session->uid, "D", "S");
-            }
+
+        if (!hi)
+        {
+            log_module(NS_LOG, LOG_DEBUG, "SASL EXTERNAL: No matching account for fingerprint");
+            irc_sasl(session->source, session->uid, "D", "F");
+        }
+        else
+        {
+            snprintf(buffer, sizeof(buffer), "%s "FMT_TIME_T, hi->handle, hi->registered);
+            log_module(NS_LOG, LOG_DEBUG, "SASL EXTERNAL: Authenticated as %s", hi->handle);
+            irc_sasl(session->source, session->uid, "L", buffer);
+            irc_sasl(session->source, session->uid, "D", "S");
         }
 
         sasl_delete_session(session);
@@ -7689,6 +8197,93 @@ sasl_packet(struct SASLSession *session)
         log_module(NS_LOG, LOG_DEBUG, "SASL OAUTHBEARER: Validating token for authzid=%s",
                    authzid ? authzid : "(none)");
 
+        /* Try local JWT validation first (no HTTP round-trip) */
+        if (nickserv_conf.keycloak_enable) {
+            struct kc_token_info *token_info = NULL;
+            int jwt_result = keycloak_validate_jwt_local(kc_realm_config, token_start, &token_info);
+
+            if (jwt_result == KC_SUCCESS && token_info) {
+                /* JWT validated locally - complete auth immediately */
+                const char *username = authzid;
+                if (!username || !*username)
+                    username = token_info->username;
+
+                if (!username || !*username) {
+                    log_module(NS_LOG, LOG_DEBUG, "SASL OAUTHBEARER: No username in authzid or token");
+                    keycloak_free_token_info(token_info);
+                    irc_sasl(session->source, session->uid, "D", "F");
+                    sasl_delete_session(session);
+                    free(raw);
+                    return;
+                }
+
+                /* Look up or auto-create account */
+                hi = get_handle_info(username);
+                if (!hi && nickserv_conf.keycloak_autocreate) {
+                    log_module(NS_LOG, LOG_INFO, "SASL OAUTHBEARER: Auto-creating account for %s", username);
+                    hi = register_handle(username, "", 0);
+                    if (hi) {
+                        char *mask = generate_hostmask(NULL, GENMASK_OMITNICK|GENMASK_NO_HIDING|GENMASK_ANY_IDENT);
+                        if (mask) {
+                            string_list_append(hi->masks, mask);
+                        }
+                    }
+                }
+
+                keycloak_free_token_info(token_info);
+
+                if (hi) {
+                    log_module(NS_LOG, LOG_DEBUG, "SASL OAUTHBEARER: JWT validated locally, user=%s", hi->handle);
+                    snprintf(buffer, sizeof(buffer), "%s " FMT_TIME_T, hi->handle, hi->registered);
+                    irc_sasl(session->source, session->uid, "L", buffer);
+                    irc_sasl(session->source, session->uid, "D", "S");
+                } else {
+                    log_module(NS_LOG, LOG_DEBUG, "SASL OAUTHBEARER: No matching account for %s", username);
+                    irc_sasl(session->source, session->uid, "D", "F");
+                }
+
+                sasl_delete_session(session);
+                free(raw);
+                return;
+            }
+
+            if (jwt_result == KC_FORBIDDEN) {
+                /* JWT signature invalid or expired - reject immediately */
+                log_module(NS_LOG, LOG_DEBUG, "SASL OAUTHBEARER: JWT validation failed (invalid/expired)");
+                if (token_info) keycloak_free_token_info(token_info);
+                irc_sasl(session->source, session->uid, "C", "eyJzdGF0dXMiOiJpbnZhbGlkX3Rva2VuIn0=");
+                irc_sasl(session->source, session->uid, "D", "F");
+                sasl_delete_session(session);
+                free(raw);
+                return;
+            }
+
+            /* jwt_result == KC_ERROR - can't validate locally, fall back to introspection */
+            log_module(NS_LOG, LOG_DEBUG, "SASL OAUTHBEARER: Local JWT validation unavailable, using introspection");
+
+            /* Store authzid as username hint for callback */
+            if (authzid && *authzid)
+                session->authzid = strdup(authzid);
+            session->state = SASL_STATE_WAITING_KEYCLOAK;
+
+            if (keycloak_introspect_token_async(kc_realm_config, kc_client_config,
+                                                 token_start, session,
+                                                 sasl_async_introspect_callback) == 0) {
+                /* Request started - callback will handle cleanup */
+                free(raw);
+                return;
+            }
+
+            /* Async failed - fall back to sync */
+            log_module(NS_LOG, LOG_WARNING, "SASL OAUTHBEARER: Async introspect failed, using sync");
+            session->state = SASL_STATE_INIT;
+            if (session->authzid) {
+                free(session->authzid);
+                session->authzid = NULL;
+            }
+        }
+
+        /* Synchronous fallback */
         hi = loc_auth_oauth(token_start, authzid, session->hostmask);
 
         if (!hi) {
@@ -7746,6 +8341,58 @@ sasl_packet(struct SASLSession *session)
             log_module(NS_LOG, LOG_DEBUG, "SASL: Incomplete credentials supplied");
             irc_sasl(session->source, session->uid, "D", "F");
         }
+#ifdef WITH_KEYCLOAK
+        else if (nickserv_conf.keycloak_enable && passwd && *passwd)
+        {
+            /* Use async Keycloak auth - non-blocking! */
+            log_module(NS_LOG, LOG_DEBUG, "SASL: Starting async Keycloak auth for %s", authcid);
+
+#ifdef WITH_LMDB
+            /* Compute credential hash for negative cache */
+            compute_cred_hash(authcid, passwd, session->cred_hash);
+
+            /* Check negative auth cache first - avoid hitting Keycloak for known bad creds */
+            if (check_authfail_cache(session->cred_hash)) {
+                log_module(NS_LOG, LOG_DEBUG, "SASL: Negative cache hit - rejecting immediately");
+                irc_sasl(session->source, session->uid, "D", "F");
+                free(raw);
+                return;
+            }
+#endif
+
+            /* Store credentials for callback */
+            session->authcid = strdup(authcid);
+            if (authzid && *authzid)
+                session->authzid = strdup(authzid);
+            session->state = SASL_STATE_WAITING_KEYCLOAK;
+
+            /* Start async auth - returns immediately */
+            if (kc_check_auth_async(kc_realm_config, kc_client_config,
+                                    authcid, passwd, session,
+                                    sasl_async_auth_callback) == 0) {
+                /* Request started - DON'T delete session, callback will handle it */
+                free(raw);
+                return;
+            }
+
+            /* Async start failed - fall through to sync path */
+            log_module(NS_LOG, LOG_WARNING, "SASL: Async auth start failed, falling back to sync");
+            session->state = SASL_STATE_INIT;
+            free(session->authcid);
+            session->authcid = NULL;
+            if (session->authzid) {
+                free(session->authzid);
+                session->authzid = NULL;
+            }
+
+            /* Fall through to synchronous loc_auth */
+            if (!(hi = loc_auth(session->sslclifp, authcid, passwd, session->hostmask)))
+            {
+                log_module(NS_LOG, LOG_DEBUG, "SASL: Invalid credentials supplied (sync fallback)");
+                irc_sasl(session->source, session->uid, "D", "F");
+            }
+        }
+#endif
         else
         {
             if (!(hi = loc_auth(session->sslclifp, authcid, passwd, session->hostmask)))
@@ -7839,6 +8486,13 @@ handle_sasl_input(struct server* source ,const char *uid, const char *subcmd, co
 
     if (!strcmp(subcmd, "D"))
     {
+        /* Check if async auth is in progress */
+        if (sess->state == SASL_STATE_WAITING_KEYCLOAK) {
+            /* Mark as cancelled - callback will clean up */
+            log_module(NS_LOG, LOG_DEBUG, "SASL: Marking session %s as cancelled (async in progress)", sess->uid);
+            sess->state = SASL_STATE_CANCELLED;
+            return;  /* Don't delete - callback will handle it */
+        }
         sasl_delete_session(sess);
         return;
     }

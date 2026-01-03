@@ -368,6 +368,19 @@ int keycloak_introspect_token(struct kc_realm realm, struct kc_client client,
                               struct kc_token_info** info_out);
 
 /**
+ * Validate a JWT token locally using cached JWKS public keys
+ * This avoids an HTTP round-trip to Keycloak for token validation.
+ * Falls back to introspection if local validation fails (unknown key, etc).
+ *
+ * @param realm         Keycloak realm configuration (for JWKS endpoint)
+ * @param token         The JWT bearer token to validate
+ * @param info_out      Output pointer for token info (caller must free with keycloak_free_token_info)
+ * @return KC_SUCCESS if valid, KC_FORBIDDEN if expired/invalid signature, KC_ERROR if can't validate locally
+ */
+int keycloak_validate_jwt_local(struct kc_realm realm, const char *token,
+                                struct kc_token_info **info_out);
+
+/**
  * Frees memory allocated for a kc_token_info structure
  * @param info      Pointer to token info (can be NULL)
  */
@@ -464,9 +477,134 @@ int keycloak_ensure_channels_parent(struct kc_realm realm, struct kc_client clie
                                     char** group_id_out);
 
 /**
- * Initialize keycloak module
+ * Initialize keycloak module (creates persistent CURL handle for connection reuse)
  */
 void init_keycloak(void);
+
+/**
+ * Cleanup keycloak module (frees persistent CURL handle)
+ */
+void cleanup_keycloak(void);
+
+/**
+ * Async authentication callback type
+ * @param session  Opaque session pointer passed to kc_check_auth_async
+ * @param result   KC_SUCCESS, KC_FORBIDDEN, or KC_ERROR
+ */
+typedef void (*kc_async_callback)(void *session, int result);
+
+/**
+ * Async fingerprint lookup callback type
+ * @param session   Opaque session pointer
+ * @param result    KC_SUCCESS, KC_NOT_FOUND, KC_COLLISION, or KC_ERROR
+ * @param username  Username found (only valid if result==KC_SUCCESS, caller must free)
+ */
+typedef void (*kc_fingerprint_callback)(void *session, int result, char *username);
+
+/**
+ * Async token introspection callback type
+ * @param session    Opaque session pointer
+ * @param result     KC_SUCCESS or KC_ERROR
+ * @param token_info Token info (only valid if result==KC_SUCCESS, caller must free)
+ */
+typedef void (*kc_introspect_callback)(void *session, int result, struct kc_token_info *token_info);
+
+/**
+ * Start async authentication check against Keycloak
+ * This function returns immediately and invokes the callback when complete.
+ * Uses curl_multi integrated with X3's ioset event loop.
+ *
+ * @param realm     Keycloak realm configuration
+ * @param client    Client credentials (client_id, client_secret)
+ * @param handle    Username to authenticate
+ * @param password  Password to verify
+ * @param session   Opaque session pointer (passed to callback)
+ * @param callback  Function to call when auth completes
+ * @return 0 on success (request started), -1 on error
+ */
+int kc_check_auth_async(struct kc_realm realm, struct kc_client client,
+                        const char *handle, const char *password,
+                        void *session, kc_async_callback callback);
+
+/**
+ * Start async fingerprint lookup against Keycloak
+ * This function returns immediately and invokes the callback when complete.
+ *
+ * @param realm       Keycloak realm configuration
+ * @param client      Client with admin access token
+ * @param fingerprint Certificate fingerprint to search for
+ * @param session     Opaque session pointer (passed to callback)
+ * @param callback    Function to call when lookup completes
+ * @return 0 on success (request started), -1 on error
+ */
+int keycloak_find_user_by_fingerprint_async(struct kc_realm realm, struct kc_client client,
+                                             const char *fingerprint, void *session,
+                                             kc_fingerprint_callback callback);
+
+/**
+ * Start async token introspection against Keycloak
+ * This function returns immediately and invokes the callback when complete.
+ *
+ * @param realm    Keycloak realm configuration
+ * @param client   Client credentials
+ * @param token    Bearer token to introspect
+ * @param session  Opaque session pointer (passed to callback)
+ * @param callback Function to call when introspection completes
+ * @return 0 on success (request started), -1 on error
+ */
+int keycloak_introspect_token_async(struct kc_realm realm, struct kc_client client,
+                                     const char *token, void *session,
+                                     kc_introspect_callback callback);
+
+/**
+ * Set a user attribute asynchronously.
+ * Uses generic kc_async_callback for success/failure notification.
+ *
+ * @param realm      Keycloak realm info
+ * @param client     Client with valid access_token
+ * @param user_id    Keycloak user UUID
+ * @param attr_name  Attribute name to set
+ * @param attr_value Attribute value (NULL to clear)
+ * @param session    Opaque session pointer (passed to callback)
+ * @param callback   Function to call when operation completes
+ * @return 0 on success (request started), -1 on error
+ */
+int keycloak_set_user_attribute_async(struct kc_realm realm, struct kc_client client,
+                                       const char *user_id, const char *attr_name,
+                                       const char *attr_value, void *session,
+                                       kc_async_callback callback);
+
+/**
+ * Add a user to a group asynchronously.
+ * Useful for non-blocking channel access sync.
+ *
+ * @param realm    Keycloak realm info
+ * @param client   Client with valid access_token
+ * @param user_id  Keycloak user UUID
+ * @param group_id Keycloak group UUID
+ * @param session  Opaque session pointer (passed to callback)
+ * @param callback Function to call when operation completes
+ * @return 0 on success (request started), -1 on error
+ */
+int keycloak_add_user_to_group_async(struct kc_realm realm, struct kc_client client,
+                                      const char *user_id, const char *group_id,
+                                      void *session, kc_async_callback callback);
+
+/**
+ * Remove a user from a group asynchronously.
+ * Useful for non-blocking channel access sync.
+ *
+ * @param realm    Keycloak realm info
+ * @param client   Client with valid access_token
+ * @param user_id  Keycloak user UUID
+ * @param group_id Keycloak group UUID
+ * @param session  Opaque session pointer (passed to callback)
+ * @param callback Function to call when operation completes
+ * @return 0 on success (request started), -1 on error
+ */
+int keycloak_remove_user_from_group_async(struct kc_realm realm, struct kc_client client,
+                                           const char *user_id, const char *group_id,
+                                           void *session, kc_async_callback callback);
 
 #endif /* WITH_KEYCLOAK */
 

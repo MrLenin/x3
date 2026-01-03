@@ -1147,6 +1147,145 @@ int x3_lmdb_sync(int force)
     return rc == 0 ? LMDB_SUCCESS : LMDB_ERROR;
 }
 
+/* ========== Generic Key-Value Operations ========== */
+
+/**
+ * Helper to resolve database name to dbi handle
+ */
+static int resolve_dbi(const char *db, MDB_dbi *dbi_out)
+{
+    if (!db || !dbi_out) {
+        return LMDB_ERROR;
+    }
+
+    if (strcmp(db, LMDB_DB_ACCOUNTS) == 0) {
+        *dbi_out = dbi_accounts;
+    } else if (strcmp(db, LMDB_DB_CHANNELS) == 0) {
+        *dbi_out = dbi_channels;
+    } else if (strcmp(db, LMDB_DB_METADATA) == 0) {
+        *dbi_out = dbi_metadata;
+    } else {
+        return LMDB_ERROR;
+    }
+    return LMDB_SUCCESS;
+}
+
+int x3_lmdb_get(const char *db, const char *key, char *value, size_t value_size)
+{
+    MDB_txn *txn;
+    MDB_val mkey, mdata;
+    MDB_dbi dbi;
+    int rc;
+
+    if (!x3_lmdb_is_available() || !db || !key || !value || value_size == 0) {
+        return LMDB_ERROR;
+    }
+
+    if (resolve_dbi(db, &dbi) != LMDB_SUCCESS) {
+        return LMDB_ERROR;
+    }
+
+    mkey.mv_size = strlen(key) + 1;
+    mkey.mv_data = (void *)key;
+
+    rc = mdb_txn_begin(lmdb_env, NULL, MDB_RDONLY, &txn);
+    if (rc != 0) {
+        return LMDB_ERROR;
+    }
+
+    rc = mdb_get(txn, dbi, &mkey, &mdata);
+    mdb_txn_abort(txn);
+
+    if (rc == MDB_NOTFOUND) {
+        return LMDB_NOT_FOUND;
+    } else if (rc != 0) {
+        return LMDB_ERROR;
+    }
+
+    /* Copy value, ensuring null termination */
+    size_t copy_len = mdata.mv_size < value_size ? mdata.mv_size : value_size - 1;
+    memcpy(value, mdata.mv_data, copy_len);
+    value[copy_len] = '\0';
+
+    return LMDB_SUCCESS;
+}
+
+int x3_lmdb_set(const char *db, const char *key, const char *value)
+{
+    MDB_txn *txn;
+    MDB_val mkey, mdata;
+    MDB_dbi dbi;
+    int rc;
+
+    if (!x3_lmdb_is_available() || !db || !key) {
+        return LMDB_ERROR;
+    }
+
+    if (resolve_dbi(db, &dbi) != LMDB_SUCCESS) {
+        return LMDB_ERROR;
+    }
+
+    /* NULL value means delete */
+    if (!value) {
+        return x3_lmdb_delete(db, key);
+    }
+
+    mkey.mv_size = strlen(key) + 1;
+    mkey.mv_data = (void *)key;
+    mdata.mv_size = strlen(value) + 1;
+    mdata.mv_data = (void *)value;
+
+    rc = mdb_txn_begin(lmdb_env, NULL, 0, &txn);
+    if (rc != 0) {
+        return LMDB_ERROR;
+    }
+
+    rc = mdb_put(txn, dbi, &mkey, &mdata, 0);
+    if (rc != 0) {
+        mdb_txn_abort(txn);
+        return LMDB_ERROR;
+    }
+
+    rc = mdb_txn_commit(txn);
+    return rc == 0 ? LMDB_SUCCESS : LMDB_ERROR;
+}
+
+int x3_lmdb_delete(const char *db, const char *key)
+{
+    MDB_txn *txn;
+    MDB_val mkey;
+    MDB_dbi dbi;
+    int rc;
+
+    if (!x3_lmdb_is_available() || !db || !key) {
+        return LMDB_ERROR;
+    }
+
+    if (resolve_dbi(db, &dbi) != LMDB_SUCCESS) {
+        return LMDB_ERROR;
+    }
+
+    mkey.mv_size = strlen(key) + 1;
+    mkey.mv_data = (void *)key;
+
+    rc = mdb_txn_begin(lmdb_env, NULL, 0, &txn);
+    if (rc != 0) {
+        return LMDB_ERROR;
+    }
+
+    rc = mdb_del(txn, dbi, &mkey, NULL);
+    if (rc == MDB_NOTFOUND) {
+        mdb_txn_abort(txn);
+        return LMDB_NOT_FOUND;
+    } else if (rc != 0) {
+        mdb_txn_abort(txn);
+        return LMDB_ERROR;
+    }
+
+    rc = mdb_txn_commit(txn);
+    return rc == 0 ? LMDB_SUCCESS : LMDB_ERROR;
+}
+
 int x3_lmdb_stats(const char *db, size_t *entries_out, size_t *size_out)
 {
     MDB_txn *txn;

@@ -3,24 +3,669 @@
 #ifdef WITH_KEYCLOAK
 
 #include <string.h>
+#include <time.h>
 
 #include "keycloak.h"
+#include "common.h"
 #include "log.h"
+#include "ioset.h"
+#include "timeq.h"
+#include "base64.h"
+#include <curl/multi.h>
+#include <openssl/evp.h>
+#include <openssl/rsa.h>
+#include <openssl/bn.h>
+#include <openssl/err.h>
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
+#include <openssl/param_build.h>
+#include <openssl/core_names.h>
+#endif
 
 static struct log_type* KC_LOG;
+
+/* Persistent CURL handle for connection reuse */
+static CURL* kc_curl_handle = NULL;
+
+/*
+ * =============================================================================
+ * JWKS Cache for Local JWT Validation
+ * =============================================================================
+ */
+
+#define JWKS_CACHE_TTL 3600  /* Cache keys for 1 hour */
+#define JWKS_MAX_KEYS 4      /* Max number of keys to cache */
+
+struct jwks_key {
+    char *kid;           /* Key ID */
+    EVP_PKEY *pkey;      /* Parsed public key */
+};
+
+static struct {
+    struct jwks_key keys[JWKS_MAX_KEYS];
+    int key_count;
+    time_t fetched;
+    char *realm_url;     /* URL of the realm this cache is for */
+} jwks_cache = {0};
+
+/* Forward declarations for JWT functions */
+static int jwks_refresh(struct kc_realm realm);
+static void jwks_cleanup(void);
+static EVP_PKEY *jwks_get_key(const char *kid);
+static char *base64url_decode_alloc(const char *input, size_t *out_len);
+static int jwt_verify_signature(const char *token, EVP_PKEY *pkey);
+static int jwt_parse_claims(const char *payload_b64, struct kc_token_info *info);
+
+/* Forward declaration for exit handler */
+static void keycloak_exit_handler(void *extra);
 
 void
 init_keycloak()
 {
     KC_LOG = log_register_type("keycloak", "file:keycloak.log");
+
+    /* Initialize persistent CURL handle */
+    kc_curl_handle = curl_easy_init();
+    if (kc_curl_handle) {
+        /* Set persistent options that survive curl_easy_reset() */
+        curl_easy_setopt(kc_curl_handle, CURLOPT_TCP_NODELAY, 1L);
+        curl_easy_setopt(kc_curl_handle, CURLOPT_NOSIGNAL, 1L);
+        curl_easy_setopt(kc_curl_handle, CURLOPT_TCP_KEEPALIVE, 1L);
+        curl_easy_setopt(kc_curl_handle, CURLOPT_TCP_KEEPIDLE, 60L);
+        curl_easy_setopt(kc_curl_handle, CURLOPT_TCP_KEEPINTVL, 30L);
+        log_module(KC_LOG, LOG_INFO, "Keycloak CURL handle initialized with connection pooling");
+    }
+
+    /* Register cleanup on exit */
+    reg_exit_func(keycloak_exit_handler, NULL);
 }
 
-typedef size_t(*curl_write_cb_ptr)(char*, size_t, size_t, void*);
+static void
+keycloak_exit_handler(UNUSED_ARG(void *extra))
+{
+    cleanup_keycloak();
+}
 
+/* Forward declaration for async cleanup */
+static void kc_async_cleanup(void);
+
+void
+cleanup_keycloak()
+{
+    /* Cleanup async infrastructure first */
+    kc_async_cleanup();
+
+    /* Cleanup JWKS cache */
+    jwks_cleanup();
+
+    if (kc_curl_handle) {
+        curl_easy_cleanup(kc_curl_handle);
+        kc_curl_handle = NULL;
+        log_module(KC_LOG, LOG_INFO, "Keycloak CURL handle cleaned up");
+    }
+}
+
+/*
+ * =============================================================================
+ * Local JWT Validation (JWKS + OpenSSL)
+ * =============================================================================
+ */
+
+/* Cleanup JWKS cache */
+static void
+jwks_cleanup(void)
+{
+    for (int i = 0; i < jwks_cache.key_count; i++) {
+        if (jwks_cache.keys[i].kid) {
+            free(jwks_cache.keys[i].kid);
+            jwks_cache.keys[i].kid = NULL;
+        }
+        if (jwks_cache.keys[i].pkey) {
+            EVP_PKEY_free(jwks_cache.keys[i].pkey);
+            jwks_cache.keys[i].pkey = NULL;
+        }
+    }
+    jwks_cache.key_count = 0;
+    jwks_cache.fetched = 0;
+    if (jwks_cache.realm_url) {
+        free(jwks_cache.realm_url);
+        jwks_cache.realm_url = NULL;
+    }
+}
+
+/* Convert base64url to standard base64 and decode */
+static char *
+base64url_decode_alloc(const char *input, size_t *out_len)
+{
+    if (!input || !out_len) return NULL;
+
+    size_t input_len = strlen(input);
+    if (input_len == 0) return NULL;
+
+    /* Calculate padded length */
+    size_t padded_len = input_len;
+    int padding = (4 - (input_len % 4)) % 4;
+    padded_len += padding;
+
+    /* Allocate buffer for standard base64 */
+    char *std_b64 = malloc(padded_len + 1);
+    if (!std_b64) return NULL;
+
+    /* Convert base64url to standard base64 */
+    for (size_t i = 0; i < input_len; i++) {
+        char c = input[i];
+        if (c == '-') c = '+';
+        else if (c == '_') c = '/';
+        std_b64[i] = c;
+    }
+    /* Add padding */
+    for (size_t i = input_len; i < padded_len; i++) {
+        std_b64[i] = '=';
+    }
+    std_b64[padded_len] = '\0';
+
+    /* Decode using existing base64 function */
+    char *decoded = NULL;
+    if (!base64_decode_alloc(std_b64, padded_len, &decoded, out_len)) {
+        free(std_b64);
+        return NULL;
+    }
+    free(std_b64);
+    return decoded;
+}
+
+/* Parse RSA public key from JWKS 'n' and 'e' values */
+static EVP_PKEY *
+jwks_parse_rsa_key(const char *n_b64, const char *e_b64)
+{
+    EVP_PKEY *pkey = NULL;
+    BIGNUM *n = NULL, *e = NULL;
+    unsigned char *n_bin = NULL, *e_bin = NULL;
+    size_t n_len = 0, e_len = 0;
+
+    /* Decode modulus and exponent */
+    n_bin = (unsigned char *)base64url_decode_alloc(n_b64, &n_len);
+    e_bin = (unsigned char *)base64url_decode_alloc(e_b64, &e_len);
+    if (!n_bin || !e_bin) {
+        goto cleanup;
+    }
+
+    /* Create BIGNUMs */
+    n = BN_bin2bn(n_bin, n_len, NULL);
+    e = BN_bin2bn(e_bin, e_len, NULL);
+    if (!n || !e) {
+        goto cleanup;
+    }
+
+    /* Create EVP_PKEY with RSA parameters */
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
+    /* OpenSSL 3.0+ uses EVP_PKEY_fromdata */
+    OSSL_PARAM_BLD *bld = OSSL_PARAM_BLD_new();
+    if (!bld) goto cleanup;
+
+    if (!OSSL_PARAM_BLD_push_BN(bld, OSSL_PKEY_PARAM_RSA_N, n) ||
+        !OSSL_PARAM_BLD_push_BN(bld, OSSL_PKEY_PARAM_RSA_E, e)) {
+        OSSL_PARAM_BLD_free(bld);
+        goto cleanup;
+    }
+
+    OSSL_PARAM *params = OSSL_PARAM_BLD_to_param(bld);
+    OSSL_PARAM_BLD_free(bld);
+    if (!params) goto cleanup;
+
+    EVP_PKEY_CTX *ctx = EVP_PKEY_CTX_new_from_name(NULL, "RSA", NULL);
+    if (ctx) {
+        if (EVP_PKEY_fromdata_init(ctx) > 0) {
+            EVP_PKEY_fromdata(ctx, &pkey, EVP_PKEY_PUBLIC_KEY, params);
+        }
+        EVP_PKEY_CTX_free(ctx);
+    }
+    OSSL_PARAM_free(params);
+#else
+    /* OpenSSL 1.1.x uses RSA_set0_key */
+    RSA *rsa = RSA_new();
+    if (!rsa) goto cleanup;
+
+    /* RSA_set0_key takes ownership of n and e on success */
+    if (RSA_set0_key(rsa, n, e, NULL) != 1) {
+        RSA_free(rsa);
+        goto cleanup;
+    }
+    n = NULL; e = NULL;  /* Ownership transferred */
+
+    pkey = EVP_PKEY_new();
+    if (!pkey) {
+        RSA_free(rsa);
+        goto cleanup;
+    }
+    if (EVP_PKEY_assign_RSA(pkey, rsa) != 1) {
+        RSA_free(rsa);
+        EVP_PKEY_free(pkey);
+        pkey = NULL;
+        goto cleanup;
+    }
+#endif
+
+cleanup:
+    if (n_bin) free(n_bin);
+    if (e_bin) free(e_bin);
+    if (n) BN_free(n);
+    if (e) BN_free(e);
+    return pkey;
+}
+
+/* Forward declarations for JWKS fetch */
+static size_t curl_write_cb(char* data, size_t size, size_t nmemb, void* clientp);
+static char *kc_build_jwks_endpoint(struct kc_realm realm);
+
+/* Refresh JWKS cache from Keycloak */
+static int
+jwks_refresh(struct kc_realm realm)
+{
+    if (!realm.base_uri || !realm.realm) {
+        return KC_ERROR;
+    }
+
+    /* Build JWKS URL using endpoint builder */
+    char *url = kc_build_jwks_endpoint(realm);
+    if (!url) {
+        return KC_ERROR;
+    }
+
+    /* Check if cache is still valid for this realm */
+    if (jwks_cache.realm_url && strcmp(jwks_cache.realm_url, url) == 0) {
+        if (now - jwks_cache.fetched < JWKS_CACHE_TTL && jwks_cache.key_count > 0) {
+            log_module(KC_LOG, LOG_DEBUG, "JWKS cache still valid (%d keys)",
+                       jwks_cache.key_count);
+            free(url);
+            return KC_SUCCESS;
+        }
+    }
+
+    log_module(KC_LOG, LOG_INFO, "Refreshing JWKS from %s", url);
+
+    /* Cleanup old cache */
+    jwks_cleanup();
+
+    /* Fetch JWKS - reuse persistent handle if available */
+    struct {
+        char *response;
+        size_t size;
+    } chunk = {0};
+
+    CURL *curl;
+    int own_handle = 0;
+    if (kc_curl_handle) {
+        curl = kc_curl_handle;
+        curl_easy_reset(curl);
+    } else {
+        curl = curl_easy_init();
+        own_handle = 1;
+        if (!curl) {
+            free(url);
+            return KC_ERROR;
+        }
+    }
+
+    curl_easy_setopt(curl, CURLOPT_URL, url);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curl_write_cb);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &chunk);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 10L);
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 5L);
+    curl_easy_setopt(curl, CURLOPT_TCP_NODELAY, 1L);
+
+    CURLcode res = curl_easy_perform(curl);
+    long http_code = 0;
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+    if (own_handle) {
+        curl_easy_cleanup(curl);
+    }
+
+    if (res != CURLE_OK || http_code != 200 || !chunk.response) {
+        log_module(KC_LOG, LOG_WARNING, "Failed to fetch JWKS: %s (HTTP %ld)",
+                   curl_easy_strerror(res), http_code);
+        if (chunk.response) free(chunk.response);
+        free(url);
+        return KC_ERROR;
+    }
+
+    /* Parse JWKS JSON */
+    json_error_t error;
+    json_t *root = json_loads(chunk.response, 0, &error);
+    free(chunk.response);
+
+    if (!root) {
+        log_module(KC_LOG, LOG_WARNING, "Failed to parse JWKS: %s", error.text);
+        free(url);
+        return KC_ERROR;
+    }
+
+    json_t *keys = json_object_get(root, "keys");
+    if (!json_is_array(keys)) {
+        json_decref(root);
+        free(url);
+        return KC_ERROR;
+    }
+
+    /* Parse each signing key */
+    size_t index;
+    json_t *key;
+    json_array_foreach(keys, index, key) {
+        if (jwks_cache.key_count >= JWKS_MAX_KEYS) break;
+
+        const char *kty = json_string_value(json_object_get(key, "kty"));
+        const char *use = json_string_value(json_object_get(key, "use"));
+        const char *alg = json_string_value(json_object_get(key, "alg"));
+        const char *kid = json_string_value(json_object_get(key, "kid"));
+        const char *n = json_string_value(json_object_get(key, "n"));
+        const char *e = json_string_value(json_object_get(key, "e"));
+
+        /* Only cache RSA signing keys (RS256) */
+        if (!kty || strcmp(kty, "RSA") != 0) continue;
+        if (use && strcmp(use, "sig") != 0) continue;  /* Skip encryption keys */
+        if (alg && strcmp(alg, "RS256") != 0) continue;
+        if (!kid || !n || !e) continue;
+
+        EVP_PKEY *pkey = jwks_parse_rsa_key(n, e);
+        if (!pkey) {
+            log_module(KC_LOG, LOG_WARNING, "Failed to parse RSA key kid=%s", kid);
+            continue;
+        }
+
+        jwks_cache.keys[jwks_cache.key_count].kid = strdup(kid);
+        jwks_cache.keys[jwks_cache.key_count].pkey = pkey;
+        jwks_cache.key_count++;
+
+        log_module(KC_LOG, LOG_DEBUG, "Cached JWKS key: kid=%s alg=%s", kid, alg ? alg : "RS256");
+    }
+
+    json_decref(root);
+
+    if (jwks_cache.key_count == 0) {
+        log_module(KC_LOG, LOG_WARNING, "No usable signing keys in JWKS");
+        free(url);
+        return KC_ERROR;
+    }
+
+    jwks_cache.fetched = now;
+    jwks_cache.realm_url = url;  /* Transfer ownership */
+
+    log_module(KC_LOG, LOG_INFO, "JWKS cache refreshed: %d keys", jwks_cache.key_count);
+    return KC_SUCCESS;
+}
+
+/* Get cached key by kid */
+static EVP_PKEY *
+jwks_get_key(const char *kid)
+{
+    if (!kid) return NULL;
+
+    for (int i = 0; i < jwks_cache.key_count; i++) {
+        if (jwks_cache.keys[i].kid && strcmp(jwks_cache.keys[i].kid, kid) == 0) {
+            return jwks_cache.keys[i].pkey;
+        }
+    }
+    return NULL;
+}
+
+/* Verify JWT RS256 signature */
+static int
+jwt_verify_signature(const char *token, EVP_PKEY *pkey)
+{
+    if (!token || !pkey) return KC_ERROR;
+
+    /* Find the two dots separating header.payload.signature */
+    const char *dot1 = strchr(token, '.');
+    if (!dot1) return KC_ERROR;
+    const char *dot2 = strchr(dot1 + 1, '.');
+    if (!dot2) return KC_ERROR;
+
+    /* The signed data is header.payload (everything before second dot) */
+    size_t signed_len = dot2 - token;
+
+    /* Decode signature */
+    size_t sig_len = 0;
+    unsigned char *sig = (unsigned char *)base64url_decode_alloc(dot2 + 1, &sig_len);
+    if (!sig) return KC_ERROR;
+
+    /* Verify RS256 signature */
+    EVP_MD_CTX *ctx = EVP_MD_CTX_new();
+    if (!ctx) {
+        free(sig);
+        return KC_ERROR;
+    }
+
+    int result = KC_ERROR;
+    if (EVP_DigestVerifyInit(ctx, NULL, EVP_sha256(), NULL, pkey) == 1) {
+        if (EVP_DigestVerifyUpdate(ctx, token, signed_len) == 1) {
+            if (EVP_DigestVerifyFinal(ctx, sig, sig_len) == 1) {
+                result = KC_SUCCESS;
+            }
+        }
+    }
+
+    EVP_MD_CTX_free(ctx);
+    free(sig);
+    return result;
+}
+
+/* Parse JWT claims from payload */
+static int
+jwt_parse_claims(const char *payload_b64, struct kc_token_info *info)
+{
+    if (!payload_b64 || !info) return KC_ERROR;
+
+    size_t payload_len = 0;
+    char *payload = base64url_decode_alloc(payload_b64, &payload_len);
+    if (!payload) return KC_ERROR;
+
+    /* Null-terminate for JSON parsing */
+    char *json_str = malloc(payload_len + 1);
+    if (!json_str) {
+        free(payload);
+        return KC_ERROR;
+    }
+    memcpy(json_str, payload, payload_len);
+    json_str[payload_len] = '\0';
+    free(payload);
+
+    json_error_t error;
+    json_t *root = json_loads(json_str, 0, &error);
+    free(json_str);
+
+    if (!root) {
+        log_module(KC_LOG, LOG_DEBUG, "Failed to parse JWT claims: %s", error.text);
+        return KC_ERROR;
+    }
+
+    /* Extract standard claims */
+    json_t *exp = json_object_get(root, "exp");
+    json_t *iat = json_object_get(root, "iat");
+    json_t *sub = json_object_get(root, "sub");
+    json_t *preferred_username = json_object_get(root, "preferred_username");
+    json_t *email = json_object_get(root, "email");
+
+    /* Check expiration */
+    if (json_is_integer(exp)) {
+        info->exp = json_integer_value(exp);
+        if (info->exp <= now) {
+            log_module(KC_LOG, LOG_DEBUG, "JWT expired: exp=%ld now=%ld", info->exp, (long)now);
+            json_decref(root);
+            return KC_FORBIDDEN;  /* Token expired */
+        }
+    }
+
+    if (json_is_integer(iat)) {
+        info->iat = json_integer_value(iat);
+    }
+
+    if (json_is_string(sub)) {
+        info->sub = strdup(json_string_value(sub));
+        info->sub_size = strlen(info->sub);
+    }
+
+    if (json_is_string(preferred_username)) {
+        info->username = strdup(json_string_value(preferred_username));
+        info->username_size = strlen(info->username);
+    }
+
+    if (json_is_string(email)) {
+        info->email = strdup(json_string_value(email));
+        info->email_size = strlen(info->email);
+    }
+
+    /* Extract opserv level from custom claim if present */
+    json_t *opserv_level = json_object_get(root, "x3_opserv_level");
+    if (json_is_integer(opserv_level)) {
+        info->opserv_level = json_integer_value(opserv_level);
+    }
+
+    info->active = true;
+    json_decref(root);
+    return KC_SUCCESS;
+}
+
+/**
+ * Validate a JWT token locally using cached JWKS
+ * Returns KC_SUCCESS if valid, KC_FORBIDDEN if expired/invalid, KC_ERROR if can't validate locally
+ */
+int
+keycloak_validate_jwt_local(struct kc_realm realm, const char *token,
+                            struct kc_token_info **info_out)
+{
+    if (!token || !info_out) return KC_ERROR;
+    *info_out = NULL;
+
+    /* Ensure JWKS is cached */
+    if (jwks_refresh(realm) != KC_SUCCESS) {
+        return KC_ERROR;  /* Can't validate locally, need fallback */
+    }
+
+    /* Parse JWT header to get kid */
+    const char *dot1 = strchr(token, '.');
+    if (!dot1) return KC_ERROR;
+
+    size_t header_b64_len = dot1 - token;
+    char *header_b64 = malloc(header_b64_len + 1);
+    if (!header_b64) return KC_ERROR;
+    memcpy(header_b64, token, header_b64_len);
+    header_b64[header_b64_len] = '\0';
+
+    size_t header_len = 0;
+    char *header = base64url_decode_alloc(header_b64, &header_len);
+    free(header_b64);
+    if (!header) return KC_ERROR;
+
+    /* Null-terminate for JSON parsing */
+    char *header_json = malloc(header_len + 1);
+    if (!header_json) {
+        free(header);
+        return KC_ERROR;
+    }
+    memcpy(header_json, header, header_len);
+    header_json[header_len] = '\0';
+    free(header);
+
+    json_error_t error;
+    json_t *hdr = json_loads(header_json, 0, &error);
+    free(header_json);
+
+    if (!hdr) {
+        log_module(KC_LOG, LOG_DEBUG, "Failed to parse JWT header: %s", error.text);
+        return KC_ERROR;
+    }
+
+    const char *alg = json_string_value(json_object_get(hdr, "alg"));
+    const char *kid = json_string_value(json_object_get(hdr, "kid"));
+
+    /* Only support RS256 */
+    if (!alg || strcmp(alg, "RS256") != 0) {
+        log_module(KC_LOG, LOG_DEBUG, "Unsupported JWT algorithm: %s", alg ? alg : "null");
+        json_decref(hdr);
+        return KC_ERROR;  /* Fall back to introspection */
+    }
+
+    if (!kid) {
+        log_module(KC_LOG, LOG_DEBUG, "JWT missing kid");
+        json_decref(hdr);
+        return KC_ERROR;
+    }
+
+    json_decref(hdr);
+
+    /* Get signing key */
+    EVP_PKEY *pkey = jwks_get_key(kid);
+    if (!pkey) {
+        log_module(KC_LOG, LOG_DEBUG, "Unknown kid in JWT: %s", kid);
+        return KC_ERROR;  /* Unknown key - might need JWKS refresh or fallback */
+    }
+
+    /* Verify signature */
+    if (jwt_verify_signature(token, pkey) != KC_SUCCESS) {
+        log_module(KC_LOG, LOG_DEBUG, "JWT signature verification failed");
+        return KC_FORBIDDEN;  /* Invalid signature */
+    }
+
+    /* Parse and validate claims */
+    const char *dot2 = strchr(dot1 + 1, '.');
+    if (!dot2) return KC_ERROR;
+
+    size_t payload_b64_len = dot2 - dot1 - 1;
+    char *payload_b64 = malloc(payload_b64_len + 1);
+    if (!payload_b64) return KC_ERROR;
+    memcpy(payload_b64, dot1 + 1, payload_b64_len);
+    payload_b64[payload_b64_len] = '\0';
+
+    struct kc_token_info *info = calloc(1, sizeof(*info));
+    if (!info) {
+        free(payload_b64);
+        return KC_ERROR;
+    }
+
+    int result = jwt_parse_claims(payload_b64, info);
+    free(payload_b64);
+
+    if (result == KC_SUCCESS) {
+        *info_out = info;
+        log_module(KC_LOG, LOG_DEBUG, "JWT validated locally: user=%s",
+                   info->username ? info->username : "unknown");
+    } else {
+        keycloak_free_token_info(info);
+    }
+
+    return result;
+}
+
+/*
+ * =============================================================================
+ * Unified HTTP API (curl_opts pattern for sync and async)
+ * =============================================================================
+ */
+
+/* Response buffer structure (shared by sync and async) */
 struct memory {
     char* response;
     size_t size;
 };
+
+/* Write callback (shared by sync and async) */
+static size_t
+curl_write_cb(char *data, size_t size, size_t nmemb, void *clientp)
+{
+    size_t realsize = size * nmemb;
+    struct memory *mem = (struct memory *)clientp;
+
+    char *ptr = realloc(mem->response, mem->size + realsize + 1);
+    if (!ptr) return 0;  /* Out of memory */
+
+    mem->response = ptr;
+    memcpy(&(mem->response[mem->size]), data, realsize);
+    mem->size += realsize;
+    mem->response[mem->size] = 0;
+
+    return realsize;
+}
+
+typedef size_t(*curl_write_cb_ptr)(char*, size_t, size_t, void*);
 
 enum http_method {
     HTTP_GET = 0,
@@ -39,7 +684,1321 @@ struct curl_opts {
     const char* xoauth2_bearer;
     curl_write_cb_ptr write_callback;
     enum http_method method;
+    /* Retry configuration */
+    int max_retries;         /* 0 = no retry (default), 1-3 typical */
+    int retry_delay_ms;      /* Base delay between retries (default 100ms) */
+    /* Logging */
+    const char* request_id;  /* Optional: for log correlation */
 };
+
+/* Convenience initializer with sensible defaults */
+#define CURL_OPTS_INIT { \
+    .write_callback = curl_write_cb, \
+    .method = HTTP_GET, \
+    .header_count = 0, \
+    .max_retries = 0, \
+    .retry_delay_ms = 100, \
+    .request_id = NULL \
+}
+
+/*
+ * Auto-cleanup helpers for response buffers (GCC/Clang cleanup attribute)
+ * Usage: AUTO_CLEANUP_RESPONSE struct memory chunk = {0};
+ *        // chunk.response will be freed automatically when scope ends
+ */
+static void memory_struct_cleanup(struct memory *mem) {
+    if (mem && mem->response) {
+        free(mem->response);
+        mem->response = NULL;
+        mem->size = 0;
+    }
+}
+
+/* For stack-allocated struct memory - most common case */
+#define AUTO_CLEANUP_RESPONSE __attribute__((cleanup(memory_struct_cleanup)))
+
+/* For sensitive data that should be zeroed before free */
+static void memory_secure_cleanup(struct memory *mem) {
+    if (mem && mem->response) {
+        memset(mem->response, 0, mem->size);
+        free(mem->response);
+        mem->response = NULL;
+        mem->size = 0;
+    }
+}
+
+/* For responses containing tokens/secrets */
+#define AUTO_CLEANUP_RESPONSE_SECURE __attribute__((cleanup(memory_secure_cleanup)))
+
+/* Auto-cleanup for allocated strings (uri, json_body, etc.) */
+static void string_cleanup(char **str) {
+    if (str && *str) {
+        free(*str);
+        *str = NULL;
+    }
+}
+
+#define AUTO_FREE_STRING __attribute__((cleanup(string_cleanup)))
+
+/* For strings containing sensitive data */
+static void string_secure_cleanup(char **str) {
+    if (str && *str) {
+        memset(*str, 0, strlen(*str));
+        free(*str);
+        *str = NULL;
+    }
+}
+
+#define AUTO_FREE_STRING_SECURE __attribute__((cleanup(string_secure_cleanup)))
+
+/*
+ * =============================================================================
+ * Keycloak Endpoint Builders
+ * =============================================================================
+ * These functions allocate and return endpoint URLs. Caller must free().
+ */
+
+/* Token endpoint: /realms/{realm}/protocol/openid-connect/token */
+static char *
+kc_build_token_endpoint(struct kc_realm realm)
+{
+    static const char tmpl[] = "%s/realms/%s/protocol/openid-connect/token";
+    if (!realm.base_uri || !realm.realm) return NULL;
+
+    int len = snprintf(NULL, 0, tmpl, realm.base_uri, realm.realm) + 1;
+    char *uri = malloc(len);
+    if (uri) snprintf(uri, len, tmpl, realm.base_uri, realm.realm);
+    return uri;
+}
+
+/* Introspect endpoint: /realms/{realm}/protocol/openid-connect/token/introspect */
+static char *
+kc_build_introspect_endpoint(struct kc_realm realm)
+{
+    static const char tmpl[] = "%s/realms/%s/protocol/openid-connect/token/introspect";
+    if (!realm.base_uri || !realm.realm) return NULL;
+
+    int len = snprintf(NULL, 0, tmpl, realm.base_uri, realm.realm) + 1;
+    char *uri = malloc(len);
+    if (uri) snprintf(uri, len, tmpl, realm.base_uri, realm.realm);
+    return uri;
+}
+
+/* Users admin endpoint: /admin/realms/{realm}/users */
+static char *
+kc_build_users_endpoint(struct kc_realm realm)
+{
+    static const char tmpl[] = "%s/admin/realms/%s/users";
+    if (!realm.base_uri || !realm.realm) return NULL;
+
+    int len = snprintf(NULL, 0, tmpl, realm.base_uri, realm.realm) + 1;
+    char *uri = malloc(len);
+    if (uri) snprintf(uri, len, tmpl, realm.base_uri, realm.realm);
+    return uri;
+}
+
+/* User admin endpoint: /admin/realms/{realm}/users/{user_id} */
+static char *
+kc_build_user_endpoint(struct kc_realm realm, const char *user_id)
+{
+    static const char tmpl[] = "%s/admin/realms/%s/users/%s";
+    if (!realm.base_uri || !realm.realm || !user_id) return NULL;
+
+    int len = snprintf(NULL, 0, tmpl, realm.base_uri, realm.realm, user_id) + 1;
+    char *uri = malloc(len);
+    if (uri) snprintf(uri, len, tmpl, realm.base_uri, realm.realm, user_id);
+    return uri;
+}
+
+/* Groups admin endpoint: /admin/realms/{realm}/groups */
+static char *
+kc_build_groups_endpoint(struct kc_realm realm)
+{
+    static const char tmpl[] = "%s/admin/realms/%s/groups";
+    if (!realm.base_uri || !realm.realm) return NULL;
+
+    int len = snprintf(NULL, 0, tmpl, realm.base_uri, realm.realm) + 1;
+    char *uri = malloc(len);
+    if (uri) snprintf(uri, len, tmpl, realm.base_uri, realm.realm);
+    return uri;
+}
+
+/* Group admin endpoint: /admin/realms/{realm}/groups/{group_id} */
+static char *
+kc_build_group_endpoint(struct kc_realm realm, const char *group_id)
+{
+    static const char tmpl[] = "%s/admin/realms/%s/groups/%s";
+    if (!realm.base_uri || !realm.realm || !group_id) return NULL;
+
+    int len = snprintf(NULL, 0, tmpl, realm.base_uri, realm.realm, group_id) + 1;
+    char *uri = malloc(len);
+    if (uri) snprintf(uri, len, tmpl, realm.base_uri, realm.realm, group_id);
+    return uri;
+}
+
+/* User's group membership endpoint: /admin/realms/{realm}/users/{user_id}/groups/{group_id} */
+static char *
+kc_build_user_group_endpoint(struct kc_realm realm, const char *user_id, const char *group_id)
+{
+    static const char tmpl[] = "%s/admin/realms/%s/users/%s/groups/%s";
+    if (!realm.base_uri || !realm.realm || !user_id || !group_id) return NULL;
+
+    int len = snprintf(NULL, 0, tmpl, realm.base_uri, realm.realm, user_id, group_id) + 1;
+    char *uri = malloc(len);
+    if (uri) snprintf(uri, len, tmpl, realm.base_uri, realm.realm, user_id, group_id);
+    return uri;
+}
+
+/* Group members endpoint: /admin/realms/{realm}/groups/{group_id}/members */
+static char *
+kc_build_group_members_endpoint(struct kc_realm realm, const char *group_id)
+{
+    static const char tmpl[] = "%s/admin/realms/%s/groups/%s/members?max=1000";
+    if (!realm.base_uri || !realm.realm || !group_id) return NULL;
+
+    int len = snprintf(NULL, 0, tmpl, realm.base_uri, realm.realm, group_id) + 1;
+    char *uri = malloc(len);
+    if (uri) snprintf(uri, len, tmpl, realm.base_uri, realm.realm, group_id);
+    return uri;
+}
+
+/* Group children (subgroups) endpoint: /admin/realms/{realm}/groups/{parent_id}/children */
+static char *
+kc_build_group_children_endpoint(struct kc_realm realm, const char *parent_id)
+{
+    static const char tmpl[] = "%s/admin/realms/%s/groups/%s/children";
+    if (!realm.base_uri || !realm.realm || !parent_id) return NULL;
+
+    int len = snprintf(NULL, 0, tmpl, realm.base_uri, realm.realm, parent_id) + 1;
+    char *uri = malloc(len);
+    if (uri) snprintf(uri, len, tmpl, realm.base_uri, realm.realm, parent_id);
+    return uri;
+}
+
+/* Group-by-path endpoint: /admin/realms/{realm}/group-by-path{path} (path includes leading /) */
+static char *
+kc_build_group_by_path_endpoint(struct kc_realm realm, const char *path)
+{
+    static const char tmpl[] = "%s/admin/realms/%s/group-by-path%s";
+    if (!realm.base_uri || !realm.realm || !path) return NULL;
+
+    int len = snprintf(NULL, 0, tmpl, realm.base_uri, realm.realm, path) + 1;
+    char *uri = malloc(len);
+    if (uri) snprintf(uri, len, tmpl, realm.base_uri, realm.realm, path);
+    return uri;
+}
+
+/* User search endpoint: /admin/realms/{realm}/users?{query} */
+static char *
+kc_build_user_search_endpoint(struct kc_realm realm, const char *query)
+{
+    static const char tmpl[] = "%s/admin/realms/%s/users?%s";
+    if (!realm.base_uri || !realm.realm || !query) return NULL;
+
+    int len = snprintf(NULL, 0, tmpl, realm.base_uri, realm.realm, query) + 1;
+    char *uri = malloc(len);
+    if (uri) snprintf(uri, len, tmpl, realm.base_uri, realm.realm, query);
+    return uri;
+}
+
+/* Reset password endpoint: /admin/realms/{realm}/users/{user_id}/reset-password */
+static char *
+kc_build_reset_password_endpoint(struct kc_realm realm, const char *user_id)
+{
+    static const char tmpl[] = "%s/admin/realms/%s/users/%s/reset-password";
+    if (!realm.base_uri || !realm.realm || !user_id) return NULL;
+
+    int len = snprintf(NULL, 0, tmpl, realm.base_uri, realm.realm, user_id) + 1;
+    char *uri = malloc(len);
+    if (uri) snprintf(uri, len, tmpl, realm.base_uri, realm.realm, user_id);
+    return uri;
+}
+
+/* JWKS endpoint: /realms/{realm}/protocol/openid-connect/certs */
+static char *
+kc_build_jwks_endpoint(struct kc_realm realm)
+{
+    static const char tmpl[] = "%s/realms/%s/protocol/openid-connect/certs";
+    if (!realm.base_uri || !realm.realm) return NULL;
+
+    int len = snprintf(NULL, 0, tmpl, realm.base_uri, realm.realm) + 1;
+    char *uri = malloc(len);
+    if (uri) snprintf(uri, len, tmpl, realm.base_uri, realm.realm);
+    return uri;
+}
+
+/* Fingerprint search endpoint: /admin/realms/{realm}/users?q=x509_fingerprints:{fp} */
+static char *
+kc_build_fingerprint_search_endpoint(struct kc_realm realm, const char *escaped_fingerprint)
+{
+    static const char tmpl[] = "%s/admin/realms/%s/users?q=x509_fingerprints:%s";
+    if (!realm.base_uri || !realm.realm || !escaped_fingerprint) return NULL;
+
+    int len = snprintf(NULL, 0, tmpl, realm.base_uri, realm.realm, escaped_fingerprint) + 1;
+    char *uri = malloc(len);
+    if (uri) snprintf(uri, len, tmpl, realm.base_uri, realm.realm, escaped_fingerprint);
+    return uri;
+}
+
+/* User lookup by username: /admin/realms/{realm}/users/?username={user}&exact=true */
+static char *
+kc_build_user_by_username_endpoint(struct kc_realm realm, const char *escaped_username, int exact)
+{
+    static const char tmpl[] = "%s/admin/realms/%s/users/?username=%s%s";
+    static const char exact_suffix[] = "&exact=true";
+    if (!realm.base_uri || !realm.realm || !escaped_username) return NULL;
+
+    const char *suffix = exact ? exact_suffix : "";
+    int len = snprintf(NULL, 0, tmpl, realm.base_uri, realm.realm, escaped_username, suffix) + 1;
+    char *uri = malloc(len);
+    if (uri) snprintf(uri, len, tmpl, realm.base_uri, realm.realm, escaped_username, suffix);
+    return uri;
+}
+
+/* Group search by name: /admin/realms/{realm}/groups?search={name}&exact=true */
+static char *
+kc_build_group_search_endpoint(struct kc_realm realm, const char *escaped_name)
+{
+    static const char tmpl[] = "%s/admin/realms/%s/groups?search=%s&exact=true";
+    if (!realm.base_uri || !realm.realm || !escaped_name) return NULL;
+
+    int len = snprintf(NULL, 0, tmpl, realm.base_uri, realm.realm, escaped_name) + 1;
+    char *uri = malloc(len);
+    if (uri) snprintf(uri, len, tmpl, realm.base_uri, realm.realm, escaped_name);
+    return uri;
+}
+
+/* Apply curl_opts to a CURL handle (shared by sync and async) */
+static int
+curl_apply_opts(CURL *curl, struct curl_opts opts, struct memory *chunk_out,
+                struct curl_slist **header_list_out)
+{
+    struct curl_slist *header_list = NULL;
+
+    if (!curl || !opts.uri) return -1;
+
+    /* Performance optimizations */
+    curl_easy_setopt(curl, CURLOPT_TCP_NODELAY, 1L);
+    curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+    curl_easy_setopt(curl, CURLOPT_TCP_KEEPALIVE, 1L);
+    curl_easy_setopt(curl, CURLOPT_TCP_KEEPIDLE, 60L);
+    curl_easy_setopt(curl, CURLOPT_TCP_KEEPINTVL, 30L);
+
+    /* Timeouts */
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 5L);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 30L);
+
+    /* URL */
+    curl_easy_setopt(curl, CURLOPT_URL, opts.uri);
+
+    /* Setup write callback if output buffer provided */
+    if (chunk_out && opts.write_callback) {
+        if (!chunk_out->response) {
+            chunk_out->response = malloc(1);
+            if (!chunk_out->response) return -1;
+            chunk_out->response[0] = 0;
+            chunk_out->size = 0;
+        }
+        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, opts.write_callback);
+        curl_easy_setopt(curl, CURLOPT_WRITEDATA, (void*)chunk_out);
+    }
+
+    /* HTTP method */
+    switch (opts.method) {
+        case HTTP_PUT:
+            curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "PUT");
+            break;
+        case HTTP_DELETE:
+            curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "DELETE");
+            break;
+        case HTTP_POST:
+            curl_easy_setopt(curl, CURLOPT_POST, 1L);
+            break;
+        case HTTP_GET:
+        default:
+            curl_easy_setopt(curl, CURLOPT_HTTPGET, 1L);
+            break;
+    }
+
+    /* POST/PUT fields */
+    if (opts.post_fields) {
+        curl_easy_setopt(curl, CURLOPT_POSTFIELDS, opts.post_fields);
+    }
+
+    /* Headers */
+    if (opts.header_count > 0) {
+        for (size_t i = 0; i < opts.header_count; i++) {
+            header_list = curl_slist_append(header_list, opts.header_list[i]);
+        }
+        if (!header_list) return -1;
+        curl_easy_setopt(curl, CURLOPT_HTTPHEADER, header_list);
+        if (header_list_out) *header_list_out = header_list;
+    }
+
+    /* Basic auth */
+    if (opts.auth_user && opts.auth_passwd) {
+        curl_easy_setopt(curl, CURLOPT_HTTPAUTH, CURLAUTH_BASIC);
+        curl_easy_setopt(curl, CURLOPT_USERNAME, opts.auth_user);
+        curl_easy_setopt(curl, CURLOPT_PASSWORD, opts.auth_passwd);
+    }
+
+    /* Bearer auth */
+    if (opts.xoauth2_bearer) {
+        curl_easy_setopt(curl, CURLOPT_HTTPAUTH, CURLAUTH_BEARER);
+        curl_easy_setopt(curl, CURLOPT_XOAUTH2_BEARER, opts.xoauth2_bearer);
+    }
+
+    return 0;
+}
+
+/*
+ * =============================================================================
+ * Async HTTP Infrastructure (curl_multi + ioset integration)
+ * =============================================================================
+ */
+
+/* curl_multi handle for async HTTP */
+static CURLM *kc_curl_multi = NULL;
+
+/* Handle pool for async requests - avoids curl_easy_init() per request */
+#define KC_HANDLE_POOL_SIZE 8
+static CURL *kc_handle_pool[KC_HANDLE_POOL_SIZE];
+static int kc_handle_pool_count = 0;
+
+/* Get a handle from pool (or create new one) */
+static CURL *kc_handle_pool_get(void) {
+    if (kc_handle_pool_count > 0) {
+        CURL *handle = kc_handle_pool[--kc_handle_pool_count];
+        curl_easy_reset(handle);
+        return handle;
+    }
+    return curl_easy_init();
+}
+
+/* Return handle to pool (or destroy if pool full) */
+static void kc_handle_pool_put(CURL *handle) {
+    if (!handle) return;
+    if (kc_handle_pool_count < KC_HANDLE_POOL_SIZE) {
+        kc_handle_pool[kc_handle_pool_count++] = handle;
+    } else {
+        curl_easy_cleanup(handle);
+    }
+}
+
+/* Cleanup the handle pool */
+static void kc_handle_pool_cleanup(void) {
+    while (kc_handle_pool_count > 0) {
+        curl_easy_cleanup(kc_handle_pool[--kc_handle_pool_count]);
+    }
+}
+
+/* Per-socket tracking for ioset integration */
+struct kc_sock_info {
+    curl_socket_t sockfd;
+    struct io_fd *io_fd;
+    int action;  /* CURL_POLL_IN, CURL_POLL_OUT, etc */
+};
+
+/* Forward declarations */
+static void kc_curl_socket_ready(struct io_fd *fd);
+static void kc_curl_timeout_fired(void *data);
+static void kc_curl_check_completed(void);
+
+/* Async request types */
+enum kc_async_type {
+    KC_ASYNC_AUTH,          /* Password authentication */
+    KC_ASYNC_FINGERPRINT,   /* Certificate fingerprint lookup */
+    KC_ASYNC_INTROSPECT,    /* Token introspection */
+    KC_ASYNC_SET_ATTR,      /* Set user attribute */
+    KC_ASYNC_GROUP_ADD,     /* Add user to group */
+    KC_ASYNC_GROUP_REMOVE   /* Remove user from group */
+};
+
+/* Async request tracking */
+struct kc_async_request {
+    CURL *easy;
+    void *session;                /* Opaque session pointer (SASLSession) */
+    struct memory response;       /* Response buffer */
+    char *uri;                    /* Allocated URL */
+    char *post_fields;            /* Allocated POST data */
+    char *request_id;             /* Optional: for log correlation (allocated copy) */
+    enum kc_async_type type;      /* Request type for result parsing */
+    union {
+        kc_async_callback auth;   /* Auth callback */
+        kc_async_callback generic;/* Generic success/failure callback */
+        kc_fingerprint_callback fingerprint;  /* Fingerprint callback */
+        kc_introspect_callback introspect;    /* Introspect callback */
+    } cb;
+};
+
+/* Called by curl when socket state changes */
+static int
+kc_curl_socket_cb(CURL *easy, curl_socket_t s, int what,
+                  void *userp, void *sockp)
+{
+    struct kc_sock_info *si = sockp;
+    (void)easy;
+    (void)userp;
+
+    if (what == CURL_POLL_REMOVE) {
+        if (si) {
+            if (si->io_fd) {
+                ioset_close(si->io_fd, 0);  /* Don't close fd, curl owns it */
+            }
+            free(si);
+        }
+        curl_multi_assign(kc_curl_multi, s, NULL);
+        return 0;
+    }
+
+    if (!si) {
+        /* New socket - register with ioset */
+        si = calloc(1, sizeof(*si));
+        if (!si) return 0;
+        si->sockfd = s;
+        si->io_fd = ioset_add(s);
+        if (!si->io_fd) {
+            free(si);
+            return 0;
+        }
+        si->io_fd->state = IO_CONNECTED;  /* Already connected by curl */
+        si->io_fd->line_reads = 0;        /* Raw socket, no line buffering */
+        si->io_fd->readable_cb = kc_curl_socket_ready;
+        si->io_fd->data = si;
+        curl_multi_assign(kc_curl_multi, s, si);
+        log_module(KC_LOG, LOG_DEBUG, "kc_async: Registered socket %d with ioset", (int)s);
+    }
+
+    si->action = what;
+    ioset_update(si->io_fd);  /* Update poll flags based on action */
+    return 0;
+}
+
+/* Called when ioset reports socket ready */
+static void
+kc_curl_socket_ready(struct io_fd *fd)
+{
+    struct kc_sock_info *si = fd->data;
+    int running;
+    int ev_bitmask = 0;
+
+    if (!si || !kc_curl_multi) return;
+
+    /* Determine events based on what curl requested */
+    if (si->action & CURL_POLL_IN)
+        ev_bitmask |= CURL_CSELECT_IN;
+    if (si->action & CURL_POLL_OUT)
+        ev_bitmask |= CURL_CSELECT_OUT;
+
+    curl_multi_socket_action(kc_curl_multi, si->sockfd, ev_bitmask, &running);
+    kc_curl_check_completed();  /* Check for finished transfers */
+}
+
+/* Called by curl when timeout value changes */
+static int
+kc_curl_timer_cb(CURLM *multi, long timeout_ms, void *userp)
+{
+    (void)multi;
+    (void)userp;
+
+    /* Remove any existing timer */
+    timeq_del(0, kc_curl_timeout_fired, NULL, TIMEQ_IGNORE_WHEN | TIMEQ_IGNORE_DATA);
+
+    if (timeout_ms >= 0) {
+        /* Schedule new timer */
+        time_t when = now + (timeout_ms / 1000) + 1;
+        if (timeout_ms == 0)
+            when = now;  /* Immediate */
+        timeq_add(when, kc_curl_timeout_fired, NULL);
+    }
+    return 0;
+}
+
+/* Called by timeq when curl timeout fires */
+static void
+kc_curl_timeout_fired(UNUSED_ARG(void *data))
+{
+    int running;
+    if (!kc_curl_multi) return;
+
+    curl_multi_socket_action(kc_curl_multi, CURL_SOCKET_TIMEOUT, 0, &running);
+    kc_curl_check_completed();
+}
+
+/* Parse fingerprint lookup response and invoke callback */
+static void
+kc_async_complete_fingerprint(struct kc_async_request *req, long http_code)
+{
+    int result = KC_ERROR;
+    char *username = NULL;
+    const char *req_id = req->request_id ? req->request_id : "-";
+
+    if (http_code != 200 || !req->response.response) {
+        log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async fingerprint: HTTP %ld", req_id, http_code);
+        req->cb.fingerprint(req->session, result, NULL);
+        return;
+    }
+
+    /* Parse JSON array response */
+    json_error_t error;
+    json_t *root = json_loads(req->response.response, 0, &error);
+    if (!root || !json_is_array(root)) {
+        log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async fingerprint: Invalid JSON response", req_id);
+        if (root) json_decref(root);
+        req->cb.fingerprint(req->session, KC_ERROR, NULL);
+        return;
+    }
+
+    size_t count = json_array_size(root);
+    if (count == 0) {
+        result = KC_NOT_FOUND;
+        log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async fingerprint: Not found", req_id);
+    } else if (count > 1) {
+        result = KC_COLLISION;
+        log_module(KC_LOG, LOG_ERROR, "[%s] SECURITY: Fingerprint collision - %zu users!", req_id, count);
+    } else {
+        /* Exactly one user - extract username */
+        json_t *user = json_array_get(root, 0);
+        const char *uname = json_string_value(json_object_get(user, "username"));
+        if (uname) {
+            username = strdup(uname);
+            result = KC_SUCCESS;
+            log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async fingerprint: Found '%s'", req_id, username);
+        }
+    }
+
+    json_decref(root);
+    req->cb.fingerprint(req->session, result, username);
+}
+
+/* Parse token introspection response and invoke callback */
+static void
+kc_async_complete_introspect(struct kc_async_request *req, long http_code)
+{
+    struct kc_token_info *token_info = NULL;
+    const char *req_id = req->request_id ? req->request_id : "-";
+
+    if (http_code != 200 || !req->response.response) {
+        log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async introspect: HTTP %ld", req_id, http_code);
+        req->cb.introspect(req->session, KC_ERROR, NULL);
+        return;
+    }
+
+    /* Parse JSON response */
+    json_error_t error;
+    json_t *root = json_loads(req->response.response, 0, &error);
+    if (!root) {
+        log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async introspect: Invalid JSON", req_id);
+        req->cb.introspect(req->session, KC_ERROR, NULL);
+        return;
+    }
+
+    /* Allocate and populate token_info */
+    token_info = calloc(1, sizeof(*token_info));
+    if (!token_info) {
+        json_decref(root);
+        req->cb.introspect(req->session, KC_ERROR, NULL);
+        return;
+    }
+
+    token_info->active = json_is_true(json_object_get(root, "active"));
+
+    const char *val;
+    if ((val = json_string_value(json_object_get(root, "username"))))
+        token_info->username = strdup(val);
+    if ((val = json_string_value(json_object_get(root, "sub"))))
+        token_info->sub = strdup(val);
+
+    json_decref(root);
+
+    log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async introspect: active=%d, username=%s",
+               req_id, token_info->active, token_info->username ? token_info->username : "(null)");
+
+    req->cb.introspect(req->session, KC_SUCCESS, token_info);
+}
+
+/* Check for completed transfers and invoke callbacks */
+static void
+kc_curl_check_completed(void)
+{
+    CURLMsg *msg;
+    int msgs_left;
+
+    if (!kc_curl_multi) return;
+
+    while ((msg = curl_multi_info_read(kc_curl_multi, &msgs_left))) {
+        if (msg->msg == CURLMSG_DONE) {
+            CURL *easy = msg->easy_handle;
+            struct kc_async_request *req = NULL;
+            long http_code = 0;
+
+            curl_easy_getinfo(easy, CURLINFO_PRIVATE, &req);
+            if (!req) {
+                log_module(KC_LOG, LOG_ERROR, "kc_async: No request data for completed transfer");
+                curl_multi_remove_handle(kc_curl_multi, easy);
+                curl_easy_cleanup(easy);
+                continue;
+            }
+
+            /* Get request_id for logging */
+            const char *req_id = req->request_id ? req->request_id : "-";
+
+            /* Get HTTP response code */
+            if (msg->data.result == CURLE_OK) {
+                curl_easy_getinfo(easy, CURLINFO_RESPONSE_CODE, &http_code);
+            } else {
+                log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async: CURL error: %s",
+                           req_id, curl_easy_strerror(msg->data.result));
+            }
+
+            /* Dispatch based on request type */
+            switch (req->type) {
+            case KC_ASYNC_AUTH: {
+                int result = KC_ERROR;
+                if (http_code == 200) {
+                    result = KC_SUCCESS;
+                    log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async auth: Success (HTTP 200)", req_id);
+                } else if (http_code == 401) {
+                    result = KC_FORBIDDEN;
+                    log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async auth: Failed (HTTP 401)", req_id);
+                } else {
+                    log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async auth: Error (HTTP %ld)", req_id, http_code);
+                }
+                if (req->cb.auth) {
+                    req->cb.auth(req->session, result);
+                }
+                break;
+            }
+            case KC_ASYNC_FINGERPRINT:
+                kc_async_complete_fingerprint(req, http_code);
+                break;
+            case KC_ASYNC_INTROSPECT:
+                kc_async_complete_introspect(req, http_code);
+                break;
+            case KC_ASYNC_SET_ATTR: {
+                int result = KC_ERROR;
+                if (http_code == 204 || http_code == 200) {
+                    result = KC_SUCCESS;
+                    log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async set_attr: Success (HTTP %ld)", req_id, http_code);
+                } else if (http_code == 404) {
+                    result = KC_NOT_FOUND;
+                    log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async set_attr: Not found (HTTP 404)", req_id);
+                } else {
+                    log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async set_attr: Error (HTTP %ld)", req_id, http_code);
+                }
+                if (req->cb.generic) {
+                    req->cb.generic(req->session, result);
+                }
+                break;
+            }
+            case KC_ASYNC_GROUP_ADD:
+            case KC_ASYNC_GROUP_REMOVE: {
+                int result = KC_ERROR;
+                if (http_code == 204 || http_code == 200) {
+                    result = KC_SUCCESS;
+                    log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async group: Success (HTTP %ld)", req_id, http_code);
+                } else if (http_code == 404) {
+                    result = KC_NOT_FOUND;
+                    log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async group: Not found (HTTP 404)", req_id);
+                } else if (http_code == 409) {
+                    /* Conflict - user already in/not in group */
+                    result = KC_SUCCESS;  /* Treat as success for idempotency */
+                    log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async group: Conflict (HTTP 409), treating as success", req_id);
+                } else {
+                    log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async group: Error (HTTP %ld)", req_id, http_code);
+                }
+                if (req->cb.generic) {
+                    req->cb.generic(req->session, result);
+                }
+                break;
+            }
+            }
+
+            /* Cleanup - return handle to pool for reuse */
+            curl_multi_remove_handle(kc_curl_multi, easy);
+            kc_handle_pool_put(easy);
+            if (req->response.response) {
+                memset(req->response.response, 0, req->response.size);
+                free(req->response.response);
+            }
+            if (req->uri) free(req->uri);
+            if (req->post_fields) {
+                memset(req->post_fields, 0, strlen(req->post_fields));
+                free(req->post_fields);
+            }
+            if (req->request_id) free(req->request_id);
+            free(req);
+        }
+    }
+}
+
+/* Initialize async HTTP infrastructure */
+static void
+kc_async_init(void)
+{
+    if (kc_curl_multi) return;  /* Already initialized */
+
+    kc_curl_multi = curl_multi_init();
+    if (!kc_curl_multi) {
+        log_module(KC_LOG, LOG_ERROR, "Failed to initialize curl_multi");
+        return;
+    }
+
+    /* Register callbacks */
+    curl_multi_setopt(kc_curl_multi, CURLMOPT_SOCKETFUNCTION, kc_curl_socket_cb);
+    curl_multi_setopt(kc_curl_multi, CURLMOPT_TIMERFUNCTION, kc_curl_timer_cb);
+
+    log_module(KC_LOG, LOG_INFO, "Keycloak async HTTP initialized (curl_multi + ioset)");
+}
+
+/* Cleanup async HTTP infrastructure */
+static void
+kc_async_cleanup(void)
+{
+    if (kc_curl_multi) {
+        /* Remove any pending timers */
+        timeq_del(0, kc_curl_timeout_fired, NULL, TIMEQ_IGNORE_WHEN | TIMEQ_IGNORE_DATA);
+
+        curl_multi_cleanup(kc_curl_multi);
+        kc_curl_multi = NULL;
+        log_module(KC_LOG, LOG_INFO, "Keycloak async HTTP cleaned up");
+    }
+
+    /* Cleanup handle pool */
+    kc_handle_pool_cleanup();
+}
+
+/*
+ * Async version of curl_perform - uses curl_multi for non-blocking HTTP
+ * The request struct must have uri, post_fields (if needed), session, type, and callback set.
+ * Returns 0 on success (request started), -1 on error
+ */
+static int
+curl_perform_async(struct kc_async_request *req, struct curl_opts opts)
+{
+    CURL *easy = NULL;
+    const char *req_id = opts.request_id ? opts.request_id : "-";
+
+    /* Initialize async infrastructure if needed */
+    if (!kc_curl_multi) {
+        kc_async_init();
+        if (!kc_curl_multi) {
+            log_module(KC_LOG, LOG_ERROR, "[%s] curl_perform_async: Failed to init async", req_id);
+            return -1;
+        }
+    }
+
+    if (!req || !opts.uri) {
+        log_module(KC_LOG, LOG_DEBUG, "[%s] curl_perform_async: Invalid arguments", req_id);
+        return -1;
+    }
+
+    /* Store request_id for completion logging */
+    if (opts.request_id) {
+        req->request_id = strdup(opts.request_id);
+    }
+
+    /* Get handle from pool (or create new one) */
+    easy = kc_handle_pool_get();
+    if (!easy) {
+        log_module(KC_LOG, LOG_ERROR, "[%s] curl_perform_async: Failed to get handle", req_id);
+        return -1;
+    }
+    req->easy = easy;
+
+    /* Initialize response buffer */
+    req->response.response = malloc(1);
+    if (req->response.response) {
+        req->response.response[0] = 0;
+        req->response.size = 0;
+    }
+
+    /* Apply unified options */
+    if (curl_apply_opts(easy, opts, &req->response, NULL) < 0) {
+        log_module(KC_LOG, LOG_ERROR, "[%s] curl_perform_async: Failed to apply options", req_id);
+        kc_handle_pool_put(easy);
+        req->easy = NULL;
+        return -1;
+    }
+
+    /* Store request pointer for callback retrieval */
+    curl_easy_setopt(easy, CURLOPT_PRIVATE, req);
+
+    /* Add to multi handle - returns immediately */
+    CURLMcode mc = curl_multi_add_handle(kc_curl_multi, easy);
+    if (mc != CURLM_OK) {
+        log_module(KC_LOG, LOG_ERROR, "[%s] curl_perform_async: curl_multi_add_handle failed: %s",
+                   req_id, curl_multi_strerror(mc));
+        curl_easy_cleanup(easy);
+        req->easy = NULL;
+        return -1;
+    }
+
+    log_module(KC_LOG, LOG_DEBUG, "[%s] curl_perform_async: Request started", req_id);
+    return 0;
+}
+
+/*
+ * Start async authentication check against Keycloak
+ * Returns 0 on success (request started), -1 on error
+ */
+int
+kc_check_auth_async(struct kc_realm realm, struct kc_client client,
+                    const char *handle, const char *password,
+                    void *session, kc_async_callback callback)
+{
+    struct kc_async_request *req = NULL;
+    char *user_enc = NULL;
+    char *passwd_enc = NULL;
+    static const char query_params_tmpl[] = "grant_type=password&username=%s&password=%s";
+
+    /* Validate inputs */
+    if (!realm.base_uri || !realm.realm || !client.client_id || !client.client_secret ||
+        !handle || !password || !callback) {
+        log_module(KC_LOG, LOG_DEBUG, "kc_check_auth_async: Invalid arguments");
+        return -1;
+    }
+
+    /* Allocate request structure */
+    req = calloc(1, sizeof(*req));
+    if (!req) {
+        log_module(KC_LOG, LOG_ERROR, "kc_check_auth_async: Out of memory");
+        return -1;
+    }
+    req->session = session;
+    req->type = KC_ASYNC_AUTH;
+    req->cb.auth = callback;
+
+    /* URL-encode credentials */
+    user_enc = curl_easy_escape(NULL, handle, 0);
+    passwd_enc = curl_easy_escape(NULL, password, 0);
+    if (!user_enc || !passwd_enc) {
+        log_module(KC_LOG, LOG_DEBUG, "kc_check_auth_async: Failed to escape credentials");
+        goto error;
+    }
+
+    /* Build URI using endpoint builder */
+    req->uri = kc_build_token_endpoint(realm);
+    if (!req->uri) goto error;
+
+    /* Build POST data */
+    int post_len = snprintf(NULL, 0, query_params_tmpl, user_enc, passwd_enc) + 1;
+    req->post_fields = malloc(post_len);
+    if (!req->post_fields) goto error;
+    snprintf(req->post_fields, post_len, query_params_tmpl, user_enc, passwd_enc);
+
+    /* Use unified async API */
+    struct curl_opts opts = CURL_OPTS_INIT;
+    opts.uri = req->uri;
+    opts.post_fields = req->post_fields;
+    opts.auth_user = client.client_id;
+    opts.auth_passwd = client.client_secret;
+    opts.method = HTTP_POST;
+
+    if (curl_perform_async(req, opts) < 0) {
+        log_module(KC_LOG, LOG_ERROR, "kc_check_auth_async: curl_perform_async failed");
+        goto error;
+    }
+
+    log_module(KC_LOG, LOG_DEBUG, "kc_check_auth_async: Started async auth for %s", handle);
+
+    /* Cleanup temporary strings */
+    curl_free(user_enc);
+    memset(passwd_enc, 0, strlen(passwd_enc));
+    curl_free(passwd_enc);
+
+    return 0;
+
+error:
+    if (user_enc) curl_free(user_enc);
+    if (passwd_enc) {
+        memset(passwd_enc, 0, strlen(passwd_enc));
+        curl_free(passwd_enc);
+    }
+    if (req) {
+        if (req->easy) curl_easy_cleanup(req->easy);
+        if (req->uri) free(req->uri);
+        if (req->post_fields) {
+            memset(req->post_fields, 0, strlen(req->post_fields));
+            free(req->post_fields);
+        }
+        if (req->response.response) free(req->response.response);
+        free(req);
+    }
+    return -1;
+}
+
+/*
+ * Start async fingerprint lookup against Keycloak
+ * Returns 0 on success (request started), -1 on error
+ */
+int
+keycloak_find_user_by_fingerprint_async(struct kc_realm realm, struct kc_client client,
+                                         const char *fingerprint, void *session,
+                                         kc_fingerprint_callback callback)
+{
+    struct kc_async_request *req = NULL;
+    char *escaped_fp = NULL;
+
+    /* Validate inputs */
+    if (!realm.base_uri || !realm.realm || !client.access_token ||
+        !fingerprint || !callback) {
+        log_module(KC_LOG, LOG_DEBUG, "fingerprint_async: Invalid arguments");
+        return -1;
+    }
+
+    /* Allocate request structure */
+    req = calloc(1, sizeof(*req));
+    if (!req) {
+        log_module(KC_LOG, LOG_ERROR, "fingerprint_async: Out of memory");
+        return -1;
+    }
+    req->session = session;
+    req->type = KC_ASYNC_FINGERPRINT;
+    req->cb.fingerprint = callback;
+
+    /* URL-encode fingerprint */
+    escaped_fp = curl_easy_escape(NULL, fingerprint, 0);
+    if (!escaped_fp) {
+        log_module(KC_LOG, LOG_DEBUG, "fingerprint_async: Failed to escape fingerprint");
+        goto error;
+    }
+
+    /* Build URI using endpoint builder */
+    req->uri = kc_build_fingerprint_search_endpoint(realm, escaped_fp);
+    if (!req->uri) {
+        log_module(KC_LOG, LOG_ERROR, "fingerprint_async: Failed to build URI");
+        goto error;
+    }
+
+    /* Use unified async API */
+    struct curl_opts opts = CURL_OPTS_INIT;
+    opts.uri = req->uri;
+    opts.xoauth2_bearer = client.access_token->access_token;
+    opts.method = HTTP_GET;
+
+    if (curl_perform_async(req, opts) < 0) {
+        log_module(KC_LOG, LOG_ERROR, "fingerprint_async: curl_perform_async failed");
+        goto error;
+    }
+
+    log_module(KC_LOG, LOG_DEBUG, "fingerprint_async: Started lookup for %s", fingerprint);
+
+    curl_free(escaped_fp);
+    return 0;
+
+error:
+    if (escaped_fp) curl_free(escaped_fp);
+    if (req) {
+        if (req->easy) curl_easy_cleanup(req->easy);
+        if (req->uri) free(req->uri);
+        if (req->response.response) free(req->response.response);
+        free(req);
+    }
+    return -1;
+}
+
+/*
+ * Start async token introspection against Keycloak
+ * Returns 0 on success (request started), -1 on error
+ */
+int
+keycloak_introspect_token_async(struct kc_realm realm, struct kc_client client,
+                                 const char *token, void *session,
+                                 kc_introspect_callback callback)
+{
+    struct kc_async_request *req = NULL;
+    char *token_enc = NULL;
+    static const char post_tmpl[] = "token=%s";
+
+    /* Validate inputs */
+    if (!realm.base_uri || !realm.realm || !client.client_id || !client.client_secret ||
+        !token || !callback) {
+        log_module(KC_LOG, LOG_DEBUG, "introspect_async: Invalid arguments");
+        return -1;
+    }
+
+    /* Allocate request structure */
+    req = calloc(1, sizeof(*req));
+    if (!req) {
+        log_module(KC_LOG, LOG_ERROR, "introspect_async: Out of memory");
+        return -1;
+    }
+    req->session = session;
+    req->type = KC_ASYNC_INTROSPECT;
+    req->cb.introspect = callback;
+
+    /* URL-encode token */
+    token_enc = curl_easy_escape(NULL, token, 0);
+    if (!token_enc) {
+        log_module(KC_LOG, LOG_DEBUG, "introspect_async: Failed to escape token");
+        goto error;
+    }
+
+    /* Build URI using endpoint builder */
+    req->uri = kc_build_introspect_endpoint(realm);
+    if (!req->uri) {
+        log_module(KC_LOG, LOG_ERROR, "introspect_async: Failed to build URI");
+        goto error;
+    }
+
+    /* Build POST fields */
+    int post_len = snprintf(NULL, 0, post_tmpl, token_enc) + 1;
+    req->post_fields = malloc(post_len);
+    if (!req->post_fields) {
+        log_module(KC_LOG, LOG_ERROR, "introspect_async: Failed to allocate POST data");
+        goto error;
+    }
+    snprintf(req->post_fields, post_len, post_tmpl, token_enc);
+
+    /* Use unified async API */
+    struct curl_opts opts = CURL_OPTS_INIT;
+    opts.uri = req->uri;
+    opts.post_fields = req->post_fields;
+    opts.auth_user = client.client_id;
+    opts.auth_passwd = client.client_secret;
+    opts.method = HTTP_POST;
+
+    if (curl_perform_async(req, opts) < 0) {
+        log_module(KC_LOG, LOG_ERROR, "introspect_async: curl_perform_async failed");
+        goto error;
+    }
+
+    log_module(KC_LOG, LOG_DEBUG, "introspect_async: Started token introspection");
+
+    curl_free(token_enc);
+    return 0;
+
+error:
+    if (token_enc) curl_free(token_enc);
+    if (req) {
+        if (req->easy) curl_easy_cleanup(req->easy);
+        if (req->uri) free(req->uri);
+        if (req->post_fields) {
+            memset(req->post_fields, 0, strlen(req->post_fields));
+            free(req->post_fields);
+        }
+        if (req->response.response) free(req->response.response);
+        free(req);
+    }
+    return -1;
+}
+
+/**
+ * Set a user attribute asynchronously.
+ * This is useful for non-blocking attribute updates during SASL flows.
+ */
+int
+keycloak_set_user_attribute_async(struct kc_realm realm, struct kc_client client,
+                                   const char *user_id, const char *attr_name,
+                                   const char *attr_value, void *session,
+                                   kc_async_callback callback)
+{
+    struct kc_async_request *req = NULL;
+    char *json_body = NULL;
+
+    /* Validate inputs */
+    if (!realm.base_uri || !realm.realm || !client.access_token ||
+        !user_id || !attr_name || !callback) {
+        log_module(KC_LOG, LOG_DEBUG, "set_attr_async: Invalid arguments");
+        return -1;
+    }
+
+    /* Allocate request structure */
+    req = calloc(1, sizeof(*req));
+    if (!req) {
+        log_module(KC_LOG, LOG_ERROR, "set_attr_async: Out of memory");
+        return -1;
+    }
+    req->session = session;
+    req->type = KC_ASYNC_SET_ATTR;
+    req->cb.generic = callback;
+
+    /* Build URI */
+    req->uri = kc_build_user_endpoint(realm, user_id);
+    if (!req->uri) {
+        log_module(KC_LOG, LOG_ERROR, "set_attr_async: Failed to build URI");
+        goto error;
+    }
+
+    /* Build JSON body - partial update with just the attribute */
+    json_t *attrs = json_object();
+    json_t *attr_array = json_array();
+    if (attr_value) {
+        json_array_append_new(attr_array, json_string(attr_value));
+    }
+    json_object_set_new(attrs, attr_name, attr_array);
+
+    json_t *user_obj = json_object();
+    json_object_set_new(user_obj, "attributes", attrs);
+    json_body = json_dumps(user_obj, JSON_COMPACT);
+    json_decref(user_obj);
+
+    if (!json_body) {
+        log_module(KC_LOG, LOG_ERROR, "set_attr_async: Failed to build JSON");
+        goto error;
+    }
+
+    /* Store post fields in request for cleanup */
+    req->post_fields = json_body;
+    json_body = NULL;  /* Transferred ownership */
+
+    /* Use unified async API */
+    struct curl_opts opts = CURL_OPTS_INIT;
+    opts.uri = req->uri;
+    opts.method = HTTP_PUT;
+    opts.post_fields = req->post_fields;
+    opts.xoauth2_bearer = client.access_token->access_token;
+    opts.header_list[0] = "Content-Type: application/json";
+    opts.header_count = 1;
+
+    if (curl_perform_async(req, opts) < 0) {
+        log_module(KC_LOG, LOG_ERROR, "set_attr_async: curl_perform_async failed");
+        goto error;
+    }
+
+    log_module(KC_LOG, LOG_DEBUG, "set_attr_async: Started attribute update for %s.%s",
+               user_id, attr_name);
+    return 0;
+
+error:
+    if (json_body) free(json_body);
+    if (req) {
+        if (req->easy) curl_easy_cleanup(req->easy);
+        if (req->uri) free(req->uri);
+        if (req->post_fields) {
+            memset(req->post_fields, 0, strlen(req->post_fields));
+            free(req->post_fields);
+        }
+        if (req->response.response) free(req->response.response);
+        free(req);
+    }
+    return -1;
+}
+
+/**
+ * Add a user to a group asynchronously.
+ * Useful for non-blocking channel access sync.
+ */
+int
+keycloak_add_user_to_group_async(struct kc_realm realm, struct kc_client client,
+                                  const char *user_id, const char *group_id,
+                                  void *session, kc_async_callback callback)
+{
+    struct kc_async_request *req = NULL;
+
+    /* Validate inputs */
+    if (!realm.base_uri || !realm.realm || !client.access_token ||
+        !user_id || !group_id || !callback) {
+        log_module(KC_LOG, LOG_DEBUG, "add_group_async: Invalid arguments");
+        return -1;
+    }
+
+    /* Allocate request structure */
+    req = calloc(1, sizeof(*req));
+    if (!req) {
+        log_module(KC_LOG, LOG_ERROR, "add_group_async: Out of memory");
+        return -1;
+    }
+    req->session = session;
+    req->type = KC_ASYNC_GROUP_ADD;
+    req->cb.generic = callback;
+
+    /* Build URI using endpoint builder */
+    req->uri = kc_build_user_group_endpoint(realm, user_id, group_id);
+    if (!req->uri) {
+        log_module(KC_LOG, LOG_ERROR, "add_group_async: Failed to build URI");
+        goto error;
+    }
+
+    /* Use unified async API - PUT with no body */
+    struct curl_opts opts = CURL_OPTS_INIT;
+    opts.uri = req->uri;
+    opts.method = HTTP_PUT;
+    opts.xoauth2_bearer = client.access_token->access_token;
+
+    if (curl_perform_async(req, opts) < 0) {
+        log_module(KC_LOG, LOG_ERROR, "add_group_async: curl_perform_async failed");
+        goto error;
+    }
+
+    log_module(KC_LOG, LOG_DEBUG, "add_group_async: Started adding user %s to group %s",
+               user_id, group_id);
+    return 0;
+
+error:
+    if (req) {
+        if (req->easy) curl_easy_cleanup(req->easy);
+        if (req->uri) free(req->uri);
+        if (req->response.response) free(req->response.response);
+        free(req);
+    }
+    return -1;
+}
+
+/**
+ * Remove a user from a group asynchronously.
+ * Useful for non-blocking channel access sync.
+ */
+int
+keycloak_remove_user_from_group_async(struct kc_realm realm, struct kc_client client,
+                                       const char *user_id, const char *group_id,
+                                       void *session, kc_async_callback callback)
+{
+    struct kc_async_request *req = NULL;
+
+    /* Validate inputs */
+    if (!realm.base_uri || !realm.realm || !client.access_token ||
+        !user_id || !group_id || !callback) {
+        log_module(KC_LOG, LOG_DEBUG, "remove_group_async: Invalid arguments");
+        return -1;
+    }
+
+    /* Allocate request structure */
+    req = calloc(1, sizeof(*req));
+    if (!req) {
+        log_module(KC_LOG, LOG_ERROR, "remove_group_async: Out of memory");
+        return -1;
+    }
+    req->session = session;
+    req->type = KC_ASYNC_GROUP_REMOVE;
+    req->cb.generic = callback;
+
+    /* Build URI using endpoint builder */
+    req->uri = kc_build_user_group_endpoint(realm, user_id, group_id);
+    if (!req->uri) {
+        log_module(KC_LOG, LOG_ERROR, "remove_group_async: Failed to build URI");
+        goto error;
+    }
+
+    /* Use unified async API - DELETE with no body */
+    struct curl_opts opts = CURL_OPTS_INIT;
+    opts.uri = req->uri;
+    opts.method = HTTP_DELETE;
+    opts.xoauth2_bearer = client.access_token->access_token;
+
+    if (curl_perform_async(req, opts) < 0) {
+        log_module(KC_LOG, LOG_ERROR, "remove_group_async: curl_perform_async failed");
+        goto error;
+    }
+
+    log_module(KC_LOG, LOG_DEBUG, "remove_group_async: Started removing user %s from group %s",
+               user_id, group_id);
+    return 0;
+
+error:
+    if (req) {
+        if (req->easy) curl_easy_cleanup(req->easy);
+        if (req->uri) free(req->uri);
+        if (req->response.response) free(req->response.response);
+        free(req);
+    }
+    return -1;
+}
+
+/* =============================================================================
+ * End of Async HTTP Infrastructure
+ * ============================================================================= */
 
 void keycloak_user_free_fields(struct kc_user* user)
 {
@@ -71,172 +2030,156 @@ void keycloak_user_free(struct kc_user* user)
     free(user);
 }
 
+/* Check if HTTP code or curl error is retryable */
+static int
+is_retryable_error(CURLcode curl_res, long http_code)
+{
+    /* Retryable curl errors */
+    if (curl_res == CURLE_COULDNT_CONNECT ||
+        curl_res == CURLE_OPERATION_TIMEDOUT ||
+        curl_res == CURLE_GOT_NOTHING ||
+        curl_res == CURLE_RECV_ERROR ||
+        curl_res == CURLE_SEND_ERROR) {
+        return 1;
+    }
+    /* Retryable HTTP codes (server errors, rate limiting) */
+    if (http_code >= 500 || http_code == 429) {
+        return 1;
+    }
+    return 0;
+}
+
 static long curl_perform(struct curl_opts opts, struct memory* chunk_out)
 {
     CURL* curl = NULL;
+    int own_handle = 0;
     CURLcode res = CURLE_FAILED_INIT;
-    char* user_pwd = NULL;
-    long result = KC_ERROR;  // assume failure
+    long result = KC_ERROR;
     long http_code = 0;
     struct curl_slist* header_list = NULL;
+    int attempt = 0;
+    int max_attempts = opts.max_retries + 1;
+    int delay_ms = opts.retry_delay_ms > 0 ? opts.retry_delay_ms : 100;
+    const char *req_id = opts.request_id ? opts.request_id : "-";
 
-    // Input validation
     if (!opts.uri) {
-        log_module(KC_LOG, LOG_DEBUG, "curl_perform: Invalid arguments");
+        log_module(KC_LOG, LOG_DEBUG, "[%s] curl_perform: Invalid arguments", req_id);
         return KC_ERROR;
     }
 
-    // Initialize curl
-    curl = curl_easy_init();
-    if (!curl) {
-        log_module(KC_LOG, LOG_DEBUG, "curl_perform: Failed to init curl");
-        return KC_ERROR;
-    }
-
-    // Setup write callback if output buffer provided
-    if (chunk_out && opts.write_callback) {
-        // Allocate response buffer
-        chunk_out->response = malloc(1);
-        if (!chunk_out->response) {
-            log_module(KC_LOG, LOG_DEBUG, "curl_perform: Failed to allocate response buffer");
-            goto cleanup;
+    /* Use persistent handle if available, otherwise create new one */
+    if (kc_curl_handle) {
+        curl = kc_curl_handle;
+        curl_easy_reset(curl);  /* Reset all options for reuse */
+        own_handle = 0;
+    } else {
+        curl = curl_easy_init();
+        own_handle = 1;
+        if (!curl) {
+            log_module(KC_LOG, LOG_DEBUG, "[%s] curl_perform: Failed to init curl", req_id);
+            return KC_ERROR;
         }
-        chunk_out->size = 0;  // Initialize size
-
-        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, opts.write_callback);
-        curl_easy_setopt(curl, CURLOPT_WRITEDATA, (void*)chunk_out);
     }
 
-    // Setup HTTP method
-    switch (opts.method) {
-        case HTTP_PUT:
-            curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "PUT");
+    for (attempt = 0; attempt < max_attempts; attempt++) {
+        /* Reset for retry */
+        if (attempt > 0) {
+            log_module(KC_LOG, LOG_DEBUG, "[%s] Retry %d/%d after %dms",
+                       req_id, attempt, opts.max_retries, delay_ms * attempt);
+
+            /* Exponential backoff */
+            struct timespec ts = { .tv_sec = 0, .tv_nsec = delay_ms * attempt * 1000000L };
+            nanosleep(&ts, NULL);
+
+            /* Reset response buffer for retry */
+            if (chunk_out && chunk_out->response) {
+                free(chunk_out->response);
+                chunk_out->response = NULL;
+                chunk_out->size = 0;
+            }
+
+            /* Free previous headers */
+            if (header_list) {
+                curl_slist_free_all(header_list);
+                header_list = NULL;
+            }
+        }
+
+        /* Reset curl handle for each attempt */
+        if (!own_handle) {
+            curl_easy_reset(curl);
+        }
+
+        /* Apply unified options */
+        if (curl_apply_opts(curl, opts, chunk_out, &header_list) < 0) {
+            log_module(KC_LOG, LOG_DEBUG, "[%s] curl_perform: Failed to apply options", req_id);
+            continue;  /* Try again if retries left */
+        }
+
+        /* Perform request (blocking) */
+        res = curl_easy_perform(curl);
+        http_code = 0;
+        curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+
+        if (res == CURLE_OK && http_code > 0 && http_code < 500 && http_code != 429) {
+            /* Success or non-retryable client error */
+            result = http_code;
             break;
-        case HTTP_DELETE:
-            curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "DELETE");
+        }
+
+        /* Check if error is retryable */
+        if (!is_retryable_error(res, http_code) || attempt >= max_attempts - 1) {
+            if (res != CURLE_OK) {
+                log_module(KC_LOG, LOG_DEBUG, "[%s] curl_perform failed: %s",
+                           req_id, curl_easy_strerror(res));
+            } else {
+                log_module(KC_LOG, LOG_DEBUG, "[%s] curl_perform: HTTP %ld (non-retryable)",
+                           req_id, http_code);
+                result = http_code;
+            }
             break;
-        case HTTP_POST:
-            curl_easy_setopt(curl, CURLOPT_POST, 1L);
-            break;
-        case HTTP_GET:
-        default:
-            // GET is default
-            break;
-    }
-
-    // Setup POST/PUT fields if provided
-    if (opts.post_fields) {
-        curl_easy_setopt(curl, CURLOPT_POSTFIELDS, opts.post_fields);
-    }
-
-    // Setup headers if provided
-    if (opts.header_count > 0) {
-        for (size_t i = 0; i < opts.header_count; i++) {
-            header_list = curl_slist_append(header_list, opts.header_list[i]);
-        }
-        if (!header_list) {
-            log_module(KC_LOG, LOG_DEBUG, "curl_perform: Failed to build headers");
-            goto cleanup;
-        }
-        curl_easy_setopt(curl, CURLOPT_HTTPHEADER, header_list);
-    }
-
-    if (opts.auth_user && opts.auth_passwd) {
-        // URL-encode credentials
-        char* user_enc  = curl_easy_escape(NULL, opts.auth_user, 0);
-        if (!user_enc) {
-            log_module(KC_LOG, LOG_DEBUG, "curl_perform: Failed to escape admin");
-            goto cleanup;
-        }
-    
-        char* passwd_enc = curl_easy_escape(NULL, opts.auth_passwd, 0);
-        if (!passwd_enc) {
-            log_module(KC_LOG, LOG_DEBUG, "curl_perform: Failed to escape passwd");
-            curl_free(user_enc);
-            goto cleanup;
         }
 
-        // Build "user:passwd" string
-        size_t user_pwd_len = strlen(user_enc) + 1 + strlen(passwd_enc) + 1;
-        user_pwd = malloc(user_pwd_len);
-        if (!user_pwd) {
-            log_module(KC_LOG, LOG_DEBUG, "curl_perform: Failed to allocate user_pwd");
-            curl_free(user_enc);
-            memset(passwd_enc, 0, strlen(passwd_enc));
-            curl_free(passwd_enc);
-            goto cleanup;
-        }
-        snprintf(user_pwd, user_pwd_len, "%s:%s", user_enc, passwd_enc);
-
-        curl_easy_setopt(curl, CURLOPT_HTTPAUTH, CURLAUTH_BASIC);
-        curl_easy_setopt(curl, CURLOPT_USERPWD, user_pwd);
-
-        memset(passwd_enc, 0, strlen(passwd_enc));
-        curl_free(passwd_enc);
-        curl_free(user_enc);
+        log_module(KC_LOG, LOG_DEBUG, "[%s] Retryable error: curl=%d http=%ld",
+                   req_id, res, http_code);
     }
 
-    if (opts.xoauth2_bearer) {
-        curl_easy_setopt(curl, CURLOPT_HTTPAUTH, CURLAUTH_BEARER);
-        curl_easy_setopt(curl, CURLOPT_XOAUTH2_BEARER, opts.xoauth2_bearer);
-    }
-
-    // Set URL and perform request
-    curl_easy_setopt(curl, CURLOPT_URL, opts.uri);
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 30L);
-    res = curl_easy_perform(curl);
-
-    if (res != CURLE_OK) {
-        log_module(KC_LOG, LOG_DEBUG, "curl_perform failed: %s", curl_easy_strerror(res));
-        goto cleanup;
-    }
-
-    // Get HTTP response code
-    if (curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code) == CURLE_OK) {
-        result = http_code;
-    }
-
-cleanup:
-    if (user_pwd) {
-        memset(user_pwd, 0, strlen(user_pwd));
-        free(user_pwd);
-    }
-
-    // Free header list if we created one
     if (header_list) {
         curl_slist_free_all(header_list);
     }
 
-    // Cleanup on failure
     if (result < 0 && chunk_out && chunk_out->response) {
         free(chunk_out->response);
         chunk_out->response = NULL;
         chunk_out->size = 0;
     }
 
-    if (curl) {
+    if (curl && own_handle) {
         curl_easy_cleanup(curl);
     }
 
     return result;
 }
 
-static size_t curl_write_cb(char* data, size_t size, size_t nmemb, void* clientp)
+/*
+ * Convenience wrapper for JSON API calls
+ * Automatically sets Content-Type header and uses standard defaults
+ */
+static long
+curl_perform_json(const char *uri, enum http_method method,
+                  const char *json_body, const char *bearer_token,
+                  struct memory *response)
 {
-    size_t realsize = size * nmemb;
-    struct memory* mem = (struct memory*)clientp;
+    struct curl_opts opts = CURL_OPTS_INIT;
+    opts.uri = uri;
+    opts.method = method;
+    opts.post_fields = json_body;
+    opts.xoauth2_bearer = bearer_token;
+    opts.header_list[0] = "Content-Type: application/json";
+    opts.header_count = 1;
+    opts.max_retries = 1;  /* Retry once for transient failures */
 
-    char* ptr = realloc(mem->response, mem->size + realsize + 1);
-    if (!ptr) {
-        return 0;  // Out of memory
-    }
-
-    mem->response = ptr;
-    memcpy(&(mem->response[mem->size]), data, realsize);
-    mem->size += realsize;
-    mem->response[mem->size] = 0;
-
-    return realsize;
+    return curl_perform(opts, response);
 }
 
 static int json_read_object_string(json_t* object, const char* key,
@@ -512,39 +2455,30 @@ static char* json_build_user_representation(const char *username, const char *em
 
 int keycloak_get_client_token(struct kc_realm realm, struct kc_client client, struct access_token** access_token)
 {
-    // Input validation
+    /* Input validation */
     if (!realm.base_uri || !realm.realm || !client.client_id || !client.client_secret || !access_token) {
         log_module(KC_LOG, LOG_DEBUG, "keycloak_get_client_token: Invalid arguments");
         return KC_ERROR;
     }
 
     int result = KC_ERROR;
-    char* uri = NULL;
-    struct memory chunk = {
-        .response = NULL,
-        .size = 0
-    };
+    struct memory chunk = {0};
+    static const char query_params[] = "grant_type=client_credentials";
 
-    static const char query_params[] = "&grant_type=client_credentials";
-    static const char uri_tmpl[] = "%s/realms/%s/protocol/openid-connect/token";
-
-    // Build URI safely
-    int uri_len = snprintf(NULL, 0, uri_tmpl, realm.base_uri, realm.realm) + 1;
-    uri = malloc(uri_len);
+    /* Build URI using endpoint builder */
+    char *uri = kc_build_token_endpoint(realm);
     if (!uri) {
         log_module(KC_LOG, LOG_DEBUG, "keycloak_get_client_token: Failed to build uri");
-        goto cleanup;
+        return KC_ERROR;
     }
-    snprintf(uri, uri_len, uri_tmpl, realm.base_uri, realm.realm);
 
-    struct curl_opts opts = {
-        .uri = uri,
-        .post_fields = query_params,
-        .write_callback = curl_write_cb,
-        .auth_user = client.client_id,
-        .auth_passwd = client.client_secret,
-        .header_count = 0
-    };
+    struct curl_opts opts = CURL_OPTS_INIT;
+    opts.uri = uri;
+    opts.post_fields = query_params;
+    opts.auth_user = client.client_id;
+    opts.auth_passwd = client.client_secret;
+    opts.method = HTTP_POST;
+    opts.max_retries = 1;
 
     long http_code = curl_perform(opts, &chunk);
 
@@ -573,23 +2507,20 @@ cleanup:
 
 int keycloak_get_user_token(struct kc_realm realm, struct kc_client client, const char* user, const char* passwd, struct access_token** user_access_token)
 {
-    // Input validation
+    /* Input validation */
     if (!realm.base_uri || !realm.realm || !user || !passwd || !user_access_token) {
         log_module(KC_LOG, LOG_DEBUG, "keycloak_get_user_token: Invalid arguments");
         return KC_ERROR;
     }
 
     int result = KC_ERROR;
-    char* uri = NULL;
-    char* user_enc = NULL;
-    char* passwd_enc = NULL;
-    char* query_params = NULL;
-    struct memory chunk = {
-        .response = NULL,
-        .size = 0
-    };
+    char *uri = NULL;
+    char *user_enc = NULL;
+    char *passwd_enc = NULL;
+    char *query_params = NULL;
+    struct memory chunk = {0};
 
-    // URL-encode credentials
+    /* URL-encode credentials */
     user_enc = curl_easy_escape(NULL, user, 0);
     if (!user_enc) {
         log_module(KC_LOG, LOG_DEBUG, "keycloak_get_user_token: Failed to escape user");
@@ -603,18 +2534,15 @@ int keycloak_get_user_token(struct kc_realm realm, struct kc_client client, cons
     }
 
     static const char query_params_tmpl[] = "grant_type=password&username=%s&password=%s";
-    static const char uri_tmpl[] = "%s/realms/%s/protocol/openid-connect/token";
 
-    // Build URI safely
-    int uri_len = snprintf(NULL, 0, uri_tmpl, realm.base_uri, realm.realm) + 1;
-    uri = malloc(uri_len);
+    /* Build URI using endpoint builder */
+    uri = kc_build_token_endpoint(realm);
     if (!uri) {
         log_module(KC_LOG, LOG_DEBUG, "keycloak_get_user_token: Failed to build uri");
         goto cleanup;
     }
-    snprintf(uri, uri_len, uri_tmpl, realm.base_uri, realm.realm);
 
-    // Build query parameters safely
+    /* Build query parameters safely */
     int query_params_len = snprintf(NULL, 0, query_params_tmpl, user_enc, passwd_enc) + 1;
     query_params = malloc(query_params_len);
     if (!query_params) {
@@ -623,14 +2551,13 @@ int keycloak_get_user_token(struct kc_realm realm, struct kc_client client, cons
     }
     snprintf(query_params, query_params_len, query_params_tmpl, user_enc, passwd_enc);
 
-    struct curl_opts opts = {
-        .uri = uri,
-        .post_fields = query_params,
-        .auth_user = client.client_id,
-        .auth_passwd = client.client_secret,
-        .write_callback = curl_write_cb,
-        .header_count = 0
-    };
+    struct curl_opts opts = CURL_OPTS_INIT;
+    opts.uri = uri;
+    opts.post_fields = query_params;
+    opts.auth_user = client.client_id;
+    opts.auth_passwd = client.client_secret;
+    opts.method = HTTP_POST;
+    opts.max_retries = 1;
 
     long http_code = curl_perform(opts, &chunk);
 
@@ -685,31 +2612,24 @@ int keycloak_get_users(struct kc_realm realm, struct kc_client client, const cha
     char* escaped_user = NULL;
     struct memory chunk = { 0 };
 
-    static const char exact_tmpl[] = "&exact=true";
-    static const char uri_tmpl[] = "%s/admin/realms/%s/users/?username=%s%s";
-
-    // URL-encode username
+    /* URL-encode username */
     escaped_user = curl_easy_escape(NULL, user, 0);
     if (!escaped_user) {
         log_module(KC_LOG, LOG_DEBUG, "keycloak_get_users: Failed to escape user");
         goto cleanup;
     }
 
-    // Build URI safely
-    int uri_len = snprintf(NULL, 0, uri_tmpl, realm.base_uri, realm.realm, escaped_user, exact ? exact_tmpl : "") + 1;
-    uri = malloc(uri_len);
+    /* Build URI using endpoint builder */
+    uri = kc_build_user_by_username_endpoint(realm, escaped_user, exact);
     if (!uri) {
         log_module(KC_LOG, LOG_DEBUG, "keycloak_get_users: Failed to build uri");
         goto cleanup;
     }
-    snprintf(uri, uri_len, uri_tmpl, realm.base_uri, realm.realm, escaped_user, exact ? exact_tmpl : "");
 
-    struct curl_opts opts = {
-        .uri = uri,
-        .write_callback = curl_write_cb,
-        .xoauth2_bearer = client.access_token->access_token,
-        .header_count = 0
-    };
+    struct curl_opts opts = CURL_OPTS_INIT;
+    opts.uri = uri;
+    opts.xoauth2_bearer = client.access_token->access_token;
+    opts.method = HTTP_GET;
 
     long http_code = curl_perform(opts, &chunk);
 
@@ -741,35 +2661,20 @@ cleanup:
 
 int keycloak_create_user(struct kc_realm realm, struct kc_client client, const char* username, const char* email, const char* passwd)
 {
-    // Input validation
     if (!realm.base_uri || !realm.realm || !client.access_token || !username || !email || !passwd) {
         log_module(KC_LOG, LOG_DEBUG, "keycloak_create_user: Invalid arguments");
         return KC_ERROR;
     }
 
     int result = KC_ERROR;
-    int auth_header_len = 0;
+    char *uri = kc_build_users_endpoint(realm);
+    char *user_repr = NULL;
+    struct memory chunk = {0};
 
-    char* uri = NULL;
-    char* auth_header = NULL;
-    char* user_repr = NULL;
-
-    struct memory chunk = {
-        .response = NULL,
-        .size = 0
-    };
-
-    static const char uri_tmpl[] = "%s/admin/realms/%s/users";
-
-    // Build URI safely
-    int uri_len = snprintf(NULL, 0, uri_tmpl, realm.base_uri, realm.realm) + 1;
-    uri = malloc(uri_len);
     if (!uri) {
         log_module(KC_LOG, LOG_DEBUG, "keycloak_create_user: Failed to build uri");
         goto cleanup;
     }
-    snprintf(uri, uri_len, uri_tmpl, realm.base_uri, realm.realm);
-
 
     user_repr = json_build_user_representation(username, email, passwd);
     if (!user_repr) {
@@ -777,16 +2682,8 @@ int keycloak_create_user(struct kc_realm realm, struct kc_client client, const c
         goto cleanup;
     }
 
-    struct curl_opts opts = {
-        .uri = uri,
-        .post_fields = user_repr,
-        .xoauth2_bearer = client.access_token->access_token,
-        .write_callback = curl_write_cb,
-        .header_list = { "Content-Type: application/json" },
-        .header_count = 1
-    };
-
-    long http_code = curl_perform(opts, &chunk);
+    long http_code = curl_perform_json(uri, HTTP_POST, user_repr,
+                                        client.access_token->access_token, &chunk);
 
     if (http_code == 201) {
         result = KC_SUCCESS;
@@ -804,17 +2701,11 @@ cleanup:
         memset(chunk.response, 0, chunk.size);
         free(chunk.response);
     }
-    if (auth_header) {
-        memset(auth_header, 0, auth_header_len);
-        free(auth_header);
-    }
     if (user_repr) {
         memset(user_repr, 0, strlen(user_repr));
         free(user_repr);
     }
-    if (uri) {
-        free(uri);
-    }
+    free(uri);
 
     return result;
 }
@@ -897,16 +2788,13 @@ int keycloak_update_user(struct kc_realm realm, struct kc_client client,
     char* json_body = NULL;
     struct memory chunk = { .response = NULL, .size = 0 };
 
-    // Update email if provided (requires PUT to user endpoint)
+    /* Update email if provided (requires PUT to user endpoint) */
     if (new_email) {
-        static const char uri_tmpl[] = "%s/admin/realms/%s/users/%s";
-        int uri_len = snprintf(NULL, 0, uri_tmpl, realm.base_uri, realm.realm, user_id) + 1;
-        uri = malloc(uri_len);
+        uri = kc_build_user_endpoint(realm, user_id);
         if (!uri) {
             log_module(KC_LOG, LOG_DEBUG, "keycloak_update_user: Failed to allocate uri");
             goto cleanup;
         }
-        snprintf(uri, uri_len, uri_tmpl, realm.base_uri, realm.realm, user_id);
 
         json_t* user_obj = json_object();
         json_object_set_new(user_obj, "email", json_string(new_email));
@@ -918,15 +2806,13 @@ int keycloak_update_user(struct kc_realm realm, struct kc_client client,
             goto cleanup;
         }
 
-        struct curl_opts opts = {
-            .uri = uri,
-            .method = HTTP_PUT,
-            .post_fields = json_body,
-            .xoauth2_bearer = client.access_token->access_token,
-            .write_callback = curl_write_cb,
-            .header_list = { "Content-Type: application/json" },
-            .header_count = 1
-        };
+        struct curl_opts opts = CURL_OPTS_INIT;
+        opts.uri = uri;
+        opts.method = HTTP_PUT;
+        opts.post_fields = json_body;
+        opts.xoauth2_bearer = client.access_token->access_token;
+        opts.header_list[0] = "Content-Type: application/json";
+        opts.header_count = 1;
 
         long http_code = curl_perform(opts, &chunk);
 
@@ -954,16 +2840,13 @@ int keycloak_update_user(struct kc_realm realm, struct kc_client client,
         }
     }
 
-    // Update password if provided (requires PUT to reset-password endpoint)
+    /* Update password if provided (requires PUT to reset-password endpoint) */
     if (new_password) {
-        static const char uri_tmpl[] = "%s/admin/realms/%s/users/%s/reset-password";
-        int uri_len = snprintf(NULL, 0, uri_tmpl, realm.base_uri, realm.realm, user_id) + 1;
-        uri = malloc(uri_len);
+        uri = kc_build_reset_password_endpoint(realm, user_id);
         if (!uri) {
             log_module(KC_LOG, LOG_DEBUG, "keycloak_update_user: Failed to allocate uri");
             goto cleanup;
         }
-        snprintf(uri, uri_len, uri_tmpl, realm.base_uri, realm.realm, user_id);
 
         json_t* cred_obj = json_object();
         json_object_set_new(cred_obj, "type", json_string("password"));
@@ -977,15 +2860,13 @@ int keycloak_update_user(struct kc_realm realm, struct kc_client client,
             goto cleanup;
         }
 
-        struct curl_opts opts = {
-            .uri = uri,
-            .method = HTTP_PUT,
-            .post_fields = json_body,
-            .xoauth2_bearer = client.access_token->access_token,
-            .write_callback = curl_write_cb,
-            .header_list = { "Content-Type: application/json" },
-            .header_count = 1
-        };
+        struct curl_opts opts = CURL_OPTS_INIT;
+        opts.uri = uri;
+        opts.method = HTTP_PUT;
+        opts.post_fields = json_body;
+        opts.xoauth2_bearer = client.access_token->access_token;
+        opts.header_list[0] = "Content-Type: application/json";
+        opts.header_count = 1;
 
         long http_code = curl_perform(opts, &chunk);
 
@@ -1026,25 +2907,18 @@ int keycloak_delete_user(struct kc_realm realm, struct kc_client client,
     }
 
     int result = KC_ERROR;
-    char* uri = NULL;
-    struct memory chunk = { .response = NULL, .size = 0 };
+    char *uri = kc_build_user_endpoint(realm, user_id);
+    struct memory chunk = {0};
 
-    static const char uri_tmpl[] = "%s/admin/realms/%s/users/%s";
-    int uri_len = snprintf(NULL, 0, uri_tmpl, realm.base_uri, realm.realm, user_id) + 1;
-    uri = malloc(uri_len);
     if (!uri) {
         log_module(KC_LOG, LOG_DEBUG, "keycloak_delete_user: Failed to allocate uri");
         goto cleanup;
     }
-    snprintf(uri, uri_len, uri_tmpl, realm.base_uri, realm.realm, user_id);
 
-    struct curl_opts opts = {
-        .uri = uri,
-        .method = HTTP_DELETE,
-        .xoauth2_bearer = client.access_token->access_token,
-        .write_callback = curl_write_cb,
-        .header_count = 0
-    };
+    struct curl_opts opts = CURL_OPTS_INIT;
+    opts.uri = uri;
+    opts.method = HTTP_DELETE;
+    opts.xoauth2_bearer = client.access_token->access_token;
 
     long http_code = curl_perform(opts, &chunk);
 
@@ -1064,9 +2938,7 @@ cleanup:
         memset(chunk.response, 0, chunk.size);
         free(chunk.response);
     }
-    if (uri) {
-        free(uri);
-    }
+    free(uri);
 
     return result;
 }
@@ -1082,20 +2954,17 @@ int keycloak_set_user_attribute(struct kc_realm realm, struct kc_client client,
     }
 
     int result = KC_ERROR;
-    char* uri = NULL;
-    char* json_body = NULL;
-    struct memory chunk = { .response = NULL, .size = 0 };
+    char *uri = NULL;
+    char *json_body = NULL;
+    struct memory chunk = {0};
 
-    static const char uri_tmpl[] = "%s/admin/realms/%s/users/%s";
-    int uri_len = snprintf(NULL, 0, uri_tmpl, realm.base_uri, realm.realm, user_id) + 1;
-    uri = malloc(uri_len);
+    uri = kc_build_user_endpoint(realm, user_id);
     if (!uri) {
         log_module(KC_LOG, LOG_DEBUG, "keycloak_set_user_attribute: Failed to allocate uri");
         goto cleanup;
     }
-    snprintf(uri, uri_len, uri_tmpl, realm.base_uri, realm.realm, user_id);
 
-    // Build JSON: { "attributes": { "attr_name": ["attr_value"] } }
+    /* Build JSON: { "attributes": { "attr_name": ["attr_value"] } } */
     json_t* user_obj = json_object();
     json_t* attrs = json_object();
     json_t* values = json_array();
@@ -1110,15 +2979,13 @@ int keycloak_set_user_attribute(struct kc_realm realm, struct kc_client client,
         goto cleanup;
     }
 
-    struct curl_opts opts = {
-        .uri = uri,
-        .method = HTTP_PUT,
-        .post_fields = json_body,
-        .xoauth2_bearer = client.access_token->access_token,
-        .write_callback = curl_write_cb,
-        .header_list = { "Content-Type: application/json" },
-        .header_count = 1
-    };
+    struct curl_opts opts = CURL_OPTS_INIT;
+    opts.uri = uri;
+    opts.method = HTTP_PUT;
+    opts.post_fields = json_body;
+    opts.xoauth2_bearer = client.access_token->access_token;
+    opts.header_list[0] = "Content-Type: application/json";
+    opts.header_count = 1;
 
     long http_code = curl_perform(opts, &chunk);
 
@@ -1160,25 +3027,19 @@ int keycloak_get_user_attribute(struct kc_realm realm, struct kc_client client,
 
     *value_out = NULL;
     int result = KC_ERROR;
-    char* uri = NULL;
-    struct memory chunk = { .response = NULL, .size = 0 };
+    char *uri = NULL;
+    struct memory chunk = {0};
 
-    static const char uri_tmpl[] = "%s/admin/realms/%s/users/%s";
-    int uri_len = snprintf(NULL, 0, uri_tmpl, realm.base_uri, realm.realm, user_id) + 1;
-    uri = malloc(uri_len);
+    uri = kc_build_user_endpoint(realm, user_id);
     if (!uri) {
         log_module(KC_LOG, LOG_DEBUG, "keycloak_get_user_attribute: Failed to allocate uri");
         goto cleanup;
     }
-    snprintf(uri, uri_len, uri_tmpl, realm.base_uri, realm.realm, user_id);
 
-    struct curl_opts opts = {
-        .uri = uri,
-        .method = HTTP_GET,
-        .xoauth2_bearer = client.access_token->access_token,
-        .write_callback = curl_write_cb,
-        .header_count = 0
-    };
+    struct curl_opts opts = CURL_OPTS_INIT;
+    opts.uri = uri;
+    opts.method = HTTP_GET;
+    opts.xoauth2_bearer = client.access_token->access_token;
 
     long http_code = curl_perform(opts, &chunk);
 
@@ -1259,26 +3120,20 @@ int keycloak_list_user_attributes(struct kc_realm realm, struct kc_client client
 
     *entries_out = NULL;
     int result = KC_ERROR;
-    char* uri = NULL;
-    struct memory chunk = { .response = NULL, .size = 0 };
+    char *uri = NULL;
+    struct memory chunk = {0};
     size_t prefix_len = prefix ? strlen(prefix) : 0;
 
-    static const char uri_tmpl[] = "%s/admin/realms/%s/users/%s";
-    int uri_len = snprintf(NULL, 0, uri_tmpl, realm.base_uri, realm.realm, user_id) + 1;
-    uri = malloc(uri_len);
+    uri = kc_build_user_endpoint(realm, user_id);
     if (!uri) {
         log_module(KC_LOG, LOG_DEBUG, "keycloak_list_user_attributes: Failed to allocate uri");
         goto cleanup;
     }
-    snprintf(uri, uri_len, uri_tmpl, realm.base_uri, realm.realm, user_id);
 
-    struct curl_opts opts = {
-        .uri = uri,
-        .method = HTTP_GET,
-        .xoauth2_bearer = client.access_token->access_token,
-        .write_callback = curl_write_cb,
-        .header_count = 0
-    };
+    struct curl_opts opts = CURL_OPTS_INIT;
+    opts.uri = uri;
+    opts.method = HTTP_GET;
+    opts.xoauth2_bearer = client.access_token->access_token;
 
     long http_code = curl_perform(opts, &chunk);
 
@@ -1379,25 +3234,19 @@ int keycloak_add_user_to_group(struct kc_realm realm, struct kc_client client,
     }
 
     int result = KC_ERROR;
-    char* uri = NULL;
-    struct memory chunk = { .response = NULL, .size = 0 };
+    struct memory chunk = {0};
 
-    static const char uri_tmpl[] = "%s/admin/realms/%s/users/%s/groups/%s";
-    int uri_len = snprintf(NULL, 0, uri_tmpl, realm.base_uri, realm.realm, user_id, group_id) + 1;
-    uri = malloc(uri_len);
+    /* Build URI using endpoint builder */
+    char *uri = kc_build_user_group_endpoint(realm, user_id, group_id);
     if (!uri) {
         log_module(KC_LOG, LOG_DEBUG, "keycloak_add_user_to_group: Failed to allocate uri");
         goto cleanup;
     }
-    snprintf(uri, uri_len, uri_tmpl, realm.base_uri, realm.realm, user_id, group_id);
 
-    struct curl_opts opts = {
-        .uri = uri,
-        .method = HTTP_PUT,
-        .xoauth2_bearer = client.access_token->access_token,
-        .write_callback = curl_write_cb,
-        .header_count = 0
-    };
+    struct curl_opts opts = CURL_OPTS_INIT;
+    opts.uri = uri;
+    opts.method = HTTP_PUT;
+    opts.xoauth2_bearer = client.access_token->access_token;
 
     long http_code = curl_perform(opts, &chunk);
 
@@ -1417,9 +3266,7 @@ cleanup:
         memset(chunk.response, 0, chunk.size);
         free(chunk.response);
     }
-    if (uri) {
-        free(uri);
-    }
+    free(uri);
 
     return result;
 }
@@ -1434,25 +3281,19 @@ int keycloak_remove_user_from_group(struct kc_realm realm, struct kc_client clie
     }
 
     int result = KC_ERROR;
-    char* uri = NULL;
-    struct memory chunk = { .response = NULL, .size = 0 };
+    struct memory chunk = {0};
 
-    static const char uri_tmpl[] = "%s/admin/realms/%s/users/%s/groups/%s";
-    int uri_len = snprintf(NULL, 0, uri_tmpl, realm.base_uri, realm.realm, user_id, group_id) + 1;
-    uri = malloc(uri_len);
+    /* Build URI using endpoint builder */
+    char *uri = kc_build_user_group_endpoint(realm, user_id, group_id);
     if (!uri) {
         log_module(KC_LOG, LOG_DEBUG, "keycloak_remove_user_from_group: Failed to allocate uri");
         goto cleanup;
     }
-    snprintf(uri, uri_len, uri_tmpl, realm.base_uri, realm.realm, user_id, group_id);
 
-    struct curl_opts opts = {
-        .uri = uri,
-        .method = HTTP_DELETE,
-        .xoauth2_bearer = client.access_token->access_token,
-        .write_callback = curl_write_cb,
-        .header_count = 0
-    };
+    struct curl_opts opts = CURL_OPTS_INIT;
+    opts.uri = uri;
+    opts.method = HTTP_DELETE;
+    opts.xoauth2_bearer = client.access_token->access_token;
 
     long http_code = curl_perform(opts, &chunk);
 
@@ -1490,9 +3331,9 @@ int keycloak_get_group_by_name(struct kc_realm realm, struct kc_client client,
 
     *group_id_out = NULL;
     int result = KC_ERROR;
-    char* uri = NULL;
-    char* escaped_name = NULL;
-    struct memory chunk = { .response = NULL, .size = 0 };
+    char *uri = NULL;
+    char *escaped_name = NULL;
+    struct memory chunk = {0};
 
     escaped_name = curl_easy_escape(NULL, group_name, 0);
     if (!escaped_name) {
@@ -1500,22 +3341,17 @@ int keycloak_get_group_by_name(struct kc_realm realm, struct kc_client client,
         goto cleanup;
     }
 
-    static const char uri_tmpl[] = "%s/admin/realms/%s/groups?search=%s&exact=true";
-    int uri_len = snprintf(NULL, 0, uri_tmpl, realm.base_uri, realm.realm, escaped_name) + 1;
-    uri = malloc(uri_len);
+    /* Build URI using endpoint builder */
+    uri = kc_build_group_search_endpoint(realm, escaped_name);
     if (!uri) {
         log_module(KC_LOG, LOG_DEBUG, "keycloak_get_group_by_name: Failed to allocate uri");
         goto cleanup;
     }
-    snprintf(uri, uri_len, uri_tmpl, realm.base_uri, realm.realm, escaped_name);
 
-    struct curl_opts opts = {
-        .uri = uri,
-        .method = HTTP_GET,
-        .xoauth2_bearer = client.access_token->access_token,
-        .write_callback = curl_write_cb,
-        .header_count = 0
-    };
+    struct curl_opts opts = CURL_OPTS_INIT;
+    opts.uri = uri;
+    opts.method = HTTP_GET;
+    opts.xoauth2_bearer = client.access_token->access_token;
 
     long http_code = curl_perform(opts, &chunk);
 
@@ -1575,36 +3411,19 @@ int keycloak_get_group_by_path(struct kc_realm realm, struct kc_client client,
 
     *group_id_out = NULL;
     int result = KC_ERROR;
-    char* uri = NULL;
-    char* escaped_path = NULL;
-    struct memory chunk = { .response = NULL, .size = 0 };
+    struct memory chunk = {0};
 
-    /* URL-encode the path (preserving slashes for Keycloak API) */
-    escaped_path = curl_easy_escape(NULL, group_path, 0);
-    if (!escaped_path) {
-        log_module(KC_LOG, LOG_DEBUG, "keycloak_get_group_by_path: Failed to escape path");
-        goto cleanup;
-    }
-
-    /* Keycloak endpoint: GET /admin/realms/{realm}/group-by-path/{path}
-     * Note: The path should start with /
-     */
-    static const char uri_tmpl[] = "%s/admin/realms/%s/group-by-path%s";
-    int uri_len = snprintf(NULL, 0, uri_tmpl, realm.base_uri, realm.realm, group_path) + 1;
-    uri = malloc(uri_len);
+    /* Build URI using endpoint builder (path should start with /) */
+    char *uri = kc_build_group_by_path_endpoint(realm, group_path);
     if (!uri) {
         log_module(KC_LOG, LOG_DEBUG, "keycloak_get_group_by_path: Failed to allocate uri");
         goto cleanup;
     }
-    snprintf(uri, uri_len, uri_tmpl, realm.base_uri, realm.realm, group_path);
 
-    struct curl_opts opts = {
-        .uri = uri,
-        .method = HTTP_GET,
-        .xoauth2_bearer = client.access_token->access_token,
-        .write_callback = curl_write_cb,
-        .header_count = 0
-    };
+    struct curl_opts opts = CURL_OPTS_INIT;
+    opts.uri = uri;
+    opts.method = HTTP_GET;
+    opts.xoauth2_bearer = client.access_token->access_token;
 
     long http_code = curl_perform(opts, &chunk);
 
@@ -1646,12 +3465,7 @@ cleanup:
         memset(chunk.response, 0, chunk.size);
         free(chunk.response);
     }
-    if (escaped_path) {
-        curl_free(escaped_path);
-    }
-    if (uri) {
-        free(uri);
-    }
+    free(uri);
 
     return result;
 }
@@ -1740,28 +3554,26 @@ int keycloak_introspect_token(struct kc_realm realm, struct kc_client client,
 
     *info_out = NULL;
     int result = KC_ERROR;
-    char* uri = NULL;
-    char* post_fields = NULL;
-    char* escaped_token = NULL;
-    struct memory chunk = { .response = NULL, .size = 0 };
+    char *uri = NULL;
+    char *post_fields = NULL;
+    char *escaped_token = NULL;
+    struct memory chunk = {0};
 
-    static const char uri_tmpl[] = "%s/realms/%s/protocol/openid-connect/token/introspect";
-    int uri_len = snprintf(NULL, 0, uri_tmpl, realm.base_uri, realm.realm) + 1;
-    uri = malloc(uri_len);
+    /* Build URI using endpoint builder */
+    uri = kc_build_introspect_endpoint(realm);
     if (!uri) {
         log_module(KC_LOG, LOG_DEBUG, "keycloak_introspect_token: Failed to allocate uri");
         goto cleanup;
     }
-    snprintf(uri, uri_len, uri_tmpl, realm.base_uri, realm.realm);
 
-    // URL-encode token
+    /* URL-encode token */
     escaped_token = curl_easy_escape(NULL, bearer_token, 0);
     if (!escaped_token) {
         log_module(KC_LOG, LOG_DEBUG, "keycloak_introspect_token: Failed to escape token");
         goto cleanup;
     }
 
-    // Build POST body
+    /* Build POST body */
     static const char post_tmpl[] = "token=%s&token_type_hint=access_token";
     int post_len = snprintf(NULL, 0, post_tmpl, escaped_token) + 1;
     post_fields = malloc(post_len);
@@ -1771,15 +3583,13 @@ int keycloak_introspect_token(struct kc_realm realm, struct kc_client client,
     }
     snprintf(post_fields, post_len, post_tmpl, escaped_token);
 
-    struct curl_opts opts = {
-        .uri = uri,
-        .method = HTTP_POST,
-        .post_fields = post_fields,
-        .auth_user = client.client_id,
-        .auth_passwd = client.client_secret,
-        .write_callback = curl_write_cb,
-        .header_count = 0
-    };
+    struct curl_opts opts = CURL_OPTS_INIT;
+    opts.uri = uri;
+    opts.method = HTTP_POST;
+    opts.post_fields = post_fields;
+    opts.auth_user = client.client_id;
+    opts.auth_passwd = client.client_secret;
+    opts.max_retries = 1;
 
     long http_code = curl_perform(opts, &chunk);
 
@@ -1846,26 +3656,19 @@ int keycloak_get_group_members(struct kc_realm realm, struct kc_client client,
     *members_out = NULL;
     int result = KC_ERROR;
     int member_count = 0;
-    char* uri = NULL;
-    struct memory chunk = { .response = NULL, .size = 0 };
+    struct memory chunk = {0};
 
-    /* Build URI: /admin/realms/{realm}/groups/{id}/members */
-    static const char uri_tmpl[] = "%s/admin/realms/%s/groups/%s/members?max=1000";
-    int uri_len = snprintf(NULL, 0, uri_tmpl, realm.base_uri, realm.realm, group_id) + 1;
-    uri = malloc(uri_len);
+    /* Build URI using endpoint builder */
+    char *uri = kc_build_group_members_endpoint(realm, group_id);
     if (!uri) {
         log_module(KC_LOG, LOG_DEBUG, "keycloak_get_group_members: Failed to allocate uri");
         goto cleanup;
     }
-    snprintf(uri, uri_len, uri_tmpl, realm.base_uri, realm.realm, group_id);
 
-    struct curl_opts opts = {
-        .uri = uri,
-        .method = HTTP_GET,
-        .xoauth2_bearer = client.access_token->access_token,
-        .write_callback = curl_write_cb,
-        .header_count = 0
-    };
+    struct curl_opts opts = CURL_OPTS_INIT;
+    opts.uri = uri;
+    opts.method = HTTP_GET;
+    opts.xoauth2_bearer = client.access_token->access_token;
 
     long http_code = curl_perform(opts, &chunk);
 
@@ -1992,26 +3795,20 @@ int keycloak_get_group_info(struct kc_realm realm, struct kc_client client,
 
     *info_out = NULL;
     int result = KC_ERROR;
-    char* uri = NULL;
-    struct memory chunk = { .response = NULL, .size = 0 };
+    char *uri = NULL;
+    struct memory chunk = {0};
 
-    /* Build URI: GET /admin/realms/{realm}/groups/{group_id} */
-    static const char uri_tmpl[] = "%s/admin/realms/%s/groups/%s";
-    int uri_len = snprintf(NULL, 0, uri_tmpl, realm.base_uri, realm.realm, group_id) + 1;
-    uri = malloc(uri_len);
+    /* Build URI using endpoint builder */
+    uri = kc_build_group_endpoint(realm, group_id);
     if (!uri) {
         log_module(KC_LOG, LOG_DEBUG, "keycloak_get_group_info: Failed to allocate uri");
         return KC_ERROR;
     }
-    snprintf(uri, uri_len, uri_tmpl, realm.base_uri, realm.realm, group_id);
 
-    struct curl_opts opts = {
-        .uri = uri,
-        .method = HTTP_GET,
-        .xoauth2_bearer = client.access_token->access_token,
-        .write_callback = curl_write_cb,
-        .header_count = 0
-    };
+    struct curl_opts opts = CURL_OPTS_INIT;
+    opts.uri = uri;
+    opts.method = HTTP_GET;
+    opts.xoauth2_bearer = client.access_token->access_token;
 
     long http_code = curl_perform(opts, &chunk);
 
@@ -2200,37 +3997,28 @@ int keycloak_find_user_by_fingerprint(struct kc_realm realm, struct kc_client cl
 
     *username_out = NULL;
     int result = KC_ERROR;
-    char* uri = NULL;
-    char* escaped_fp = NULL;
-    struct memory chunk = { .response = NULL, .size = 0 };
+    char *uri = NULL;
+    char *escaped_fp = NULL;
+    struct memory chunk = {0};
 
-    /* URL-encode the fingerprint for the query parameter
-     * Keycloak's Admin API supports q= for attribute search:
-     * GET /admin/realms/{realm}/users?q=x509_fingerprints:{fingerprint}
-     */
+    /* URL-encode the fingerprint for the query parameter */
     escaped_fp = curl_easy_escape(NULL, fingerprint, 0);
     if (!escaped_fp) {
         log_module(KC_LOG, LOG_DEBUG, "keycloak_find_user_by_fingerprint: Failed to escape fingerprint");
         goto cleanup;
     }
 
-    /* Build the search URI */
-    static const char uri_tmpl[] = "%s/admin/realms/%s/users?q=x509_fingerprints:%s";
-    int uri_len = snprintf(NULL, 0, uri_tmpl, realm.base_uri, realm.realm, escaped_fp) + 1;
-    uri = malloc(uri_len);
+    /* Build the search URI using endpoint builder */
+    uri = kc_build_fingerprint_search_endpoint(realm, escaped_fp);
     if (!uri) {
         log_module(KC_LOG, LOG_DEBUG, "keycloak_find_user_by_fingerprint: Failed to allocate uri");
         goto cleanup;
     }
-    snprintf(uri, uri_len, uri_tmpl, realm.base_uri, realm.realm, escaped_fp);
 
-    struct curl_opts opts = {
-        .uri = uri,
-        .method = HTTP_GET,
-        .xoauth2_bearer = client.access_token->access_token,
-        .write_callback = curl_write_cb,
-        .header_count = 0
-    };
+    struct curl_opts opts = CURL_OPTS_INIT;
+    opts.uri = uri;
+    opts.method = HTTP_GET;
+    opts.xoauth2_bearer = client.access_token->access_token;
 
     long http_code = curl_perform(opts, &chunk);
 
@@ -2317,19 +4105,16 @@ int keycloak_create_group(struct kc_realm realm, struct kc_client client,
         *group_id_out = NULL;
 
     int result = KC_ERROR;
-    char* uri = NULL;
-    char* json_body = NULL;
-    struct memory chunk = { .response = NULL, .size = 0 };
+    char *uri = NULL;
+    char *json_body = NULL;
+    struct memory chunk = {0};
 
-    /* Build URI: POST /admin/realms/{realm}/groups */
-    static const char uri_tmpl[] = "%s/admin/realms/%s/groups";
-    int uri_len = snprintf(NULL, 0, uri_tmpl, realm.base_uri, realm.realm) + 1;
-    uri = malloc(uri_len);
+    /* Build URI using endpoint builder */
+    uri = kc_build_groups_endpoint(realm);
     if (!uri) {
         log_module(KC_LOG, LOG_DEBUG, "keycloak_create_group: Failed to allocate uri");
         goto cleanup;
     }
-    snprintf(uri, uri_len, uri_tmpl, realm.base_uri, realm.realm);
 
     /* Build JSON: { "name": "group_name" } */
     json_t* group_obj = json_object();
@@ -2342,15 +4127,13 @@ int keycloak_create_group(struct kc_realm realm, struct kc_client client,
         goto cleanup;
     }
 
-    struct curl_opts opts = {
-        .uri = uri,
-        .method = HTTP_POST,
-        .post_fields = json_body,
-        .xoauth2_bearer = client.access_token->access_token,
-        .write_callback = curl_write_cb,
-        .header_list = { "Content-Type: application/json" },
-        .header_count = 1
-    };
+    struct curl_opts opts = CURL_OPTS_INIT;
+    opts.uri = uri;
+    opts.method = HTTP_POST;
+    opts.post_fields = json_body;
+    opts.xoauth2_bearer = client.access_token->access_token;
+    opts.header_list[0] = "Content-Type: application/json";
+    opts.header_count = 1;
 
     long http_code = curl_perform(opts, &chunk);
 
@@ -2406,19 +4189,15 @@ int keycloak_create_subgroup(struct kc_realm realm, struct kc_client client,
         *group_id_out = NULL;
 
     int result = KC_ERROR;
-    char* uri = NULL;
-    char* json_body = NULL;
-    struct memory chunk = { .response = NULL, .size = 0 };
+    char *json_body = NULL;
+    struct memory chunk = {0};
 
-    /* Build URI: POST /admin/realms/{realm}/groups/{parent_id}/children */
-    static const char uri_tmpl[] = "%s/admin/realms/%s/groups/%s/children";
-    int uri_len = snprintf(NULL, 0, uri_tmpl, realm.base_uri, realm.realm, parent_id) + 1;
-    uri = malloc(uri_len);
+    /* Build URI using endpoint builder */
+    char *uri = kc_build_group_children_endpoint(realm, parent_id);
     if (!uri) {
         log_module(KC_LOG, LOG_DEBUG, "keycloak_create_subgroup: Failed to allocate uri");
         goto cleanup;
     }
-    snprintf(uri, uri_len, uri_tmpl, realm.base_uri, realm.realm, parent_id);
 
     /* Build JSON: { "name": "group_name" } */
     json_t* group_obj = json_object();
@@ -2431,15 +4210,13 @@ int keycloak_create_subgroup(struct kc_realm realm, struct kc_client client,
         goto cleanup;
     }
 
-    struct curl_opts opts = {
-        .uri = uri,
-        .method = HTTP_POST,
-        .post_fields = json_body,
-        .xoauth2_bearer = client.access_token->access_token,
-        .write_callback = curl_write_cb,
-        .header_list = { "Content-Type: application/json" },
-        .header_count = 1
-    };
+    struct curl_opts opts = CURL_OPTS_INIT;
+    opts.uri = uri;
+    opts.method = HTTP_POST;
+    opts.post_fields = json_body;
+    opts.xoauth2_bearer = client.access_token->access_token;
+    opts.header_list[0] = "Content-Type: application/json";
+    opts.header_count = 1;
 
     long http_code = curl_perform(opts, &chunk);
 
@@ -2503,9 +4280,9 @@ int keycloak_set_group_attribute(struct kc_realm realm, struct kc_client client,
     }
 
     int result = KC_ERROR;
-    char* uri = NULL;
-    char* json_body = NULL;
-    struct memory chunk = { .response = NULL, .size = 0 };
+    char *uri = NULL;
+    char *json_body = NULL;
+    struct memory chunk = {0};
 
     /* First, get the existing group to preserve its current state */
     struct kc_group_info* info = NULL;
@@ -2517,16 +4294,13 @@ int keycloak_set_group_attribute(struct kc_realm realm, struct kc_client client,
         return KC_ERROR;
     }
 
-    /* Build URI: PUT /admin/realms/{realm}/groups/{group_id} */
-    static const char uri_tmpl[] = "%s/admin/realms/%s/groups/%s";
-    int uri_len = snprintf(NULL, 0, uri_tmpl, realm.base_uri, realm.realm, group_id) + 1;
-    uri = malloc(uri_len);
+    /* Build URI using endpoint builder */
+    uri = kc_build_group_endpoint(realm, group_id);
     if (!uri) {
         log_module(KC_LOG, LOG_DEBUG, "keycloak_set_group_attribute: Failed to allocate uri");
         keycloak_free_group_info(info);
         goto cleanup;
     }
-    snprintf(uri, uri_len, uri_tmpl, realm.base_uri, realm.realm, group_id);
 
     /* Build JSON with existing attributes + new attribute */
     json_t* group_obj = json_object();
@@ -2556,15 +4330,13 @@ int keycloak_set_group_attribute(struct kc_realm realm, struct kc_client client,
         goto cleanup;
     }
 
-    struct curl_opts opts = {
-        .uri = uri,
-        .method = HTTP_PUT,
-        .post_fields = json_body,
-        .xoauth2_bearer = client.access_token->access_token,
-        .write_callback = curl_write_cb,
-        .header_list = { "Content-Type: application/json" },
-        .header_count = 1
-    };
+    struct curl_opts opts = CURL_OPTS_INIT;
+    opts.uri = uri;
+    opts.method = HTTP_PUT;
+    opts.post_fields = json_body;
+    opts.xoauth2_bearer = client.access_token->access_token;
+    opts.header_list[0] = "Content-Type: application/json";
+    opts.header_count = 1;
 
     long http_code = curl_perform(opts, &chunk);
 
@@ -2604,26 +4376,20 @@ int keycloak_delete_group(struct kc_realm realm, struct kc_client client,
     }
 
     int result = KC_ERROR;
-    char* uri = NULL;
-    struct memory chunk = { .response = NULL, .size = 0 };
+    char *uri = NULL;
+    struct memory chunk = {0};
 
-    /* Build URI: DELETE /admin/realms/{realm}/groups/{group_id} */
-    static const char uri_tmpl[] = "%s/admin/realms/%s/groups/%s";
-    int uri_len = snprintf(NULL, 0, uri_tmpl, realm.base_uri, realm.realm, group_id) + 1;
-    uri = malloc(uri_len);
+    /* Build URI using endpoint builder */
+    uri = kc_build_group_endpoint(realm, group_id);
     if (!uri) {
         log_module(KC_LOG, LOG_DEBUG, "keycloak_delete_group: Failed to allocate uri");
         goto cleanup;
     }
-    snprintf(uri, uri_len, uri_tmpl, realm.base_uri, realm.realm, group_id);
 
-    struct curl_opts opts = {
-        .uri = uri,
-        .method = HTTP_DELETE,
-        .xoauth2_bearer = client.access_token->access_token,
-        .write_callback = curl_write_cb,
-        .header_count = 0
-    };
+    struct curl_opts opts = CURL_OPTS_INIT;
+    opts.uri = uri;
+    opts.method = HTTP_DELETE;
+    opts.xoauth2_bearer = client.access_token->access_token;
 
     long http_code = curl_perform(opts, &chunk);
 

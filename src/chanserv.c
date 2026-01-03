@@ -10610,6 +10610,55 @@ chanserv_sync_keycloak_channel(const char *channel)
     return total;
 }
 
+/*
+ * Async context for Keycloak group operations with LMDB update
+ */
+struct cs_group_async_ctx {
+    char *channel;
+    char *username;
+    unsigned short access;
+    int is_add;  /* 1 = add to group, 0 = remove from group */
+};
+
+/* Callback for async group add/remove operations */
+static void
+cs_group_async_callback(void *session, int result)
+{
+    struct cs_group_async_ctx *ctx = session;
+    if (!ctx) return;
+
+    if (result == KC_SUCCESS) {
+        log_module(CS_LOG, LOG_DEBUG, "cs_group_async: %s %s %s %s group (async)",
+                   result == KC_SUCCESS ? "Success" : "Failed",
+                   ctx->is_add ? "adding" : "removing",
+                   ctx->username, ctx->is_add ? "to" : "from");
+
+#ifdef WITH_LMDB
+        /* Update LMDB cache on success */
+        if (x3_lmdb_is_available()) {
+            if (ctx->is_add) {
+                x3_lmdb_chanaccess_set(ctx->channel, ctx->username, ctx->access);
+                log_module(CS_LOG, LOG_DEBUG, "cs_group_async: Updated LMDB cache %s/%s level %d",
+                           ctx->channel, ctx->username, ctx->access);
+            } else {
+                x3_lmdb_chanaccess_delete(ctx->channel, ctx->username);
+                log_module(CS_LOG, LOG_DEBUG, "cs_group_async: Removed LMDB cache %s/%s",
+                           ctx->channel, ctx->username);
+            }
+        }
+#endif
+    } else {
+        log_module(CS_LOG, LOG_DEBUG, "cs_group_async: Failed to %s %s %s group (result=%d)",
+                   ctx->is_add ? "add" : "remove",
+                   ctx->username, ctx->is_add ? "to" : "from", result);
+    }
+
+    /* Free context */
+    free(ctx->channel);
+    free(ctx->username);
+    free(ctx);
+}
+
 /**
  * Push a user's access level change to Keycloak (bidirectional sync: X3 -> Keycloak)
  * Creates the channel group if it doesn't exist, then adds/updates user membership.
@@ -10675,19 +10724,43 @@ chanserv_push_keycloak_access(const char *channel, const char *username, unsigne
         snprintf(group_path, sizeof(group_path), "/irc-channels/%s", channel);
         rc = keycloak_get_group_by_path(realm, client, group_path, &group_id);
         if (rc == KC_SUCCESS && group_id) {
-            keycloak_remove_user_from_group(realm, client, kc_user.id, group_id);
-            free(group_id);
-            log_module(CS_LOG, LOG_DEBUG, "chanserv_push_keycloak_access: Removed %s from %s group",
-                       username, channel);
+            /* Prepare async context for LMDB update in callback */
+            struct cs_group_async_ctx *ctx = malloc(sizeof(*ctx));
+            if (ctx) {
+                ctx->channel = strdup(channel);
+                ctx->username = strdup(username);
+                ctx->access = 0;
+                ctx->is_add = 0;
 
+                /* Fire async remove (LMDB update happens in callback) */
+                if (keycloak_remove_user_from_group_async(realm, client, kc_user.id,
+                                                          group_id, ctx,
+                                                          cs_group_async_callback) < 0) {
+                    /* Async failed, fall back to sync */
+                    log_module(CS_LOG, LOG_DEBUG, "chanserv_push_keycloak_access: Async failed, using sync remove");
+                    keycloak_remove_user_from_group(realm, client, kc_user.id, group_id);
 #ifdef WITH_LMDB
-            /* Remove from LMDB cache */
-            if (x3_lmdb_is_available()) {
-                x3_lmdb_chanaccess_delete(channel, username);
-                log_module(CS_LOG, LOG_DEBUG, "chanserv_push_keycloak_access: Removed LMDB cache for %s/%s",
-                           channel, username);
-            }
+                    if (x3_lmdb_is_available()) {
+                        x3_lmdb_chanaccess_delete(channel, username);
+                    }
 #endif
+                    free(ctx->channel);
+                    free(ctx->username);
+                    free(ctx);
+                } else {
+                    log_module(CS_LOG, LOG_DEBUG, "chanserv_push_keycloak_access: Async remove started for %s from %s",
+                               username, channel);
+                }
+            } else {
+                /* Out of memory, fall back to sync */
+                keycloak_remove_user_from_group(realm, client, kc_user.id, group_id);
+#ifdef WITH_LMDB
+                if (x3_lmdb_is_available()) {
+                    x3_lmdb_chanaccess_delete(channel, username);
+                }
+#endif
+            }
+            free(group_id);
         }
         keycloak_user_free_fields(&kc_user);
         keycloak_free_access_token(client.access_token);
@@ -10703,29 +10776,53 @@ chanserv_push_keycloak_access(const char *channel, const char *username, unsigne
         return KC_ERROR;
     }
 
-    /* Update the group's access level attribute (in case it changed) */
+    /* Update the group's access level attribute (in case it changed) - sync for now */
     snprintf(level_str, sizeof(level_str), "%u", access);
     keycloak_set_group_attribute(realm, client, group_id,
                                  chanserv_conf.keycloak_access_level_attr, level_str);
 
-    /* Add user to the group */
-    rc = keycloak_add_user_to_group(realm, client, kc_user.id, group_id);
-    if (rc != KC_SUCCESS) {
-        log_module(CS_LOG, LOG_DEBUG, "chanserv_push_keycloak_access: Failed to add user to group");
-    } else {
-        log_module(CS_LOG, LOG_DEBUG, "chanserv_push_keycloak_access: Added %s to %s group with level %d",
-                   username, channel, access);
+    /* Add user to the group - use async with LMDB update in callback */
+    {
+        struct cs_group_async_ctx *ctx = malloc(sizeof(*ctx));
+        if (ctx) {
+            ctx->channel = strdup(channel);
+            ctx->username = strdup(username);
+            ctx->access = access;
+            ctx->is_add = 1;
 
+            /* Fire async add (LMDB update happens in callback) */
+            if (keycloak_add_user_to_group_async(realm, client, kc_user.id,
+                                                  group_id, ctx,
+                                                  cs_group_async_callback) < 0) {
+                /* Async failed, fall back to sync */
+                log_module(CS_LOG, LOG_DEBUG, "chanserv_push_keycloak_access: Async failed, using sync add");
+                rc = keycloak_add_user_to_group(realm, client, kc_user.id, group_id);
+                if (rc == KC_SUCCESS) {
 #ifdef WITH_LMDB
-        /* Update LMDB cache to keep it in sync with Keycloak */
-        if (x3_lmdb_is_available()) {
-            int lmdb_rc = x3_lmdb_chanaccess_set(channel, username, access);
-            if (lmdb_rc == LMDB_SUCCESS) {
-                log_module(CS_LOG, LOG_DEBUG, "chanserv_push_keycloak_access: Updated LMDB cache for %s/%s level %d",
-                           channel, username, access);
+                    if (x3_lmdb_is_available()) {
+                        x3_lmdb_chanaccess_set(channel, username, access);
+                    }
+#endif
+                }
+                free(ctx->channel);
+                free(ctx->username);
+                free(ctx);
+            } else {
+                log_module(CS_LOG, LOG_DEBUG, "chanserv_push_keycloak_access: Async add started for %s to %s level %d",
+                           username, channel, access);
+                rc = KC_SUCCESS;  /* Async started successfully */
+            }
+        } else {
+            /* Out of memory, fall back to sync */
+            rc = keycloak_add_user_to_group(realm, client, kc_user.id, group_id);
+            if (rc == KC_SUCCESS) {
+#ifdef WITH_LMDB
+                if (x3_lmdb_is_available()) {
+                    x3_lmdb_chanaccess_set(channel, username, access);
+                }
+#endif
             }
         }
-#endif
     }
 
     /* Cleanup */

@@ -31,6 +31,8 @@
 #ifdef HAVE_SYS_SOCKET_H
 #include <sys/socket.h>
 #endif
+/* For TCP_NODELAY - available on all POSIX systems */
+#include <netinet/tcp.h>
 
 #ifdef WITH_IOSET_WIN32
 
@@ -287,6 +289,14 @@ ioset_connect(struct sockaddr *local, unsigned int sa_size, const char *peer, un
             log_module(MAIN_LOG, LOG_ERROR, "socket() for %s returned errno %d (%s).", peer, errno, strerror(errno));
             freeaddrinfo(ai);
             return NULL;
+        }
+    }
+
+    /* Disable Nagle's algorithm for low-latency IRC messaging */
+    {
+        int opt = 1;
+        if (setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, (const char*)&opt, sizeof(opt)) < 0) {
+            log_module(MAIN_LOG, LOG_WARNING, "Unable to set TCP_NODELAY on socket for %s: %s", peer, strerror(errno));
         }
     }
 
