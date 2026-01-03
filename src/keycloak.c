@@ -689,6 +689,9 @@ struct curl_opts {
     int retry_delay_ms;      /* Base delay between retries (default 100ms) */
     /* Logging */
     const char* request_id;  /* Optional: for log correlation */
+    /* Binary POST data (alternative to post_fields) */
+    const void* post_data;   /* Binary data pointer */
+    size_t post_data_len;    /* Binary data length */
 };
 
 /* Convenience initializer with sensible defaults */
@@ -1020,8 +1023,11 @@ curl_apply_opts(CURL *curl, struct curl_opts opts, struct memory *chunk_out,
             break;
     }
 
-    /* POST/PUT fields */
-    if (opts.post_fields) {
+    /* POST/PUT fields - binary data takes priority over string fields */
+    if (opts.post_data && opts.post_data_len > 0) {
+        curl_easy_setopt(curl, CURLOPT_POSTFIELDS, opts.post_data);
+        curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, (long)opts.post_data_len);
+    } else if (opts.post_fields) {
         curl_easy_setopt(curl, CURLOPT_POSTFIELDS, opts.post_fields);
     }
 
@@ -1111,7 +1117,8 @@ enum kc_async_type {
     KC_ASYNC_INTROSPECT,    /* Token introspection */
     KC_ASYNC_SET_ATTR,      /* Set user attribute */
     KC_ASYNC_GROUP_ADD,     /* Add user to group */
-    KC_ASYNC_GROUP_REMOVE   /* Remove user from group */
+    KC_ASYNC_GROUP_REMOVE,  /* Remove user from group */
+    KC_ASYNC_WEBPUSH        /* WebPush notification delivery */
 };
 
 /* Async request tracking */
@@ -1122,13 +1129,18 @@ struct kc_async_request {
     char *uri;                    /* Allocated URL */
     char *post_fields;            /* Allocated POST data */
     char *request_id;             /* Optional: for log correlation (allocated copy) */
+    struct curl_slist *header_list;  /* HTTP headers (must free on completion) */
     enum kc_async_type type;      /* Request type for result parsing */
     union {
         kc_async_callback auth;   /* Auth callback */
         kc_async_callback generic;/* Generic success/failure callback */
         kc_fingerprint_callback fingerprint;  /* Fingerprint callback */
         kc_introspect_callback introspect;    /* Introspect callback */
+        void (*webpush)(void *session, int result, long http_code);  /* WebPush callback */
     } cb;
+    /* WebPush-specific: copy of binary POST data for async request */
+    void *post_data_copy;
+    size_t post_data_len;
 };
 
 /* Called by curl when socket state changes */
@@ -1201,15 +1213,22 @@ kc_curl_timer_cb(CURLM *multi, long timeout_ms, void *userp)
     (void)multi;
     (void)userp;
 
-    /* Remove any existing timer */
+    /* Remove any existing second-precision fallback timer */
     timeq_del(0, kc_curl_timeout_fired, NULL, TIMEQ_IGNORE_WHEN | TIMEQ_IGNORE_DATA);
 
-    if (timeout_ms >= 0) {
-        /* Schedule new timer */
-        time_t when = now + (timeout_ms / 1000) + 1;
-        if (timeout_ms == 0)
-            when = now;  /* Immediate */
-        timeq_add(when, kc_curl_timeout_fired, NULL);
+    if (timeout_ms == -1) {
+        /* Clear curl's timer - no pending operations */
+        ioset_set_poll_hint_ms(0);
+    } else if (timeout_ms == 0) {
+        /* Immediate action needed - hint minimal timeout */
+        ioset_set_poll_hint_ms(1);
+        /* Also schedule immediate timeq callback for safety */
+        timeq_add(now, kc_curl_timeout_fired, NULL);
+    } else {
+        /* Use millisecond-precision poll hint */
+        ioset_set_poll_hint_ms(timeout_ms);
+        /* Also schedule second-precision fallback (coarse, but ensures we don't miss) */
+        timeq_add(now + (timeout_ms / 1000) + 1, kc_curl_timeout_fired, NULL);
     }
     return 0;
 }
@@ -1220,6 +1239,9 @@ kc_curl_timeout_fired(UNUSED_ARG(void *data))
 {
     int running;
     if (!kc_curl_multi) return;
+
+    /* Clear poll hint - curl will reset it via timer callback if needed */
+    ioset_set_poll_hint_ms(0);
 
     curl_multi_socket_action(kc_curl_multi, CURL_SOCKET_TIMEOUT, 0, &running);
     kc_curl_check_completed();
@@ -1412,6 +1434,27 @@ kc_curl_check_completed(void)
                 }
                 break;
             }
+            case KC_ASYNC_WEBPUSH: {
+                int result = KC_ERROR;
+                if (http_code >= 200 && http_code < 300) {
+                    result = KC_SUCCESS;
+                    log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async webpush: Success (HTTP %ld)", req_id, http_code);
+                } else if (http_code == 410) {
+                    /* Subscription expired - special handling for cleanup */
+                    result = KC_FORBIDDEN;  /* Using KC_FORBIDDEN to indicate expired */
+                    log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async webpush: Subscription expired (HTTP 410)", req_id);
+                } else {
+                    log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async webpush: Error (HTTP %ld)", req_id, http_code);
+                }
+                if (req->cb.webpush) {
+                    req->cb.webpush(req->session, result, http_code);
+                }
+                /* Free the binary POST data copy if present */
+                if (req->post_data_copy) {
+                    free(req->post_data_copy);
+                }
+                break;
+            }
             }
 
             /* Cleanup - return handle to pool for reuse */
@@ -1426,6 +1469,7 @@ kc_curl_check_completed(void)
                 memset(req->post_fields, 0, strlen(req->post_fields));
                 free(req->post_fields);
             }
+            if (req->header_list) curl_slist_free_all(req->header_list);
             if (req->request_id) free(req->request_id);
             free(req);
         }
@@ -1456,8 +1500,9 @@ static void
 kc_async_cleanup(void)
 {
     if (kc_curl_multi) {
-        /* Remove any pending timers */
+        /* Remove any pending timers and clear poll hint */
         timeq_del(0, kc_curl_timeout_fired, NULL, TIMEQ_IGNORE_WHEN | TIMEQ_IGNORE_DATA);
+        ioset_set_poll_hint_ms(0);
 
         curl_multi_cleanup(kc_curl_multi);
         kc_curl_multi = NULL;
@@ -1513,8 +1558,8 @@ curl_perform_async(struct kc_async_request *req, struct curl_opts opts)
         req->response.size = 0;
     }
 
-    /* Apply unified options */
-    if (curl_apply_opts(easy, opts, &req->response, NULL) < 0) {
+    /* Apply unified options - track header_list for cleanup */
+    if (curl_apply_opts(easy, opts, &req->response, &req->header_list) < 0) {
         log_module(KC_LOG, LOG_ERROR, "[%s] curl_perform_async: Failed to apply options", req_id);
         kc_handle_pool_put(easy);
         req->easy = NULL;
@@ -1529,6 +1574,8 @@ curl_perform_async(struct kc_async_request *req, struct curl_opts opts)
     if (mc != CURLM_OK) {
         log_module(KC_LOG, LOG_ERROR, "[%s] curl_perform_async: curl_multi_add_handle failed: %s",
                    req_id, curl_multi_strerror(mc));
+        if (req->header_list) curl_slist_free_all(req->header_list);
+        req->header_list = NULL;
         curl_easy_cleanup(easy);
         req->easy = NULL;
         return -1;
@@ -1990,6 +2037,93 @@ error:
     if (req) {
         if (req->easy) curl_easy_cleanup(req->easy);
         if (req->uri) free(req->uri);
+        if (req->response.response) free(req->response.response);
+        free(req);
+    }
+    return -1;
+}
+
+/**
+ * Send a WebPush notification asynchronously.
+ * This is a generic HTTP POST for WebPush that uses the async curl_multi infrastructure.
+ *
+ * @param endpoint      Push service endpoint URL
+ * @param headers       Array of header strings (e.g., "Content-Type: application/octet-stream")
+ * @param header_count  Number of headers
+ * @param body          Binary body data
+ * @param body_len      Length of body data
+ * @param session       Opaque session pointer (passed to callback)
+ * @param callback      Function to call when request completes
+ * @return 0 on success (request started), -1 on error
+ */
+int
+kc_webpush_send_async(const char *endpoint,
+                      const char **headers, size_t header_count,
+                      const void *body, size_t body_len,
+                      void *session,
+                      kc_webpush_callback callback)
+{
+    struct kc_async_request *req = NULL;
+
+    /* Validate inputs */
+    if (!endpoint || !body || body_len == 0 || !callback) {
+        log_module(KC_LOG, LOG_DEBUG, "webpush_async: Invalid arguments");
+        return -1;
+    }
+
+    /* Allocate request structure */
+    req = calloc(1, sizeof(*req));
+    if (!req) {
+        log_module(KC_LOG, LOG_ERROR, "webpush_async: Out of memory");
+        return -1;
+    }
+    req->session = session;
+    req->type = KC_ASYNC_WEBPUSH;
+    req->cb.webpush = callback;
+
+    /* Copy endpoint URL */
+    req->uri = strdup(endpoint);
+    if (!req->uri) {
+        log_module(KC_LOG, LOG_ERROR, "webpush_async: Failed to copy URI");
+        goto error;
+    }
+
+    /* Copy binary body data (must persist until request completes) */
+    req->post_data_copy = malloc(body_len);
+    if (!req->post_data_copy) {
+        log_module(KC_LOG, LOG_ERROR, "webpush_async: Failed to copy body");
+        goto error;
+    }
+    memcpy(req->post_data_copy, body, body_len);
+    req->post_data_len = body_len;
+
+    /* Build curl options */
+    struct curl_opts opts = CURL_OPTS_INIT;
+    opts.uri = req->uri;
+    opts.method = HTTP_POST;
+    opts.post_data = req->post_data_copy;
+    opts.post_data_len = body_len;
+
+    /* Copy headers (up to 10) */
+    if (header_count > 10) header_count = 10;
+    for (size_t i = 0; i < header_count && headers[i]; i++) {
+        opts.header_list[i] = headers[i];
+    }
+    opts.header_count = header_count;
+
+    if (curl_perform_async(req, opts) < 0) {
+        log_module(KC_LOG, LOG_ERROR, "webpush_async: curl_perform_async failed");
+        goto error;
+    }
+
+    log_module(KC_LOG, LOG_DEBUG, "webpush_async: Started push to %s", endpoint);
+    return 0;
+
+error:
+    if (req) {
+        if (req->easy) curl_easy_cleanup(req->easy);
+        if (req->uri) free(req->uri);
+        if (req->post_data_copy) free(req->post_data_copy);
         if (req->response.response) free(req->response.response);
         free(req);
     }

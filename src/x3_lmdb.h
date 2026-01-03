@@ -36,6 +36,7 @@ enum lmdb_error {
 #define LMDB_PREFIX_CHANACCESS "chanaccess:"
 #define LMDB_PREFIX_FINGERPRINT "fp:"  /* Certificate fingerprint → username cache */
 #define LMDB_PREFIX_AUTHFAIL "authfail:"  /* Failed auth attempts cache (hash → timestamp) */
+#define LMDB_PREFIX_FPFAIL "fpfail:"  /* Failed fingerprint lookups cache (fingerprint → timestamp) */
 
 /* Metadata entry for iteration */
 struct lmdb_metadata_entry {

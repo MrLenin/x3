@@ -7487,9 +7487,15 @@ nickserv_define_func(const char *name, modcmd_func_t func, int min_level, int mu
 
 /* SASL session states for async auth */
 enum sasl_state {
-    SASL_STATE_INIT,              /* Initial state */
-    SASL_STATE_WAITING_KEYCLOAK,  /* Async Keycloak auth in progress */
-    SASL_STATE_CANCELLED          /* Client disconnected mid-auth */
+    SASL_STATE_NONE = 0,          /* Not initialized / invalid */
+    SASL_STATE_INIT,              /* Session created, waiting for mechanism */
+    SASL_STATE_MECH_SELECTED,     /* Mechanism received, waiting for data */
+    SASL_STATE_AUTHENTICATING,    /* Async auth in progress (Keycloak/LDAP) */
+    SASL_STATE_PENDING_RESULT,    /* Auth complete, waiting to send response */
+    SASL_STATE_COMPLETE,          /* Successfully authenticated */
+    SASL_STATE_FAILED,            /* Authentication failed */
+    SASL_STATE_CANCELLED,         /* Client disconnected during auth */
+    SASL_STATE_TIMEOUT            /* Session timed out */
 };
 
 struct SASLSession
@@ -7509,10 +7515,90 @@ struct SASLSession
     char *authcid;          /* Stored username for async callback */
     char *authzid;          /* Authorization identity for impersonation */
     char cred_hash[33];     /* MD5 hash of credentials for negative cache (hex string) */
+    uint32_t sequence;      /* Unique sequence number for async callback validation */
 };
 
 struct SASLSession *saslsessions = NULL;
 static dict_t sasl_session_dict = NULL;  /* Hash table for O(1) session lookup by UID */
+static uint32_t sasl_sequence_counter = 0;  /* Global sequence counter for session IDs */
+
+/**
+ * Async callback context - carries session reference with sequence validation
+ * Used to detect stale callbacks when UID is reused for new client
+ */
+struct sasl_async_ctx {
+    struct SASLSession *session;
+    uint32_t sequence;      /* Expected sequence number */
+    char uid[128];          /* Copy of UID for validation after session might be freed */
+};
+
+/**
+ * Create async callback context for a session
+ * The context includes the sequence number for validation when callback returns
+ */
+static struct sasl_async_ctx *
+sasl_async_ctx_new(struct SASLSession *session)
+{
+    struct sasl_async_ctx *ctx = calloc(1, sizeof(*ctx));
+    if (!ctx) return NULL;
+    ctx->session = session;
+    ctx->sequence = session->sequence;
+    safestrncpy(ctx->uid, session->uid, sizeof(ctx->uid));
+    return ctx;
+}
+
+/**
+ * Validate async callback context and return session if still valid
+ * Returns NULL if session no longer exists or sequence doesn't match (UID reused)
+ */
+static struct SASLSession *
+sasl_async_ctx_validate(struct sasl_async_ctx *ctx)
+{
+    struct SASLSession *session;
+
+    if (!ctx) return NULL;
+
+    /* Look up current session for this UID */
+    if (!sasl_session_dict) {
+        log_module(NS_LOG, LOG_DEBUG, "SASL async: No session dict");
+        return NULL;
+    }
+
+    int found = 0;
+    session = dict_find(sasl_session_dict, ctx->uid, &found);
+    if (!found || !session) {
+        log_module(NS_LOG, LOG_DEBUG, "SASL async: Session for %s no longer exists", ctx->uid);
+        return NULL;
+    }
+
+    /* Validate sequence number matches - detects UID reuse */
+    if (session->sequence != ctx->sequence) {
+        log_module(NS_LOG, LOG_WARNING, "SASL async: Sequence mismatch for %s (expected %u, got %u) - UID reused",
+                   ctx->uid, ctx->sequence, session->sequence);
+        return NULL;
+    }
+
+    /* Session still valid */
+    return session;
+}
+
+/**
+ * Check if session is in a terminal state (should be cleaned up without processing)
+ * Terminal states: CANCELLED (client disconnected), TIMEOUT (stale check), FAILED (error)
+ */
+static int
+sasl_session_is_terminal(struct SASLSession *session)
+{
+    if (!session) return 1;
+    switch (session->state) {
+        case SASL_STATE_CANCELLED:
+        case SASL_STATE_TIMEOUT:
+        case SASL_STATE_FAILED:
+            return 1;
+        default:
+            return 0;
+    }
+}
 
 /* Negative auth cache TTL - how long to remember failed auths */
 #define AUTHFAIL_CACHE_TTL 60  /* 60 seconds */
@@ -7586,6 +7672,57 @@ cache_authfail(const char *cred_hash)
     x3_lmdb_set(LMDB_DB_METADATA, lmdb_key, cache_value);
     log_module(NS_LOG, LOG_DEBUG, "Cached auth failure for hash %s", cred_hash);
 }
+
+/* Fingerprint failure cache TTL - how long to remember failed fingerprint lookups */
+#define FPFAIL_CACHE_TTL 60  /* 60 seconds */
+
+/**
+ * Check if fingerprint is in the negative lookup cache
+ * @param fingerprint The SSL certificate fingerprint
+ * @return 1 if cached (lookup should fail), 0 if not cached (proceed with lookup)
+ */
+static int
+check_fpfail_cache(const char *fingerprint)
+{
+    char lmdb_key[128];
+    char cached_value[32];
+
+    if (!fingerprint || !*fingerprint)
+        return 0;
+
+    snprintf(lmdb_key, sizeof(lmdb_key), "%s%s", LMDB_PREFIX_FPFAIL, fingerprint);
+
+    if (x3_lmdb_get(LMDB_DB_METADATA, lmdb_key, cached_value, sizeof(cached_value)) == LMDB_SUCCESS) {
+        time_t cached_time = (time_t)strtoul(cached_value, NULL, 10);
+        if (now - cached_time < FPFAIL_CACHE_TTL) {
+            log_module(NS_LOG, LOG_DEBUG, "Negative fingerprint cache hit (age=%lu)",
+                       (unsigned long)(now - cached_time));
+            return 1;  /* Cache hit - fingerprint known to not match */
+        }
+        /* Expired - delete stale entry */
+        x3_lmdb_delete(LMDB_DB_METADATA, lmdb_key);
+    }
+    return 0;  /* Not in cache */
+}
+
+/**
+ * Add fingerprint to the negative lookup cache
+ * @param fingerprint The SSL certificate fingerprint
+ */
+static void
+cache_fpfail(const char *fingerprint)
+{
+    char lmdb_key[128];
+    char cache_value[32];
+
+    if (!fingerprint || !*fingerprint)
+        return;
+
+    snprintf(lmdb_key, sizeof(lmdb_key), "%s%s", LMDB_PREFIX_FPFAIL, fingerprint);
+    snprintf(cache_value, sizeof(cache_value), "%lu", (unsigned long)now);
+    x3_lmdb_set(LMDB_DB_METADATA, lmdb_key, cache_value);
+    log_module(NS_LOG, LOG_DEBUG, "Cached fingerprint failure for %s", fingerprint);
+}
 #endif /* WITH_LMDB */
 
 void
@@ -7652,10 +7789,16 @@ sasl_delete_stale(UNUSED_ARG(void *data))
 
         if (sess->last_activity < cutoff)
         {
-            log_module(NS_LOG, LOG_DEBUG, "SASL: Deleting stale session %s (idle %ld seconds)",
-                       sess->uid, (long)(now - sess->last_activity));
+            log_module(NS_LOG, LOG_DEBUG, "SASL: Stale session %s (idle %ld seconds, state=%d)",
+                       sess->uid, (long)(now - sess->last_activity), sess->state);
             delcount++;
-            sasl_delete_session(sess);
+            /* If async auth in progress, mark as timed out - callback will clean up */
+            if (sess->state == SASL_STATE_AUTHENTICATING) {
+                log_module(NS_LOG, LOG_DEBUG, "SASL: Marking session %s as TIMEOUT (async in progress)", sess->uid);
+                sess->state = SASL_STATE_TIMEOUT;
+            } else {
+                sasl_delete_session(sess);
+            }
         }
         else
         {
@@ -7696,6 +7839,8 @@ sasl_get_session(const char *uid)
     safestrncpy(sess->uid, uid, sizeof(sess->uid));
     sess->created = now;
     sess->last_activity = now;
+    sess->sequence = ++sasl_sequence_counter;  /* Unique sequence for callback validation */
+    sess->state = SASL_STATE_INIT;             /* Session created, waiting for mechanism */
 
     /* Add to linked list (for stale iteration) */
     if (saslsessions)
@@ -7717,23 +7862,34 @@ sasl_get_session(const char *uid)
  * Async auth callback - invoked when Keycloak auth completes
  */
 static void
-sasl_async_auth_callback(void *session_ptr, int result)
+sasl_async_auth_callback(void *ctx_ptr, int result)
 {
-    struct SASLSession *session = (struct SASLSession *)session_ptr;
+    struct sasl_async_ctx *ctx = (struct sasl_async_ctx *)ctx_ptr;
+    struct SASLSession *session;
     struct handle_info *hi = NULL;
     struct handle_info *hii = NULL;  /* Impersonator's handle_info */
 
-    if (!session) {
-        log_module(NS_LOG, LOG_ERROR, "SASL async callback: NULL session");
+    if (!ctx) {
+        log_module(NS_LOG, LOG_ERROR, "SASL async callback: NULL context");
         return;
     }
 
-    log_module(NS_LOG, LOG_DEBUG, "SASL async callback: uid=%s result=%d state=%d",
-               session->uid, result, session->state);
+    /* Validate session still exists and sequence matches (detects UID reuse) */
+    session = sasl_async_ctx_validate(ctx);
+    if (!session) {
+        log_module(NS_LOG, LOG_DEBUG, "SASL async callback: Session invalid or reused for uid=%s", ctx->uid);
+        free(ctx);
+        return;
+    }
+    free(ctx);
+    ctx = NULL;
 
-    /* Check if client disconnected while auth was in progress */
-    if (session->state == SASL_STATE_CANCELLED) {
-        log_module(NS_LOG, LOG_DEBUG, "SASL async callback: Session was cancelled, cleaning up");
+    log_module(NS_LOG, LOG_DEBUG, "SASL async callback: uid=%s result=%d state=%d seq=%u",
+               session->uid, result, session->state, session->sequence);
+
+    /* Check if session is in terminal state (cancelled/timeout/failed) */
+    if (sasl_session_is_terminal(session)) {
+        log_module(NS_LOG, LOG_DEBUG, "SASL async callback: Session in terminal state %d, cleaning up", session->state);
         sasl_delete_session(session);
         return;
     }
@@ -7747,10 +7903,10 @@ sasl_async_auth_callback(void *session_ptr, int result)
             log_module(NS_LOG, LOG_INFO, "SASL async: Auto-creating account for %s", session->authcid);
             hi = register_handle(session->authcid, "", 0);
             if (hi) {
-                char *mask = generate_hostmask(NULL, GENMASK_OMITNICK|GENMASK_NO_HIDING|GENMASK_ANY_IDENT);
-                if (mask) {
-                    string_list_append(hi->masks, mask);
-                }
+                hi->masks = alloc_string_list(1);
+                hi->sslfps = alloc_string_list(1);
+                hi->ignores = alloc_string_list(1);
+                /* Note: No hostmask generated here - we don't have user context during SASL. */
             }
         }
     }
@@ -7833,24 +7989,36 @@ sasl_async_auth_callback(void *session_ptr, int result)
  * Async fingerprint lookup callback - invoked when Keycloak fingerprint search completes
  */
 static void
-sasl_async_fingerprint_callback(void *session_ptr, int result, char *username)
+sasl_async_fingerprint_callback(void *ctx_ptr, int result, char *username)
 {
-    struct SASLSession *session = (struct SASLSession *)session_ptr;
+    struct sasl_async_ctx *ctx = (struct sasl_async_ctx *)ctx_ptr;
+    struct SASLSession *session;
     struct handle_info *hi = NULL;
     char buffer[256];
 
-    if (!session) {
-        log_module(NS_LOG, LOG_ERROR, "SASL fingerprint callback: NULL session");
+    if (!ctx) {
+        log_module(NS_LOG, LOG_ERROR, "SASL fingerprint callback: NULL context");
         if (username) free(username);
         return;
     }
 
-    log_module(NS_LOG, LOG_DEBUG, "SASL fingerprint callback: uid=%s result=%d username=%s",
-               session->uid, result, username ? username : "(null)");
+    /* Validate session still exists and sequence matches (detects UID reuse) */
+    session = sasl_async_ctx_validate(ctx);
+    if (!session) {
+        log_module(NS_LOG, LOG_DEBUG, "SASL fingerprint callback: Session invalid or reused for uid=%s", ctx->uid);
+        free(ctx);
+        if (username) free(username);
+        return;
+    }
+    free(ctx);
+    ctx = NULL;
 
-    /* Check if client disconnected while lookup was in progress */
-    if (session->state == SASL_STATE_CANCELLED) {
-        log_module(NS_LOG, LOG_DEBUG, "SASL fingerprint callback: Session was cancelled");
+    log_module(NS_LOG, LOG_DEBUG, "SASL fingerprint callback: uid=%s result=%d username=%s seq=%u",
+               session->uid, result, username ? username : "(null)", session->sequence);
+
+    /* Check if session is in terminal state (cancelled/timeout/failed) */
+    if (sasl_session_is_terminal(session)) {
+        log_module(NS_LOG, LOG_DEBUG, "SASL fingerprint callback: Session in terminal state %d", session->state);
         if (username) free(username);
         sasl_delete_session(session);
         return;
@@ -7903,6 +8071,11 @@ sasl_async_fingerprint_callback(void *session_ptr, int result, char *username)
         irc_sasl(session->source, session->uid, "D", "S");
     } else {
         log_module(NS_LOG, LOG_DEBUG, "SASL EXTERNAL: No matching account for fingerprint");
+#ifdef WITH_LMDB
+        /* Cache this failure to avoid repeated Keycloak lookups */
+        if (session->sslclifp)
+            cache_fpfail(session->sslclifp);
+#endif
         irc_sasl(session->source, session->uid, "D", "F");
     }
 
@@ -7913,25 +8086,37 @@ sasl_async_fingerprint_callback(void *session_ptr, int result, char *username)
  * Async token introspection callback - invoked when Keycloak token validation completes
  */
 static void
-sasl_async_introspect_callback(void *session_ptr, int result, struct kc_token_info *token_info)
+sasl_async_introspect_callback(void *ctx_ptr, int result, struct kc_token_info *token_info)
 {
-    struct SASLSession *session = (struct SASLSession *)session_ptr;
+    struct sasl_async_ctx *ctx = (struct sasl_async_ctx *)ctx_ptr;
+    struct SASLSession *session;
     struct handle_info *hi = NULL;
     char buffer[256];
     const char *username;
 
-    if (!session) {
-        log_module(NS_LOG, LOG_ERROR, "SASL introspect callback: NULL session");
+    if (!ctx) {
+        log_module(NS_LOG, LOG_ERROR, "SASL introspect callback: NULL context");
         if (token_info) keycloak_free_token_info(token_info);
         return;
     }
 
-    log_module(NS_LOG, LOG_DEBUG, "SASL introspect callback: uid=%s result=%d",
-               session->uid, result);
+    /* Validate session still exists and sequence matches (detects UID reuse) */
+    session = sasl_async_ctx_validate(ctx);
+    if (!session) {
+        log_module(NS_LOG, LOG_DEBUG, "SASL introspect callback: Session invalid or reused for uid=%s", ctx->uid);
+        free(ctx);
+        if (token_info) keycloak_free_token_info(token_info);
+        return;
+    }
+    free(ctx);
+    ctx = NULL;
 
-    /* Check if client disconnected while lookup was in progress */
-    if (session->state == SASL_STATE_CANCELLED) {
-        log_module(NS_LOG, LOG_DEBUG, "SASL introspect callback: Session was cancelled");
+    log_module(NS_LOG, LOG_DEBUG, "SASL introspect callback: uid=%s result=%d seq=%u",
+               session->uid, result, session->sequence);
+
+    /* Check if session is in terminal state (cancelled/timeout/failed) */
+    if (sasl_session_is_terminal(session)) {
+        log_module(NS_LOG, LOG_DEBUG, "SASL introspect callback: Session in terminal state %d", session->state);
         if (token_info) keycloak_free_token_info(token_info);
         sasl_delete_session(session);
         return;
@@ -7987,10 +8172,11 @@ sasl_async_introspect_callback(void *session_ptr, int result, struct kc_token_in
         log_module(NS_LOG, LOG_INFO, "SASL OAUTHBEARER: Auto-creating account for %s", username);
         hi = register_handle(username, "", 0);
         if (hi) {
-            char *mask = generate_hostmask(NULL, GENMASK_OMITNICK|GENMASK_NO_HIDING|GENMASK_ANY_IDENT);
-            if (mask) {
-                string_list_append(hi->masks, mask);
-            }
+            hi->masks = alloc_string_list(1);
+            hi->sslfps = alloc_string_list(1);
+            hi->ignores = alloc_string_list(1);
+            /* Note: No hostmask generated here - we don't have user context during SASL.
+             * The account works fine without masks, and user can add masks later. */
         }
     }
 
@@ -8047,6 +8233,7 @@ sasl_packet(struct SASLSession *session)
 
         strncpy(session->mech, session->buf, sizeof(session->mech) - 1);
         session->mech[sizeof(session->mech) - 1] = '\0';
+        session->state = SASL_STATE_MECH_SELECTED;  /* Mechanism received, waiting for data */
         irc_sasl(session->source, session->uid, "C", "+");
     }
     else if (!strcmp(session->mech, "EXTERNAL"))
@@ -8072,6 +8259,17 @@ sasl_packet(struct SASLSession *session)
             return;
         }
 
+#ifdef WITH_LMDB
+        /* Check negative cache before expensive Keycloak lookup */
+        if (check_fpfail_cache(session->sslclifp)) {
+            log_module(NS_LOG, LOG_DEBUG, "SASL EXTERNAL: Fingerprint in negative cache, rejecting");
+            irc_sasl(session->source, session->uid, "D", "F");
+            sasl_delete_session(session);
+            free(raw);
+            return;
+        }
+#endif
+
 #ifdef WITH_KEYCLOAK
         if (nickserv_conf.keycloak_enable && kc_ensure_token() == KC_SUCCESS) {
             /* Use async Keycloak fingerprint lookup */
@@ -8080,10 +8278,10 @@ sasl_packet(struct SASLSession *session)
             /* Store authzid for callback */
             if (authzid && *authzid)
                 session->authzid = strdup(authzid);
-            session->state = SASL_STATE_WAITING_KEYCLOAK;
+            session->state = SASL_STATE_AUTHENTICATING;
 
             if (keycloak_find_user_by_fingerprint_async(kc_realm_config, kc_client_config,
-                                                         session->sslclifp, session,
+                                                         session->sslclifp, sasl_async_ctx_new(session),
                                                          sasl_async_fingerprint_callback) == 0) {
                 /* Request started - callback will handle cleanup */
                 free(raw);
@@ -8110,6 +8308,11 @@ sasl_packet(struct SASLSession *session)
         if (!hi)
         {
             log_module(NS_LOG, LOG_DEBUG, "SASL EXTERNAL: No matching account for fingerprint");
+#ifdef WITH_LMDB
+            /* Cache this failure to avoid repeated lookups */
+            if (session->sslclifp)
+                cache_fpfail(session->sslclifp);
+#endif
             irc_sasl(session->source, session->uid, "D", "F");
         }
         else
@@ -8223,10 +8426,10 @@ sasl_packet(struct SASLSession *session)
                     log_module(NS_LOG, LOG_INFO, "SASL OAUTHBEARER: Auto-creating account for %s", username);
                     hi = register_handle(username, "", 0);
                     if (hi) {
-                        char *mask = generate_hostmask(NULL, GENMASK_OMITNICK|GENMASK_NO_HIDING|GENMASK_ANY_IDENT);
-                        if (mask) {
-                            string_list_append(hi->masks, mask);
-                        }
+                        hi->masks = alloc_string_list(1);
+                        hi->sslfps = alloc_string_list(1);
+                        hi->ignores = alloc_string_list(1);
+                        /* Note: No hostmask generated here - we don't have user context during SASL. */
                     }
                 }
 
@@ -8264,10 +8467,10 @@ sasl_packet(struct SASLSession *session)
             /* Store authzid as username hint for callback */
             if (authzid && *authzid)
                 session->authzid = strdup(authzid);
-            session->state = SASL_STATE_WAITING_KEYCLOAK;
+            session->state = SASL_STATE_AUTHENTICATING;
 
             if (keycloak_introspect_token_async(kc_realm_config, kc_client_config,
-                                                 token_start, session,
+                                                 token_start, sasl_async_ctx_new(session),
                                                  sasl_async_introspect_callback) == 0) {
                 /* Request started - callback will handle cleanup */
                 free(raw);
@@ -8364,11 +8567,11 @@ sasl_packet(struct SASLSession *session)
             session->authcid = strdup(authcid);
             if (authzid && *authzid)
                 session->authzid = strdup(authzid);
-            session->state = SASL_STATE_WAITING_KEYCLOAK;
+            session->state = SASL_STATE_AUTHENTICATING;
 
             /* Start async auth - returns immediately */
             if (kc_check_auth_async(kc_realm_config, kc_client_config,
-                                    authcid, passwd, session,
+                                    authcid, passwd, sasl_async_ctx_new(session),
                                     sasl_async_auth_callback) == 0) {
                 /* Request started - DON'T delete session, callback will handle it */
                 free(raw);
@@ -8473,9 +8676,15 @@ handle_sasl_input(struct server* source ,const char *uid, const char *subcmd, co
     /* If we get a mechanism selection (S subcmd) but session already has a mechanism,
      * this means the UID was reused by IRCd for a new client. Reset the session. */
     if (!strcmp(subcmd, "S") && sess->mech[0]) {
-        log_module(NS_LOG, LOG_DEBUG, "SASL: Resetting stale session for %s (had mech=%s, age=%lds)",
-                   uid, sess->mech, (long)(now - sess->created));
-        sasl_delete_session(sess);
+        log_module(NS_LOG, LOG_DEBUG, "SASL: Resetting stale session for %s (had mech=%s, age=%lds, state=%d)",
+                   uid, sess->mech, (long)(now - sess->created), sess->state);
+        /* If async auth in progress, mark as cancelled - callback will clean up */
+        if (sess->state == SASL_STATE_AUTHENTICATING) {
+            log_module(NS_LOG, LOG_DEBUG, "SASL: Marking old session %s as CANCELLED (async in progress)", sess->uid);
+            sess->state = SASL_STATE_CANCELLED;
+        } else {
+            sasl_delete_session(sess);
+        }
         sess = sasl_get_session(uid);  /* Create fresh session */
     }
 
@@ -8487,7 +8696,7 @@ handle_sasl_input(struct server* source ,const char *uid, const char *subcmd, co
     if (!strcmp(subcmd, "D"))
     {
         /* Check if async auth is in progress */
-        if (sess->state == SASL_STATE_WAITING_KEYCLOAK) {
+        if (sess->state == SASL_STATE_AUTHENTICATING) {
             /* Mark as cancelled - callback will clean up */
             log_module(NS_LOG, LOG_DEBUG, "SASL: Marking session %s as cancelled (async in progress)", sess->uid);
             sess->state = SASL_STATE_CANCELLED;
@@ -8508,9 +8717,15 @@ handle_sasl_input(struct server* source ,const char *uid, const char *subcmd, co
 
     /* Handle AUTHENTICATE * (abort) - IRCv3 spec says this should trigger 906 */
     if (!strcmp(data, "*")) {
-        log_module(NS_LOG, LOG_DEBUG, "SASL: Client aborted authentication for %s", sess->uid);
+        log_module(NS_LOG, LOG_DEBUG, "SASL: Client aborted authentication for %s (state=%d)", sess->uid, sess->state);
         irc_sasl(source, uid, "D", "A");
-        sasl_delete_session(sess);
+        /* If async auth in progress, mark as cancelled - callback will clean up */
+        if (sess->state == SASL_STATE_AUTHENTICATING) {
+            log_module(NS_LOG, LOG_DEBUG, "SASL: Marking session %s as CANCELLED (async in progress)", sess->uid);
+            sess->state = SASL_STATE_CANCELLED;
+        } else {
+            sasl_delete_session(sess);
+        }
         return;
     }
 
@@ -8527,8 +8742,15 @@ handle_sasl_input(struct server* source ,const char *uid, const char *subcmd, co
     {
         if (sess->buflen + len + 1 > 8192) /* This is a little much... */
         {
+            log_module(NS_LOG, LOG_DEBUG, "SASL: Buffer overflow for %s (state=%d)", sess->uid, sess->state);
             irc_sasl(source, uid, "D", "F");
-            sasl_delete_session(sess);
+            /* If async auth in progress, mark as failed - callback will clean up */
+            if (sess->state == SASL_STATE_AUTHENTICATING) {
+                log_module(NS_LOG, LOG_DEBUG, "SASL: Marking session %s as FAILED (async in progress)", sess->uid);
+                sess->state = SASL_STATE_FAILED;
+            } else {
+                sasl_delete_session(sess);
+            }
             return;
         }
 

@@ -627,13 +627,159 @@ webpush_send(const struct webpush_subscription *sub, const char *message, int tt
     return ret;
 }
 
+/* Async webpush session context */
+struct webpush_async_session {
+    char endpoint[WEBPUSH_MAX_ENDPOINT];   /* For logging */
+    void *user_data;                       /* Caller context */
+    webpush_async_callback callback;       /* Caller callback */
+};
+
+/* Internal callback from keycloak async layer */
+static void
+webpush_async_complete(void *session, int result, long http_code)
+{
+    struct webpush_async_session *wp_session = session;
+    int wp_result;
+
+    if (!wp_session) {
+        log_module(MAIN_LOG, LOG_ERROR, "WEBPUSH: async callback with NULL session");
+        return;
+    }
+
+    /* Convert result codes */
+    if (result == 0) {
+        if (http_code >= 200 && http_code < 300) {
+            log_module(MAIN_LOG, LOG_INFO, "WEBPUSH: Async sent to %s (HTTP %ld)",
+                       wp_session->endpoint, http_code);
+            wp_result = WEBPUSH_OK;
+        } else if (http_code == 410) {
+            log_module(MAIN_LOG, LOG_WARNING, "WEBPUSH: Subscription expired for %s",
+                       wp_session->endpoint);
+            wp_result = WEBPUSH_ERR_EXPIRED;
+        } else {
+            log_module(MAIN_LOG, LOG_WARNING, "WEBPUSH: HTTP %ld from %s",
+                       http_code, wp_session->endpoint);
+            wp_result = WEBPUSH_ERR_HTTP;
+        }
+    } else {
+        log_module(MAIN_LOG, LOG_ERROR, "WEBPUSH: Async request failed for %s",
+                   wp_session->endpoint);
+        wp_result = WEBPUSH_ERR_HTTP;
+    }
+
+    /* Invoke caller's callback */
+    if (wp_session->callback) {
+        wp_session->callback(wp_session->user_data, wp_result, http_code);
+    }
+
+    free(wp_session);
+}
+
+int
+webpush_send_async(const struct webpush_subscription *sub, const char *message, int ttl,
+                   void *user_data, webpush_async_callback callback)
+{
+    struct webpush_async_session *session = NULL;
+    unsigned char encrypted[WEBPUSH_ENCRYPTED_MAX];
+    size_t encrypted_len = sizeof(encrypted);
+    char vapid_header[1024];
+    char audience[256];
+    char ttl_header[64];
+    char length_header[64];
+    char auth_header[1100];
+    const char *headers[10];
+    size_t header_count = 0;
+    int ret;
+
+    if (!sub || !message || !callback)
+        return WEBPUSH_ERR_INVALID;
+
+    /* Encrypt the message */
+    if (webpush_encrypt(sub, (unsigned char*)message, strlen(message), encrypted, &encrypted_len) != WEBPUSH_OK) {
+        log_module(MAIN_LOG, LOG_ERROR, "WEBPUSH: Encryption failed");
+        return WEBPUSH_ERR_CRYPTO;
+    }
+
+    /* Get audience (origin) from endpoint */
+    if (get_audience(sub->endpoint, audience, sizeof(audience)) < 0) {
+        log_module(MAIN_LOG, LOG_ERROR, "WEBPUSH: Invalid endpoint URL");
+        return WEBPUSH_ERR_INVALID;
+    }
+
+    /* Create VAPID header */
+    if (create_vapid_header(audience, vapid_header, sizeof(vapid_header)) < 0) {
+        log_module(MAIN_LOG, LOG_ERROR, "WEBPUSH: Failed to create VAPID header");
+        return WEBPUSH_ERR_CRYPTO;
+    }
+
+    /* Allocate session to track this request */
+    session = calloc(1, sizeof(*session));
+    if (!session)
+        return WEBPUSH_ERR_MEMORY;
+
+    strncpy(session->endpoint, sub->endpoint, sizeof(session->endpoint) - 1);
+    session->user_data = user_data;
+    session->callback = callback;
+
+    /* Build headers array (these are copied by kc_webpush_send_async) */
+    headers[header_count++] = "Content-Type: application/octet-stream";
+    headers[header_count++] = "Content-Encoding: aes128gcm";
+    snprintf(ttl_header, sizeof(ttl_header), "TTL: %d", ttl > 0 ? ttl : 86400);
+    headers[header_count++] = ttl_header;
+    snprintf(length_header, sizeof(length_header), "Content-Length: %zu", encrypted_len);
+    headers[header_count++] = length_header;
+    snprintf(auth_header, sizeof(auth_header), "Authorization: %s", vapid_header);
+    headers[header_count++] = auth_header;
+
+    /* Submit async request (encrypted data is copied by kc layer) */
+    ret = kc_webpush_send_async(sub->endpoint, headers, header_count,
+                                encrypted, encrypted_len,
+                                session, webpush_async_complete);
+
+    if (ret < 0) {
+        log_module(MAIN_LOG, LOG_ERROR, "WEBPUSH: Failed to start async request for %s",
+                   sub->endpoint);
+        free(session);
+        return WEBPUSH_ERR_HTTP;
+    }
+
+    log_module(MAIN_LOG, LOG_DEBUG, "WEBPUSH: Async request started for %s", sub->endpoint);
+    return WEBPUSH_OK;
+}
+
+/* Context for tracking individual async notifications */
+struct webpush_notify_ctx {
+    char account_name[128];  /* Account for logging */
+    char key[64];            /* Subscription key (for deletion on expiry) */
+};
+
+/* Callback for individual push notifications */
+static void
+webpush_notify_callback(void *user_data, int result, long http_code)
+{
+    struct webpush_notify_ctx *ctx = user_data;
+
+    if (!ctx)
+        return;
+
+    if (result == WEBPUSH_ERR_EXPIRED) {
+        /* TODO: Delete expired subscription from Keycloak */
+        log_module(MAIN_LOG, LOG_INFO, "WEBPUSH: Subscription %s for %s expired, should be removed",
+                   ctx->key, ctx->account_name);
+    }
+
+    free(ctx);
+    (void)http_code;  /* Already logged in webpush_async_complete */
+}
+
 int
 webpush_notify_user(const char *account_name, const char *message)
 {
     struct kc_metadata_entry *entries = NULL;
     struct kc_metadata_entry *entry;
     struct webpush_subscription sub;
-    int sent = 0;
+    struct webpush_notify_ctx *ctx;
+    int started = 0;
     int result;
 
     if (!account_name || !message)
@@ -650,9 +796,9 @@ webpush_notify_user(const char *account_name, const char *message)
         return 0;
     }
 
-    log_module(MAIN_LOG, LOG_INFO, "WEBPUSH: Sending push notifications for %s", account_name);
+    log_module(MAIN_LOG, LOG_INFO, "WEBPUSH: Starting async push notifications for %s", account_name);
 
-    /* Iterate over subscriptions and send to each */
+    /* Iterate over subscriptions and start async send to each */
     for (entry = entries; entry; entry = entry->next) {
         /* Value format: endpoint|p256dh|auth */
         if (webpush_parse_subscription(entry->value, &sub) != 0) {
@@ -660,22 +806,30 @@ webpush_notify_user(const char *account_name, const char *message)
             continue;
         }
 
-        result = webpush_send(&sub, message, 86400);  /* 24 hour TTL */
+        /* Allocate context for callback */
+        ctx = calloc(1, sizeof(*ctx));
+        if (!ctx) {
+            log_module(MAIN_LOG, LOG_ERROR, "WEBPUSH: Out of memory for callback context");
+            continue;
+        }
+        strncpy(ctx->account_name, account_name, sizeof(ctx->account_name) - 1);
+        strncpy(ctx->key, entry->key, sizeof(ctx->key) - 1);
+
+        result = webpush_send_async(&sub, message, 86400, ctx, webpush_notify_callback);
 
         if (result == WEBPUSH_OK) {
-            sent++;
-        } else if (result == WEBPUSH_ERR_EXPIRED) {
-            /* Subscription expired - could delete it here */
-            log_module(MAIN_LOG, LOG_INFO, "WEBPUSH: Subscription %s expired, should be removed",
-                       entry->key);
-            /* TODO: Delete expired subscription from Keycloak */
+            started++;
+        } else {
+            /* Async request failed to start - immediate error */
+            log_module(MAIN_LOG, LOG_WARNING, "WEBPUSH: Failed to start async for %s", entry->key);
+            free(ctx);
         }
     }
 
     keycloak_free_metadata_entries(entries);
 
-    log_module(MAIN_LOG, LOG_INFO, "WEBPUSH: Sent %d push notifications for %s", sent, account_name);
-    return sent;
+    log_module(MAIN_LOG, LOG_INFO, "WEBPUSH: Started %d async push notifications for %s", started, account_name);
+    return started;
 }
 
 #else /* !HAVE_WEBPUSH_CRYPTO */
@@ -695,6 +849,8 @@ int webpush_encrypt(const struct webpush_subscription *sub,
                     const unsigned char *plaintext, size_t plaintext_len,
                     unsigned char *out, size_t *out_len) { return -1; }
 int webpush_send(const struct webpush_subscription *sub, const char *message, int ttl) { return -1; }
+int webpush_send_async(const struct webpush_subscription *sub, const char *message, int ttl,
+                       void *user_data, webpush_async_callback callback) { return -1; }
 int webpush_notify_user(const char *account_name, const char *message) { return 0; }
 
 #endif /* HAVE_WEBPUSH_CRYPTO */
@@ -712,6 +868,8 @@ int webpush_encrypt(const struct webpush_subscription *sub,
                     const unsigned char *plaintext, size_t plaintext_len,
                     unsigned char *out, size_t *out_len) { return -1; }
 int webpush_send(const struct webpush_subscription *sub, const char *message, int ttl) { return -1; }
+int webpush_send_async(const struct webpush_subscription *sub, const char *message, int ttl,
+                       void *user_data, webpush_async_callback callback) { return -1; }
 int webpush_notify_user(const char *account_name, const char *message) { return 0; }
 
 #endif /* WITH_KEYCLOAK */

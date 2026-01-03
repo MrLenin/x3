@@ -72,4 +72,11 @@ void ioset_close(struct io_fd *fd, int os_close);
 void ioset_cleanup(void);
 void ioset_set_time(unsigned long new_now);
 
+/* Millisecond-precision poll hint for async HTTP (curl_multi).
+ * Set to 0 to use default timeq-based timeout.
+ * When non-zero, poll will use this as maximum timeout in milliseconds.
+ */
+void ioset_set_poll_hint_ms(long timeout_ms);
+long ioset_get_poll_hint_ms(void);
+
 #endif /* !defined(IOSET_H) */

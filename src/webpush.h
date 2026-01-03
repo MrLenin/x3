@@ -105,6 +105,28 @@ int webpush_send(const struct webpush_subscription *sub,
                  const char *message, int ttl);
 
 /**
+ * Async callback for webpush_send_async.
+ * @param user_data Opaque pointer passed to webpush_send_async
+ * @param result WEBPUSH_OK, WEBPUSH_ERR_EXPIRED, or WEBPUSH_ERR_HTTP
+ * @param http_code HTTP status code (if available)
+ */
+typedef void (*webpush_async_callback)(void *user_data, int result, long http_code);
+
+/**
+ * Send a push notification asynchronously.
+ * Does not block - callback is invoked when request completes.
+ * @param sub The subscription to send to
+ * @param message The IRC message to send
+ * @param ttl Time-to-live in seconds
+ * @param user_data Opaque pointer passed to callback
+ * @param callback Function called when request completes
+ * @return WEBPUSH_OK if request started, error code otherwise
+ */
+int webpush_send_async(const struct webpush_subscription *sub,
+                       const char *message, int ttl,
+                       void *user_data, webpush_async_callback callback);
+
+/**
  * Send push notifications for a user who has messages.
  * Called when a message arrives for an offline user.
  * @param account_name The user's account name

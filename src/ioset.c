@@ -91,6 +91,8 @@ int do_write_dbs;
 int do_reopen;
 static struct io_engine *engine;
 static struct io_fd *active_fd;
+/* Millisecond poll hint for async HTTP (curl_multi integration) */
+static long poll_hint_ms = 0;
 
 static void
 ioq_init(struct ioq *ioq, int size) {
@@ -643,6 +645,7 @@ ioset_run(void) {
     extern struct io_fd *socket_io_fd;
     struct timeval timeout;
     time_t wakey;
+    long timeout_ms;
 
     while (!quit_services) {
         while (!socket_io_fd)
@@ -655,6 +658,15 @@ ioset_run(void) {
         else
             timeout.tv_sec = wakey - now;
         timeout.tv_usec = 0;
+
+        /* Apply millisecond poll hint if set (for curl_multi async HTTP) */
+        if (poll_hint_ms > 0) {
+            timeout_ms = (timeout.tv_sec * 1000) + (timeout.tv_usec / 1000);
+            if (poll_hint_ms < timeout_ms || timeout_ms == 0) {
+                timeout.tv_sec = poll_hint_ms / 1000;
+                timeout.tv_usec = (poll_hint_ms % 1000) * 1000;
+            }
+        }
 
         if (engine->loop(&timeout))
             continue;
@@ -671,6 +683,17 @@ ioset_run(void) {
             do_reopen = 0;
         }
     }
+}
+
+/* Millisecond poll hint API for async HTTP integration */
+void
+ioset_set_poll_hint_ms(long timeout_ms) {
+    poll_hint_ms = timeout_ms;
+}
+
+long
+ioset_get_poll_hint_ms(void) {
+    return poll_hint_ms;
 }
 
 void
