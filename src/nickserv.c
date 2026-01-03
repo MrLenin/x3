@@ -7399,8 +7399,6 @@ nickserv_define_func(const char *name, modcmd_func_t func, int min_level, int mu
     }
 }
 
-#define SDFLAG_STALE 0x01  /**< SASL session data is stale, delete on next pass. */
-
 struct SASLSession
 {
     struct SASLSession *next;
@@ -7412,16 +7410,22 @@ struct SASLSession
     char mech[16];  /* Increased from 10 to hold "OAUTHBEARER" + null */
     char *sslclifp;
     char *hostmask;
-    int flags;
+    time_t created;       /* When session was created */
+    time_t last_activity; /* Last packet received - used for stale detection */
 };
 
 struct SASLSession *saslsessions = NULL;
+static dict_t sasl_session_dict = NULL;  /* Hash table for O(1) session lookup by UID */
 
 void
 sasl_delete_session(struct SASLSession *session)
 {
     if (!session)
         return;
+
+    /* Remove from hash table first (before freeing) */
+    if (sasl_session_dict && session->uid[0])
+        dict_remove(sasl_session_dict, session->uid);
 
     if (session->buf)
         free(session->buf);
@@ -7445,6 +7449,15 @@ sasl_delete_session(struct SASLSession *session)
     free(session);
 }
 
+/* SASL session stale timeout in seconds - sessions inactive longer than this are deleted */
+#define SASL_STALE_TIMEOUT 120
+
+/* SASL stale check interval in seconds - how often we scan for stale sessions */
+#define SASL_STALE_CHECK_INTERVAL 60
+
+/* Flag indicating stale check timer is running (started at init, runs forever) */
+static int sasl_stale_timer_running = 0;
+
 void
 sasl_delete_stale(UNUSED_ARG(void *data))
 {
@@ -7452,59 +7465,71 @@ sasl_delete_stale(UNUSED_ARG(void *data))
     int remcount = 0;
     struct SASLSession *sess = NULL;
     struct SASLSession *nextsess = NULL;
-
-    log_module(NS_LOG, LOG_DEBUG, "SASL: Checking for stale sessions");
+    time_t cutoff = now - SASL_STALE_TIMEOUT;
 
     for (sess = saslsessions; sess; sess = nextsess)
     {
         nextsess = sess->next;
 
-        if (sess->flags & SDFLAG_STALE)
+        if (sess->last_activity < cutoff)
         {
+            log_module(NS_LOG, LOG_DEBUG, "SASL: Deleting stale session %s (idle %ld seconds)",
+                       sess->uid, (long)(now - sess->last_activity));
             delcount++;
             sasl_delete_session(sess);
         }
         else
         {
             remcount++;
-            sess->flags |= SDFLAG_STALE;
         }
     }
 
-    if (delcount)
-        log_module(NS_LOG, LOG_DEBUG, "SASL: Deleted %d stale sessions, %d remaining", delcount, remcount);
-    if (remcount)
-        timeq_add(now + 30, sasl_delete_stale, NULL);
+    if (delcount || remcount)
+        log_module(NS_LOG, LOG_DEBUG, "SASL: Stale check complete - deleted %d, active %d", delcount, remcount);
+
+    /* Always reschedule - this timer runs continuously */
+    timeq_add(now + SASL_STALE_CHECK_INTERVAL, sasl_delete_stale, NULL);
 }
 
 struct SASLSession*
 sasl_get_session(const char *uid)
 {
     struct SASLSession *sess;
+    int found = 0;
+    unsigned int total;
 
-    for (sess = saslsessions; sess; sess = sess->next)
-    {
-        if (!strncmp(sess->uid, uid, 128))
-        {
-            log_module(NS_LOG, LOG_DEBUG, "SASL: Found session for %s", sess->uid);
+    /* O(1) lookup using hash table */
+    if (sasl_session_dict) {
+        sess = dict_find(sasl_session_dict, uid, &found);
+        if (found && sess) {
+            total = dict_size(sasl_session_dict);
+            log_module(NS_LOG, LOG_DEBUG, "SASL: Found session for %s (mech=%s, age=%lds, %u total sessions)",
+                       sess->uid, sess->mech[0] ? sess->mech : "none",
+                       (long)(now - sess->created), total);
             return sess;
         }
     }
 
+    /* Create new session */
     sess = malloc(sizeof(struct SASLSession));
     memset(sess, 0, sizeof(struct SASLSession));
 
     safestrncpy(sess->uid, uid, sizeof(sess->uid));
+    sess->created = now;
+    sess->last_activity = now;
 
-    if (!saslsessions)
-        timeq_add(now + 30, sasl_delete_stale, NULL);
-
+    /* Add to linked list (for stale iteration) */
     if (saslsessions)
         saslsessions->prev = sess;
     sess->next = saslsessions;
     saslsessions = sess;
 
-    log_module(NS_LOG, LOG_DEBUG, "SASL: Created session for %s", sess->uid);
+    /* Add to hash table for O(1) lookup */
+    if (sasl_session_dict)
+        dict_insert(sasl_session_dict, sess->uid, sess);
+
+    total = sasl_session_dict ? dict_size(sasl_session_dict) : 1;
+    log_module(NS_LOG, LOG_DEBUG, "SASL: Created NEW session for %s (%u total sessions)", sess->uid, total);
     return sess;
 }
 
@@ -7778,17 +7803,39 @@ sasl_packet(struct SASLSession *session)
         return;
     }
 
-    /* clear stale state */
-    session->flags &= ~SDFLAG_STALE;
+    /* Update activity timestamp */
+    session->last_activity = now;
 }
 
 void
 handle_sasl_input(struct server* source ,const char *uid, const char *subcmd, const char *data, const char *ext, UNUSED_ARG(void *extra))
 {
-    struct SASLSession* sess = sasl_get_session(uid);
-    int len = strlen(data);
+    struct SASLSession* sess;
+    int len;
+
+    /* Handle NULL data gracefully */
+    if (!data)
+        data = "";
+    len = strlen(data);
+
+    log_module(NS_LOG, LOG_DEBUG, "SASL INPUT: uid=%s subcmd=%s len=%d data=%s",
+               uid, subcmd, len, len > 0 ? data : "(empty)");
+
+    sess = sasl_get_session(uid);
+
+    /* If we get a mechanism selection (S subcmd) but session already has a mechanism,
+     * this means the UID was reused by IRCd for a new client. Reset the session. */
+    if (!strcmp(subcmd, "S") && sess->mech[0]) {
+        log_module(NS_LOG, LOG_DEBUG, "SASL: Resetting stale session for %s (had mech=%s, age=%lds)",
+                   uid, sess->mech, (long)(now - sess->created));
+        sasl_delete_session(sess);
+        sess = sasl_get_session(uid);  /* Create fresh session */
+    }
 
     sess->source = source;
+
+    /* Update activity timestamp - any SASL activity from IRCd means session is active */
+    sess->last_activity = now;
 
     if (!strcmp(subcmd, "D"))
     {
@@ -7804,6 +7851,14 @@ handle_sasl_input(struct server* source ,const char *uid, const char *subcmd, co
 
     if (strcmp(subcmd, "S") && strcmp(subcmd, "C"))
         return;
+
+    /* Handle AUTHENTICATE * (abort) - IRCv3 spec says this should trigger 906 */
+    if (!strcmp(data, "*")) {
+        log_module(NS_LOG, LOG_DEBUG, "SASL: Client aborted authentication for %s", sess->uid);
+        irc_sasl(source, uid, "D", "A");
+        sasl_delete_session(sess);
+        return;
+    }
 
     if (len == 0)
         return;
@@ -8189,6 +8244,18 @@ init_nickserv(const char *nick)
     reg_account_func(handle_account);
     reg_auth_func(handle_loc_auth_oper, NULL);
     reg_sasl_input_func(handle_sasl_input, NULL);
+
+    /* Initialize SASL session hash table for O(1) lookup */
+    if (!sasl_session_dict)
+        sasl_session_dict = dict_new();
+
+    /* Start global SASL session stale check timer - runs continuously every 60 seconds */
+    if (!sasl_stale_timer_running) {
+        sasl_stale_timer_running = 1;
+        timeq_add(now + SASL_STALE_CHECK_INTERVAL, sasl_delete_stale, NULL);
+        log_module(NS_LOG, LOG_INFO, "SASL: Started global stale session timer (interval %ds, timeout %ds)",
+                   SASL_STALE_CHECK_INTERVAL, SASL_STALE_TIMEOUT);
+    }
 
     /* set up handle_inverse_flags */
     memset(handle_inverse_flags, 0, sizeof(handle_inverse_flags));
