@@ -624,6 +624,9 @@ AddChannel(const char *name, time_t time_, const char *modes, char *banlist, cha
     char new_modes[MAXLEN], *argv[MAXNUMPARAMS];
     unsigned int nn;
 
+    /* Initialize first element to avoid uninitialized read in mod_chanmode */
+    argv[0] = NULL;
+
     if (!IsChannelName(name)) {
         log_module(MAIN_LOG, LOG_ERROR, "Somebody asked to add channel '%s', which isn't a channel name!", name);
         return NULL;

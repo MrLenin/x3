@@ -596,14 +596,18 @@ keycloak_validate_jwt_local(struct kc_realm realm, const char *token,
         return KC_ERROR;
     }
 
+    /* Copy kid before freeing hdr - json_string_value returns pointer into JSON object */
+    char *kid_copy = strdup(kid);
     json_decref(hdr);
 
     /* Get signing key */
-    EVP_PKEY *pkey = jwks_get_key(kid);
+    EVP_PKEY *pkey = jwks_get_key(kid_copy);
     if (!pkey) {
-        log_module(KC_LOG, LOG_DEBUG, "Unknown kid in JWT: %s", kid);
+        log_module(KC_LOG, LOG_DEBUG, "Unknown kid in JWT: %s", kid_copy);
+        free(kid_copy);
         return KC_ERROR;  /* Unknown key - might need JWKS refresh or fallback */
     }
+    free(kid_copy);
 
     /* Verify signature */
     if (jwt_verify_signature(token, pkey) != KC_SUCCESS) {

@@ -10,9 +10,14 @@
 BASECONFDIST=/x3/x3.conf-dist
 BASECONF=/x3/x3.conf
 
+# Note: Using Valgrind instead of ASAN (ASAN causes mmap failures)
+
 # If config already exists, use it as-is
 if [ -f "$BASECONF" ] && [ -s "$BASECONF" ]; then
     echo "Using existing $BASECONF (bind-mounted or pre-configured)"
+    # Create core dump directory and change to it
+    mkdir -p /x3/cores 2>/dev/null || true
+    cd /x3/cores
     exec "$@"
 fi
 
@@ -51,6 +56,12 @@ grep -oE '%[A-Za-z_][A-Za-z0-9_]*%' "$BASECONF" | sort -u | while read -r placeh
 done
 
 echo "Generated $BASECONF from template"
+
+# Create core dump directory if it doesn't exist
+mkdir -p /x3/cores 2>/dev/null || true
+
+# Change to cores directory so core dumps are saved there
+cd /x3/cores
 
 # Run the command passed to docker (CMD from Dockerfile)
 exec "$@"

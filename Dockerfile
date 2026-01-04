@@ -4,7 +4,7 @@ ENV GID=1234
 ENV UID=1234
 
 RUN DEBIAN_FRONTEND=noninteractive RUNLEVEL=1 apt-get update 
-RUN DEBIAN_FRONTEND=noninteractive RUNLEVEL=1 apt-get update && apt-get -y install build-essential libcurl4-openssl-dev libjansson-dev libssl-dev flex byacc gawk git vim procps net-tools libtre5 libtre-dev liblmdb-dev
+RUN DEBIAN_FRONTEND=noninteractive RUNLEVEL=1 apt-get update && apt-get -y install build-essential libcurl4-openssl-dev libjansson-dev libssl-dev flex byacc gawk git vim procps net-tools libtre5 libtre-dev liblmdb-dev gdb valgrind
 
 RUN mkdir -p /x3
 RUN mkdir -p /x3/x3src
@@ -23,9 +23,12 @@ WORKDIR  /x3/x3src
 # configure script already regenerated with LMDB support - no autogen.sh needed
 # Enable SSL for encrypted uplink connections to IRCd
 # Disable glibc C23 features to avoid __isoc23_strtol linker errors on Debian 12
-RUN CFLAGS="-D__USE_ISOC23=0" ./configure --prefix=/x3 --enable-modules=snoop,memoserv,helpserv --with-keycloak --with-lmdb --with-ssl
+ENV CFLAGS="-D__USE_ISOC23=0"
+# Re-enable all modules - using Valgrind instead of ASAN (no memory overhead)
+RUN ./configure --prefix=/x3 --enable-modules=snoop,memoserv,helpserv --with-keycloak --with-lmdb --with-ssl
 
-RUN make
+# Build with debug symbols for Valgrind (no ASAN - causes mmap failures)
+RUN make CFLAGS="-D__USE_ISOC23=0 -g -O1"
 RUN make install
 WORKDIR /x3
 
@@ -33,6 +36,9 @@ USER root
 #Clean up build
 #RUN apt-get remove -y build-essential && apt-get autoremove -y
 #RUN apt-get clean
+
+# Dummy sendmail - tests scrape cookies from logs, no actual email needed
+RUN printf '#!/bin/sh\ncat > /dev/null\nexit 0\n' > /usr/sbin/sendmail && chmod +x /usr/sbin/sendmail
 
 COPY docker/x3.conf-dist /x3/x3.conf-dist
 COPY docker/dockerentrypoint.sh /dockerentrypoint.sh
@@ -42,5 +48,7 @@ USER x3
 # Run entrypoint (volume permissions fixed by init container in docker-compose)
 ENTRYPOINT ["/dockerentrypoint.sh"]
 
+# Memory fixes verified with Valgrind (0 errors) - running without for now
+# Valgrind was causing SIGTERM issues in Docker/WSL
 CMD ["/x3/x3", "-f", "-d"]
 

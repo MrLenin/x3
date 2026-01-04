@@ -2903,6 +2903,14 @@ static NICKSERV_FUNC(cmd_auth)
         argv[pw_arg] = "SUSPENDED";
         return 1;
     }
+    /* Check for pending email verification - accounts with ACTIVATION cookies
+     * must use the COOKIE command first to verify their email address */
+    if (hi->cookie && hi->cookie->type == ACTIVATION) {
+        send_message_type(4, user, cmd->parent->bot,
+                          handle_find_message(hi, "NSMSG_USE_COOKIE_REGISTER"));
+        argv[pw_arg] = "UNVERIFIED";
+        return 1;
+    }
     maxlogins = hi->maxlogins ? hi->maxlogins : nickserv_conf.default_maxlogins;
     for (used = 0, other = hi->users; other; other = other->next_authed) {
         if (++used >= maxlogins) {
@@ -8529,7 +8537,7 @@ sasl_async_auth_callback(void *ctx_ptr, int result)
     if (sasl_session_is_terminal(session)) {
         log_module(NS_LOG, LOG_DEBUG, "SASL async callback: Session in terminal state %d, cleaning up", session->state);
         sasl_delete_session(session);
-        return;
+        return 1;
     }
 
     /* Process result */
@@ -8561,7 +8569,7 @@ sasl_async_auth_callback(void *ctx_ptr, int result)
             log_module(NS_LOG, LOG_DEBUG, "SASL async: Account %s is suspended", hi->handle);
             irc_sasl(session->source, session->uid, "D", "F");
             sasl_delete_session(session);
-            return;
+            return 1;
         }
 
         /* Check max logins */
@@ -8573,7 +8581,7 @@ sasl_async_auth_callback(void *ctx_ptr, int result)
                 log_module(NS_LOG, LOG_DEBUG, "SASL async: Account %s at max logins", hi->handle);
                 irc_sasl(session->source, session->uid, "D", "F");
                 sasl_delete_session(session);
-                return;
+                return 1;
             }
         }
 
@@ -8587,14 +8595,14 @@ sasl_async_auth_callback(void *ctx_ptr, int result)
                                session->authzid);
                     irc_sasl(session->source, session->uid, "D", "F");
                     sasl_delete_session(session);
-                    return;
+                    return 1;
                 }
             } else {
                 log_module(NS_LOG, LOG_DEBUG, "SASL async: Impersonation unauthorized for %s",
                            session->authcid);
                 irc_sasl(session->source, session->uid, "D", "F");
                 sasl_delete_session(session);
-                return;
+                return 1;
             }
         }
 
@@ -8675,7 +8683,7 @@ sasl_async_fingerprint_callback(void *ctx_ptr, int result, char *username)
         log_module(NS_LOG, LOG_DEBUG, "SASL fingerprint callback: Session in terminal state %d", session->state);
         if (username) free(username);
         sasl_delete_session(session);
-        return;
+        return 1;
     }
 
     if (result == KC_COLLISION) {
@@ -8683,7 +8691,7 @@ sasl_async_fingerprint_callback(void *ctx_ptr, int result, char *username)
         irc_sasl(session->source, session->uid, "D", "F");
         if (username) free(username);
         sasl_delete_session(session);
-        return;
+        return 1;
     }
 
     if (result == KC_SUCCESS && username) {
@@ -8694,7 +8702,7 @@ sasl_async_fingerprint_callback(void *ctx_ptr, int result, char *username)
             irc_sasl(session->source, session->uid, "D", "F");
             free(username);
             sasl_delete_session(session);
-            return;
+            return 1;
         }
 
         /* Look up or auto-create account */
@@ -8782,7 +8790,7 @@ sasl_async_introspect_callback(void *ctx_ptr, int result, struct kc_token_info *
         log_module(NS_LOG, LOG_DEBUG, "SASL introspect callback: Session in terminal state %d", session->state);
         if (token_info) keycloak_free_token_info(token_info);
         sasl_delete_session(session);
-        return;
+        return 1;
     }
 
     if (result != KC_SUCCESS || !token_info) {
@@ -8791,7 +8799,7 @@ sasl_async_introspect_callback(void *ctx_ptr, int result, struct kc_token_info *
         irc_sasl(session->source, session->uid, "D", "F");
         if (token_info) keycloak_free_token_info(token_info);
         sasl_delete_session(session);
-        return;
+        return 1;
     }
 
     if (!token_info->active) {
@@ -8800,7 +8808,7 @@ sasl_async_introspect_callback(void *ctx_ptr, int result, struct kc_token_info *
         irc_sasl(session->source, session->uid, "D", "F");
         keycloak_free_token_info(token_info);
         sasl_delete_session(session);
-        return;
+        return 1;
     }
 
     /* Get username: authzid takes priority per RFC 7628, token username is fallback */
@@ -8814,7 +8822,7 @@ sasl_async_introspect_callback(void *ctx_ptr, int result, struct kc_token_info *
         irc_sasl(session->source, session->uid, "D", "F");
         keycloak_free_token_info(token_info);
         sasl_delete_session(session);
-        return;
+        return 1;
     }
 
     /* If authzid was provided, verify the token owner is authorized to use it.
@@ -8868,7 +8876,8 @@ sasl_async_introspect_callback(void *ctx_ptr, int result, struct kc_token_info *
 }
 #endif /* WITH_KEYCLOAK */
 
-void
+/* Returns 1 if session was deleted, 0 if still valid */
+int
 sasl_packet(struct SASLSession *session)
 {
     log_module(NS_LOG, LOG_DEBUG, "SASL: Got packet containing: %s", session->buf);
@@ -8900,7 +8909,7 @@ sasl_packet(struct SASLSession *session)
             irc_sasl(session->source, session->uid, "M", mechs);
             irc_sasl(session->source, session->uid, "D", "F");
             sasl_delete_session(session);
-            return;
+            return 1;
         }
 
         strncpy(session->mech, session->buf, sizeof(session->mech) - 1);
@@ -8928,7 +8937,7 @@ sasl_packet(struct SASLSession *session)
             irc_sasl(session->source, session->uid, "D", "F");
             sasl_delete_session(session);
             free(raw);
-            return;
+            return 1;
         }
 
 #ifdef WITH_LMDB
@@ -8938,7 +8947,7 @@ sasl_packet(struct SASLSession *session)
             irc_sasl(session->source, session->uid, "D", "F");
             sasl_delete_session(session);
             free(raw);
-            return;
+            return 1;
         }
 #endif
 
@@ -8957,7 +8966,7 @@ sasl_packet(struct SASLSession *session)
                                                          sasl_async_fingerprint_callback) == 0) {
                 /* Request started - callback will handle cleanup */
                 free(raw);
-                return;
+                return 1;
             }
 
             /* Async failed - fall back to sync */
@@ -9002,7 +9011,7 @@ sasl_packet(struct SASLSession *session)
         sasl_delete_session(session);
 
         free(raw);
-        return;
+        return 1;
     }
 #ifdef WITH_KEYCLOAK
     else if (!strcmp(session->mech, "OAUTHBEARER"))
@@ -9024,7 +9033,7 @@ sasl_packet(struct SASLSession *session)
             log_module(NS_LOG, LOG_DEBUG, "SASL OAUTHBEARER: Failed to decode payload");
             irc_sasl(session->source, session->uid, "D", "F");
             sasl_delete_session(session);
-            return;
+            return 1;
         }
 
         raw = (char *)realloc(raw, rawlen + 1);
@@ -9070,7 +9079,7 @@ sasl_packet(struct SASLSession *session)
             irc_sasl(session->source, session->uid, "D", "F");
             sasl_delete_session(session);
             free(raw);
-            return;
+            return 1;
         }
 
         log_module(NS_LOG, LOG_DEBUG, "SASL OAUTHBEARER: Validating token for authzid=%s",
@@ -9093,7 +9102,7 @@ sasl_packet(struct SASLSession *session)
                     irc_sasl(session->source, session->uid, "D", "F");
                     sasl_delete_session(session);
                     free(raw);
-                    return;
+                    return 1;
                 }
 
                 /* Look up or auto-create account */
@@ -9132,7 +9141,7 @@ sasl_packet(struct SASLSession *session)
 
                 sasl_delete_session(session);
                 free(raw);
-                return;
+                return 1;
             }
 
             if (jwt_result == KC_FORBIDDEN) {
@@ -9143,7 +9152,7 @@ sasl_packet(struct SASLSession *session)
                 irc_sasl(session->source, session->uid, "D", "F");
                 sasl_delete_session(session);
                 free(raw);
-                return;
+                return 1;
             }
 
             /* jwt_result == KC_ERROR - can't validate locally, fall back to introspection */
@@ -9159,7 +9168,7 @@ sasl_packet(struct SASLSession *session)
                                                  sasl_async_introspect_callback) == 0) {
                 /* Request started - callback will handle cleanup */
                 free(raw);
-                return;
+                return 1;
             }
 
             /* Async failed - fall back to sync */
@@ -9188,7 +9197,7 @@ sasl_packet(struct SASLSession *session)
 
         sasl_delete_session(session);
         free(raw);
-        return;
+        return 1;
     }
 #endif /* WITH_KEYCLOAK */
     else if (!strcmp(session->mech, "PLAIN"))
@@ -9244,7 +9253,7 @@ sasl_packet(struct SASLSession *session)
                 log_module(NS_LOG, LOG_DEBUG, "SASL: Negative cache hit - rejecting immediately");
                 irc_sasl(session->source, session->uid, "D", "F");
                 free(raw);
-                return;
+                return 1;
             }
 #endif
 
@@ -9260,7 +9269,7 @@ sasl_packet(struct SASLSession *session)
                                     sasl_async_auth_callback) == 0) {
                 /* Request started - DON'T delete session, callback will handle it */
                 free(raw);
-                return;
+                return 1;
             }
 
             /* Async start failed - fall through to sync path */
@@ -9327,7 +9336,7 @@ sasl_packet(struct SASLSession *session)
         sasl_delete_session(session);
 
         free(raw);
-        return;
+        return 1;
     }
     else
     {
@@ -9335,11 +9344,12 @@ sasl_packet(struct SASLSession *session)
         log_module(NS_LOG, LOG_WARNING, "SASL: Unknown mechanism %s", session->mech);
         irc_sasl(session->source, session->uid, "D", "F");
         sasl_delete_session(session);
-        return;
+        return 1;
     }
 
     /* Update activity timestamp */
     session->last_activity = now;
+    return 0;  /* Session still valid */
 }
 
 void
@@ -9453,11 +9463,15 @@ handle_sasl_input(struct server* source ,const char *uid, const char *subcmd, co
     /* Messages not exactly 400 bytes are the end of a packet. */
     if(len < 400)
     {
-        sasl_packet(sess);
-        sess->buflen = 0;
-        if (sess->buf != NULL)
-          free(sess->buf);
-        sess->buf = sess->p = NULL;
+        /* sasl_packet returns 1 if session was deleted, 0 if still valid */
+        if (!sasl_packet(sess)) {
+            /* Session still valid - reset buffer for next packet */
+            sess->buflen = 0;
+            if (sess->buf != NULL)
+              free(sess->buf);
+            sess->buf = sess->p = NULL;
+        }
+        /* If session was deleted, don't access it */
     }
 }
 
@@ -9872,14 +9886,15 @@ init_nickserv(const char *nick)
 	nickserv_define_func("NICKINFO", cmd_nickinfo, -1, 1, 0);
         nickserv_define_func("RECLAIM", cmd_reclaim, -1, 1, 0);
     }
-    if (nickserv_conf.email_enabled) {
-        nickserv_define_func("AUTHCOOKIE", cmd_authcookie, -1, 0, 0);
-        nickserv_define_func("RESETPASS", cmd_resetpass, -1, 0, 0);
-        nickserv_define_func("COOKIE", cmd_cookie, -1, 0, 0);
-        nickserv_define_func("DELCOOKIE", cmd_delcookie, -1, 1, 0);
-        nickserv_define_func("ODELCOOKIE", cmd_odelcookie, 0, 1, 0);
-        dict_insert(nickserv_opt_dict, "EMAIL", opt_email);
-    }
+    /* Register email/cookie commands unconditionally - config isn't loaded yet
+     * at init time, so nickserv_conf.email_enabled would always be 0 here.
+     * The commands will check for valid cookies at runtime. */
+    nickserv_define_func("AUTHCOOKIE", cmd_authcookie, -1, 0, 0);
+    nickserv_define_func("RESETPASS", cmd_resetpass, -1, 0, 0);
+    nickserv_define_func("COOKIE", cmd_cookie, -1, 0, 0);
+    nickserv_define_func("DELCOOKIE", cmd_delcookie, -1, 1, 0);
+    nickserv_define_func("ODELCOOKIE", cmd_odelcookie, 0, 1, 0);
+    dict_insert(nickserv_opt_dict, "EMAIL", opt_email);
     nickserv_define_func("GHOST", cmd_ghost, -1, 1, 0);
     /* ignore commands */
     nickserv_define_func("ADDIGNORE", cmd_addignore, -1, 1, 0);
