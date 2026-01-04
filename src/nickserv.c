@@ -229,6 +229,11 @@ static struct access_token *kc_admin_token = NULL;
 static time_t kc_token_expires = 0;
 static int keycloak_available = 1;  /* Track Keycloak availability */
 
+/* Timer scheduling flags - timers are scheduled after config loads, not at init time */
+static int expire_handles_timer_set = 0;
+static int expire_nicks_timer_set = 0;
+static int metadata_purge_timer_set = 0;
+
 /* Forward declarations for Keycloak wrapper functions */
 static int kc_ensure_token(void);
 static int kc_check_auth(const char *handle, const char *password);
@@ -430,6 +435,7 @@ static const struct message_entry msgtab[] = {
     { "NSMSG_SETTING_LIST_END",    "-------------End Of Settings------------" },
     { "NSMSG_INVALID_OPTION", "$b%s$b is an invalid account setting." },
     { "NSMSG_INVALID_ANNOUNCE", "$b%s$b is an invalid announcements value." },
+    { "NSMSG_INVALID_STYLE", "$b%s$b is an invalid style. Valid styles: Normal, Clean, Advanced, Classic." },
     { "NSMSG_SET_INFO", "$bINFO:         $b%s" },
     { "NSMSG_SET_WIDTH", "$bWIDTH:        $b%d" },
     { "NSMSG_SET_TABLEWIDTH", "$bTABLEWIDTH:   $b%d" },
@@ -488,10 +494,6 @@ static const struct message_entry msgtab[] = {
         "If you did NOT request your password to be changed, you do not need to do anything.\n"
         "Please contact the %1$s staff if you have questions." },
     { "NSEMAIL_EMAIL_CHANGE_SUBJECT", "Email address change verification for %s" },
-#ifdef stupid_verify_old_email        
-    { "NSEMAIL_EMAIL_CHANGE_BODY_NEW", "This email has been sent to verify that your email address belongs to the same person as account %5$s on %1$s.  The SECOND HALF of your cookie is %2$.*6$s.\nTo verify your address as associated with this account, log on to %1$s and type the following command:\n    /msg %3$s@%4$s COOKIE %5$s ?????%2$.*6$s\n(Replace the ????? with the FIRST HALF of the cookie, as sent to your OLD email address.)\nIf you did NOT request this email address to be associated with this account, you do not need to do anything.  Please contact the %1$s staff if you have questions." },
-    { "NSEMAIL_EMAIL_CHANGE_BODY_OLD", "This email has been sent to verify that you want to change your email for account %5$s on %1$s from this address to %7$s.  The FIRST HALF of your cookie is %2$.*6$s\nTo verify your new address as associated with this account, log on to %1$s and type the following command:\n    /msg %3$s@%4$s COOKIE %5$s %2$.*6$s?????\n(Replace the ????? with the SECOND HALF of the cookie, as sent to your NEW email address.)\nIf you did NOT request this change of email address, you do not need to do anything.  Please contact the %1$s staff if you have questions." },
-#endif
     { "NSEMAIL_EMAIL_VERIFY_SUBJECT", "Email address verification for %s" },
     { "NSEMAIL_EMAIL_VERIFY_BODY", "This email has been sent to verify that this address belongs to the same person as %5$s on %1$s.  Your cookie is %2$s.\nTo verify your address as associated with this account, log on to %1$s and type the following command:\n    /msg %3$s@%4$s COOKIE %5$s %2$s\nIf you did NOT request this email address to be associated with this account, you do not need to do anything.  Please contact the %1$s staff if you have questions." },
     { "NSEMAIL_ALLOWAUTH_SUBJECT", "Authentication allowed for %s" },
@@ -1408,10 +1410,6 @@ nickserv_make_cookie(struct userNode *user, struct handle_info *hi, enum cookie_
     cookie->expires = now + nickserv_conf.cookie_timeout;
     /* Adding dedicated password gen function for more control -Rubin */
     genpass(cookie->cookie, 10);
-    /*
-     *inttobase64(cookie->cookie, rand(), 5);
-     *inttobase64(cookie->cookie+5, rand(), 5);
-     */
 
     netname = nickserv_conf.network_name;
     subject[0] = 0;
@@ -1447,31 +1445,14 @@ nickserv_make_cookie(struct userNode *user, struct handle_info *hi, enum cookie_
     case EMAIL_CHANGE:
         misc = hi->email_addr;
         hi->email_addr = cookie->data;
-#ifdef stupid_verify_old_email
-        if (misc) {
-            if (user)
-                send_message(user, nickserv, "NSMSG_USE_COOKIE_EMAIL_2");
-            fmt = handle_find_message(hi, "NSEMAIL_EMAIL_CHANGE_SUBJECT");
-            snprintf(subject, sizeof(subject), fmt, netname);
-            fmt = handle_find_message(hi, "NSEMAIL_EMAIL_CHANGE_BODY_NEW");
-            snprintf(body, sizeof(body), fmt, netname, cookie->cookie+COOKIELEN/2, nickserv->nick, self->name, hi->handle, COOKIELEN/2);
-            mail_send(nickserv, hi, subject, body, 1);
-            fmt = handle_find_message(hi, "NSEMAIL_EMAIL_CHANGE_BODY_OLD");
-            snprintf(body, sizeof(body), fmt, netname, cookie->cookie, nickserv->nick, self->name, hi->handle, COOKIELEN/2, hi->email_addr);
-            first_time = 1;
-        } else {
-#endif
-            if (user)
-                send_message(user, nickserv, "NSMSG_USE_COOKIE_EMAIL_1");
-            fmt = handle_find_message(hi, "NSEMAIL_EMAIL_VERIFY_SUBJECT");
-            snprintf(subject, sizeof(subject), fmt, netname);
-            fmt = handle_find_message(hi, "NSEMAIL_EMAIL_VERIFY_BODY");
-            snprintf(body, sizeof(body), fmt, netname, cookie->cookie, nickserv->nick, self->name, hi->handle);
-            mail_send(nickserv, hi, subject, body, 1);
-            subject[0] = 0;
-#ifdef stupid_verify_old_email
-        }
-#endif
+        if (user)
+            send_message(user, nickserv, "NSMSG_USE_COOKIE_EMAIL_1");
+        fmt = handle_find_message(hi, "NSEMAIL_EMAIL_VERIFY_SUBJECT");
+        snprintf(subject, sizeof(subject), fmt, netname);
+        fmt = handle_find_message(hi, "NSEMAIL_EMAIL_VERIFY_BODY");
+        snprintf(body, sizeof(body), fmt, netname, cookie->cookie, nickserv->nick, self->name, hi->handle);
+        mail_send(nickserv, hi, subject, body, 1);
+        subject[0] = 0;
         hi->email_addr = misc;
         break;
     case ALLOWAUTH:
@@ -2554,10 +2535,19 @@ struct handle_info *loc_auth(char *sslfp, char *handle, char *password, char *us
             return NULL;
         }
     }
-    /* TODO - Add LOGGING to this function so LOC's are logged.. */
+    /* Log successful LOC authentication */
+    log_module(NS_LOG, LOG_INFO, "LOC auth success: %s (sslfp=%s userhost=%s)",
+               hi->handle, sslfp ? "yes" : "no", userhost ? userhost : "*@*");
     return hi;
 }
 
+/* Returns the current SASL mechanism list as a comma-separated string.
+ *
+ * Thread-safety note: Uses a static buffer which is safe because X3 is
+ * single-threaded (event-driven with ioset). The returned pointer remains
+ * valid until the next call to this function. Callers must copy the string
+ * if they need to preserve it across other function calls.
+ */
 const char *nickserv_get_sasl_mechanisms(void)
 {
     static char mechs[128];
@@ -3822,9 +3812,13 @@ static OPTION_FUNC(opt_style)
             hi->userlist_style = HI_STYLE_ADVANCED;
         else if (!irccasecmp(argv[1], "Classic"))
             hi->userlist_style = HI_STYLE_CLASSIC;
-        else  /* Default to normal */
+        else if (!irccasecmp(argv[1], "Normal"))
             hi->userlist_style = HI_STYLE_NORMAL;
-    } /* TODO: give error if unknow style is chosen */
+        else {
+            reply("NSMSG_INVALID_STYLE", argv[1]);
+            return 0;
+        }
+    }
 
     switch (hi->userlist_style) {
         case HI_STYLE_ADVANCED:
@@ -4036,7 +4030,7 @@ static OPTION_FUNC(opt_language)
         hi->language = lang;
     }
     if (!(noreply))
-        reply("NSMSG_SET_LANGUAGE", hi->language->name);
+        reply("NSMSG_SET_LANGUAGE", hi->language ? hi->language->name : "C");
     return 1;
 }
 
@@ -4226,6 +4220,10 @@ static OPTION_FUNC(opt_title)
             }
             free(hi->fakehost);
             hi->fakehost = malloc(strlen(title)+2);
+            if (!hi->fakehost) {
+                log_module(NS_LOG, LOG_ERROR, "malloc failed in SET TITLE");
+                return 0;
+            }
             hi->fakehost[0] = '.';
             strcpy(hi->fakehost+1, title);
         }
@@ -4665,7 +4663,7 @@ nickserv_saxdb_write(struct saxdb_context *ctx) {
         }
         if (hi->opserv_level)
             saxdb_write_int(ctx, KEY_OPSERV_LEVEL, hi->opserv_level);
-        if (hi->language != lang_C)
+        if (hi->language && hi->language != lang_C)
             saxdb_write_string(ctx, KEY_LANGUAGE, hi->language->name);
         saxdb_write_string(ctx, KEY_PASSWD, hi->passwd);
         saxdb_write_int(ctx, KEY_REGISTER_ON, hi->registered);
@@ -5822,7 +5820,7 @@ kc_do_oslevel(const char *handle, int level, int oldlevel)
 }
 
 /* Fire-and-forget callback for email verification sync */
-static void
+static int
 kc_email_verified_callback(void *session, int result)
 {
     (void)session;
@@ -5831,6 +5829,7 @@ kc_email_verified_callback(void *session, int result)
     } else {
         log_module(NS_LOG, LOG_DEBUG, "Keycloak emailVerified sync failed: %d", result);
     }
+    return 1;  /* Terminal - fire-and-forget operation complete */
 }
 
 /**
@@ -6031,13 +6030,14 @@ kc_delfromgroup(const char *handle, const char *group_name)
 }
 
 /* Fire-and-forget callback for async attribute updates (just logs result) */
-static void
+static int
 ns_attr_async_callback(void *session, int result)
 {
     (void)session;
     if (result != KC_SUCCESS) {
         log_module(NS_LOG, LOG_DEBUG, "ns_attr_async: Attribute update failed (result=%d)", result);
     }
+    return 1;  /* Terminal - fire-and-forget operation complete */
 }
 
 /**
@@ -7447,6 +7447,27 @@ nickserv_conf_read(void)
     log_module(NS_LOG, LOG_INFO, "Metadata compression enabled: threshold=%zu bytes, level=%d",
                x3_compress_get_threshold(), x3_compress_get_level());
 #endif
+
+    /* Schedule timers after config is loaded (not at init time when values are 0).
+     * These only run once - the timer callbacks reschedule themselves. */
+    if (nickserv_conf.handle_expire_frequency && !expire_handles_timer_set) {
+        expire_handles_timer_set = 1;
+        timeq_add(now + nickserv_conf.handle_expire_frequency, expire_handles, NULL);
+        log_module(NS_LOG, LOG_INFO, "Scheduled handle expiration timer (interval: %lu)",
+                   nickserv_conf.handle_expire_frequency);
+    }
+    if (nickserv_conf.nick_expire_frequency && nickserv_conf.expire_nicks && !expire_nicks_timer_set) {
+        expire_nicks_timer_set = 1;
+        timeq_add(now + nickserv_conf.nick_expire_frequency, expire_nicks, NULL);
+        log_module(NS_LOG, LOG_INFO, "Scheduled nick expiration timer (interval: %lu)",
+                   nickserv_conf.nick_expire_frequency);
+    }
+    if (nickserv_conf.metadata_ttl_enabled && nickserv_conf.metadata_purge_frequency && !metadata_purge_timer_set) {
+        metadata_purge_timer_set = 1;
+        timeq_add(now + nickserv_conf.metadata_purge_frequency, metadata_purge_expired, NULL);
+        log_module(NS_LOG, LOG_INFO, "Scheduled metadata purge timer (interval: %lu)",
+                   nickserv_conf.metadata_purge_frequency);
+    }
 }
 
 static void
@@ -7858,7 +7879,7 @@ static void reg_complete_registration(struct RegSession *session);
 /**
  * Async callback for Keycloak user creation
  */
-static void
+static int
 reg_async_kc_callback(void *ctx_ptr, int result)
 {
     struct reg_async_ctx *ctx = (struct reg_async_ctx *)ctx_ptr;
@@ -7866,14 +7887,14 @@ reg_async_kc_callback(void *ctx_ptr, int result)
 
     if (!ctx) {
         log_module(NS_LOG, LOG_ERROR, "REG async callback: NULL context");
-        return;
+        return 1;  /* Terminal - no valid context */
     }
 
     session = reg_async_ctx_validate(ctx);
     if (!session) {
         log_module(NS_LOG, LOG_DEBUG, "REG async callback: Session invalid for uid=%s", ctx->uid);
         free(ctx);
-        return;
+        return 1;  /* Terminal - session no longer valid */
     }
     free(ctx);
 
@@ -7884,7 +7905,7 @@ reg_async_kc_callback(void *ctx_ptr, int result)
     if (reg_session_is_terminal(session)) {
         log_module(NS_LOG, LOG_DEBUG, "REG async callback: Session in terminal state, cleaning up");
         reg_delete_session(session);
-        return;
+        return 1;  /* Terminal - session was cancelled */
     }
 
     if (result == KC_SUCCESS || result == KC_USER_EXISTS) {
@@ -7898,6 +7919,7 @@ reg_async_kc_callback(void *ctx_ptr, int result)
         irc_regreply(session->uid, 'F', session->account, session->result_msg);
         reg_delete_session(session);
     }
+    return 1;  /* Terminal - registration complete or failed */
 }
 #endif /* WITH_KEYCLOAK */
 
@@ -8507,7 +8529,7 @@ sasl_get_session(const char *uid)
 /*
  * Async auth callback - invoked when Keycloak auth completes
  */
-static void
+static int
 sasl_async_auth_callback(void *ctx_ptr, int result)
 {
     struct sasl_async_ctx *ctx = (struct sasl_async_ctx *)ctx_ptr;
@@ -8517,7 +8539,7 @@ sasl_async_auth_callback(void *ctx_ptr, int result)
 
     if (!ctx) {
         log_module(NS_LOG, LOG_ERROR, "SASL async callback: NULL context");
-        return;
+        return 1;  /* Terminal - no valid context */
     }
 
     /* Validate session still exists and sequence matches (detects UID reuse) */
@@ -8525,7 +8547,7 @@ sasl_async_auth_callback(void *ctx_ptr, int result)
     if (!session) {
         log_module(NS_LOG, LOG_DEBUG, "SASL async callback: Session invalid or reused for uid=%s", ctx->uid);
         free(ctx);
-        return;
+        return 1;  /* Terminal - session no longer valid */
     }
     free(ctx);
     ctx = NULL;
@@ -8537,7 +8559,7 @@ sasl_async_auth_callback(void *ctx_ptr, int result)
     if (sasl_session_is_terminal(session)) {
         log_module(NS_LOG, LOG_DEBUG, "SASL async callback: Session in terminal state %d, cleaning up", session->state);
         sasl_delete_session(session);
-        return 1;
+        return 1;  /* Terminal - session already in terminal state */
     }
 
     /* Process result */
@@ -8645,12 +8667,13 @@ sasl_async_auth_callback(void *ctx_ptr, int result)
     }
 
     sasl_delete_session(session);
+    return 1;  /* Terminal - SASL authentication complete (success or failure) */
 }
 
 /*
  * Async fingerprint lookup callback - invoked when Keycloak fingerprint search completes
  */
-static void
+static int
 sasl_async_fingerprint_callback(void *ctx_ptr, int result, char *username)
 {
     struct sasl_async_ctx *ctx = (struct sasl_async_ctx *)ctx_ptr;
@@ -8661,7 +8684,7 @@ sasl_async_fingerprint_callback(void *ctx_ptr, int result, char *username)
     if (!ctx) {
         log_module(NS_LOG, LOG_ERROR, "SASL fingerprint callback: NULL context");
         if (username) free(username);
-        return;
+        return 1;  /* Terminal - no valid context */
     }
 
     /* Validate session still exists and sequence matches (detects UID reuse) */
@@ -8670,7 +8693,7 @@ sasl_async_fingerprint_callback(void *ctx_ptr, int result, char *username)
         log_module(NS_LOG, LOG_DEBUG, "SASL fingerprint callback: Session invalid or reused for uid=%s", ctx->uid);
         free(ctx);
         if (username) free(username);
-        return;
+        return 1;  /* Terminal - session no longer valid */
     }
     free(ctx);
     ctx = NULL;
@@ -8751,12 +8774,13 @@ sasl_async_fingerprint_callback(void *ctx_ptr, int result, char *username)
     }
 
     sasl_delete_session(session);
+    return 1;  /* Terminal - SASL EXTERNAL authentication complete */
 }
 
 /*
  * Async token introspection callback - invoked when Keycloak token validation completes
  */
-static void
+static int
 sasl_async_introspect_callback(void *ctx_ptr, int result, struct kc_token_info *token_info)
 {
     struct sasl_async_ctx *ctx = (struct sasl_async_ctx *)ctx_ptr;
@@ -8768,7 +8792,7 @@ sasl_async_introspect_callback(void *ctx_ptr, int result, struct kc_token_info *
     if (!ctx) {
         log_module(NS_LOG, LOG_ERROR, "SASL introspect callback: NULL context");
         if (token_info) keycloak_free_token_info(token_info);
-        return;
+        return 1;  /* Terminal - no valid context */
     }
 
     /* Validate session still exists and sequence matches (detects UID reuse) */
@@ -8777,7 +8801,7 @@ sasl_async_introspect_callback(void *ctx_ptr, int result, struct kc_token_info *
         log_module(NS_LOG, LOG_DEBUG, "SASL introspect callback: Session invalid or reused for uid=%s", ctx->uid);
         free(ctx);
         if (token_info) keycloak_free_token_info(token_info);
-        return;
+        return 1;  /* Terminal - session no longer valid */
     }
     free(ctx);
     ctx = NULL;
@@ -8790,7 +8814,7 @@ sasl_async_introspect_callback(void *ctx_ptr, int result, struct kc_token_info *
         log_module(NS_LOG, LOG_DEBUG, "SASL introspect callback: Session in terminal state %d", session->state);
         if (token_info) keycloak_free_token_info(token_info);
         sasl_delete_session(session);
-        return 1;
+        return 1;  /* Terminal - session already in terminal state */
     }
 
     if (result != KC_SUCCESS || !token_info) {
@@ -8799,7 +8823,7 @@ sasl_async_introspect_callback(void *ctx_ptr, int result, struct kc_token_info *
         irc_sasl(session->source, session->uid, "D", "F");
         if (token_info) keycloak_free_token_info(token_info);
         sasl_delete_session(session);
-        return 1;
+        return 1;  /* Terminal - introspection failed */
     }
 
     if (!token_info->active) {
@@ -8808,7 +8832,7 @@ sasl_async_introspect_callback(void *ctx_ptr, int result, struct kc_token_info *
         irc_sasl(session->source, session->uid, "D", "F");
         keycloak_free_token_info(token_info);
         sasl_delete_session(session);
-        return 1;
+        return 1;  /* Terminal - token not active */
     }
 
     /* Get username: authzid takes priority per RFC 7628, token username is fallback */
@@ -8822,7 +8846,7 @@ sasl_async_introspect_callback(void *ctx_ptr, int result, struct kc_token_info *
         irc_sasl(session->source, session->uid, "D", "F");
         keycloak_free_token_info(token_info);
         sasl_delete_session(session);
-        return 1;
+        return 1;  /* Terminal - no username available */
     }
 
     /* If authzid was provided, verify the token owner is authorized to use it.
@@ -8873,6 +8897,7 @@ sasl_async_introspect_callback(void *ctx_ptr, int result, struct kc_token_info *
     }
 
     sasl_delete_session(session);
+    return 1;  /* Terminal - SASL OAUTHBEARER authentication complete */
 }
 #endif /* WITH_KEYCLOAK */
 
@@ -9954,12 +9979,8 @@ init_nickserv(const char *nick)
     }
     saxdb_register("NickServ", nickserv_saxdb_read, nickserv_saxdb_write);
     reg_exit_func(nickserv_db_cleanup, NULL);
-    if(nickserv_conf.handle_expire_frequency)
-        timeq_add(now + nickserv_conf.handle_expire_frequency, expire_handles, NULL);
-    if(nickserv_conf.nick_expire_frequency && nickserv_conf.expire_nicks)
-        timeq_add(now + nickserv_conf.nick_expire_frequency, expire_nicks, NULL);
-    if(nickserv_conf.metadata_ttl_enabled && nickserv_conf.metadata_purge_frequency)
-        timeq_add(now + nickserv_conf.metadata_purge_frequency, metadata_purge_expired, NULL);
+    /* Note: Timer scheduling moved to nickserv_conf_read() because config
+     * values are 0 at this point (before config is loaded). */
 
     if(autojoin_channels && nickserv) {
         for (i = 0; i < autojoin_channels->used; i++) {

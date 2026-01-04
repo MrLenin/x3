@@ -1571,11 +1571,11 @@ modcmd_describe_command(struct userNode *user, struct svccmd *cmd, struct svccmd
     if (buf1_used)
         buf1[buf1_used] = '\0';
     else
-        strcpy(buf1, user_find_message(user, "MSG_NONE"));
+        safestrncpy(buf1, user_find_message(user, "MSG_NONE"), sizeof(buf1));
     if (buf2_used)
         buf2[buf2_used] = '\0';
     else
-        strcpy(buf2, user_find_message(user, "MSG_NONE"));
+        safestrncpy(buf2, user_find_message(user, "MSG_NONE"), sizeof(buf2));
     reply("MCMSG_COMMAND_FLAGS", buf1, buf2);
     for (ii = buf1_used = buf2_used = 0; handle_flags[ii]; ++ii) {
         if (target->req_account_flags & (1 << ii))

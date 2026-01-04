@@ -202,7 +202,8 @@ target_vendor = @target_vendor@
 top_build_prefix = @top_build_prefix@
 top_builddir = @top_builddir@
 top_srcdir = @top_srcdir@
-AM_CPPFLAGS = @RX_INCLUDES@
+# -D__USE_ISOC23=0 prevents glibc C23 strtol redirects that cause linker errors on Debian 12
+AM_CPPFLAGS = @RX_INCLUDES@ -DPREFIX=\"@prefix@\" -D__USE_ISOC23=0
 noinst_DATA = \
 	chanserv.help \
 	global.help \

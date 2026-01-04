@@ -490,24 +490,27 @@ void cleanup_keycloak(void);
  * Async authentication callback type
  * @param session  Opaque session pointer passed to kc_check_auth_async
  * @param result   KC_SUCCESS, KC_FORBIDDEN, or KC_ERROR
+ * @return 0 if session may continue processing, 1 if session is terminal
  */
-typedef void (*kc_async_callback)(void *session, int result);
+typedef int (*kc_async_callback)(void *session, int result);
 
 /**
  * Async fingerprint lookup callback type
  * @param session   Opaque session pointer
  * @param result    KC_SUCCESS, KC_NOT_FOUND, KC_COLLISION, or KC_ERROR
  * @param username  Username found (only valid if result==KC_SUCCESS, caller must free)
+ * @return 0 if session may continue processing, 1 if session is terminal
  */
-typedef void (*kc_fingerprint_callback)(void *session, int result, char *username);
+typedef int (*kc_fingerprint_callback)(void *session, int result, char *username);
 
 /**
  * Async token introspection callback type
  * @param session    Opaque session pointer
  * @param result     KC_SUCCESS or KC_ERROR
  * @param token_info Token info (only valid if result==KC_SUCCESS, caller must free)
+ * @return 0 if session may continue processing, 1 if session is terminal
  */
-typedef void (*kc_introspect_callback)(void *session, int result, struct kc_token_info *token_info);
+typedef int (*kc_introspect_callback)(void *session, int result, struct kc_token_info *token_info);
 
 /**
  * Start async authentication check against Keycloak
@@ -653,8 +656,9 @@ int kc_webpush_send_async(const char *endpoint,
  * Callback type for async user creation.
  * @param session   Opaque session pointer (registration context)
  * @param result    KC_SUCCESS, KC_USER_EXISTS, or KC_ERROR
+ * @return 0 if session may continue processing, 1 if session is terminal
  */
-typedef void (*kc_create_user_callback)(void *session, int result);
+typedef int (*kc_create_user_callback)(void *session, int result);
 
 /**
  * Create a user in Keycloak asynchronously.

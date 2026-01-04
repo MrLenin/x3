@@ -49,7 +49,15 @@ get_file_id(const char *fname)
     entry = bsearch(fname, file_id_map, file_ids_used, sizeof(file_id_map[0]), file_id_cmp);
     if (entry)
         return ((char*)entry - file_id_map[0]) / sizeof(file_id_map[0]);
-    strcpy(file_id_map[file_ids_used++], fname);
+    /* Bounds check: file_id_map has 256 entries, file_id field is 8 bits */
+    if (file_ids_used >= 256) {
+        log_module(MAIN_LOG, LOG_ERROR, "file_id_map overflow: too many source files");
+        return 0;  /* Return first entry as fallback */
+    }
+    /* Safe copy: truncate filename to fit 32-char buffer */
+    strncpy(file_id_map[file_ids_used], fname, sizeof(file_id_map[0]) - 1);
+    file_id_map[file_ids_used][sizeof(file_id_map[0]) - 1] = '\0';
+    file_ids_used++;
     qsort(file_id_map, file_ids_used, sizeof(file_id_map[0]), file_id_cmp);
     return file_ids_used - 1;
 }

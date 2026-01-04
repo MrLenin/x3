@@ -40,6 +40,14 @@ struct jwks_key {
     EVP_PKEY *pkey;      /* Parsed public key */
 };
 
+/* JWKS (JSON Web Key Set) cache for JWT signature verification.
+ *
+ * Thread-safety note: This cache is accessed without locking because X3 uses
+ * single-threaded event-driven I/O (ioset). All Keycloak HTTP operations
+ * either block or use async callbacks that run in the main event loop.
+ * The cache is refreshed synchronously via jwks_refresh() before any JWT
+ * validation that finds a missing key.
+ */
 static struct {
     struct jwks_key keys[JWKS_MAX_KEYS];
     int key_count;

@@ -1,4 +1,5 @@
-AM_CPPFLAGS = @RX_INCLUDES@ -DPREFIX=\"@prefix@\"
+# -D__USE_ISOC23=0 prevents glibc C23 strtol redirects that cause linker errors on Debian 12
+AM_CPPFLAGS = @RX_INCLUDES@ -DPREFIX=\"@prefix@\" -D__USE_ISOC23=0
 LIBS = @LIBS@ @RX_LIBS@
 TRACK = @TRACK@
 pythonpath = @pythonpath@

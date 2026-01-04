@@ -10621,11 +10621,11 @@ struct cs_group_async_ctx {
 };
 
 /* Callback for async group add/remove operations */
-static void
+static int
 cs_group_async_callback(void *session, int result)
 {
     struct cs_group_async_ctx *ctx = session;
-    if (!ctx) return;
+    if (!ctx) return 1;  /* Terminal - no context */
 
     if (result == KC_SUCCESS) {
         log_module(CS_LOG, LOG_DEBUG, "cs_group_async: %s %s %s %s group (async)",
@@ -10657,6 +10657,7 @@ cs_group_async_callback(void *session, int result)
     free(ctx->channel);
     free(ctx->username);
     free(ctx);
+    return 1;  /* Terminal - async group operation complete */
 }
 
 /**
