@@ -136,6 +136,7 @@
 #define CMD_MARKREAD            "MARKREAD"
 #define CMD_WEBPUSH             "WEBPUSH"
 #define CMD_TAGMSG              "TAGMSG"
+#define CMD_MULTILINE           "MULTILINE"
 #define CMD_CHATHISTORY         "CHATHISTORY"
 
 /* Tokenized commands. */
@@ -245,6 +246,7 @@
 #define TOK_MARKREAD            "MR"
 #define TOK_WEBPUSH             "WP"
 #define TOK_TAGMSG              "TM"
+#define TOK_MULTILINE           "ML"
 #define TOK_VERIFY_ACCT         "VF"
 #define TOK_REGREPLY            "RR"
 #define TOK_CHATHISTORY         "CH"
@@ -3529,6 +3531,10 @@ init_parse(void)
     /* IRCv3 message-tags TAGMSG support - just acknowledge, don't process */
     dict_insert(irc_func_dict, CMD_TAGMSG, cmd_tagmsg);
     dict_insert(irc_func_dict, TOK_TAGMSG, cmd_tagmsg);
+
+    /* IRCv3 multiline batches - Nefarious handles routing, X3 ignores */
+    dict_insert(irc_func_dict, CMD_MULTILINE, cmd_dummy);
+    dict_insert(irc_func_dict, TOK_MULTILINE, cmd_dummy);
 
     /* In P10, DESTRUCT doesn't do anything except be broadcast to servers.
      * Apparently to obliterate channels from any servers that think they
