@@ -3560,6 +3560,12 @@ nickserv_addsslfp(struct userNode *user, struct handle_info *hi, const char *ssl
         }
     }
     string_list_append(hi->sslfps, new_sslfp);
+
+#ifdef WITH_LMDB
+    /* Store fingerprint in LMDB with registration timestamp and 90-day TTL */
+    x3_lmdb_fingerprint_set(new_sslfp, hi->handle, now, now);
+#endif
+
     send_message(user, nickserv, "NSMSG_ADDSSLFP_SUCCESS", new_sslfp);
     return 1;
 }
@@ -3593,6 +3599,12 @@ nickserv_delsslfp(struct svccmd *cmd, struct userNode *user, struct handle_info 
         if (!irccasecmp(del_sslfp, hi->sslfps->list[i])) {
             char *old_sslfp = hi->sslfps->list[i];
             hi->sslfps->list[i] = hi->sslfps->list[--hi->sslfps->used];
+
+#ifdef WITH_LMDB
+            /* Remove fingerprint from LMDB */
+            x3_lmdb_fingerprint_delete(old_sslfp);
+#endif
+
             reply("NSMSG_DELSSLFP_SUCCESS", old_sslfp);
             free(old_sslfp);
             return 1;
@@ -5615,6 +5627,28 @@ nickserv_db_read_handle(char *handle, dict_t obj)
                            hi->handle, (long)hi->lastseen, (long)hi->last_present);
             }
         }
+
+        /* Fingerprint Migration: ensure all fingerprints are in LMDB */
+        if (hi->sslfps && hi->sslfps->used > 0) {
+            unsigned int ii;
+            for (ii = 0; ii < hi->sslfps->used; ii++) {
+                const char *fp = hi->sslfps->list[ii];
+                char existing_account[64];
+                /* Check if fingerprint already in LMDB */
+                rc = x3_lmdb_fingerprint_get(fp, existing_account, NULL, NULL, NULL);
+                if (rc == LMDB_NOT_FOUND || rc == LMDB_EXPIRED) {
+                    /* Migrate fingerprint from SAXDB to LMDB */
+                    x3_lmdb_fingerprint_set(fp, hi->handle, hi->registered, 0);
+                    log_module(NS_LOG, LOG_DEBUG, "nickserv: Migrated fingerprint to LMDB for %s: %s",
+                               hi->handle, fp);
+                } else if (rc == LMDB_SUCCESS && strcasecmp(existing_account, hi->handle) != 0) {
+                    /* Fingerprint exists but belongs to different account - log warning */
+                    log_module(NS_LOG, LOG_WARNING,
+                               "nickserv: Fingerprint conflict: %s claims %s but LMDB says %s",
+                               hi->handle, fp, existing_account);
+                }
+            }
+        }
     }
 #endif
 }
@@ -6375,8 +6409,7 @@ loc_auth_external(const char *fingerprint, const char *authzid, const char *host
     struct handle_info *hi = NULL;
     char *kc_username = NULL;
     int rc;
-    char lmdb_key[256];
-    char cached_username[128];
+    char cached_account[64];
 
     if (!fingerprint || !*fingerprint) {
         log_module(NS_LOG, LOG_DEBUG, "loc_auth_external: No fingerprint provided");
@@ -6385,65 +6418,57 @@ loc_auth_external(const char *fingerprint, const char *authzid, const char *host
 
     log_module(NS_LOG, LOG_DEBUG, "loc_auth_external: Looking up fingerprint %s", fingerprint);
 
-    /* Step 1: Check LMDB fingerprint cache (instant, with TTL) */
-    snprintf(lmdb_key, sizeof(lmdb_key), "%s%s", LMDB_PREFIX_FINGERPRINT, fingerprint);
-    if (x3_lmdb_get(LMDB_DB_METADATA, lmdb_key, cached_username, sizeof(cached_username)) == LMDB_SUCCESS) {
-        /* Cache format: "timestamp:username" - check TTL (1 hour default) */
-        char *colon = strchr(cached_username, ':');
-        if (colon) {
-            time_t cached_time = (time_t)strtoul(cached_username, NULL, 10);
-            char *username = colon + 1;
-            time_t fp_cache_ttl = 3600;  /* 1 hour TTL for fingerprint cache */
+    /* Step 1: Check LMDB fingerprint cache (with 90-day TTL) */
+#ifdef WITH_LMDB
+    rc = x3_lmdb_fingerprint_get(fingerprint, cached_account, NULL, NULL, NULL);
+    if (rc == LMDB_SUCCESS) {
+        log_module(NS_LOG, LOG_DEBUG, "loc_auth_external: LMDB cache hit: %s -> %s",
+                   fingerprint, cached_account);
 
-            if (now - cached_time < fp_cache_ttl) {
-                log_module(NS_LOG, LOG_DEBUG, "loc_auth_external: LMDB cache hit: %s -> %s",
-                           fingerprint, username);
+        /* Verify authzid if provided */
+        if (authzid && *authzid && strcasecmp(cached_account, authzid) != 0) {
+            log_module(NS_LOG, LOG_WARNING,
+                "loc_auth_external: authzid mismatch - client claimed '%s' but cert belongs to '%s'",
+                authzid, cached_account);
+            return NULL;
+        }
 
-                /* Verify authzid if provided */
-                if (authzid && *authzid && strcasecmp(username, authzid) != 0) {
-                    log_module(NS_LOG, LOG_WARNING,
-                        "loc_auth_external: authzid mismatch - client claimed '%s' but cert belongs to '%s'",
-                        authzid, username);
+        hi = get_handle_info(cached_account);
+        if (hi) {
+            /* Verify account isn't suspended and maxlogins */
+            if (HANDLE_FLAGGED(hi, SUSPENDED)) {
+                log_module(NS_LOG, LOG_DEBUG, "loc_auth_external: Account %s is suspended", hi->handle);
+                return NULL;
+            }
+            int used = 0;
+            int maxlogins = hi->maxlogins ? hi->maxlogins : nickserv_conf.default_maxlogins;
+            struct userNode *other;
+            for (other = hi->users; other; other = other->next_authed) {
+                if (++used >= maxlogins) {
+                    log_module(NS_LOG, LOG_DEBUG, "loc_auth_external: Account %s at max logins", hi->handle);
                     return NULL;
                 }
-
-                hi = get_handle_info(username);
-                if (hi) {
-                    /* Verify account isn't suspended and maxlogins */
-                    if (HANDLE_FLAGGED(hi, SUSPENDED)) {
-                        log_module(NS_LOG, LOG_DEBUG, "loc_auth_external: Account %s is suspended", hi->handle);
-                        return NULL;
-                    }
-                    int used = 0;
-                    int maxlogins = hi->maxlogins ? hi->maxlogins : nickserv_conf.default_maxlogins;
-                    struct userNode *other;
-                    for (other = hi->users; other; other = other->next_authed) {
-                        if (++used >= maxlogins) {
-                            log_module(NS_LOG, LOG_DEBUG, "loc_auth_external: Account %s at max logins", hi->handle);
-                            return NULL;
-                        }
-                    }
-                    return hi;
-                }
-                /* Cache entry exists but account doesn't - stale cache, continue to lookup */
-                log_module(NS_LOG, LOG_DEBUG, "loc_auth_external: Stale cache entry for %s", username);
-            } else {
-                log_module(NS_LOG, LOG_DEBUG, "loc_auth_external: Cache expired for fingerprint (age=%lu)",
-                           (unsigned long)(now - cached_time));
-                /* Delete expired entry */
-                x3_lmdb_delete(LMDB_DB_METADATA, lmdb_key);
             }
+            /* Touch fingerprint to refresh TTL and update last_used */
+            x3_lmdb_fingerprint_touch(fingerprint);
+            return hi;
         }
+        /* Cache entry exists but account doesn't - stale cache, delete it */
+        log_module(NS_LOG, LOG_DEBUG, "loc_auth_external: Stale cache entry for %s", cached_account);
+        x3_lmdb_fingerprint_delete(fingerprint);
+    } else if (rc == LMDB_EXPIRED) {
+        log_module(NS_LOG, LOG_DEBUG, "loc_auth_external: Fingerprint cache expired");
     }
+#endif
 
     /* Step 2: Check local X3 fingerprint storage (in-memory, instant) */
     hi = loc_auth((char*)fingerprint, (char*)authzid, NULL, (char*)hostmask);
     if (hi) {
-        char cache_value[256];
         log_module(NS_LOG, LOG_DEBUG, "loc_auth_external: Local lookup found %s", hi->handle);
-        /* Cache in LMDB for future lookups with timestamp */
-        snprintf(cache_value, sizeof(cache_value), "%lu:%s", (unsigned long)now, hi->handle);
-        x3_lmdb_set(LMDB_DB_METADATA, lmdb_key, cache_value);
+#ifdef WITH_LMDB
+        /* Cache in LMDB with enhanced format (account, registered, last_used, TTL) */
+        x3_lmdb_fingerprint_set(fingerprint, hi->handle, 0, 0);
+#endif
         return hi;
     }
 
@@ -6465,14 +6490,14 @@ loc_auth_external(const char *fingerprint, const char *authzid, const char *host
         }
 
         if (rc == KC_SUCCESS && kc_username) {
-            char cache_value[256];
             log_module(NS_LOG, LOG_DEBUG,
                 "loc_auth_external: Keycloak returned user '%s' for fingerprint",
                 kc_username);
 
-            /* Cache in LMDB for future lookups with timestamp */
-            snprintf(cache_value, sizeof(cache_value), "%lu:%s", (unsigned long)now, kc_username);
-            x3_lmdb_set(LMDB_DB_METADATA, lmdb_key, cache_value);
+#ifdef WITH_LMDB
+            /* Cache in LMDB with enhanced format (account, registered, last_used, TTL) */
+            x3_lmdb_fingerprint_set(fingerprint, kc_username, 0, 0);
+#endif
 
             /* If authzid was provided, verify it matches */
             if (authzid && *authzid && strcasecmp(kc_username, authzid) != 0) {

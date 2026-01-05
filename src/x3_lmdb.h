@@ -354,6 +354,22 @@ void x3_lmdb_free_chanaccess_entries(struct lmdb_chanaccess_entry *entries);
 #define LMDB_ACTIVITY_TTL_DAYS 30
 #define LMDB_ACTIVITY_TTL_SECS (LMDB_ACTIVITY_TTL_DAYS * 86400)
 
+/* ========== Fingerprint Data ========== */
+
+/* Default TTL for fingerprint data (90 days in seconds) */
+#define LMDB_FINGERPRINT_TTL_DAYS 90
+#define LMDB_FINGERPRINT_TTL_SECS (LMDB_FINGERPRINT_TTL_DAYS * 86400)
+
+/* Fingerprint entry structure */
+struct lmdb_fingerprint_entry {
+    char *fingerprint;
+    char *account;
+    time_t registered;
+    time_t last_used;
+    time_t expires;
+    struct lmdb_fingerprint_entry *next;
+};
+
 /**
  * Get activity data for an account
  * @param account Account name
@@ -386,6 +402,62 @@ int x3_lmdb_activity_touch(const char *account);
  * @return LMDB_SUCCESS on success, LMDB_NOT_FOUND if not found, LMDB_ERROR on failure
  */
 int x3_lmdb_activity_delete(const char *account);
+
+/* ========== Fingerprint Storage ========== */
+
+/**
+ * Get fingerprint data by fingerprint
+ * @param fingerprint SSL certificate fingerprint (with colons)
+ * @param account_out Buffer for account name (must be at least 64 bytes, can be NULL)
+ * @param registered_out Output for registration timestamp (can be NULL)
+ * @param last_used_out Output for last-used timestamp (can be NULL)
+ * @param expires_out Output for expiry timestamp (can be NULL)
+ * @return LMDB_SUCCESS on success, LMDB_NOT_FOUND if not found, LMDB_EXPIRED if expired, LMDB_ERROR on failure
+ */
+int x3_lmdb_fingerprint_get(const char *fingerprint, char *account_out,
+                            time_t *registered_out, time_t *last_used_out,
+                            time_t *expires_out);
+
+/**
+ * Set fingerprint data (with automatic 90-day TTL)
+ * If fingerprint already exists, updates last_used and refreshes TTL
+ * @param fingerprint SSL certificate fingerprint (with colons)
+ * @param account Account name
+ * @param registered Registration timestamp (0 to use current time for new entries)
+ * @param last_used Last-used timestamp (0 to use current time)
+ * @return LMDB_SUCCESS on success, LMDB_ERROR on failure
+ */
+int x3_lmdb_fingerprint_set(const char *fingerprint, const char *account,
+                            time_t registered, time_t last_used);
+
+/**
+ * Refresh TTL on fingerprint and update last_used timestamp
+ * Called when fingerprint is successfully used for SASL EXTERNAL auth
+ * @param fingerprint SSL certificate fingerprint
+ * @return LMDB_SUCCESS on success, LMDB_NOT_FOUND if not found, LMDB_ERROR on failure
+ */
+int x3_lmdb_fingerprint_touch(const char *fingerprint);
+
+/**
+ * Delete fingerprint data
+ * @param fingerprint SSL certificate fingerprint
+ * @return LMDB_SUCCESS on success, LMDB_NOT_FOUND if not found, LMDB_ERROR on failure
+ */
+int x3_lmdb_fingerprint_delete(const char *fingerprint);
+
+/**
+ * List all fingerprints for an account
+ * @param account Account name
+ * @param entries_out Output pointer for linked list (caller must free with x3_lmdb_free_fingerprint_entries)
+ * @return Number of entries found, LMDB_ERROR on failure
+ */
+int x3_lmdb_fingerprint_list_account(const char *account, struct lmdb_fingerprint_entry **entries_out);
+
+/**
+ * Free a linked list of fingerprint entries
+ * @param entries Head of the list to free (can be NULL)
+ */
+void x3_lmdb_free_fingerprint_entries(struct lmdb_fingerprint_entry *entries);
 
 /* ========== Generic Key-Value Operations ========== */
 
@@ -485,6 +557,12 @@ void init_x3_lmdb(void);
 #define x3_lmdb_activity_set(a, l, p)   (-1)
 #define x3_lmdb_activity_touch(a)       (-2)
 #define x3_lmdb_activity_delete(a)      (-2)
+#define x3_lmdb_fingerprint_get(f, a, r, u, e) (-2)
+#define x3_lmdb_fingerprint_set(f, a, r, u) (-1)
+#define x3_lmdb_fingerprint_touch(f)    (-2)
+#define x3_lmdb_fingerprint_delete(f)   (-2)
+#define x3_lmdb_fingerprint_list_account(a, e) (-1)
+#define x3_lmdb_free_fingerprint_entries(e) do {} while(0)
 #define x3_lmdb_free_entries(e)         do {} while(0)
 #define x3_lmdb_sync(f)                 (0)
 #define x3_lmdb_stats(d, e, s)          (-1)

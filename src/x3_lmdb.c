@@ -1911,6 +1911,342 @@ int x3_lmdb_activity_delete(const char *account)
     return rc == 0 ? LMDB_SUCCESS : LMDB_ERROR;
 }
 
+/* ========== Fingerprint Storage ========== */
+
+int x3_lmdb_fingerprint_get(const char *fingerprint, char *account_out,
+                            time_t *registered_out, time_t *last_used_out,
+                            time_t *expires_out)
+{
+    MDB_txn *txn;
+    MDB_val mkey, mdata;
+    char keybuf[LMDB_KEY_BUFFER_SIZE];
+    int rc;
+    time_t expires = 0;
+
+    if (!x3_lmdb_is_available() || !fingerprint) {
+        return LMDB_ERROR;
+    }
+
+    /* Build key: "fp:<fingerprint>" */
+    snprintf(keybuf, sizeof(keybuf), "%s%s", LMDB_PREFIX_FINGERPRINT, fingerprint);
+
+    mkey.mv_size = strlen(keybuf) + 1;
+    mkey.mv_data = keybuf;
+
+    rc = mdb_txn_begin(lmdb_env, NULL, MDB_RDONLY, &txn);
+    if (rc != 0) {
+        return LMDB_ERROR;
+    }
+
+    rc = mdb_get(txn, dbi_metadata, &mkey, &mdata);
+    mdb_txn_abort(txn);
+
+    if (rc == MDB_NOTFOUND) {
+        return LMDB_NOT_FOUND;
+    } else if (rc != 0) {
+        return LMDB_ERROR;
+    }
+
+    /* Parse stored value - format: "T:<expiry>:<account>:<registered>:<last_used>" */
+    const char *stored = (const char *)mdata.mv_data;
+    const char *data_start = stored;
+
+    /* Check for TTL prefix */
+    if (stored[0] == 'T' && stored[1] == ':') {
+        const char *ts_end = strchr(stored + 2, ':');
+        if (ts_end) {
+            expires = (time_t)strtol(stored + 2, NULL, 10);
+            data_start = ts_end + 1;
+
+            /* Check if expired */
+            if (expires > 0 && expires <= time(NULL)) {
+                /* Auto-delete expired entry */
+                x3_lmdb_fingerprint_delete(fingerprint);
+                return LMDB_EXPIRED;
+            }
+        }
+    }
+
+    /* Parse account:registered:last_used */
+    const char *colon1 = strchr(data_start, ':');
+    const char *colon2 = colon1 ? strchr(colon1 + 1, ':') : NULL;
+
+    if (account_out) {
+        if (colon1) {
+            size_t len = colon1 - data_start;
+            if (len > 63) len = 63;
+            memcpy(account_out, data_start, len);
+            account_out[len] = '\0';
+        } else {
+            /* Legacy format: just username */
+            strncpy(account_out, data_start, 63);
+            account_out[63] = '\0';
+        }
+    }
+
+    if (registered_out) {
+        *registered_out = colon1 ? (time_t)strtol(colon1 + 1, NULL, 10) : 0;
+    }
+
+    if (last_used_out) {
+        *last_used_out = colon2 ? (time_t)strtol(colon2 + 1, NULL, 10) : 0;
+    }
+
+    if (expires_out) {
+        *expires_out = expires;
+    }
+
+    return LMDB_SUCCESS;
+}
+
+int x3_lmdb_fingerprint_set(const char *fingerprint, const char *account,
+                            time_t registered, time_t last_used)
+{
+    MDB_txn *txn;
+    MDB_val mkey, mdata;
+    char keybuf[LMDB_KEY_BUFFER_SIZE];
+    char valuebuf[256];
+    time_t existing_registered = 0;
+    time_t expires;
+    int rc;
+    time_t now_time = time(NULL);
+
+    if (!x3_lmdb_is_available() || !fingerprint || !account) {
+        return LMDB_ERROR;
+    }
+
+    /* If registered is 0, try to preserve existing value or use now */
+    if (registered == 0) {
+        if (x3_lmdb_fingerprint_get(fingerprint, NULL, &existing_registered, NULL, NULL) == LMDB_SUCCESS) {
+            registered = existing_registered;
+        } else {
+            registered = now_time;
+        }
+    }
+
+    /* If last_used is 0, use current time */
+    if (last_used == 0) {
+        last_used = now_time;
+    }
+
+    /* Build key: "fp:<fingerprint>" */
+    snprintf(keybuf, sizeof(keybuf), "%s%s", LMDB_PREFIX_FINGERPRINT, fingerprint);
+
+    mkey.mv_size = strlen(keybuf) + 1;
+    mkey.mv_data = keybuf;
+
+    /* Calculate expiry (90 days from now) */
+    expires = now_time + LMDB_FINGERPRINT_TTL_SECS;
+
+    /* Build value: "T:<expiry>:<account>:<registered>:<last_used>" */
+    snprintf(valuebuf, sizeof(valuebuf), "T:%ld:%s:%ld:%ld",
+             (long)expires, account, (long)registered, (long)last_used);
+
+    mdata.mv_size = strlen(valuebuf) + 1;
+    mdata.mv_data = valuebuf;
+
+    rc = mdb_txn_begin(lmdb_env, NULL, 0, &txn);
+    if (rc != 0) {
+        return LMDB_ERROR;
+    }
+
+    rc = mdb_put(txn, dbi_metadata, &mkey, &mdata, 0);
+    if (rc != 0) {
+        mdb_txn_abort(txn);
+        return LMDB_ERROR;
+    }
+
+    rc = mdb_txn_commit(txn);
+    if (rc == 0) {
+        log_module(MAIN_LOG, LOG_DEBUG, "x3_lmdb: Set fingerprint %s -> %s (reg=%ld, used=%ld, exp=%ld)",
+                   fingerprint, account, (long)registered, (long)last_used, (long)expires);
+    }
+
+    return rc == 0 ? LMDB_SUCCESS : LMDB_ERROR;
+}
+
+int x3_lmdb_fingerprint_touch(const char *fingerprint)
+{
+    char account[64];
+    time_t registered = 0;
+    time_t now_time = time(NULL);
+    int rc;
+
+    if (!x3_lmdb_is_available() || !fingerprint) {
+        return LMDB_ERROR;
+    }
+
+    /* Get current values */
+    rc = x3_lmdb_fingerprint_get(fingerprint, account, &registered, NULL, NULL);
+    if (rc != LMDB_SUCCESS) {
+        return rc;  /* Entry doesn't exist or other error */
+    }
+
+    /* Re-set with updated last_used - this refreshes the TTL */
+    return x3_lmdb_fingerprint_set(fingerprint, account, registered, now_time);
+}
+
+int x3_lmdb_fingerprint_delete(const char *fingerprint)
+{
+    MDB_txn *txn;
+    MDB_val mkey;
+    char keybuf[LMDB_KEY_BUFFER_SIZE];
+    int rc;
+
+    if (!x3_lmdb_is_available() || !fingerprint) {
+        return LMDB_ERROR;
+    }
+
+    /* Build key: "fp:<fingerprint>" */
+    snprintf(keybuf, sizeof(keybuf), "%s%s", LMDB_PREFIX_FINGERPRINT, fingerprint);
+
+    mkey.mv_size = strlen(keybuf) + 1;
+    mkey.mv_data = keybuf;
+
+    rc = mdb_txn_begin(lmdb_env, NULL, 0, &txn);
+    if (rc != 0) {
+        return LMDB_ERROR;
+    }
+
+    rc = mdb_del(txn, dbi_metadata, &mkey, NULL);
+    if (rc == MDB_NOTFOUND) {
+        mdb_txn_abort(txn);
+        return LMDB_NOT_FOUND;
+    } else if (rc != 0) {
+        mdb_txn_abort(txn);
+        return LMDB_ERROR;
+    }
+
+    rc = mdb_txn_commit(txn);
+    if (rc == 0) {
+        log_module(MAIN_LOG, LOG_DEBUG, "x3_lmdb: Deleted fingerprint %s", fingerprint);
+    }
+    return rc == 0 ? LMDB_SUCCESS : LMDB_ERROR;
+}
+
+int x3_lmdb_fingerprint_list_account(const char *account, struct lmdb_fingerprint_entry **entries_out)
+{
+    MDB_txn *txn;
+    MDB_cursor *cursor;
+    MDB_val mkey, mdata;
+    struct lmdb_fingerprint_entry *head = NULL, *tail = NULL, *entry;
+    int rc, count = 0;
+    const char *prefix = LMDB_PREFIX_FINGERPRINT;
+    size_t prefix_len = strlen(prefix);
+
+    if (!x3_lmdb_is_available() || !account || !entries_out) {
+        return LMDB_ERROR;
+    }
+
+    *entries_out = NULL;
+
+    rc = mdb_txn_begin(lmdb_env, NULL, MDB_RDONLY, &txn);
+    if (rc != 0) {
+        return LMDB_ERROR;
+    }
+
+    rc = mdb_cursor_open(txn, dbi_metadata, &cursor);
+    if (rc != 0) {
+        mdb_txn_abort(txn);
+        return LMDB_ERROR;
+    }
+
+    /* Iterate all fp: entries and filter by account */
+    mkey.mv_size = prefix_len;
+    mkey.mv_data = (void *)prefix;
+
+    rc = mdb_cursor_get(cursor, &mkey, &mdata, MDB_SET_RANGE);
+    while (rc == 0) {
+        const char *key = (const char *)mkey.mv_data;
+
+        /* Check if we're still in fp: prefix */
+        if (strncmp(key, prefix, prefix_len) != 0) {
+            break;
+        }
+
+        /* Parse value to check account */
+        const char *stored = (const char *)mdata.mv_data;
+        const char *data_start = stored;
+        time_t expires = 0, registered = 0, last_used = 0;
+
+        /* Check for TTL prefix */
+        if (stored[0] == 'T' && stored[1] == ':') {
+            const char *ts_end = strchr(stored + 2, ':');
+            if (ts_end) {
+                expires = (time_t)strtol(stored + 2, NULL, 10);
+                data_start = ts_end + 1;
+
+                /* Skip expired entries */
+                if (expires > 0 && expires <= time(NULL)) {
+                    rc = mdb_cursor_get(cursor, &mkey, &mdata, MDB_NEXT);
+                    continue;
+                }
+            }
+        }
+
+        /* Parse account:registered:last_used */
+        const char *colon1 = strchr(data_start, ':');
+        const char *colon2 = colon1 ? strchr(colon1 + 1, ':') : NULL;
+
+        char entry_account[64];
+        if (colon1) {
+            size_t len = colon1 - data_start;
+            if (len > 63) len = 63;
+            memcpy(entry_account, data_start, len);
+            entry_account[len] = '\0';
+            registered = (time_t)strtol(colon1 + 1, NULL, 10);
+            if (colon2) {
+                last_used = (time_t)strtol(colon2 + 1, NULL, 10);
+            }
+        } else {
+            /* Legacy format */
+            strncpy(entry_account, data_start, 63);
+            entry_account[63] = '\0';
+        }
+
+        /* Check if this fingerprint belongs to the requested account */
+        if (strcasecmp(entry_account, account) == 0) {
+            entry = malloc(sizeof(*entry));
+            if (entry) {
+                entry->fingerprint = strdup(key + prefix_len);
+                entry->account = strdup(entry_account);
+                entry->registered = registered;
+                entry->last_used = last_used;
+                entry->expires = expires;
+                entry->next = NULL;
+
+                if (tail) {
+                    tail->next = entry;
+                    tail = entry;
+                } else {
+                    head = tail = entry;
+                }
+                count++;
+            }
+        }
+
+        rc = mdb_cursor_get(cursor, &mkey, &mdata, MDB_NEXT);
+    }
+
+    mdb_cursor_close(cursor);
+    mdb_txn_abort(txn);
+
+    *entries_out = head;
+    return count;
+}
+
+void x3_lmdb_free_fingerprint_entries(struct lmdb_fingerprint_entry *entries)
+{
+    struct lmdb_fingerprint_entry *entry, *next;
+
+    for (entry = entries; entry; entry = next) {
+        next = entry->next;
+        free(entry->fingerprint);
+        free(entry->account);
+        free(entry);
+    }
+}
+
 /* ========== Module Registration ========== */
 
 static void lmdb_exit_handler(UNUSED_ARG(void *extra))
