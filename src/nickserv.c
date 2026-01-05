@@ -139,6 +139,18 @@
 #define KEY_KARMA "karma"
 #define KEY_FORCE_HANDLES_LOWERCASE "force_handles_lowercase"
 
+/* IRCv3 Metadata keys for user preferences (x3. namespace) */
+#define X3_METADATA_PREFIX "x3."
+#define X3_META_SCREEN_WIDTH "x3.screen_width"
+#define X3_META_TABLE_WIDTH "x3.table_width"
+#define X3_META_STYLE "x3.style"
+#define X3_META_ANNOUNCEMENTS "x3.announcements"
+#define X3_META_MAXLOGINS "x3.maxlogins"
+
+/* Preference metadata TTL: 90 days in seconds */
+#define X3_PREF_TTL_DAYS 90
+#define X3_PREF_TTL_SECS (X3_PREF_TTL_DAYS * 86400)
+
 #define KEY_LDAP_ENABLE "ldap_enable"
 
 #ifdef WITH_LDAP
@@ -553,6 +565,7 @@ static void nickserv_reclaim(struct userNode *user, struct nick_info *ni, enum r
 static void nickserv_reclaim_p(void *data);
 static int nickserv_addmask(struct userNode *user, struct handle_info *hi, const char *mask);
 static void nickserv_update_activity_lmdb(struct handle_info *hi, int update_lastseen, int update_last_present);
+static void nickserv_sync_preference_metadata(struct handle_info *hi, const char *key, const char *value);
 
 struct nickserv_config nickserv_conf;
 
@@ -3759,13 +3772,19 @@ static OPTION_FUNC(opt_info)
 
 static OPTION_FUNC(opt_width)
 {
-    if (argc > 1)
+    if (argc > 1) {
 	hi->screen_width = strtoul(argv[1], NULL, 0);
 
-    if ((hi->screen_width > 0) && (hi->screen_width < MIN_LINE_SIZE))
-        hi->screen_width = MIN_LINE_SIZE;
-    else if (hi->screen_width > MAX_LINE_SIZE)
-        hi->screen_width = MAX_LINE_SIZE;
+        if ((hi->screen_width > 0) && (hi->screen_width < MIN_LINE_SIZE))
+            hi->screen_width = MIN_LINE_SIZE;
+        else if (hi->screen_width > MAX_LINE_SIZE)
+            hi->screen_width = MAX_LINE_SIZE;
+
+        /* Sync to IRCv3 metadata */
+        char value_str[16];
+        snprintf(value_str, sizeof(value_str), "%u", hi->screen_width);
+        nickserv_sync_preference_metadata(hi, X3_META_SCREEN_WIDTH, value_str);
+    }
 
     if (!(noreply))
         reply("NSMSG_SET_WIDTH", hi->screen_width);
@@ -3774,13 +3793,19 @@ static OPTION_FUNC(opt_width)
 
 static OPTION_FUNC(opt_tablewidth)
 {
-    if (argc > 1)
+    if (argc > 1) {
 	hi->table_width = strtoul(argv[1], NULL, 0);
 
-    if ((hi->table_width > 0) && (hi->table_width < MIN_LINE_SIZE))
-        hi->table_width = MIN_LINE_SIZE;
-    else if (hi->screen_width > MAX_LINE_SIZE)
-        hi->table_width = MAX_LINE_SIZE;
+        if ((hi->table_width > 0) && (hi->table_width < MIN_LINE_SIZE))
+            hi->table_width = MIN_LINE_SIZE;
+        else if (hi->screen_width > MAX_LINE_SIZE)
+            hi->table_width = MAX_LINE_SIZE;
+
+        /* Sync to IRCv3 metadata */
+        char value_str[16];
+        snprintf(value_str, sizeof(value_str), "%u", hi->table_width);
+        nickserv_sync_preference_metadata(hi, X3_META_TABLE_WIDTH, value_str);
+    }
 
     if (!(noreply))
         reply("NSMSG_SET_TABLEWIDTH", hi->table_width);
@@ -3847,6 +3872,7 @@ static OPTION_FUNC(opt_autohide)
 static OPTION_FUNC(opt_style)
 {
     char *style;
+    int changed = 0;
 
     if (argc > 1) {
         if (!irccasecmp(argv[1], "Clean"))
@@ -3861,6 +3887,7 @@ static OPTION_FUNC(opt_style)
             reply("NSMSG_INVALID_STYLE", argv[1]);
             return 0;
         }
+        changed = 1;
     }
 
     switch (hi->userlist_style) {
@@ -3878,6 +3905,10 @@ static OPTION_FUNC(opt_style)
         style = "Normal";
     }
 
+    /* Sync to IRCv3 metadata if changed */
+    if (changed)
+        nickserv_sync_preference_metadata(hi, X3_META_STYLE, style);
+
     if (!(noreply))
         reply("NSMSG_SET_STYLE", style);
     return 1;
@@ -3886,19 +3917,25 @@ static OPTION_FUNC(opt_style)
 static OPTION_FUNC(opt_announcements)
 {
     const char *choice;
+    const char *metadata_value = NULL;
+    int changed = 0;
 
     if (argc > 1) {
-        if (enabled_string(argv[1]))
+        if (enabled_string(argv[1])) {
             hi->announcements = 'y';
-        else if (disabled_string(argv[1]))
+            metadata_value = "on";
+        } else if (disabled_string(argv[1])) {
             hi->announcements = 'n';
-        else if (!strcmp(argv[1], "?") || !irccasecmp(argv[1], "default"))
+            metadata_value = "off";
+        } else if (!strcmp(argv[1], "?") || !irccasecmp(argv[1], "default")) {
             hi->announcements = '?';
-        else {
+            metadata_value = "default";
+        } else {
             if (!(noreply))
                 reply("NSMSG_INVALID_ANNOUNCE", argv[1]);
             return 0;
         }
+        changed = 1;
     }
 
     switch (hi->announcements) {
@@ -3907,6 +3944,11 @@ static OPTION_FUNC(opt_announcements)
     case '?': choice = "default"; break;
     default: choice = "unknown"; break;
     }
+
+    /* Sync to IRCv3 metadata if changed */
+    if (changed && metadata_value)
+        nickserv_sync_preference_metadata(hi, X3_META_ANNOUNCEMENTS, metadata_value);
+
     if (!(noreply))
         reply("NSMSG_SET_ANNOUNCEMENTS", choice);
     return 1;
@@ -4027,6 +4069,7 @@ static OPTION_FUNC(opt_email)
 static OPTION_FUNC(opt_maxlogins)
 {
     unsigned char maxlogins;
+    int changed = 0;
     if (argc > 1) {
         maxlogins = strtoul(argv[1], NULL, 0);
         if ((maxlogins > nickserv_conf.hard_maxlogins) && !override) {
@@ -4035,8 +4078,17 @@ static OPTION_FUNC(opt_maxlogins)
             return 0;
         }
         hi->maxlogins = maxlogins;
+        changed = 1;
     }
     maxlogins = hi->maxlogins ? hi->maxlogins : nickserv_conf.default_maxlogins;
+
+    /* Sync to IRCv3 metadata if changed */
+    if (changed) {
+        char value_str[16];
+        snprintf(value_str, sizeof(value_str), "%u", (unsigned)maxlogins);
+        nickserv_sync_preference_metadata(hi, X3_META_MAXLOGINS, value_str);
+    }
+
     if (!(noreply))
         reply("NSMSG_SET_MAXLOGINS", maxlogins);
     return 1;
@@ -6606,6 +6658,100 @@ is_immutable_key(const char *key)
 }
 #endif /* WITH_LMDB */
 
+/**
+ * Handle x3.* preference metadata keys from IRCv3 METADATA SET.
+ * This validates the value and updates the handle_info struct.
+ *
+ * @param hi Handle info to update
+ * @param key The metadata key (must start with "x3.")
+ * @param value The value to set
+ * @return 0 on success, -1 on invalid key/value
+ */
+static int
+handle_x3_preference_metadata(struct handle_info *hi, const char *key, const char *value)
+{
+    if (!hi || !key || !value)
+        return -1;
+
+    /* x3.screen_width */
+    if (!strcmp(key, X3_META_SCREEN_WIDTH)) {
+        unsigned int width = strtoul(value, NULL, 0);
+        if (width > 0 && width < MIN_LINE_SIZE)
+            width = MIN_LINE_SIZE;
+        else if (width > MAX_LINE_SIZE)
+            width = MAX_LINE_SIZE;
+        hi->screen_width = width;
+        log_module(NS_LOG, LOG_DEBUG, "handle_x3_preference_metadata: Set %s screen_width=%u",
+                   hi->handle, width);
+        return 0;
+    }
+
+    /* x3.table_width */
+    if (!strcmp(key, X3_META_TABLE_WIDTH)) {
+        unsigned int width = strtoul(value, NULL, 0);
+        if (width > 0 && width < MIN_LINE_SIZE)
+            width = MIN_LINE_SIZE;
+        else if (width > MAX_LINE_SIZE)
+            width = MAX_LINE_SIZE;
+        hi->table_width = width;
+        log_module(NS_LOG, LOG_DEBUG, "handle_x3_preference_metadata: Set %s table_width=%u",
+                   hi->handle, width);
+        return 0;
+    }
+
+    /* x3.style */
+    if (!strcmp(key, X3_META_STYLE)) {
+        if (!irccasecmp(value, "Clean"))
+            hi->userlist_style = HI_STYLE_CLEAN;
+        else if (!irccasecmp(value, "Advanced"))
+            hi->userlist_style = HI_STYLE_ADVANCED;
+        else if (!irccasecmp(value, "Classic"))
+            hi->userlist_style = HI_STYLE_CLASSIC;
+        else if (!irccasecmp(value, "Normal"))
+            hi->userlist_style = HI_STYLE_NORMAL;
+        else {
+            log_module(NS_LOG, LOG_WARNING, "handle_x3_preference_metadata: Invalid style '%s' for %s",
+                       value, hi->handle);
+            return -1;
+        }
+        log_module(NS_LOG, LOG_DEBUG, "handle_x3_preference_metadata: Set %s style=%s",
+                   hi->handle, value);
+        return 0;
+    }
+
+    /* x3.announcements */
+    if (!strcmp(key, X3_META_ANNOUNCEMENTS)) {
+        if (!irccasecmp(value, "on") || !irccasecmp(value, "yes") || !strcmp(value, "1"))
+            hi->announcements = 'y';
+        else if (!irccasecmp(value, "off") || !irccasecmp(value, "no") || !strcmp(value, "0"))
+            hi->announcements = 'n';
+        else if (!irccasecmp(value, "default") || !strcmp(value, "?"))
+            hi->announcements = '?';
+        else {
+            log_module(NS_LOG, LOG_WARNING, "handle_x3_preference_metadata: Invalid announcements '%s' for %s",
+                       value, hi->handle);
+            return -1;
+        }
+        log_module(NS_LOG, LOG_DEBUG, "handle_x3_preference_metadata: Set %s announcements=%c",
+                   hi->handle, hi->announcements);
+        return 0;
+    }
+
+    /* x3.maxlogins */
+    if (!strcmp(key, X3_META_MAXLOGINS)) {
+        unsigned int maxlogins = strtoul(value, NULL, 0);
+        if (maxlogins > nickserv_conf.hard_maxlogins)
+            maxlogins = nickserv_conf.hard_maxlogins;
+        hi->maxlogins = maxlogins;
+        log_module(NS_LOG, LOG_DEBUG, "handle_x3_preference_metadata: Set %s maxlogins=%u",
+                   hi->handle, maxlogins);
+        return 0;
+    }
+
+    /* Unknown x3.* key */
+    return -1;
+}
+
 int
 nickserv_set_user_metadata(struct handle_info *hi, const char *key, const char *value, int visibility)
 {
@@ -6615,6 +6761,19 @@ nickserv_set_user_metadata(struct handle_info *hi, const char *key, const char *
 
     if (!hi || !key)
         return -1;
+
+    /* Handle x3.* preference metadata keys specially.
+     * These update the handle_info struct and use 90-day TTL.
+     */
+    if (strncmp(key, X3_METADATA_PREFIX, strlen(X3_METADATA_PREFIX)) == 0) {
+        if (value && *value) {
+            if (handle_x3_preference_metadata(hi, key, value) == 0) {
+                /* x3.* preferences are always private */
+                visibility = METADATA_VIS_PRIVATE;
+            }
+            /* Continue to store in LMDB/Keycloak even if struct update failed */
+        }
+    }
 
     /* Encode visibility in stored value: P:value for private, value for public */
     if (value && *value) {
@@ -6638,12 +6797,18 @@ nickserv_set_user_metadata(struct handle_info *hi, const char *key, const char *
     /* Step 1: Write to LMDB cache */
     if (x3_lmdb_is_available()) {
         int rc;
+        int is_x3_pref = (strncmp(key, X3_METADATA_PREFIX, strlen(X3_METADATA_PREFIX)) == 0);
 
         if (value && *value) {
             /* Determine expiry time based on TTL settings */
             time_t expires = 0;
-            if (nickserv_conf.metadata_ttl_enabled && !is_immutable_key(key)) {
-                expires = now + nickserv_conf.metadata_default_ttl;
+            if (!is_immutable_key(key)) {
+                if (is_x3_pref) {
+                    /* x3.* preference keys use 90-day TTL */
+                    expires = now + X3_PREF_TTL_SECS;
+                } else if (nickserv_conf.metadata_ttl_enabled) {
+                    expires = now + nickserv_conf.metadata_default_ttl;
+                }
             }
             rc = x3_lmdb_account_set_ex(hi->handle, key, stored_value, expires);
         } else {
@@ -6654,7 +6819,7 @@ nickserv_set_user_metadata(struct handle_info *hi, const char *key, const char *
             lmdb_ok = 1;
             log_module(NS_LOG, LOG_DEBUG, "nickserv_set_user_metadata: LMDB cache set %s.%s = %s (vis=%d, ttl=%s)",
                        hi->handle, key, value ? value : "(deleted)", visibility,
-                       is_immutable_key(key) ? "immutable" : "default");
+                       is_immutable_key(key) ? "immutable" : (is_x3_pref ? "90d" : "default"));
         } else {
             log_module(NS_LOG, LOG_WARNING, "nickserv_set_user_metadata: LMDB cache failed for %s.%s",
                        hi->handle, key);
@@ -6866,6 +7031,54 @@ nickserv_update_activity_lmdb(struct handle_info *hi, int update_lastseen, int u
     (void)update_lastseen;
     (void)update_last_present;
 #endif
+}
+
+/**
+ * Sync a user preference to IRCv3 metadata.
+ * This writes to LMDB with 90-day TTL and pushes to Nefarious for online users.
+ *
+ * User preferences use the x3. namespace and are PRIVATE visibility.
+ * TTL is refreshed whenever the preference is modified.
+ *
+ * @param hi Handle info for the user
+ * @param key Metadata key (should be x3.screen_width, x3.style, etc.)
+ * @param value The preference value as a string
+ */
+static void
+nickserv_sync_preference_metadata(struct handle_info *hi, const char *key, const char *value)
+{
+    if (!hi || !key)
+        return;
+
+#ifdef WITH_LMDB
+    if (x3_lmdb_is_available()) {
+        char stored_value[256];
+        time_t expires;
+
+        /* Preferences are private - prefix with P: */
+        snprintf(stored_value, sizeof(stored_value), "P:%s", value ? value : "");
+
+        /* Calculate 90-day TTL expiry */
+        expires = now + X3_PREF_TTL_SECS;
+
+        int rc = x3_lmdb_account_set_ex(hi->handle, key, stored_value, expires);
+        if (rc == LMDB_SUCCESS) {
+            log_module(NS_LOG, LOG_DEBUG, "nickserv_sync_preference_metadata: Stored %s.%s = %s (ttl=%dd)",
+                       hi->handle, key, value ? value : "(empty)", X3_PREF_TTL_DAYS);
+        } else {
+            log_module(NS_LOG, LOG_WARNING, "nickserv_sync_preference_metadata: LMDB failed for %s.%s (rc=%d)",
+                       hi->handle, key, rc);
+        }
+    }
+#endif
+
+    /* Push to Nefarious for online users */
+    struct userNode *user;
+    for (user = hi->users; user; user = user->next_authed) {
+        irc_metadata(user->nick, key, value, METADATA_VIS_PRIVATE);
+        log_module(NS_LOG, LOG_DEBUG, "nickserv_sync_preference_metadata: Pushed %s to IRCd for %s",
+                   key, user->nick);
+    }
 }
 
 void

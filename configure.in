@@ -518,6 +518,11 @@ fi
 )
 AC_MSG_RESULT($LIBS)
 
+dnl Check for libcrypt (for bcrypt/crypt())
+AC_CHECK_LIB(crypt, crypt,
+[
+LIBS="-lcrypt $LIBS"
+])
 
 dnl ldap checking
 withval=''
