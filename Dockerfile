@@ -23,12 +23,13 @@ WORKDIR  /x3/x3src
 # configure script already regenerated with LMDB support - no autogen.sh needed
 # Enable SSL for encrypted uplink connections to IRCd
 # Disable glibc C23 features to avoid __isoc23_strtol linker errors on Debian 12
-ENV CFLAGS="-D__USE_ISOC23=0"
+ENV CFLAGS="-D__USE_ISOC23=0 -g -O1"
+ENV CPPFLAGS="-D__USE_ISOC23=0"
 # Re-enable all modules - using Valgrind instead of ASAN (no memory overhead)
-RUN ./configure --prefix=/x3 --enable-modules=snoop,memoserv,helpserv --with-keycloak --with-lmdb --with-ssl
+RUN ./configure --prefix=/x3 --enable-modules=snoop,memoserv,helpserv --with-keycloak --with-lmdb --with-ssl CFLAGS="-D__USE_ISOC23=0 -g -O1" CPPFLAGS="-D__USE_ISOC23=0"
 
 # Build with debug symbols for Valgrind (no ASAN - causes mmap failures)
-RUN make CFLAGS="-D__USE_ISOC23=0 -g -O1"
+RUN make
 RUN make install
 WORKDIR /x3
 
@@ -48,7 +49,7 @@ USER x3
 # Run entrypoint (volume permissions fixed by init container in docker-compose)
 ENTRYPOINT ["/dockerentrypoint.sh"]
 
-# Memory fixes verified with Valgrind (0 errors) - running without for now
-# Valgrind was causing SIGTERM issues in Docker/WSL
-CMD ["/x3/x3", "-f", "-d"]
+# Run with Valgrind for memory testing (logs to x3cores mount for easy access)
+# %n = sequence number for unique filenames per run (starts at 0)
+CMD ["valgrind", "--leak-check=full", "--show-leak-kinds=all", "--track-origins=yes", "--log-file=/x3/cores/valgrind.%n.log", "/x3/x3", "-f", "-d"]
 

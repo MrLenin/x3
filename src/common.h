@@ -197,7 +197,10 @@ unsigned long ParseInterval(const char *interval);
 unsigned long ParseVolume(const char *volume);
 
 #define MD5_CRYPT_LENGTH 42
-/* buffer[] must be at least MD5_CRYPT_LENGTH bytes long */
+/* PASSWD_LEN: max length for password hashes (PBKDF2-SHA512 needs ~120 chars) */
+#define PASSWD_LEN 256
+/* buffer[] must be at least MD5_CRYPT_LENGTH bytes long (legacy) */
+/* For new code, use PASSWD_LEN instead */
 const char *cryptpass(const char *pass, char buffer[]);
 int checkpass(const char *pass, const char *crypt);
 

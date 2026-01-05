@@ -25,6 +25,7 @@
 #include "global.h"
 #include "modcmd.h"
 #include "opserv.h" /* for gag_create(), opserv_bad_channel() */
+#include "password.h"
 #include "proto.h"  /* for irc_metadata() */
 #include "saxdb.h"
 #include "mail.h"
@@ -183,6 +184,12 @@
 #define KEY_METADATA_COMPRESS_THRESHOLD "metadata_compress_threshold"
 #define KEY_METADATA_COMPRESS_LEVEL     "metadata_compress_level"
 
+/* Password hashing configuration keys */
+#define KEY_PASSWORD_ALGORITHM       "password_algorithm"
+#define KEY_PASSWORD_PBKDF2_ITERATIONS "password_pbkdf2_iterations"
+#define KEY_PASSWORD_BCRYPT_COST     "password_bcrypt_cost"
+#define KEY_PASSWORD_LAZY_MIGRATION  "password_lazy_migration"
+
 /* Default immutable keys (space-separated) that never expire */
 #define DEFAULT_IMMUTABLE_KEYS "avatar pronouns bot homepage"
 
@@ -239,6 +246,7 @@ static int kc_ensure_token(void);
 static int kc_check_auth(const char *handle, const char *password);
 static int kc_get_user_info(const char *handle, char **email_out);
 static int kc_do_add(const char *handle, const char *password, const char *email);
+static int kc_do_add_with_hash(const char *handle, const char *hash, const char *email);
 static int kc_do_modify(const char *handle, const char *password, const char *email);
 static int kc_delete_account(const char *handle);
 static int kc_do_oslevel(const char *handle, int level, int oldlevel);
@@ -249,6 +257,34 @@ static int kc_check_email_verified(const char *handle, int *verified_out);
 static int kc_try_auto_activate(struct handle_info *hi);
 static struct handle_info *loc_auth_oauth(const char *bearer_token, const char *username_hint, const char *hostmask);
 #endif
+
+/*
+ * Password verification with lazy migration.
+ * Verifies password and upgrades hash format if needed.
+ * Returns 1 on success (password matches), 0 on failure.
+ */
+static int
+checkpass_migrate(const char *password, struct handle_info *hi)
+{
+    int result;
+
+    /* Use the new password module for verification */
+    result = pw_verify(password, hi->passwd);
+    if (result != 1)
+        return 0;
+
+    /* Password verified - check if we need to upgrade the hash */
+    if (pw_config.enable_lazy_migration && pw_needs_rehash(hi->passwd)) {
+        char new_hash[PASSWD_LEN];
+        if (pw_hash(password, new_hash, sizeof(new_hash)) == 0) {
+            /* Successfully created new hash, update the account */
+            strcpy(hi->passwd, new_hash);
+            log_module(NS_LOG, LOG_INFO, "Upgraded password hash for account %s", hi->handle);
+        }
+    }
+
+    return 1;
+}
 
 static const struct message_entry msgtab[] = {
     { "NSMSG_NO_ANGLEBRACKETS", "The < and > in help indicate that that word is a required parameter, but DO NOT actually type them in messages to me." },
@@ -1265,7 +1301,7 @@ nickserv_register(struct userNode *user, struct userNode *settee, const char *ha
 {
     struct handle_info *hi;
     struct nick_info *ni;
-    char crypted[MD5_CRYPT_LENGTH] = "";
+    char crypted[PASSWD_LEN] = "";
 
     if ((hi = dict_find(nickserv_handle_dict, handle, NULL))) {
         if(user)
@@ -1285,7 +1321,7 @@ nickserv_register(struct userNode *user, struct userNode *settee, const char *ha
         if (!is_secure_password(handle, passwd, user))
             return 0;
 
-        cryptpass(passwd, crypted);
+        pw_cryptpass(passwd, crypted);
     }
 #ifdef WITH_LDAP
     if(nickserv_conf.ldap_enable && nickserv_conf.ldap_admin_dn) {
@@ -1298,21 +1334,8 @@ nickserv_register(struct userNode *user, struct userNode *settee, const char *ha
         }
     }
 #endif
-#ifdef WITH_KEYCLOAK
-    if (nickserv_conf.keycloak_enable) {
-        int rc;
-        /* Unlike LDAP, we always set the password immediately for Keycloak.
-         * Reason: Cookie activation only has the hashed password, but Keycloak
-         * needs plaintext to do its own hashing. X3 cookie verification still
-         * enforces email verification before allowing IRC authentication. */
-        rc = kc_do_add(handle, passwd, NULL);
-        if (rc != KC_SUCCESS && rc != KC_USER_EXISTS) {
-            if (user)
-                send_message(user, nickserv, "NSMSG_LDAP_FAIL", "keycloak error");
-            return 0;
-        }
-    }
-#endif
+    /* Note: Keycloak user creation is deferred to cookie activation (ACTIVATION case)
+     * to match the non-Keycloak flow where password isn't set until activation. */
     hi = register_handle(handle, crypted, 0);
     hi->masks = alloc_string_list(1);
     hi->sslfps = alloc_string_list(1);
@@ -1520,7 +1543,7 @@ static NICKSERV_FUNC(cmd_register)
     irc_in_addr_t ip;
     struct handle_info *hi;
     const char *email_addr, *password;
-    char syncpass[MD5_CRYPT_LENGTH];
+    char syncpass[PASSWD_LEN];
     int no_auth, weblink;
 
     if (checkDefCon(DEFCON_NO_NEW_NICKS) && !IsOper(user)) {
@@ -1662,7 +1685,7 @@ static NICKSERV_FUNC(cmd_register)
     user->modes |= FLAGS_REGISTERING; 
 
     if (nickserv_conf.sync_log) {
-      cryptpass(password, syncpass);
+      pw_cryptpass(password, syncpass);
       /*
       * An 0 is only sent if theres no email address. Thios should only happen if email functions are
        * disabled which they wont be for us. Email Required MUST be set on if you are using this.
@@ -2432,7 +2455,7 @@ struct handle_info *loc_auth(char *sslfp, char *handle, char *password, char *us
 #else
     if (password && *password) {
 #endif
-        if (checkpass(password, hi->passwd))
+        if (checkpass_migrate(password, hi))
             auth++;
     }
     
@@ -2856,10 +2879,10 @@ static NICKSERV_FUNC(cmd_auth)
 #ifdef WITH_LDAP
         if (nickserv_conf.ldap_enable && ldap_result == LDAP_INVALID_CREDENTIALS)
             password_invalid = 1;
-        else if (!nickserv_conf.ldap_enable && !checkpass(passwd, hi->passwd))
+        else if (!nickserv_conf.ldap_enable && !checkpass_migrate(passwd, hi))
             password_invalid = 1;
 #else
-        if (!checkpass(passwd, hi->passwd))
+        if (!checkpass_migrate(passwd, hi))
             password_invalid = 1;
 #endif
 
@@ -2917,8 +2940,9 @@ static NICKSERV_FUNC(cmd_auth)
         reply("NSMSG_PLEASE_SET_EMAIL");
     if (!sslfpauth && !is_secure_password(hi->handle, passwd, NULL))
         reply("NSMSG_WEAK_PASSWORD");
-    if (!sslfpauth && (hi->passwd[0] != '$'))
-        cryptpass(passwd, hi->passwd);
+    /* Upgrade legacy password hash if needed (for LDAP/Keycloak auth paths) */
+    if (!sslfpauth && pw_needs_rehash(hi->passwd))
+        pw_cryptpass(passwd, hi->passwd);
 
    /* If a channel was waiting for this user to auth, 
     * finish adding them */
@@ -3122,7 +3146,7 @@ static NICKSERV_FUNC(cmd_odelcookie)
 static NICKSERV_FUNC(cmd_resetpass)
 {
     struct handle_info *hi;
-    char crypted[MD5_CRYPT_LENGTH];
+    char crypted[PASSWD_LEN];
     int weblink;
 
     NICKSERV_MIN_PARMS(3);
@@ -3149,7 +3173,7 @@ static NICKSERV_FUNC(cmd_resetpass)
         reply("MSG_SET_EMAIL_ADDR");
         return 0;
     }
-    cryptpass(argv[2], crypted);
+    pw_cryptpass(argv[2], crypted);
     argv[2] = "****";
     nickserv_make_cookie(user, hi, PASSWORD_CHANGE, crypted, weblink);
     return 1;
@@ -3208,17 +3232,24 @@ static NICKSERV_FUNC(cmd_cookie)
             }
         }
 #endif
-        /* Note: Keycloak password was already set during registration (we need
-         * plaintext which is only available then, not the hash stored in cookie) */
+#ifdef WITH_KEYCLOAK
+        /* Create Keycloak user with password hash at activation time.
+         * This matches the non-Keycloak flow where password isn't set until
+         * activation, preventing authentication before email verification. */
+        if (nickserv_conf.keycloak_enable) {
+            int rc = kc_do_add_with_hash(hi->handle, hi->cookie->data, hi->email_addr);
+            if (rc != KC_SUCCESS && rc != KC_USER_EXISTS) {
+                reply("NSMSG_LDAP_FAIL", "keycloak error");
+                return 0;
+            }
+        }
+#endif
+        /* Apply the password hash from cookie */
         safestrncpy(hi->passwd, hi->cookie->data, sizeof(hi->passwd));
         set_user_handle_info(user, hi, 1);
         reply("NSMSG_HANDLE_ACTIVATED");
         if (nickserv_conf.sync_log)
           SyncLog("ACCOUNTACC %s", hi->handle);
-#ifdef WITH_KEYCLOAK
-        /* Sync email verification to Keycloak (fire-and-forget) */
-        kc_sync_email_verified(hi->handle, 1);
-#endif
         break;
     case PASSWORD_CHANGE:
 #ifdef WITH_LDAP
@@ -3379,12 +3410,12 @@ static NICKSERV_FUNC(cmd_pass)
         }
     } else
 #endif
-    if (!checkpass(old_pass, hi->passwd)) {
+    if (!checkpass_migrate(old_pass, hi)) {
         argv[1] = "BADPASS";
 	reply("NSMSG_PASSWORD_INVALID");
 	return 0;
     }
-    cryptpass(new_pass, crypted);
+    pw_cryptpass(new_pass, crypted);
 #ifdef WITH_LDAP
     if(nickserv_conf.ldap_enable && nickserv_conf.ldap_admin_dn) {
         int rc;
@@ -3881,7 +3912,7 @@ static OPTION_FUNC(opt_password)
 	return 0;
     }
 
-    cryptpass(argv[1], crypted);
+    pw_cryptpass(argv[1], crypted);
 #ifdef WITH_LDAP
     if(nickserv_conf.ldap_enable && nickserv_conf.ldap_admin_dn) {
         int rc;
@@ -4479,7 +4510,7 @@ static NICKSERV_FUNC(cmd_unregister)
     hi = user->handle_info;
     passwd = argv[1];
     argv[1] = "****";
-    if (checkpass(passwd, hi->passwd)) {
+    if (checkpass_migrate(passwd, hi)) {
         if(nickserv_unregister_handle(hi, user, cmd->parent->bot))
             return 1;
         else
@@ -5285,7 +5316,7 @@ static MODCMD_FUNC(cmd_checkpass)
         reply("MSG_HANDLE_UNKNOWN", argv[1]);
         return 0;
     }
-    if (checkpass(argv[2], hi->passwd))
+    if (checkpass_migrate(argv[2], hi))
         reply("CHECKPASS_YES");
     else
         reply("CHECKPASS_NO");
@@ -5740,6 +5771,34 @@ kc_do_add(const char *handle, const char *password, const char *email)
 
     return keycloak_create_user(kc_realm_config, kc_client_config,
                                 handle, email ? email : "", password);
+}
+
+/* Create user in Keycloak with pre-hashed PBKDF2 password (credential import) */
+static int
+kc_do_add_with_hash(const char *handle, const char *hash, const char *email)
+{
+    char cred_data[256];
+    char secret_data[512];
+
+    if (kc_ensure_token() != KC_SUCCESS) {
+        return KC_ERROR;
+    }
+
+    /* Convert X3 hash to Keycloak credential import format */
+    if (pw_export_keycloak(hash, cred_data, sizeof(cred_data),
+                           secret_data, sizeof(secret_data)) != 0) {
+        /* Hash format not exportable (e.g., MD5 or bcrypt) */
+        log_module(NS_LOG, LOG_WARNING,
+                   "kc_do_add_with_hash: Hash format not exportable for %s, falling back to no password",
+                   handle);
+        /* Create user without password - they'll need to reset it */
+        return keycloak_create_user(kc_realm_config, kc_client_config,
+                                    handle, email ? email : "", "");
+    }
+
+    return keycloak_create_user_with_hash(kc_realm_config, kc_client_config,
+                                          handle, email ? email : "",
+                                          cred_data, secret_data);
 }
 
 /* Modify user password and/or email in Keycloak */
@@ -7448,6 +7507,37 @@ nickserv_conf_read(void)
                x3_compress_get_threshold(), x3_compress_get_level());
 #endif
 
+    /* Password hashing configuration */
+    str = database_get_data(conf_node, KEY_PASSWORD_ALGORITHM, RECDB_QSTRING);
+    nickserv_conf.password_algorithm = str ? str : "pbkdf2-sha256";
+
+    str = database_get_data(conf_node, KEY_PASSWORD_PBKDF2_ITERATIONS, RECDB_QSTRING);
+    nickserv_conf.password_pbkdf2_iterations = str ? strtoul(str, NULL, 0) : 100000;
+
+    str = database_get_data(conf_node, KEY_PASSWORD_BCRYPT_COST, RECDB_QSTRING);
+    nickserv_conf.password_bcrypt_cost = str ? strtoul(str, NULL, 0) : 12;
+
+    str = database_get_data(conf_node, KEY_PASSWORD_LAZY_MIGRATION, RECDB_QSTRING);
+    nickserv_conf.password_lazy_migration = str ? !disabled_string(str) : 1;  /* Enabled by default */
+
+    /* Apply password config to password module */
+    pw_config.pbkdf2_iterations = nickserv_conf.password_pbkdf2_iterations;
+    pw_config.bcrypt_cost = nickserv_conf.password_bcrypt_cost;
+    pw_config.enable_lazy_migration = nickserv_conf.password_lazy_migration;
+
+    /* Set default algorithm based on config */
+    if (strcasecmp(nickserv_conf.password_algorithm, "pbkdf2-sha512") == 0) {
+        pw_config.default_algorithm = PW_ALG_PBKDF2_SHA512;
+    } else if (strcasecmp(nickserv_conf.password_algorithm, "bcrypt") == 0) {
+        pw_config.default_algorithm = PW_ALG_BCRYPT;
+    } else {
+        pw_config.default_algorithm = PW_ALG_PBKDF2_SHA256;  /* Default */
+    }
+
+    log_module(NS_LOG, LOG_INFO, "Password hashing: algorithm=%s, iterations=%lu, bcrypt_cost=%u, lazy_migration=%s",
+               nickserv_conf.password_algorithm, nickserv_conf.password_pbkdf2_iterations,
+               nickserv_conf.password_bcrypt_cost, nickserv_conf.password_lazy_migration ? "yes" : "no");
+
     /* Schedule timers after config is loaded (not at init time when values are 0).
      * These only run once - the timer callbacks reschedule themselves. */
     if (nickserv_conf.handle_expire_frequency && !expire_handles_timer_set) {
@@ -7691,7 +7781,7 @@ struct RegSession {
     char uid[128];                /* server!fd.cookie identifier */
     char account[NICKSERV_HANDLE_LEN + 1];
     char email[256];
-    char password_hash[MD5_CRYPT_LENGTH];  /* Hashed password for X3 account */
+    char password_hash[PASSWD_LEN];  /* Hashed password for X3 account */
     char result_msg[256];         /* Error/status message */
     time_t created;
     enum reg_state state;
@@ -8011,7 +8101,7 @@ nickserv_ircv3_register_p10(const char *uid, const char *handle,
 {
     struct RegSession *session;
     struct handle_info_list *hil;
-    char crypted[MD5_CRYPT_LENGTH] = "";
+    char crypted[PASSWD_LEN] = "";
     int email_required;
     int use_email;
     const char *actual_handle;
@@ -8087,7 +8177,7 @@ nickserv_ircv3_register_p10(const char *uid, const char *handle,
     }
 
     /* Hash the password */
-    cryptpass(password, crypted);
+    pw_cryptpass(password, crypted);
 
     /* Create registration session */
     session = reg_get_session(uid);
@@ -9580,7 +9670,7 @@ nickserv_ircv3_register(struct userNode *user, const char *handle,
 {
     struct handle_info *hi;
     struct handle_info_list *hil;
-    char crypted[MD5_CRYPT_LENGTH] = "";
+    char crypted[PASSWD_LEN] = "";
     int email_required;
     int use_email;
     const char *actual_handle;
@@ -9674,7 +9764,7 @@ nickserv_ircv3_register(struct userNode *user, const char *handle,
     }
 
     /* Hash the password */
-    cryptpass(password, crypted);
+    pw_cryptpass(password, crypted);
 
 #ifdef WITH_LDAP
     if (nickserv_conf.ldap_enable && nickserv_conf.ldap_admin_dn) {

@@ -41,6 +41,7 @@
 #endif
 
 #include "x3_ssl.h"
+#include "password.h"
 
 #ifdef HAVE_GETOPT_H
 #include <getopt.h>
@@ -263,6 +264,7 @@ int main(int argc, char *argv[])
     gline_init();
     shun_init();
     mail_init();
+    pw_init();
     helpfile_init();
     conf_globals(); /* initializes the core services */
     conf_rlimits();

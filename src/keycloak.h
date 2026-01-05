@@ -126,6 +126,23 @@ int keycloak_get_user(struct kc_realm realm, struct kc_client client, const char
 int keycloak_create_user(struct kc_realm realm, struct kc_client client, const char* username, const char* email, const char* passwd);
 
 /**
+ * Creates a new user in Keycloak with a pre-hashed PBKDF2 password.
+ * Uses Keycloak's credential import format to avoid sending plaintext passwords.
+ * The hash must be generated using pw_export_keycloak() from password.c.
+ *
+ * @param realm       Keycloak realm configuration
+ * @param client      Client with admin access token
+ * @param username    New user's username (must not be NULL)
+ * @param email       New user's email (can be empty string)
+ * @param cred_data   credentialData JSON from pw_export_keycloak()
+ * @param secret_data secretData JSON from pw_export_keycloak()
+ * @return KC_SUCCESS on creation, KC_USER_EXISTS if user already exists, KC_ERROR on other failures
+ */
+int keycloak_create_user_with_hash(struct kc_realm realm, struct kc_client client,
+                                   const char* username, const char* email,
+                                   const char* cred_data, const char* secret_data);
+
+/**
  * Frees only the internal fields of a kc_user structure (not the struct itself)
  * Use this for stack-allocated kc_user structs
  * @param user      Pointer to user (can be NULL)

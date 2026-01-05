@@ -74,6 +74,7 @@ x3_SOURCES = \
 	md5.c md5.h \
 	modcmd.c modcmd.h \
 	modules.c modules.h \
+	password.c password.h \
 	keycloak.c keycloak.h \
 	nickserv.c nickserv.h \
 	x3_lmdb.h \

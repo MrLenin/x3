@@ -117,7 +117,7 @@ struct handle_info {
     unsigned char userlist_style;
     unsigned char announcements;
     unsigned char maxlogins;
-    char passwd[MD5_CRYPT_LENGTH+1];
+    char passwd[PASSWD_LEN];
     char last_quit_host[USERLEN+HOSTLEN+2];
 };
 
@@ -235,6 +235,11 @@ struct nickserv_config {
     unsigned long metadata_default_ttl;     // Default TTL in seconds (2592000 = 30 days)
     unsigned long metadata_purge_frequency; // Purge interval in seconds (3600 = hourly)
     const char *metadata_immutable_keys;    // Space-separated keys that never expire
+    /* Password hashing configuration */
+    const char *password_algorithm;         // "pbkdf2-sha256", "pbkdf2-sha512", "bcrypt"
+    unsigned long password_pbkdf2_iterations; // PBKDF2 iterations (default: 100000)
+    unsigned int password_bcrypt_cost;      // bcrypt cost factor (default: 12)
+    unsigned int password_lazy_migration;   // Rehash legacy passwords on login (default: 1)
 };
 
 void init_nickserv(const char *nick);

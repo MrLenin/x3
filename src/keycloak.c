@@ -65,6 +65,8 @@ static int jwt_parse_claims(const char *payload_b64, struct kc_token_info *info)
 
 /* Forward declaration for JSON helpers used by async functions */
 static char* json_build_user_representation(const char *username, const char *email, const char *passwd);
+static char* json_build_user_with_hash(const char *username, const char *email,
+                                       const char *cred_data, const char *secret_data);
 
 /* Forward declaration for exit handler */
 static void keycloak_exit_handler(void *extra);
@@ -2808,6 +2810,57 @@ static char* json_build_user_representation(const char *username, const char *em
     return result;
 }
 
+/**
+ * Build user JSON representation with pre-hashed password for credential import.
+ * Uses Keycloak's credential import format instead of plaintext password.
+ *
+ * @param username    Username for the new user
+ * @param email       Email address (can be empty string)
+ * @param cred_data   JSON string for credentialData (algorithm, iterations)
+ * @param secret_data JSON string for secretData (hash value, salt)
+ * @return Allocated JSON string or NULL on failure
+ */
+static char* json_build_user_with_hash(const char *username, const char *email,
+                                       const char *cred_data, const char *secret_data)
+{
+    if (!username || !email || !cred_data || !secret_data) {
+        log_module(KC_LOG, LOG_DEBUG, "json_build_user_with_hash: Invalid arguments");
+        return NULL;
+    }
+
+    char* result = NULL;
+
+    json_t* user_obj = json_object();
+    json_t* creds = json_array();
+    json_t* cred = json_object();
+
+    /* Build user object */
+    json_object_set_new(user_obj, "username", json_string(username));
+    json_object_set_new(user_obj, "email", json_string(email));
+    json_object_set_new(user_obj, "enabled", json_true());
+
+    /* Build credential with pre-hashed password (credential import format) */
+    json_object_set_new(cred, "type", json_string("password"));
+
+    /* credentialData and secretData must be JSON strings containing JSON */
+    json_object_set_new(cred, "credentialData", json_string(cred_data));
+    json_object_set_new(cred, "secretData", json_string(secret_data));
+    json_object_set_new(cred, "temporary", json_false());
+
+    json_array_append_new(creds, cred);
+    json_object_set_new(user_obj, "credentials", creds);
+
+    result = json_dumps(user_obj, JSON_COMPACT);
+
+    if (!result) {
+        log_module(KC_LOG, LOG_DEBUG, "json_build_user_with_hash: json_dumps failed");
+    }
+
+    json_decref(user_obj);
+
+    return result;
+}
+
 
 int keycloak_get_client_token(struct kc_realm realm, struct kc_client client, struct access_token** access_token)
 {
@@ -3049,6 +3102,75 @@ int keycloak_create_user(struct kc_realm realm, struct kc_client client, const c
         result = KC_USER_EXISTS;
     } else {
         log_module(KC_LOG, LOG_DEBUG, "keycloak_create_user: Failed with HTTP %ld: %s",
+            http_code, chunk.response ? chunk.response : "no response");
+    }
+
+cleanup:
+    if (chunk.response) {
+        memset(chunk.response, 0, chunk.size);
+        free(chunk.response);
+    }
+    if (user_repr) {
+        memset(user_repr, 0, strlen(user_repr));
+        free(user_repr);
+    }
+    free(uri);
+
+    return result;
+}
+
+/**
+ * Create a user in Keycloak with a pre-hashed PBKDF2 password.
+ * Uses Keycloak's credential import format to avoid sending plaintext.
+ *
+ * @param realm       Keycloak realm configuration
+ * @param client      Client with admin access token
+ * @param username    New user's username
+ * @param email       New user's email (can be empty string)
+ * @param cred_data   credentialData JSON string from pw_export_keycloak()
+ * @param secret_data secretData JSON string from pw_export_keycloak()
+ * @return KC_SUCCESS, KC_USER_EXISTS, or KC_ERROR
+ */
+int keycloak_create_user_with_hash(struct kc_realm realm, struct kc_client client,
+                                   const char* username, const char* email,
+                                   const char* cred_data, const char* secret_data)
+{
+    if (!realm.base_uri || !realm.realm || !client.access_token ||
+        !username || !email || !cred_data || !secret_data) {
+        log_module(KC_LOG, LOG_DEBUG, "keycloak_create_user_with_hash: Invalid arguments");
+        return KC_ERROR;
+    }
+
+    int result = KC_ERROR;
+    char *uri = kc_build_users_endpoint(realm);
+    char *user_repr = NULL;
+    struct memory chunk = {0};
+
+    if (!uri) {
+        log_module(KC_LOG, LOG_DEBUG, "keycloak_create_user_with_hash: Failed to build uri");
+        goto cleanup;
+    }
+
+    user_repr = json_build_user_with_hash(username, email, cred_data, secret_data);
+    if (!user_repr) {
+        log_module(KC_LOG, LOG_DEBUG, "keycloak_create_user_with_hash: Failed to build user representation");
+        goto cleanup;
+    }
+
+    log_module(KC_LOG, LOG_DEBUG, "keycloak_create_user_with_hash: Creating user %s with pre-hashed password",
+               username);
+
+    long http_code = curl_perform_json(uri, HTTP_POST, user_repr,
+                                        client.access_token->access_token, &chunk);
+
+    if (http_code == 201) {
+        result = KC_SUCCESS;
+        log_module(KC_LOG, LOG_DEBUG, "keycloak_create_user_with_hash: User created successfully (HTTP 201)");
+    } else if (http_code == 409) {
+        log_module(KC_LOG, LOG_DEBUG, "keycloak_create_user_with_hash: User already exists (HTTP 409)");
+        result = KC_USER_EXISTS;
+    } else {
+        log_module(KC_LOG, LOG_DEBUG, "keycloak_create_user_with_hash: Failed with HTTP %ld: %s",
             http_code, chunk.response ? chunk.response : "no response");
     }
 
