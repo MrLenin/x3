@@ -1725,6 +1725,192 @@ void x3_lmdb_free_chanaccess_entries(struct lmdb_chanaccess_entry *entries)
     }
 }
 
+/* ========== Activity Data (lastseen/last_present) ========== */
+
+int x3_lmdb_activity_get(const char *account, time_t *lastseen_out, time_t *last_present_out)
+{
+    MDB_txn *txn;
+    MDB_val mkey, mdata;
+    char keybuf[LMDB_KEY_BUFFER_SIZE];
+    int rc;
+    time_t expires = 0;
+
+    if (!x3_lmdb_is_available() || !account) {
+        return LMDB_ERROR;
+    }
+
+    /* Build key: "activity:<account>" */
+    snprintf(keybuf, sizeof(keybuf), "%s%s", LMDB_PREFIX_ACTIVITY, account);
+
+    mkey.mv_size = strlen(keybuf) + 1;
+    mkey.mv_data = keybuf;
+
+    rc = mdb_txn_begin(lmdb_env, NULL, MDB_RDONLY, &txn);
+    if (rc != 0) {
+        return LMDB_ERROR;
+    }
+
+    rc = mdb_get(txn, dbi_metadata, &mkey, &mdata);
+    mdb_txn_abort(txn);
+
+    if (rc == MDB_NOTFOUND) {
+        return LMDB_NOT_FOUND;
+    } else if (rc != 0) {
+        return LMDB_ERROR;
+    }
+
+    /* Parse stored value - format: "T:<expiry>:<lastseen>:<last_present>" or "<lastseen>:<last_present>" */
+    const char *stored = (const char *)mdata.mv_data;
+    const char *data_start = stored;
+
+    /* Check for TTL prefix */
+    if (stored[0] == 'T' && stored[1] == ':') {
+        const char *ts_end = strchr(stored + 2, ':');
+        if (ts_end) {
+            expires = (time_t)strtol(stored + 2, NULL, 10);
+            data_start = ts_end + 1;
+
+            /* Check if expired */
+            if (expires > 0 && expires <= time(NULL)) {
+                /* Auto-delete expired entry */
+                x3_lmdb_activity_delete(account);
+                return LMDB_EXPIRED;
+            }
+        }
+    }
+
+    /* Parse lastseen:last_present */
+    if (lastseen_out) {
+        *lastseen_out = (time_t)strtol(data_start, NULL, 10);
+    }
+    if (last_present_out) {
+        const char *colon = strchr(data_start, ':');
+        if (colon) {
+            *last_present_out = (time_t)strtol(colon + 1, NULL, 10);
+        } else {
+            *last_present_out = 0;
+        }
+    }
+
+    return LMDB_SUCCESS;
+}
+
+int x3_lmdb_activity_set(const char *account, time_t lastseen, time_t last_present)
+{
+    MDB_txn *txn;
+    MDB_val mkey, mdata;
+    char keybuf[LMDB_KEY_BUFFER_SIZE];
+    char valuebuf[128];
+    time_t existing_lastseen = 0, existing_last_present = 0;
+    time_t expires;
+    int rc;
+
+    if (!x3_lmdb_is_available() || !account) {
+        return LMDB_ERROR;
+    }
+
+    /* If either timestamp is 0, try to preserve existing value */
+    if (lastseen == 0 || last_present == 0) {
+        if (x3_lmdb_activity_get(account, &existing_lastseen, &existing_last_present) == LMDB_SUCCESS) {
+            if (lastseen == 0) {
+                lastseen = existing_lastseen;
+            }
+            if (last_present == 0) {
+                last_present = existing_last_present;
+            }
+        }
+    }
+
+    /* Build key: "activity:<account>" */
+    snprintf(keybuf, sizeof(keybuf), "%s%s", LMDB_PREFIX_ACTIVITY, account);
+
+    mkey.mv_size = strlen(keybuf) + 1;
+    mkey.mv_data = keybuf;
+
+    /* Calculate expiry (30 days from now) */
+    expires = time(NULL) + LMDB_ACTIVITY_TTL_SECS;
+
+    /* Build value: "T:<expiry>:<lastseen>:<last_present>" */
+    snprintf(valuebuf, sizeof(valuebuf), "T:%ld:%ld:%ld",
+             (long)expires, (long)lastseen, (long)last_present);
+
+    mdata.mv_size = strlen(valuebuf) + 1;
+    mdata.mv_data = valuebuf;
+
+    rc = mdb_txn_begin(lmdb_env, NULL, 0, &txn);
+    if (rc != 0) {
+        return LMDB_ERROR;
+    }
+
+    rc = mdb_put(txn, dbi_metadata, &mkey, &mdata, 0);
+    if (rc != 0) {
+        mdb_txn_abort(txn);
+        return LMDB_ERROR;
+    }
+
+    rc = mdb_txn_commit(txn);
+    if (rc == 0) {
+        log_module(MAIN_LOG, LOG_DEBUG, "x3_lmdb: Set activity for %s: lastseen=%ld, last_present=%ld, expires=%ld",
+                   account, (long)lastseen, (long)last_present, (long)expires);
+    }
+
+    return rc == 0 ? LMDB_SUCCESS : LMDB_ERROR;
+}
+
+int x3_lmdb_activity_touch(const char *account)
+{
+    time_t lastseen = 0, last_present = 0;
+    int rc;
+
+    if (!x3_lmdb_is_available() || !account) {
+        return LMDB_ERROR;
+    }
+
+    /* Get current values */
+    rc = x3_lmdb_activity_get(account, &lastseen, &last_present);
+    if (rc != LMDB_SUCCESS) {
+        return rc;  /* Entry doesn't exist or other error */
+    }
+
+    /* Re-set with same values - this refreshes the TTL */
+    return x3_lmdb_activity_set(account, lastseen, last_present);
+}
+
+int x3_lmdb_activity_delete(const char *account)
+{
+    MDB_txn *txn;
+    MDB_val mkey;
+    char keybuf[LMDB_KEY_BUFFER_SIZE];
+    int rc;
+
+    if (!x3_lmdb_is_available() || !account) {
+        return LMDB_ERROR;
+    }
+
+    /* Build key: "activity:<account>" */
+    snprintf(keybuf, sizeof(keybuf), "%s%s", LMDB_PREFIX_ACTIVITY, account);
+
+    mkey.mv_size = strlen(keybuf) + 1;
+    mkey.mv_data = keybuf;
+
+    rc = mdb_txn_begin(lmdb_env, NULL, 0, &txn);
+    if (rc != 0) {
+        return LMDB_ERROR;
+    }
+
+    rc = mdb_del(txn, dbi_metadata, &mkey, NULL);
+    if (rc == MDB_NOTFOUND) {
+        mdb_txn_abort(txn);
+        return LMDB_NOT_FOUND;
+    } else if (rc != 0) {
+        mdb_txn_abort(txn);
+        return LMDB_ERROR;
+    }
+
+    rc = mdb_txn_commit(txn);
+    return rc == 0 ? LMDB_SUCCESS : LMDB_ERROR;
+}
+
 /* ========== Module Registration ========== */
 
 static void lmdb_exit_handler(UNUSED_ARG(void *extra))

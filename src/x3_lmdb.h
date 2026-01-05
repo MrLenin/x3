@@ -345,6 +345,48 @@ int x3_lmdb_chanaccess_clear(const char *channel);
  */
 void x3_lmdb_free_chanaccess_entries(struct lmdb_chanaccess_entry *entries);
 
+/* ========== Activity Data (lastseen/last_present) ========== */
+
+/* Key prefix for activity data */
+#define LMDB_PREFIX_ACTIVITY "activity:"
+
+/* Default TTL for activity data (30 days in seconds) */
+#define LMDB_ACTIVITY_TTL_DAYS 30
+#define LMDB_ACTIVITY_TTL_SECS (LMDB_ACTIVITY_TTL_DAYS * 86400)
+
+/**
+ * Get activity data for an account
+ * @param account Account name
+ * @param lastseen_out Output for lastseen timestamp (can be NULL)
+ * @param last_present_out Output for last_present timestamp (can be NULL)
+ * @return LMDB_SUCCESS on success, LMDB_NOT_FOUND if not found, LMDB_EXPIRED if expired, LMDB_ERROR on failure
+ */
+int x3_lmdb_activity_get(const char *account, time_t *lastseen_out, time_t *last_present_out);
+
+/**
+ * Set activity data for an account (with automatic 30-day TTL)
+ * @param account Account name
+ * @param lastseen Lastseen timestamp (0 to preserve existing value)
+ * @param last_present Last_present timestamp (0 to preserve existing value)
+ * @return LMDB_SUCCESS on success, LMDB_ERROR on failure
+ */
+int x3_lmdb_activity_set(const char *account, time_t lastseen, time_t last_present);
+
+/**
+ * Refresh TTL on activity data without changing values
+ * Called when account performs any action to keep data from expiring
+ * @param account Account name
+ * @return LMDB_SUCCESS on success, LMDB_NOT_FOUND if no entry exists, LMDB_ERROR on failure
+ */
+int x3_lmdb_activity_touch(const char *account);
+
+/**
+ * Delete activity data for an account
+ * @param account Account name
+ * @return LMDB_SUCCESS on success, LMDB_NOT_FOUND if not found, LMDB_ERROR on failure
+ */
+int x3_lmdb_activity_delete(const char *account);
+
 /* ========== Generic Key-Value Operations ========== */
 
 /**
@@ -439,6 +481,10 @@ void init_x3_lmdb(void);
 #define x3_lmdb_chanaccess_list_account(a, e) (-1)
 #define x3_lmdb_chanaccess_clear(c)     (-1)
 #define x3_lmdb_free_chanaccess_entries(e) do {} while(0)
+#define x3_lmdb_activity_get(a, l, p)   (-2)
+#define x3_lmdb_activity_set(a, l, p)   (-1)
+#define x3_lmdb_activity_touch(a)       (-2)
+#define x3_lmdb_activity_delete(a)      (-2)
 #define x3_lmdb_free_entries(e)         do {} while(0)
 #define x3_lmdb_sync(f)                 (0)
 #define x3_lmdb_stats(d, e, s)          (-1)

@@ -552,6 +552,7 @@ static const struct message_entry msgtab[] = {
 static void nickserv_reclaim(struct userNode *user, struct nick_info *ni, enum reclaim_action action);
 static void nickserv_reclaim_p(void *data);
 static int nickserv_addmask(struct userNode *user, struct handle_info *hi, const char *mask);
+static void nickserv_update_activity_lmdb(struct handle_info *hi, int update_lastseen, int update_last_present);
 
 struct nickserv_config nickserv_conf;
 
@@ -1214,6 +1215,8 @@ set_user_handle_info(struct userNode *user, struct handle_info *hi, int stamp)
             HANDLE_CLEAR_FLAG(user->handle_info, HELPING);
         /* record them as being last seen at this time */
 	user->handle_info->lastseen = now;
+        /* Also update LMDB (dual-write during migration) */
+        nickserv_update_activity_lmdb(user->handle_info, 1, 0);
         if ((ni = get_nick_info(user->nick)))
             ni->lastseen = now;
         /* and record their hostmask */
@@ -1242,6 +1245,8 @@ set_user_handle_info(struct userNode *user, struct handle_info *hi, int stamp)
 	user->next_authed = hi->users;
 	hi->users = user;
 	hi->lastseen = now;
+        /* Also update LMDB (dual-write during migration) */
+        nickserv_update_activity_lmdb(hi, 1, 0);
         /* Add to helpers list */
         if (IsHelper(user) && !userList_contains(&curr_helpers, user))
             userList_append(&curr_helpers, user);
@@ -1274,6 +1279,13 @@ set_user_handle_info(struct userNode *user, struct handle_info *hi, int stamp)
 
             /* Sync any stored metadata from Keycloak to the IRCd */
             nickserv_sync_metadata_to_ircd(user);
+
+            /* Sync $last_present to Nefarious if available */
+            if (hi->last_present > 0) {
+                char timestamp_str[32];
+                snprintf(timestamp_str, sizeof(timestamp_str), "%ld", (long)hi->last_present);
+                irc_metadata(hi->handle, "$last_present", timestamp_str, METADATA_VIS_PUBLIC);
+            }
         }
 
         /* Stop trying to kick this user off their nick */
@@ -5524,6 +5536,35 @@ nickserv_db_read_handle(char *handle, dict_t obj)
         else
             nickserv_free_cookie(cookie);
     }
+
+    /* LMDB Activity Migration: sync activity data between SAXDB and LMDB */
+#ifdef WITH_LMDB
+    if (x3_lmdb_is_available()) {
+        time_t lmdb_lastseen = 0, lmdb_last_present = 0;
+        int rc = x3_lmdb_activity_get(hi->handle, &lmdb_lastseen, &lmdb_last_present);
+
+        if (rc == LMDB_SUCCESS) {
+            /* LMDB has activity data - use fresher values */
+            if (lmdb_lastseen > hi->lastseen) {
+                log_module(NS_LOG, LOG_DEBUG, "nickserv: Loading fresher lastseen from LMDB for %s: %ld > %ld",
+                           hi->handle, (long)lmdb_lastseen, (long)hi->lastseen);
+                hi->lastseen = lmdb_lastseen;
+            }
+            if (lmdb_last_present > hi->last_present) {
+                log_module(NS_LOG, LOG_DEBUG, "nickserv: Loading fresher last_present from LMDB for %s: %ld > %ld",
+                           hi->handle, (long)lmdb_last_present, (long)hi->last_present);
+                hi->last_present = lmdb_last_present;
+            }
+        } else if (rc == LMDB_NOT_FOUND || rc == LMDB_EXPIRED) {
+            /* LMDB doesn't have activity data - migrate from SAXDB */
+            if (hi->lastseen > 0 || hi->last_present > 0) {
+                x3_lmdb_activity_set(hi->handle, hi->lastseen, hi->last_present);
+                log_module(NS_LOG, LOG_DEBUG, "nickserv: Migrated activity to LMDB for %s: lastseen=%ld, last_present=%ld",
+                           hi->handle, (long)hi->lastseen, (long)hi->last_present);
+            }
+        }
+    }
+#endif
 }
 
 static int
@@ -6793,6 +6834,40 @@ nickserv_get_user_metadata(struct handle_info *hi, const char *key, char *value_
     return 1; /* Not found - no backend */
 }
 
+/**
+ * Update activity data (lastseen/last_present) in LMDB.
+ * This is a dual-write: data is stored both in the struct (for SAXDB)
+ * and in LMDB (for fast access and TTL management).
+ *
+ * @param hi Handle info to update
+ * @param update_lastseen If true, update lastseen to current time
+ * @param update_last_present If true, update last_present to current time
+ */
+static void
+nickserv_update_activity_lmdb(struct handle_info *hi, int update_lastseen, int update_last_present)
+{
+#ifdef WITH_LMDB
+    if (!hi || !x3_lmdb_is_available())
+        return;
+
+    time_t lastseen_val = update_lastseen ? now : 0;
+    time_t last_present_val = update_last_present ? now : 0;
+
+    /* If only updating one field, passing 0 tells LMDB to preserve existing value */
+    int rc = x3_lmdb_activity_set(hi->handle, lastseen_val, last_present_val);
+    if (rc == LMDB_SUCCESS) {
+        log_module(NS_LOG, LOG_DEBUG, "nickserv: Updated LMDB activity for %s (lastseen=%s, last_present=%s)",
+                   hi->handle,
+                   update_lastseen ? "updated" : "preserved",
+                   update_last_present ? "updated" : "preserved");
+    }
+#else
+    (void)hi;
+    (void)update_lastseen;
+    (void)update_last_present;
+#endif
+}
+
 void
 nickserv_sync_metadata_to_ircd(struct userNode *user)
 {
@@ -7141,8 +7216,16 @@ handle_is_present(struct handle_info *hi)
 void
 handle_update_last_present(struct handle_info *hi)
 {
-    if (hi)
+    if (hi) {
         hi->last_present = now;
+        /* Also update LMDB (dual-write during migration) */
+        nickserv_update_activity_lmdb(hi, 0, 1);
+
+        /* Sync to Nefarious via metadata - clients can query $last_present */
+        char timestamp_str[32];
+        snprintf(timestamp_str, sizeof(timestamp_str), "%ld", (long)now);
+        irc_metadata(hi->handle, "$last_present", timestamp_str, METADATA_VIS_PUBLIC);
+    }
 }
 
 static void
