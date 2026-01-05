@@ -3493,6 +3493,84 @@ cleanup:
     return result;
 }
 
+int keycloak_set_user_attribute_array(struct kc_realm realm, struct kc_client client,
+                                      const char* user_id, const char* attr_name,
+                                      const char** values, size_t value_count)
+{
+    if (!realm.base_uri || !realm.realm || !client.access_token ||
+        !user_id || !attr_name) {
+        log_module(KC_LOG, LOG_DEBUG, "keycloak_set_user_attribute_array: Invalid arguments");
+        return KC_ERROR;
+    }
+
+    int result = KC_ERROR;
+    char *uri = NULL;
+    char *json_body = NULL;
+    struct memory chunk = {0};
+
+    uri = kc_build_user_endpoint(realm, user_id);
+    if (!uri) {
+        log_module(KC_LOG, LOG_DEBUG, "keycloak_set_user_attribute_array: Failed to allocate uri");
+        goto cleanup;
+    }
+
+    /* Build JSON: { "attributes": { "attr_name": ["val1", "val2", ...] } } */
+    json_t* user_obj = json_object();
+    json_t* attrs = json_object();
+    json_t* values_arr = json_array();
+
+    for (size_t i = 0; i < value_count; i++) {
+        if (values[i]) {
+            json_array_append_new(values_arr, json_string(values[i]));
+        }
+    }
+
+    json_object_set_new(attrs, attr_name, values_arr);
+    json_object_set_new(user_obj, "attributes", attrs);
+    json_body = json_dumps(user_obj, JSON_COMPACT);
+    json_decref(user_obj);
+
+    if (!json_body) {
+        log_module(KC_LOG, LOG_DEBUG, "keycloak_set_user_attribute_array: Failed to build JSON");
+        goto cleanup;
+    }
+
+    struct curl_opts opts = CURL_OPTS_INIT;
+    opts.uri = uri;
+    opts.method = HTTP_PUT;
+    opts.post_fields = json_body;
+    opts.xoauth2_bearer = client.access_token->access_token;
+    opts.header_list[0] = "Content-Type: application/json";
+    opts.header_count = 1;
+
+    long http_code = curl_perform(opts, &chunk);
+
+    if (http_code == 204) {
+        log_module(KC_LOG, LOG_DEBUG, "keycloak_set_user_attribute_array: Attribute set (HTTP 204)");
+        result = KC_SUCCESS;
+    } else if (http_code == 404) {
+        log_module(KC_LOG, LOG_DEBUG, "keycloak_set_user_attribute_array: User not found (HTTP 404)");
+        result = KC_NOT_FOUND;
+    } else {
+        log_module(KC_LOG, LOG_DEBUG, "keycloak_set_user_attribute_array: Failed with HTTP %ld: %s",
+            http_code, chunk.response ? chunk.response : "no response");
+    }
+
+cleanup:
+    if (chunk.response) {
+        memset(chunk.response, 0, chunk.size);
+        free(chunk.response);
+    }
+    if (json_body) {
+        free(json_body);
+    }
+    if (uri) {
+        free(uri);
+    }
+
+    return result;
+}
+
 int keycloak_get_user_attribute(struct kc_realm realm, struct kc_client client,
                                 const char* user_id, const char* attr_name,
                                 char** value_out)

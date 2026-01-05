@@ -206,6 +206,20 @@ int keycloak_set_user_attribute(struct kc_realm realm, struct kc_client client,
                                 const char* attr_value);
 
 /**
+ * Sets a custom attribute on a Keycloak user with multiple values (array)
+ * @param realm       Keycloak realm configuration
+ * @param client      Client with admin access token
+ * @param user_id     User's Keycloak ID (UUID)
+ * @param attr_name   Attribute name (e.g., "x509_fingerprints")
+ * @param values      Array of attribute values
+ * @param value_count Number of values in the array
+ * @return KC_SUCCESS on success, KC_NOT_FOUND if user doesn't exist, KC_ERROR on failure
+ */
+int keycloak_set_user_attribute_array(struct kc_realm realm, struct kc_client client,
+                                      const char* user_id, const char* attr_name,
+                                      const char** values, size_t value_count);
+
+/**
  * Gets a custom attribute from a Keycloak user
  * @param realm      Keycloak realm configuration
  * @param client     Client with admin access token

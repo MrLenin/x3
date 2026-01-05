@@ -265,6 +265,7 @@ static int kc_do_oslevel(const char *handle, int level, int oldlevel);
 static int kc_add2group(const char *handle, const char *group);
 static int kc_delfromgroup(const char *handle, const char *group);
 static void kc_sync_email_verified(const char *handle, int verified);
+static void kc_sync_fingerprints(struct handle_info *hi);
 static int kc_check_email_verified(const char *handle, int *verified_out);
 static int kc_try_auto_activate(struct handle_info *hi);
 static struct handle_info *loc_auth_oauth(const char *bearer_token, const char *username_hint, const char *hostmask);
@@ -3566,6 +3567,11 @@ nickserv_addsslfp(struct userNode *user, struct handle_info *hi, const char *ssl
     x3_lmdb_fingerprint_set(new_sslfp, hi->handle, now, now);
 #endif
 
+#ifdef WITH_KEYCLOAK
+    /* Sync fingerprints to Keycloak */
+    kc_sync_fingerprints(hi);
+#endif
+
     send_message(user, nickserv, "NSMSG_ADDSSLFP_SUCCESS", new_sslfp);
     return 1;
 }
@@ -3603,6 +3609,11 @@ nickserv_delsslfp(struct svccmd *cmd, struct userNode *user, struct handle_info 
 #ifdef WITH_LMDB
             /* Remove fingerprint from LMDB */
             x3_lmdb_fingerprint_delete(old_sslfp);
+#endif
+
+#ifdef WITH_KEYCLOAK
+            /* Sync fingerprints to Keycloak (now with one fewer) */
+            kc_sync_fingerprints(hi);
 #endif
 
             reply("NSMSG_DELSSLFP_SUCCESS", old_sslfp);
@@ -6056,6 +6067,71 @@ kc_sync_email_verified(const char *handle, int verified)
         log_module(NS_LOG, LOG_WARNING, "kc_sync_email_verified: Failed to start async sync for %s", handle);
     }
 
+    free(user_id);
+}
+
+/**
+ * Sync all fingerprints for an account to Keycloak.
+ * Updates the x509_fingerprints attribute with all fingerprints from hi->sslfps.
+ * Fire-and-forget operation - errors are logged but not returned.
+ *
+ * @param hi  Handle info for the account
+ */
+static void
+kc_sync_fingerprints(struct handle_info *hi)
+{
+    if (!nickserv_conf.keycloak_enable || !hi) {
+        return;
+    }
+
+    if (kc_ensure_token() != KC_SUCCESS) {
+        log_module(NS_LOG, LOG_DEBUG, "kc_sync_fingerprints: Failed to get admin token");
+        return;
+    }
+
+    /* Get user ID from Keycloak */
+    struct kc_user user;
+    int rc = keycloak_get_user(kc_realm_config, kc_client_config, hi->handle, &user);
+    if (rc != KC_SUCCESS) {
+        log_module(NS_LOG, LOG_DEBUG, "kc_sync_fingerprints: User %s not found in Keycloak", hi->handle);
+        return;
+    }
+
+    char *user_id = strdup(user.id);
+    keycloak_user_free_fields(&user);
+
+    if (!user_id) {
+        return;
+    }
+
+    /* Build array of fingerprints */
+    const char **fingerprints = NULL;
+    size_t fp_count = 0;
+
+    if (hi->sslfps && hi->sslfps->used > 0) {
+        fingerprints = malloc(sizeof(char*) * hi->sslfps->used);
+        if (fingerprints) {
+            for (unsigned int i = 0; i < hi->sslfps->used; i++) {
+                fingerprints[i] = hi->sslfps->list[i];
+            }
+            fp_count = hi->sslfps->used;
+        }
+    }
+
+    /* Sync to Keycloak */
+    rc = keycloak_set_user_attribute_array(kc_realm_config, kc_client_config,
+                                           user_id, "x509_fingerprints",
+                                           fingerprints, fp_count);
+
+    if (rc == KC_SUCCESS) {
+        log_module(NS_LOG, LOG_DEBUG, "kc_sync_fingerprints: Synced %zu fingerprints for %s",
+                   fp_count, hi->handle);
+    } else {
+        log_module(NS_LOG, LOG_WARNING, "kc_sync_fingerprints: Failed to sync fingerprints for %s: %d",
+                   hi->handle, rc);
+    }
+
+    free(fingerprints);
     free(user_id);
 }
 
