@@ -236,5 +236,6 @@ int trace_check_bans(struct userNode *user, struct chanNode *chan);
 int chanserv_set_channel_metadata(struct chanData *cData, const char *key, const char *value, int visibility);
 int chanserv_get_channel_metadata(struct chanData *cData, const char *key, char *value_out, int *visibility_out);
 void chanserv_sync_metadata_to_ircd(struct chanData *cData);
+void chanserv_sync_x3_metadata(struct chanData *cData, int sync_immutable);
 
 #endif

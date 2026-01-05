@@ -75,7 +75,7 @@ extern struct nickserv_config nickserv_conf;
 #define KEY_CHANNEL_METADATA_TTL_ENABLED "channel_metadata_ttl_enabled"
 #define KEY_CHANNEL_METADATA_DEFAULT_TTL "channel_metadata_default_ttl"
 #define KEY_CHANNEL_IMMUTABLE_KEYS  "channel_immutable_keys"
-#define DEFAULT_CHANNEL_IMMUTABLE_KEYS "url website rules description"
+#define DEFAULT_CHANNEL_IMMUTABLE_KEYS "url website rules description x3.registered x3.founder"
 #define KEY_NODELETE_LEVEL          "nodelete_level"
 #define KEY_MAX_USERINFO_LENGTH     "max_userinfo_length"
 #define KEY_GIVEOWNERSHIP_PERIOD    "giveownership_timeout"
@@ -154,6 +154,19 @@ extern struct nickserv_config nickserv_conf;
 #define KEY_TRIGGERED               "triggered"
 
 #define KEY_GOD_TIMEOUT             "god_timeout"
+
+/* X3 Channel Metadata Keys - exposed via IRCv3 METADATA */
+#define X3_CHAN_META_PREFIX         "x3."
+#define X3_CHAN_META_GREETING       "x3.greeting"
+#define X3_CHAN_META_USER_GREETING  "x3.user_greeting"
+#define X3_CHAN_META_TOPIC_MASK     "x3.topic_mask"
+#define X3_CHAN_META_MODES          "x3.modes"
+#define X3_CHAN_META_REGISTERED     "x3.registered"
+#define X3_CHAN_META_FOUNDER        "x3.founder"
+
+/* TTL for mutable channel metadata (90 days) */
+#define X3_CHAN_META_TTL_DAYS       90
+#define X3_CHAN_META_TTL_SECS       (X3_CHAN_META_TTL_DAYS * 86400)
 
 #define CHANNEL_DEFAULT_FLAGS   (CHANNEL_OFFCHANNEL | CHANNEL_UNREVIEWED)
 #define CHANNEL_PRESERVED_FLAGS (CHANNEL_UNREVIEWED)
@@ -1785,6 +1798,7 @@ expire_ban(void *data) /* lamer.. */
 }
 
 static void chanserv_expire_suspension(void *data);
+void chanserv_sync_x3_metadata(struct chanData *cData, int sync_immutable);
 
 static void
 unregister_channel(struct chanData *channel, const char *reason)
@@ -2723,6 +2737,9 @@ static CHANSERV_FUNC(cmd_register)
     /* Push owner access to Keycloak when channel is registered */
     chanserv_push_keycloak_access(channel->name, handle->handle, UL_OWNER);
 #endif
+
+    /* Sync X3 channel settings as IRCv3 metadata (including immutable keys on registration) */
+    chanserv_sync_x3_metadata(cData, 1);
 
     sprintf(reason, "%s registered to %s by %s.", channel->name, handle->handle, user->handle_info->handle);
     global_message_args(MESSAGE_RECIPIENT_OPERS | MESSAGE_RECIPIENT_HELPERS, "CSMSG_REGISTERED_TO", channel->name, 
@@ -6734,6 +6751,10 @@ static MODCMD_FUNC(chan_opt_topicmask)
             else if(!match_ircglob(cData->topic, cData->topic_mask))
                 reply("CSMSG_TOPIC_MISMATCH", channel->name);
         }
+
+        /* Sync topic_mask as x3.topic_mask metadata */
+        chanserv_set_channel_metadata(cData, X3_CHAN_META_TOPIC_MASK,
+                                      cData->topic_mask, METADATA_VIS_PUBLIC);
     }
 
     if(channel->channel_info->topic_mask)
@@ -6776,12 +6797,24 @@ int opt_greeting_common(struct userNode *user, struct svccmd *cmd, int argc, cha
 
 static MODCMD_FUNC(chan_opt_greeting)
 {
-    return opt_greeting_common(user, cmd, argc, argv, "CSMSG_SET_GREETING", &channel->channel_info->greeting);
+    int result = opt_greeting_common(user, cmd, argc, argv, "CSMSG_SET_GREETING", &channel->channel_info->greeting);
+    if (result && argc > 1) {
+        /* Sync greeting as x3.greeting metadata */
+        chanserv_set_channel_metadata(channel->channel_info, X3_CHAN_META_GREETING,
+                                      channel->channel_info->greeting, METADATA_VIS_PUBLIC);
+    }
+    return result;
 }
 
 static MODCMD_FUNC(chan_opt_usergreeting)
 {
-    return opt_greeting_common(user, cmd, argc, argv, "CSMSG_SET_USERGREETING", &channel->channel_info->user_greeting);
+    int result = opt_greeting_common(user, cmd, argc, argv, "CSMSG_SET_USERGREETING", &channel->channel_info->user_greeting);
+    if (result && argc > 1) {
+        /* Sync user_greeting as x3.user_greeting metadata */
+        chanserv_set_channel_metadata(channel->channel_info, X3_CHAN_META_USER_GREETING,
+                                      channel->channel_info->user_greeting, METADATA_VIS_PUBLIC);
+    }
+    return result;
 }
 
 static MODCMD_FUNC(chan_opt_maxsetinfo)
@@ -6837,6 +6870,11 @@ static MODCMD_FUNC(chan_opt_modes)
             modcmd_chanmode_announce(new_modes);
             mod_chanmode_free(new_modes);
         }
+
+        /* Sync modes as x3.modes metadata */
+        mod_chanmode_format(&channel->channel_info->modes, modes);
+        chanserv_set_channel_metadata(channel->channel_info, X3_CHAN_META_MODES,
+                                      modes[0] ? modes : NULL, METADATA_VIS_PUBLIC);
     }
 
     mod_chanmode_format(&channel->channel_info->modes, modes);
@@ -9827,6 +9865,9 @@ chanserv_channel_read(const char *key, struct record_data *hir)
         }
     }
 
+    /* Sync X3 channel settings as IRCv3 metadata (includes immutable keys on load) */
+    chanserv_sync_x3_metadata(cData, 1);
+
     return 0;
 }
 
@@ -10366,6 +10407,69 @@ chanserv_sync_metadata_to_ircd(struct chanData *cData)
         }
     }
 #endif
+}
+
+/**
+ * Sync X3 channel settings as IRCv3 metadata.
+ * Pushes x3.registered, x3.founder, x3.greeting, x3.user_greeting, x3.topic_mask, x3.modes
+ * @param cData The channel data to sync
+ * @param sync_immutable If true, sync immutable keys (registered, founder) as well
+ */
+void
+chanserv_sync_x3_metadata(struct chanData *cData, int sync_immutable)
+{
+    char buf[512];
+
+    if (!cData || !cData->channel)
+        return;
+
+    log_module(CS_LOG, LOG_DEBUG, "chanserv_sync_x3_metadata: Syncing x3.* metadata for %s (immutable=%d)",
+               cData->channel->name, sync_immutable);
+
+    if (sync_immutable) {
+        /* x3.registered - channel registration timestamp (immutable, no TTL) */
+        snprintf(buf, sizeof(buf), "%lu", (unsigned long)cData->registered);
+        chanserv_set_channel_metadata(cData, X3_CHAN_META_REGISTERED, buf, METADATA_VIS_PUBLIC);
+
+        /* x3.founder - channel founder/registrar (immutable, no TTL) */
+        if (cData->registrar && *cData->registrar) {
+            chanserv_set_channel_metadata(cData, X3_CHAN_META_FOUNDER, cData->registrar, METADATA_VIS_PUBLIC);
+        }
+    }
+
+    /* x3.greeting - channel greeting (mutable, with TTL) */
+    if (cData->greeting && *cData->greeting) {
+        chanserv_set_channel_metadata(cData, X3_CHAN_META_GREETING, cData->greeting, METADATA_VIS_PUBLIC);
+    } else {
+        /* Clear if not set */
+        chanserv_set_channel_metadata(cData, X3_CHAN_META_GREETING, NULL, METADATA_VIS_PUBLIC);
+    }
+
+    /* x3.user_greeting - per-user greeting (mutable, with TTL) */
+    if (cData->user_greeting && *cData->user_greeting) {
+        chanserv_set_channel_metadata(cData, X3_CHAN_META_USER_GREETING, cData->user_greeting, METADATA_VIS_PUBLIC);
+    } else {
+        chanserv_set_channel_metadata(cData, X3_CHAN_META_USER_GREETING, NULL, METADATA_VIS_PUBLIC);
+    }
+
+    /* x3.topic_mask - topic mask (mutable, with TTL) */
+    if (cData->topic_mask && *cData->topic_mask) {
+        chanserv_set_channel_metadata(cData, X3_CHAN_META_TOPIC_MASK, cData->topic_mask, METADATA_VIS_PUBLIC);
+    } else {
+        chanserv_set_channel_metadata(cData, X3_CHAN_META_TOPIC_MASK, NULL, METADATA_VIS_PUBLIC);
+    }
+
+    /* x3.modes - enforced channel modes (mutable, with TTL) */
+    if (cData->modes.modes_set || cData->modes.modes_clear) {
+        mod_chanmode_format(&cData->modes, buf);
+        if (buf[0]) {
+            chanserv_set_channel_metadata(cData, X3_CHAN_META_MODES, buf, METADATA_VIS_PUBLIC);
+        } else {
+            chanserv_set_channel_metadata(cData, X3_CHAN_META_MODES, NULL, METADATA_VIS_PUBLIC);
+        }
+    } else {
+        chanserv_set_channel_metadata(cData, X3_CHAN_META_MODES, NULL, METADATA_VIS_PUBLIC);
+    }
 }
 
 /* ========== Keycloak Channel Access Sync ========== */
