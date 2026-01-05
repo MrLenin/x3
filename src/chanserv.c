@@ -971,16 +971,33 @@ _GetChannelUser(struct chanData *channel, struct handle_info *handle, int overri
 
     head = &(channel->users);
 
-    /* LMDB fallback: Check Keycloak-synced access if not found in SAXDB */
+    /* X3 is authoritative for channel state. Keycloak/LMDB is the storage backend.
+     * Only use LMDB to import users that exist in Keycloak but not yet in X3
+     * (e.g., admin added user via Keycloak UI before they connected to IRC).
+     */
     if(!uData && handle->handle && x3_lmdb_is_available()) {
         unsigned short lmdb_access;
-        int rc = x3_lmdb_chanaccess_get(channel->channel->name, handle->handle, &lmdb_access);
+        time_t lmdb_timestamp;
+        int rc = x3_lmdb_chanaccess_get_ex(channel->channel->name, handle->handle,
+                                           &lmdb_access, &lmdb_timestamp);
         if(rc == LMDB_SUCCESS && lmdb_access > 0) {
-            /* Found in LMDB - create a userData entry */
-            uData = add_channel_user(channel, handle, lmdb_access, now, NULL, 0);
-            if(uData) {
-                /* Mark as LMDB-sourced so we know it came from Keycloak sync */
-                /* The entry is now in channel->users and will be found on next lookup */
+            /* Check if cache entry is stale (older than sync_frequency * 2) */
+            int is_stale = 0;
+            if(chanserv_conf.keycloak_sync_frequency > 0 && lmdb_timestamp > 0) {
+                time_t age = now - lmdb_timestamp;
+                time_t max_age = chanserv_conf.keycloak_sync_frequency * 2;
+                if(age > max_age) {
+                    is_stale = 1;
+                    log_module(CS_LOG, LOG_DEBUG, "GetChannelUser: %s/%s LMDB cache stale (age=%ld, max=%ld)",
+                               channel->channel->name, handle->handle, (long)age, (long)max_age);
+                }
+            }
+
+            if(!is_stale) {
+                /* User not in X3 but found in LMDB - import from Keycloak storage */
+                uData = add_channel_user(channel, handle, lmdb_access, now, NULL, 0);
+                log_module(CS_LOG, LOG_DEBUG, "GetChannelUser: %s/%s access %d imported from Keycloak",
+                           channel->channel->name, handle->handle, lmdb_access);
             }
         }
     }
@@ -10452,13 +10469,22 @@ chanserv_sync_keycloak_channel_level(const char *channel, unsigned short level)
         return -1;
     }
 
-    /* Store each member in LMDB */
+    /* Store each member in LMDB, checking for conflicts */
     for (member = members; member; member = member->next) {
+        unsigned short existing_access;
+        int had_existing = (x3_lmdb_chanaccess_get(channel, member->username, &existing_access) == LMDB_SUCCESS);
+
         rc = x3_lmdb_chanaccess_set(channel, member->username, level);
         if (rc == LMDB_SUCCESS) {
             count++;
-            log_module(CS_LOG, LOG_DEBUG, "Synced Keycloak access: %s -> %s level %d",
-                       member->username, channel, level);
+            if (had_existing && existing_access != level) {
+                /* LMDB had a different value - X3 may have changed it since last Keycloak sync */
+                log_module(CS_LOG, LOG_INFO, "Keycloak sync override: %s/%s was %d, now %d (Keycloak authoritative)",
+                           channel, member->username, existing_access, level);
+            } else {
+                log_module(CS_LOG, LOG_DEBUG, "Synced Keycloak access: %s -> %s level %d",
+                           member->username, channel, level);
+            }
         }
     }
 
@@ -10491,8 +10517,11 @@ chanserv_sync_keycloak_group_with_attribute(const char *channel, const char *gro
         return -1;
     }
 
-    /* Store each member in LMDB */
+    /* Store each member in LMDB, checking for conflicts */
     for (member = members; member; member = member->next) {
+        unsigned short existing_access;
+        int had_existing;
+
         if (member->access_level == 0) {
             /* Skip members with no access level (attribute not set on group) */
             log_module(CS_LOG, LOG_DEBUG,
@@ -10501,11 +10530,19 @@ chanserv_sync_keycloak_group_with_attribute(const char *channel, const char *gro
             continue;
         }
 
+        had_existing = (x3_lmdb_chanaccess_get(channel, member->username, &existing_access) == LMDB_SUCCESS);
+
         rc = x3_lmdb_chanaccess_set(channel, member->username, member->access_level);
         if (rc == LMDB_SUCCESS) {
             count++;
-            log_module(CS_LOG, LOG_DEBUG, "Synced Keycloak access: %s -> %s level %d (from attribute)",
-                       member->username, channel, member->access_level);
+            if (had_existing && existing_access != member->access_level) {
+                /* LMDB had a different value - X3 may have changed it since last Keycloak sync */
+                log_module(CS_LOG, LOG_INFO, "Keycloak sync override: %s/%s was %d, now %d (Keycloak authoritative)",
+                           channel, member->username, existing_access, member->access_level);
+            } else {
+                log_module(CS_LOG, LOG_DEBUG, "Synced Keycloak access: %s -> %s level %d (from attribute)",
+                           member->username, channel, member->access_level);
+            }
         }
     }
 
@@ -10872,9 +10909,18 @@ chanserv_delete_keycloak_channel(const char *channel)
         return KC_ERROR;
     }
 
-    /* Find the channel group */
-    snprintf(group_path, sizeof(group_path), "/irc-channels/%s", channel);
-    rc = keycloak_get_group_by_path(realm, client, group_path, &group_id);
+    /* Find the channel group - use configured prefix and mode */
+    if (chanserv_conf.keycloak_hierarchical_groups) {
+        /* Hierarchical mode: /irc-channels/#help */
+        snprintf(group_path, sizeof(group_path), "/%s/%s",
+                 chanserv_conf.keycloak_group_prefix, channel);
+        rc = keycloak_get_group_by_path(realm, client, group_path, &group_id);
+    } else {
+        /* Flat mode: irc-channel-#help */
+        snprintf(group_path, sizeof(group_path), "%s%s",
+                 chanserv_conf.keycloak_group_prefix, channel);
+        rc = keycloak_get_group_by_name(realm, client, group_path, &group_id);
+    }
     if (rc == KC_NOT_FOUND) {
         /* Group doesn't exist - that's fine */
         keycloak_free_access_token(client.access_token);

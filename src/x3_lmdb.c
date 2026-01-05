@@ -1396,17 +1396,83 @@ int x3_lmdb_chanaccess_get(const char *channel, const char *account, unsigned sh
         return LMDB_ERROR;
     }
 
-    /* Parse access level from stored value */
+    /* Parse access level from stored value (format: "access" or "access:timestamp") */
     *access_out = (unsigned short)strtol((const char *)mdata.mv_data, NULL, 10);
+    return LMDB_SUCCESS;
+}
+
+int x3_lmdb_chanaccess_get_ex(const char *channel, const char *account,
+                               unsigned short *access_out, time_t *timestamp_out)
+{
+    MDB_txn *txn;
+    MDB_val mkey, mdata;
+    char keybuf[LMDB_KEY_BUFFER_SIZE];
+    char *colon;
+    int rc;
+
+    if (!x3_lmdb_is_available() || !channel || !account || !access_out) {
+        return LMDB_ERROR;
+    }
+
+    /* Build composite key: "chanaccess:<channel>\0<account>" */
+    size_t prefix_len = strlen(LMDB_PREFIX_CHANACCESS);
+    size_t channel_len = strlen(channel);
+    size_t account_len = strlen(account);
+
+    if (prefix_len + channel_len + 1 + account_len + 1 > sizeof(keybuf)) {
+        return LMDB_ERROR;
+    }
+
+    memcpy(keybuf, LMDB_PREFIX_CHANACCESS, prefix_len);
+    memcpy(keybuf + prefix_len, channel, channel_len);
+    keybuf[prefix_len + channel_len] = '\0';
+    memcpy(keybuf + prefix_len + channel_len + 1, account, account_len + 1);
+
+    mkey.mv_size = prefix_len + channel_len + 1 + account_len + 1;
+    mkey.mv_data = keybuf;
+
+    rc = mdb_txn_begin(lmdb_env, NULL, MDB_RDONLY, &txn);
+    if (rc != 0) {
+        return LMDB_ERROR;
+    }
+
+    rc = mdb_get(txn, dbi_metadata, &mkey, &mdata);
+    mdb_txn_abort(txn);
+
+    if (rc == MDB_NOTFOUND) {
+        return LMDB_NOT_FOUND;
+    } else if (rc != 0) {
+        return LMDB_ERROR;
+    }
+
+    /* Parse format: "access" or "access:timestamp" */
+    *access_out = (unsigned short)strtol((const char *)mdata.mv_data, NULL, 10);
+
+    if (timestamp_out) {
+        colon = strchr((const char *)mdata.mv_data, ':');
+        if (colon) {
+            *timestamp_out = (time_t)strtol(colon + 1, NULL, 10);
+        } else {
+            *timestamp_out = 0;  /* No timestamp - old format entry */
+        }
+    }
+
     return LMDB_SUCCESS;
 }
 
 int x3_lmdb_chanaccess_set(const char *channel, const char *account, unsigned short access)
 {
+    /* Default: store with current timestamp */
+    return x3_lmdb_chanaccess_set_ex(channel, account, access, time(NULL));
+}
+
+int x3_lmdb_chanaccess_set_ex(const char *channel, const char *account,
+                               unsigned short access, time_t timestamp)
+{
     MDB_txn *txn;
     MDB_val mkey, mdata;
     char keybuf[LMDB_KEY_BUFFER_SIZE];
-    char valuebuf[16];
+    char valuebuf[32];  /* Increased size for "access:timestamp" format */
     int rc;
 
     if (!x3_lmdb_is_available() || !channel || !account) {
@@ -1436,7 +1502,8 @@ int x3_lmdb_chanaccess_set(const char *channel, const char *account, unsigned sh
     }
 
     if (access > 0) {
-        snprintf(valuebuf, sizeof(valuebuf), "%u", access);
+        /* Store as "access:timestamp" */
+        snprintf(valuebuf, sizeof(valuebuf), "%u:%ld", access, (long)timestamp);
         mdata.mv_size = strlen(valuebuf) + 1;
         mdata.mv_data = valuebuf;
         rc = mdb_put(txn, dbi_metadata, &mkey, &mdata, 0);

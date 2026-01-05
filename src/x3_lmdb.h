@@ -278,13 +278,35 @@ int x3_lmdb_metadata_purge_expired(void);
 int x3_lmdb_chanaccess_get(const char *channel, const char *account, unsigned short *access_out);
 
 /**
- * Set channel access level for an account
+ * Get channel access level for an account with timestamp
+ * @param channel Channel name (with #)
+ * @param account Account name
+ * @param access_out Output for access level
+ * @param timestamp_out Output for timestamp when entry was cached (can be NULL, 0 = legacy entry)
+ * @return LMDB_SUCCESS on success, LMDB_NOT_FOUND if not found, LMDB_ERROR on failure
+ */
+int x3_lmdb_chanaccess_get_ex(const char *channel, const char *account,
+                               unsigned short *access_out, time_t *timestamp_out);
+
+/**
+ * Set channel access level for an account (uses current timestamp)
  * @param channel Channel name (with #)
  * @param account Account name
  * @param access Access level (0 to delete)
  * @return LMDB_SUCCESS on success, LMDB_ERROR on failure
  */
 int x3_lmdb_chanaccess_set(const char *channel, const char *account, unsigned short access);
+
+/**
+ * Set channel access level for an account with explicit timestamp
+ * @param channel Channel name (with #)
+ * @param account Account name
+ * @param access Access level (0 to delete)
+ * @param timestamp Timestamp to store with entry
+ * @return LMDB_SUCCESS on success, LMDB_ERROR on failure
+ */
+int x3_lmdb_chanaccess_set_ex(const char *channel, const char *account,
+                               unsigned short access, time_t timestamp);
 
 /**
  * Delete channel access for an account
@@ -409,7 +431,9 @@ void init_x3_lmdb(void);
 #define x3_lmdb_channel_get_ex(c, k, v, e) (-2)
 #define x3_lmdb_metadata_purge_expired() (0)
 #define x3_lmdb_chanaccess_get(c, a, o) (-2)
+#define x3_lmdb_chanaccess_get_ex(c, a, o, t) (-2)
 #define x3_lmdb_chanaccess_set(c, a, l) (-1)
+#define x3_lmdb_chanaccess_set_ex(c, a, l, t) (-1)
 #define x3_lmdb_chanaccess_delete(c, a) (-2)
 #define x3_lmdb_chanaccess_list(c, e)   (-1)
 #define x3_lmdb_chanaccess_list_account(a, e) (-1)
