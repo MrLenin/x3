@@ -512,6 +512,119 @@ int x3_lmdb_sync(int force);
  */
 int x3_lmdb_stats(const char *db, size_t *entries_out, size_t *size_out);
 
+/* ========== Snapshot/Backup ========== */
+
+/* Default snapshot interval (1 hour in seconds) */
+#define LMDB_SNAPSHOT_INTERVAL_DEFAULT 3600
+
+/* Default retention count (keep last 24 snapshots) */
+#define LMDB_SNAPSHOT_RETENTION_DEFAULT 24
+
+/* Snapshot statistics */
+struct lmdb_snapshot_stats {
+    time_t last_snapshot;
+    time_t last_duration_ms;
+    size_t last_size_bytes;
+    unsigned int snapshots_retained;
+    char last_path[256];
+};
+
+/**
+ * Create a snapshot (hot backup) of the LMDB database
+ * @param backup_path Path to backup directory (will be created if needed)
+ * @param compact Use MDB_CP_COMPACT flag to remove free pages (slower but smaller)
+ * @return LMDB_SUCCESS on success, LMDB_ERROR on failure
+ */
+int x3_lmdb_snapshot(const char *backup_path, int compact);
+
+/**
+ * Create a snapshot with automatic timestamped directory
+ * Creates backup at: <base_path>/lmdb-YYYYMMDDHHMM/
+ * @param base_path Base directory for snapshots
+ * @param compact Use compaction
+ * @param path_out Output buffer for actual path (must be at least 256 bytes, can be NULL)
+ * @return LMDB_SUCCESS on success, LMDB_ERROR on failure
+ */
+int x3_lmdb_snapshot_auto(const char *base_path, int compact, char *path_out);
+
+/**
+ * Get last snapshot statistics
+ * @return Pointer to static stats structure
+ */
+const struct lmdb_snapshot_stats *x3_lmdb_get_snapshot_stats(void);
+
+/**
+ * Set snapshot interval (0 to disable automatic snapshots)
+ * @param interval_secs Interval in seconds (0 to disable)
+ */
+void x3_lmdb_set_snapshot_interval(unsigned int interval_secs);
+
+/**
+ * Set snapshot retention count
+ * @param count Number of snapshots to retain (0 = unlimited)
+ */
+void x3_lmdb_set_snapshot_retention(unsigned int count);
+
+/**
+ * Cleanup old snapshots beyond retention count
+ * @param base_path Base directory containing snapshots
+ * @return Number of snapshots deleted
+ */
+int x3_lmdb_cleanup_old_snapshots(const char *base_path);
+
+/* ========== JSON Export ========== */
+
+/**
+ * Export all LMDB data to a JSON file
+ * @param json_path Path to output JSON file
+ * @return LMDB_SUCCESS on success, LMDB_ERROR on failure
+ */
+int x3_lmdb_export_json(const char *json_path);
+
+/**
+ * Export LMDB data to JSON with automatic timestamped filename
+ * Creates file at: <base_path>/lmdb-export-YYYYMMDDHHMM.json
+ * @param base_path Directory for export file
+ * @param path_out Output buffer for actual path (must be at least 256 bytes, can be NULL)
+ * @return LMDB_SUCCESS on success, LMDB_ERROR on failure
+ */
+int x3_lmdb_export_json_auto(const char *base_path, char *path_out);
+
+/* ========== TTL Purge Job ========== */
+
+/* Default purge interval (1 hour in seconds) */
+#define LMDB_PURGE_INTERVAL_DEFAULT 3600
+
+/* Purge job statistics */
+struct lmdb_purge_stats {
+    unsigned long activity_purged;
+    unsigned long fingerprint_purged;
+    unsigned long metadata_purged;
+    unsigned long channel_purged;
+    unsigned long total_purged;
+    time_t last_run;
+    time_t duration_ms;
+};
+
+/**
+ * Run TTL purge job to clean expired entries from all LMDB databases
+ * @param stats_out Optional output for purge statistics (can be NULL)
+ * @return Total number of entries purged
+ */
+int x3_lmdb_purge_expired(struct lmdb_purge_stats *stats_out);
+
+/**
+ * Get last purge job statistics
+ * @return Pointer to static stats structure (valid until next purge)
+ */
+const struct lmdb_purge_stats *x3_lmdb_get_purge_stats(void);
+
+/**
+ * Set purge job interval (0 to disable automatic purge)
+ * @param interval_secs Interval in seconds (0 to disable)
+ */
+void x3_lmdb_set_purge_interval(unsigned int interval_secs);
+
 /* ========== Module Registration ========== */
 
 /**
@@ -566,6 +679,17 @@ void init_x3_lmdb(void);
 #define x3_lmdb_free_entries(e)         do {} while(0)
 #define x3_lmdb_sync(f)                 (0)
 #define x3_lmdb_stats(d, e, s)          (-1)
+#define x3_lmdb_purge_expired(s)        (0)
+#define x3_lmdb_get_purge_stats()       ((const struct lmdb_purge_stats *)NULL)
+#define x3_lmdb_set_purge_interval(i)   do {} while(0)
+#define x3_lmdb_snapshot(p, c)          (-1)
+#define x3_lmdb_snapshot_auto(p, c, o)  (-1)
+#define x3_lmdb_get_snapshot_stats()    ((const struct lmdb_snapshot_stats *)NULL)
+#define x3_lmdb_set_snapshot_interval(i) do {} while(0)
+#define x3_lmdb_set_snapshot_retention(c) do {} while(0)
+#define x3_lmdb_cleanup_old_snapshots(p) (0)
+#define x3_lmdb_export_json(p)          (-1)
+#define x3_lmdb_export_json_auto(p, o)  (-1)
 #define init_x3_lmdb()                  do {} while(0)
 
 #endif /* WITH_LMDB */

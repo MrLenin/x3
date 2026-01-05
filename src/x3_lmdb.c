@@ -15,6 +15,7 @@
 #include "conf.h"
 #include "log.h"
 #include "proto.h"
+#include "timeq.h"
 
 #include <lmdb.h>
 #include <stdlib.h>
@@ -2247,16 +2248,810 @@ void x3_lmdb_free_fingerprint_entries(struct lmdb_fingerprint_entry *entries)
     }
 }
 
+/* ========== Snapshot/Backup ========== */
+
+#include <dirent.h>
+#include <unistd.h>
+
+/* Static storage for snapshot statistics */
+static struct lmdb_snapshot_stats snapshot_stats = {0};
+static unsigned int snapshot_interval = 0; /* Disabled by default */
+static unsigned int snapshot_retention = LMDB_SNAPSHOT_RETENTION_DEFAULT;
+static char snapshot_base_path[MAXLEN] = "";
+
+/**
+ * Forward declaration for snapshot callback
+ */
+static void lmdb_snapshot_callback(void *data);
+
+int x3_lmdb_snapshot(const char *backup_path, int compact)
+{
+    int rc;
+    unsigned int flags = compact ? MDB_CP_COMPACT : 0;
+    time_t start_time, end_time;
+    struct stat st;
+
+    if (!lmdb_initialized || !lmdb_env) {
+        log_module(MAIN_LOG, LOG_ERROR, "x3_lmdb: Snapshot failed: LMDB not initialized");
+        return LMDB_ERROR;
+    }
+
+    if (!backup_path || backup_path[0] == '\0') {
+        log_module(MAIN_LOG, LOG_ERROR, "x3_lmdb: Snapshot failed: Invalid backup path");
+        return LMDB_ERROR;
+    }
+
+    /* Create backup directory if it doesn't exist */
+    if (stat(backup_path, &st) != 0) {
+        if (mkdir(backup_path, 0755) != 0 && errno != EEXIST) {
+            log_module(MAIN_LOG, LOG_ERROR, "x3_lmdb: Snapshot failed: Cannot create directory '%s': %s",
+                       backup_path, strerror(errno));
+            return LMDB_ERROR;
+        }
+    }
+
+    start_time = time(NULL);
+
+    /* Perform the hot backup using mdb_env_copy2 */
+    rc = mdb_env_copy2(lmdb_env, backup_path, flags);
+    if (rc != 0) {
+        log_module(MAIN_LOG, LOG_ERROR, "x3_lmdb: Snapshot failed: %s", mdb_strerror(rc));
+        return LMDB_ERROR;
+    }
+
+    end_time = time(NULL);
+
+    /* Get size of backup */
+    {
+        char data_path[MAXLEN];
+        snprintf(data_path, sizeof(data_path), "%s/data.mdb", backup_path);
+        if (stat(data_path, &st) == 0) {
+            snapshot_stats.last_size_bytes = st.st_size;
+        }
+    }
+
+    /* Update statistics */
+    snapshot_stats.last_snapshot = start_time;
+    snapshot_stats.last_duration_ms = (end_time - start_time) * 1000;
+    strncpy(snapshot_stats.last_path, backup_path, sizeof(snapshot_stats.last_path) - 1);
+    snapshot_stats.last_path[sizeof(snapshot_stats.last_path) - 1] = '\0';
+
+    log_module(MAIN_LOG, LOG_INFO, "x3_lmdb: Snapshot created at '%s' (%lu bytes, %lu ms, compact=%d)",
+               backup_path, (unsigned long)snapshot_stats.last_size_bytes,
+               (unsigned long)snapshot_stats.last_duration_ms, compact);
+
+    return LMDB_SUCCESS;
+}
+
+int x3_lmdb_snapshot_auto(const char *base_path, int compact, char *path_out)
+{
+    char snapshot_path[MAXLEN];
+    struct tm *tm_info;
+    time_t now_time;
+    int rc;
+
+    if (!base_path || base_path[0] == '\0') {
+        return LMDB_ERROR;
+    }
+
+    /* Create base directory if needed */
+    {
+        struct stat st;
+        if (stat(base_path, &st) != 0) {
+            if (mkdir(base_path, 0755) != 0 && errno != EEXIST) {
+                log_module(MAIN_LOG, LOG_ERROR, "x3_lmdb: Cannot create base path '%s': %s",
+                           base_path, strerror(errno));
+                return LMDB_ERROR;
+            }
+        }
+    }
+
+    /* Generate timestamped directory name */
+    now_time = time(NULL);
+    tm_info = localtime(&now_time);
+    snprintf(snapshot_path, sizeof(snapshot_path), "%s/lmdb-%04d%02d%02d%02d%02d",
+             base_path,
+             tm_info->tm_year + 1900, tm_info->tm_mon + 1, tm_info->tm_mday,
+             tm_info->tm_hour, tm_info->tm_min);
+
+    rc = x3_lmdb_snapshot(snapshot_path, compact);
+
+    if (rc == LMDB_SUCCESS && path_out) {
+        strncpy(path_out, snapshot_path, 255);
+        path_out[255] = '\0';
+    }
+
+    /* Cleanup old snapshots if retention is set */
+    if (rc == LMDB_SUCCESS && snapshot_retention > 0) {
+        x3_lmdb_cleanup_old_snapshots(base_path);
+    }
+
+    return rc;
+}
+
+const struct lmdb_snapshot_stats *x3_lmdb_get_snapshot_stats(void)
+{
+    return &snapshot_stats;
+}
+
+void x3_lmdb_set_snapshot_interval(unsigned int interval_secs)
+{
+    unsigned int old_interval = snapshot_interval;
+    snapshot_interval = interval_secs;
+
+    if (lmdb_initialized) {
+        /* Cancel any existing scheduled snapshot */
+        timeq_del(0, lmdb_snapshot_callback, NULL, TIMEQ_IGNORE_WHEN);
+
+        if (interval_secs > 0 && snapshot_base_path[0] != '\0') {
+            timeq_add(now + interval_secs, lmdb_snapshot_callback, NULL);
+            log_module(MAIN_LOG, LOG_INFO, "x3_lmdb: Snapshot job scheduled every %u seconds",
+                       interval_secs);
+        } else if (old_interval > 0) {
+            log_module(MAIN_LOG, LOG_INFO, "x3_lmdb: Snapshot job disabled (was %u seconds)",
+                       old_interval);
+        }
+    }
+}
+
+void x3_lmdb_set_snapshot_retention(unsigned int count)
+{
+    snapshot_retention = count;
+    log_module(MAIN_LOG, LOG_DEBUG, "x3_lmdb: Snapshot retention set to %u", count);
+}
+
+/**
+ * Compare function for sorting snapshot directories by name (oldest first)
+ */
+static int snapshot_name_cmp(const void *a, const void *b)
+{
+    return strcmp(*(const char **)a, *(const char **)b);
+}
+
+int x3_lmdb_cleanup_old_snapshots(const char *base_path)
+{
+    DIR *dir;
+    struct dirent *entry;
+    char **snapshots = NULL;
+    unsigned int snapshot_count = 0;
+    unsigned int capacity = 64;
+    unsigned int i, deleted = 0;
+
+    if (!base_path || snapshot_retention == 0) {
+        return 0;
+    }
+
+    dir = opendir(base_path);
+    if (!dir) {
+        return 0;
+    }
+
+    /* Allocate array for snapshot names */
+    snapshots = malloc(capacity * sizeof(char *));
+    if (!snapshots) {
+        closedir(dir);
+        return 0;
+    }
+
+    /* Find all snapshot directories matching pattern lmdb-YYYYMMDDHHMM */
+    while ((entry = readdir(dir)) != NULL) {
+        if (strncmp(entry->d_name, "lmdb-", 5) == 0 && strlen(entry->d_name) == 17) {
+            /* Check if it looks like a valid timestamp */
+            int valid = 1;
+            for (i = 5; i < 17 && valid; i++) {
+                if (entry->d_name[i] < '0' || entry->d_name[i] > '9') {
+                    valid = 0;
+                }
+            }
+            if (valid) {
+                if (snapshot_count >= capacity) {
+                    capacity *= 2;
+                    snapshots = realloc(snapshots, capacity * sizeof(char *));
+                    if (!snapshots) {
+                        closedir(dir);
+                        return 0;
+                    }
+                }
+                snapshots[snapshot_count++] = strdup(entry->d_name);
+            }
+        }
+    }
+    closedir(dir);
+
+    /* Sort snapshots by name (oldest first since name is timestamped) */
+    if (snapshot_count > 0) {
+        qsort(snapshots, snapshot_count, sizeof(char *), snapshot_name_cmp);
+    }
+
+    /* Delete oldest snapshots beyond retention count */
+    while (snapshot_count > snapshot_retention) {
+        char full_path[MAXLEN];
+        char data_file[MAXLEN];
+        char lock_file[MAXLEN];
+
+        snprintf(full_path, sizeof(full_path), "%s/%s", base_path, snapshots[0]);
+        snprintf(data_file, sizeof(data_file), "%s/data.mdb", full_path);
+        snprintf(lock_file, sizeof(lock_file), "%s/lock.mdb", full_path);
+
+        /* Remove files in the snapshot directory */
+        unlink(data_file);
+        unlink(lock_file);
+
+        /* Remove the directory */
+        if (rmdir(full_path) == 0) {
+            log_module(MAIN_LOG, LOG_DEBUG, "x3_lmdb: Deleted old snapshot: %s", snapshots[0]);
+            deleted++;
+        }
+
+        free(snapshots[0]);
+        /* Shift remaining entries */
+        for (i = 1; i < snapshot_count; i++) {
+            snapshots[i - 1] = snapshots[i];
+        }
+        snapshot_count--;
+    }
+
+    /* Update stats */
+    snapshot_stats.snapshots_retained = snapshot_count;
+
+    /* Free remaining snapshot names */
+    for (i = 0; i < snapshot_count; i++) {
+        free(snapshots[i]);
+    }
+    free(snapshots);
+
+    if (deleted > 0) {
+        log_module(MAIN_LOG, LOG_INFO, "x3_lmdb: Cleaned up %u old snapshots, %u retained",
+                   deleted, snapshot_count);
+    }
+
+    return deleted;
+}
+
+/**
+ * Timeq callback for scheduled snapshot
+ */
+static void lmdb_snapshot_callback(UNUSED_ARG(void *data))
+{
+    char path_out[256];
+
+    if (snapshot_base_path[0] != '\0') {
+        x3_lmdb_snapshot_auto(snapshot_base_path, 1, path_out);
+    }
+
+    /* Reschedule if interval is non-zero */
+    if (snapshot_interval > 0) {
+        timeq_add(now + snapshot_interval, lmdb_snapshot_callback, NULL);
+    }
+}
+
+/* ========== JSON Export ========== */
+
+/**
+ * Write JSON-escaped string to file
+ */
+static void json_write_escaped_string(FILE *fp, const char *str)
+{
+    fputc('"', fp);
+    while (*str) {
+        switch (*str) {
+            case '"': fputs("\\\"", fp); break;
+            case '\\': fputs("\\\\", fp); break;
+            case '\b': fputs("\\b", fp); break;
+            case '\f': fputs("\\f", fp); break;
+            case '\n': fputs("\\n", fp); break;
+            case '\r': fputs("\\r", fp); break;
+            case '\t': fputs("\\t", fp); break;
+            default:
+                if ((unsigned char)*str < 0x20) {
+                    fprintf(fp, "\\u%04x", (unsigned char)*str);
+                } else {
+                    fputc(*str, fp);
+                }
+        }
+        str++;
+    }
+    fputc('"', fp);
+}
+
+/**
+ * Export a single database to JSON object in file
+ */
+static int json_export_db(FILE *fp, MDB_dbi dbi, const char *db_name, int *first)
+{
+    MDB_txn *txn;
+    MDB_cursor *cursor;
+    MDB_val mkey, mdata;
+    int rc;
+    int entry_count = 0;
+
+    rc = mdb_txn_begin(lmdb_env, NULL, MDB_RDONLY, &txn);
+    if (rc != 0) {
+        return 0;
+    }
+
+    rc = mdb_cursor_open(txn, dbi, &cursor);
+    if (rc != 0) {
+        mdb_txn_abort(txn);
+        return 0;
+    }
+
+    /* Start database object */
+    if (!*first) {
+        fprintf(fp, ",\n");
+    }
+    *first = 0;
+    fprintf(fp, "    \"%s\": {\n", db_name);
+
+    int first_entry = 1;
+    rc = mdb_cursor_get(cursor, &mkey, &mdata, MDB_FIRST);
+    while (rc == 0) {
+        char key_str[LMDB_KEY_BUFFER_SIZE];
+        char value_str[LMDB_MAX_VALUE_SIZE];
+
+        /* Convert key to printable string (handle embedded nulls) */
+        size_t key_len = mkey.mv_size < sizeof(key_str) - 1 ? mkey.mv_size : sizeof(key_str) - 1;
+        memcpy(key_str, mkey.mv_data, key_len);
+        key_str[key_len] = '\0';
+
+        /* Replace embedded nulls with '|' for composite keys */
+        for (size_t i = 0; i < key_len; i++) {
+            if (key_str[i] == '\0') key_str[i] = '|';
+        }
+
+        /* Decompress and decode value if needed */
+#ifdef WITH_ZSTD
+        if (x3_is_compressed(mdata.mv_data, mdata.mv_size)) {
+            unsigned char decompressed[LMDB_MAX_VALUE_SIZE];
+            size_t decompressed_len;
+            if (x3_decompress(mdata.mv_data, mdata.mv_size,
+                              decompressed, sizeof(decompressed) - 1, &decompressed_len) >= 0) {
+                memcpy(value_str, decompressed, decompressed_len);
+                value_str[decompressed_len] = '\0';
+            } else {
+                snprintf(value_str, sizeof(value_str), "<compressed:%zu bytes>", mdata.mv_size);
+            }
+        } else
+#endif
+        {
+            size_t val_len = mdata.mv_size < sizeof(value_str) - 1 ? mdata.mv_size : sizeof(value_str) - 1;
+            memcpy(value_str, mdata.mv_data, val_len);
+            value_str[val_len] = '\0';
+        }
+
+        /* Write entry */
+        if (!first_entry) {
+            fprintf(fp, ",\n");
+        }
+        first_entry = 0;
+        fprintf(fp, "      ");
+        json_write_escaped_string(fp, key_str);
+        fprintf(fp, ": ");
+        json_write_escaped_string(fp, value_str);
+        entry_count++;
+
+        rc = mdb_cursor_get(cursor, &mkey, &mdata, MDB_NEXT);
+    }
+
+    fprintf(fp, "\n    }");
+
+    mdb_cursor_close(cursor);
+    mdb_txn_abort(txn);
+
+    return entry_count;
+}
+
+int x3_lmdb_export_json(const char *json_path)
+{
+    FILE *fp;
+    time_t now_time;
+    struct tm *tm_info;
+    int first = 1;
+    int total_entries = 0;
+
+    if (!lmdb_initialized || !lmdb_env) {
+        log_module(MAIN_LOG, LOG_ERROR, "x3_lmdb: JSON export failed: LMDB not initialized");
+        return LMDB_ERROR;
+    }
+
+    if (!json_path || json_path[0] == '\0') {
+        log_module(MAIN_LOG, LOG_ERROR, "x3_lmdb: JSON export failed: Invalid path");
+        return LMDB_ERROR;
+    }
+
+    fp = fopen(json_path, "w");
+    if (!fp) {
+        log_module(MAIN_LOG, LOG_ERROR, "x3_lmdb: JSON export failed: Cannot open '%s': %s",
+                   json_path, strerror(errno));
+        return LMDB_ERROR;
+    }
+
+    /* Write JSON header */
+    now_time = time(NULL);
+    tm_info = localtime(&now_time);
+
+    fprintf(fp, "{\n");
+    fprintf(fp, "  \"_metadata\": {\n");
+    fprintf(fp, "    \"export_time\": \"%04d-%02d-%02dT%02d:%02d:%02d\",\n",
+            tm_info->tm_year + 1900, tm_info->tm_mon + 1, tm_info->tm_mday,
+            tm_info->tm_hour, tm_info->tm_min, tm_info->tm_sec);
+    fprintf(fp, "    \"source\": \"x3_lmdb\",\n");
+    fprintf(fp, "    \"path\": \"%s\"\n", lmdb_path);
+    fprintf(fp, "  },\n");
+    fprintf(fp, "  \"databases\": {\n");
+
+    /* Export each database */
+    total_entries += json_export_db(fp, dbi_accounts, "accounts", &first);
+    total_entries += json_export_db(fp, dbi_channels, "channels", &first);
+    total_entries += json_export_db(fp, dbi_metadata, "metadata", &first);
+
+    fprintf(fp, "\n  }\n");
+    fprintf(fp, "}\n");
+
+    fclose(fp);
+
+    log_module(MAIN_LOG, LOG_INFO, "x3_lmdb: JSON export to '%s' complete (%d entries)",
+               json_path, total_entries);
+
+    return LMDB_SUCCESS;
+}
+
+int x3_lmdb_export_json_auto(const char *base_path, char *path_out)
+{
+    char export_path[MAXLEN];
+    struct tm *tm_info;
+    time_t now_time;
+    int rc;
+
+    if (!base_path || base_path[0] == '\0') {
+        return LMDB_ERROR;
+    }
+
+    /* Create base directory if needed */
+    {
+        struct stat st;
+        if (stat(base_path, &st) != 0) {
+            if (mkdir(base_path, 0755) != 0 && errno != EEXIST) {
+                log_module(MAIN_LOG, LOG_ERROR, "x3_lmdb: Cannot create base path '%s': %s",
+                           base_path, strerror(errno));
+                return LMDB_ERROR;
+            }
+        }
+    }
+
+    /* Generate timestamped filename */
+    now_time = time(NULL);
+    tm_info = localtime(&now_time);
+    snprintf(export_path, sizeof(export_path), "%s/lmdb-export-%04d%02d%02d%02d%02d.json",
+             base_path,
+             tm_info->tm_year + 1900, tm_info->tm_mon + 1, tm_info->tm_mday,
+             tm_info->tm_hour, tm_info->tm_min);
+
+    rc = x3_lmdb_export_json(export_path);
+
+    if (rc == LMDB_SUCCESS && path_out) {
+        strncpy(path_out, export_path, 255);
+        path_out[255] = '\0';
+    }
+
+    return rc;
+}
+
+/* ========== TTL Purge Job ========== */
+
+/* Static storage for purge statistics */
+static struct lmdb_purge_stats purge_stats = {0};
+static unsigned int purge_interval = LMDB_PURGE_INTERVAL_DEFAULT;
+
+/**
+ * Helper to purge expired entries from account/channel metadata databases
+ * Scans for entries with TTL prefix that have expired
+ */
+static unsigned long purge_metadata_db(MDB_dbi dbi, const char *db_name)
+{
+    MDB_txn *txn;
+    MDB_cursor *cursor;
+    MDB_val mkey, mdata;
+    unsigned long purged = 0;
+    int rc;
+    time_t now = time(NULL);
+    char value_buf[LMDB_MAX_VALUE_SIZE];
+    time_t expires;
+
+    if (!lmdb_initialized) {
+        return 0;
+    }
+
+    rc = mdb_txn_begin(lmdb_env, NULL, 0, &txn);
+    if (rc != 0) {
+        log_module(MAIN_LOG, LOG_WARNING, "x3_lmdb: Purge %s: Failed to begin txn: %s",
+                   db_name, mdb_strerror(rc));
+        return 0;
+    }
+
+    rc = mdb_cursor_open(txn, dbi, &cursor);
+    if (rc != 0) {
+        log_module(MAIN_LOG, LOG_WARNING, "x3_lmdb: Purge %s: Failed to open cursor: %s",
+                   db_name, mdb_strerror(rc));
+        mdb_txn_abort(txn);
+        return 0;
+    }
+
+    rc = mdb_cursor_get(cursor, &mkey, &mdata, MDB_FIRST);
+    while (rc == 0) {
+        const char *stored = (const char *)mdata.mv_data;
+
+        /* Check if entry has TTL prefix and is expired */
+        if (stored[0] == 'T' && stored[1] == ':') {
+            /* Parse expiration time */
+            if (decode_ttl_value(stored, value_buf, sizeof(value_buf), &expires) == 0) {
+                if (expires > 0 && expires <= now) {
+                    /* Entry is expired, delete it */
+                    rc = mdb_cursor_del(cursor, 0);
+                    if (rc == 0) {
+                        purged++;
+                    }
+                }
+            }
+        }
+
+        rc = mdb_cursor_get(cursor, &mkey, &mdata, MDB_NEXT);
+    }
+
+    mdb_cursor_close(cursor);
+
+    rc = mdb_txn_commit(txn);
+    if (rc != 0) {
+        log_module(MAIN_LOG, LOG_WARNING, "x3_lmdb: Purge %s: Failed to commit: %s",
+                   db_name, mdb_strerror(rc));
+        return 0;
+    }
+
+    if (purged > 0) {
+        log_module(MAIN_LOG, LOG_DEBUG, "x3_lmdb: Purged %lu expired entries from %s",
+                   purged, db_name);
+    }
+
+    return purged;
+}
+
+/**
+ * Purge expired activity entries (30-day TTL)
+ */
+static unsigned long purge_activity_entries(void)
+{
+    MDB_txn *txn;
+    MDB_cursor *cursor;
+    MDB_val mkey, mdata;
+    unsigned long purged = 0;
+    int rc;
+    time_t now = time(NULL);
+    const char *prefix = "activity:";
+    size_t prefix_len = strlen(prefix);
+
+    if (!lmdb_initialized) {
+        return 0;
+    }
+
+    rc = mdb_txn_begin(lmdb_env, NULL, 0, &txn);
+    if (rc != 0) {
+        return 0;
+    }
+
+    rc = mdb_cursor_open(txn, dbi_metadata, &cursor);
+    if (rc != 0) {
+        mdb_txn_abort(txn);
+        return 0;
+    }
+
+    rc = mdb_cursor_get(cursor, &mkey, &mdata, MDB_FIRST);
+    while (rc == 0) {
+        const char *key = (const char *)mkey.mv_data;
+
+        /* Check if this is an activity entry */
+        if (mkey.mv_size > prefix_len && strncmp(key, prefix, prefix_len) == 0) {
+            const char *stored = (const char *)mdata.mv_data;
+
+            /* Check for TTL prefix */
+            if (stored[0] == 'T' && stored[1] == ':') {
+                time_t expires = 0;
+                char *colon = strchr(stored + 2, ':');
+                if (colon) {
+                    expires = (time_t)strtol(stored + 2, NULL, 10);
+                    if (expires > 0 && expires <= now) {
+                        rc = mdb_cursor_del(cursor, 0);
+                        if (rc == 0) {
+                            purged++;
+                        }
+                    }
+                }
+            }
+        }
+
+        rc = mdb_cursor_get(cursor, &mkey, &mdata, MDB_NEXT);
+    }
+
+    mdb_cursor_close(cursor);
+    mdb_txn_commit(txn);
+
+    if (purged > 0) {
+        log_module(MAIN_LOG, LOG_DEBUG, "x3_lmdb: Purged %lu expired activity entries", purged);
+    }
+
+    return purged;
+}
+
+/**
+ * Purge expired fingerprint entries (90-day TTL)
+ */
+static unsigned long purge_fingerprint_entries(void)
+{
+    MDB_txn *txn;
+    MDB_cursor *cursor;
+    MDB_val mkey, mdata;
+    unsigned long purged = 0;
+    int rc;
+    time_t now = time(NULL);
+    const char *prefix = "fp:";
+    size_t prefix_len = strlen(prefix);
+
+    if (!lmdb_initialized) {
+        return 0;
+    }
+
+    rc = mdb_txn_begin(lmdb_env, NULL, 0, &txn);
+    if (rc != 0) {
+        return 0;
+    }
+
+    rc = mdb_cursor_open(txn, dbi_metadata, &cursor);
+    if (rc != 0) {
+        mdb_txn_abort(txn);
+        return 0;
+    }
+
+    rc = mdb_cursor_get(cursor, &mkey, &mdata, MDB_FIRST);
+    while (rc == 0) {
+        const char *key = (const char *)mkey.mv_data;
+
+        /* Check if this is a fingerprint entry */
+        if (mkey.mv_size > prefix_len && strncmp(key, prefix, prefix_len) == 0) {
+            const char *stored = (const char *)mdata.mv_data;
+
+            /* Check for TTL prefix */
+            if (stored[0] == 'T' && stored[1] == ':') {
+                time_t expires = 0;
+                char *colon = strchr(stored + 2, ':');
+                if (colon) {
+                    expires = (time_t)strtol(stored + 2, NULL, 10);
+                    if (expires > 0 && expires <= now) {
+                        rc = mdb_cursor_del(cursor, 0);
+                        if (rc == 0) {
+                            purged++;
+                        }
+                    }
+                }
+            }
+        }
+
+        rc = mdb_cursor_get(cursor, &mkey, &mdata, MDB_NEXT);
+    }
+
+    mdb_cursor_close(cursor);
+    mdb_txn_commit(txn);
+
+    if (purged > 0) {
+        log_module(MAIN_LOG, LOG_DEBUG, "x3_lmdb: Purged %lu expired fingerprint entries", purged);
+    }
+
+    return purged;
+}
+
+/**
+ * Timeq callback for scheduled purge job
+ */
+static void lmdb_purge_callback(UNUSED_ARG(void *data))
+{
+    struct lmdb_purge_stats stats;
+
+    x3_lmdb_purge_expired(&stats);
+
+    /* Reschedule if interval is non-zero */
+    if (purge_interval > 0) {
+        timeq_add(now + purge_interval, lmdb_purge_callback, NULL);
+    }
+}
+
+int x3_lmdb_purge_expired(struct lmdb_purge_stats *stats_out)
+{
+    struct lmdb_purge_stats stats = {0};
+    time_t start_time, end_time;
+
+    if (!lmdb_initialized) {
+        if (stats_out) {
+            memset(stats_out, 0, sizeof(*stats_out));
+        }
+        return 0;
+    }
+
+    start_time = time(NULL);
+
+    /* Purge expired entries from each category */
+    stats.activity_purged = purge_activity_entries();
+    stats.fingerprint_purged = purge_fingerprint_entries();
+    stats.metadata_purged = purge_metadata_db(dbi_accounts, "accounts");
+    stats.channel_purged = purge_metadata_db(dbi_channels, "channels");
+
+    stats.total_purged = stats.activity_purged + stats.fingerprint_purged +
+                         stats.metadata_purged + stats.channel_purged;
+
+    end_time = time(NULL);
+    stats.last_run = start_time;
+    stats.duration_ms = (end_time - start_time) * 1000;
+
+    /* Store in static for later retrieval */
+    memcpy(&purge_stats, &stats, sizeof(stats));
+
+    if (stats.total_purged > 0) {
+        log_module(MAIN_LOG, LOG_INFO,
+                   "x3_lmdb: TTL purge complete: %lu activity, %lu fingerprints, %lu metadata, %lu channel (%lu total)",
+                   stats.activity_purged, stats.fingerprint_purged,
+                   stats.metadata_purged, stats.channel_purged, stats.total_purged);
+    }
+
+    if (stats_out) {
+        memcpy(stats_out, &stats, sizeof(stats));
+    }
+
+    return (int)stats.total_purged;
+}
+
+const struct lmdb_purge_stats *x3_lmdb_get_purge_stats(void)
+{
+    return &purge_stats;
+}
+
+void x3_lmdb_set_purge_interval(unsigned int interval_secs)
+{
+    unsigned int old_interval = purge_interval;
+    purge_interval = interval_secs;
+
+    if (lmdb_initialized) {
+        /* Cancel any existing scheduled purge */
+        timeq_del(0, lmdb_purge_callback, NULL, TIMEQ_IGNORE_WHEN);
+
+        /* Schedule new purge if interval is non-zero */
+        if (interval_secs > 0) {
+            timeq_add(now + interval_secs, lmdb_purge_callback, NULL);
+            log_module(MAIN_LOG, LOG_INFO, "x3_lmdb: Purge job scheduled every %u seconds",
+                       interval_secs);
+        } else {
+            log_module(MAIN_LOG, LOG_INFO, "x3_lmdb: Purge job disabled (was %u seconds)",
+                       old_interval);
+        }
+    }
+}
+
 /* ========== Module Registration ========== */
 
 static void lmdb_exit_handler(UNUSED_ARG(void *extra))
 {
+    /* Cancel any scheduled purge job */
+    timeq_del(0, lmdb_purge_callback, NULL, TIMEQ_IGNORE_WHEN);
+
+    /* Cancel any scheduled snapshot job */
+    timeq_del(0, lmdb_snapshot_callback, NULL, TIMEQ_IGNORE_WHEN);
+
     x3_lmdb_shutdown();
 }
 
 void init_x3_lmdb(void)
 {
     const char *dbpath;
+    const char *purge_str;
+    const char *snapshot_str;
+    const char *retention_str;
+    const char *snapshot_path_str;
 
     /* Get database path from configuration */
     dbpath = conf_get_data("services/x3/lmdb_path", RECDB_QSTRING);
@@ -2267,6 +3062,46 @@ void init_x3_lmdb(void)
     if (x3_lmdb_init(dbpath, 0) == LMDB_SUCCESS) {
         log_module(MAIN_LOG, LOG_INFO, "x3_lmdb: Module initialized");
         reg_exit_func(lmdb_exit_handler, NULL);
+
+        /* Configure purge interval from config (default 1 hour) */
+        purge_str = conf_get_data("services/x3/lmdb_purge_interval", RECDB_QSTRING);
+        if (purge_str) {
+            purge_interval = (unsigned int)strtoul(purge_str, NULL, 10);
+        }
+
+        /* Schedule initial purge job (delayed by interval to let services settle) */
+        if (purge_interval > 0) {
+            timeq_add(now + purge_interval, lmdb_purge_callback, NULL);
+            log_module(MAIN_LOG, LOG_INFO, "x3_lmdb: TTL purge job scheduled every %u seconds",
+                       purge_interval);
+        }
+
+        /* Configure snapshot settings */
+        snapshot_path_str = conf_get_data("services/x3/lmdb_snapshot_path", RECDB_QSTRING);
+        if (snapshot_path_str) {
+            strncpy(snapshot_base_path, snapshot_path_str, sizeof(snapshot_base_path) - 1);
+            snapshot_base_path[sizeof(snapshot_base_path) - 1] = '\0';
+        } else {
+            /* Default to x3data/backups */
+            snprintf(snapshot_base_path, sizeof(snapshot_base_path), "x3data/backups");
+        }
+
+        snapshot_str = conf_get_data("services/x3/lmdb_snapshot_interval", RECDB_QSTRING);
+        if (snapshot_str) {
+            snapshot_interval = (unsigned int)strtoul(snapshot_str, NULL, 10);
+        }
+
+        retention_str = conf_get_data("services/x3/lmdb_snapshot_retention", RECDB_QSTRING);
+        if (retention_str) {
+            snapshot_retention = (unsigned int)strtoul(retention_str, NULL, 10);
+        }
+
+        /* Schedule initial snapshot job if interval is configured */
+        if (snapshot_interval > 0 && snapshot_base_path[0] != '\0') {
+            timeq_add(now + snapshot_interval, lmdb_snapshot_callback, NULL);
+            log_module(MAIN_LOG, LOG_INFO, "x3_lmdb: Snapshot job scheduled every %u seconds to '%s' (retention: %u)",
+                       snapshot_interval, snapshot_base_path, snapshot_retention);
+        }
     } else {
         log_module(MAIN_LOG, LOG_WARNING, "x3_lmdb: Module initialization failed, metadata persistence disabled");
     }

@@ -32,6 +32,7 @@
 #include "timeq.h"
 #include "saxdb.h"
 #include "shun.h"
+#include "x3_lmdb.h"
 
 #include <tre/regex.h>
 
@@ -441,6 +442,18 @@ static const struct message_entry msgtab[] = {
 
     { "OSMSG_PRIV_UNKNOWN", "Unknown privilege flag %s, see /msg $O HELP PRIVFLAGS for a flag list" },
     { "OSMSG_PRIV_SET",     "Privilege flag %s has been %sset" },
+
+    { "OSMSG_LMDB_NOT_AVAILABLE", "LMDB is not available." },
+    { "OSMSG_LMDB_SNAPSHOT_STARTED", "Creating LMDB snapshot..." },
+    { "OSMSG_LMDB_SNAPSHOT_SUCCESS", "LMDB snapshot created: $b%s$b (%lu bytes, %lu ms)" },
+    { "OSMSG_LMDB_SNAPSHOT_FAILED", "LMDB snapshot failed." },
+    { "OSMSG_LMDB_EXPORT_STARTED", "Exporting LMDB to JSON..." },
+    { "OSMSG_LMDB_EXPORT_SUCCESS", "LMDB exported to: $b%s$b" },
+    { "OSMSG_LMDB_EXPORT_FAILED", "LMDB export failed." },
+    { "OSMSG_LMDB_STATS_HEADER", "LMDB Statistics:" },
+    { "OSMSG_LMDB_STATS_SNAPSHOT", "  Last snapshot: %s (%lu bytes, %u retained)" },
+    { "OSMSG_LMDB_STATS_PURGE", "  Last purge: %s (%lu entries purged)" },
+    { "OSMSG_LMDB_STATS_NONE", "  No snapshot/purge history." },
 
     { NULL, NULL }
 };
@@ -2697,6 +2710,106 @@ static MODCMD_FUNC(cmd_stats_memory) {
     return 1;
 }
 #endif
+
+/* LMDB commands */
+static MODCMD_FUNC(cmd_lmdb_snapshot)
+{
+#ifdef WITH_LMDB
+    char path_out[256];
+    const struct lmdb_snapshot_stats *stats;
+
+    if (!x3_lmdb_is_available()) {
+        reply("OSMSG_LMDB_NOT_AVAILABLE");
+        return 0;
+    }
+
+    reply("OSMSG_LMDB_SNAPSHOT_STARTED");
+
+    if (x3_lmdb_snapshot_auto("x3data/backups", 1, path_out) == LMDB_SUCCESS) {
+        stats = x3_lmdb_get_snapshot_stats();
+        reply("OSMSG_LMDB_SNAPSHOT_SUCCESS", path_out,
+              (unsigned long)stats->last_size_bytes,
+              (unsigned long)stats->last_duration_ms);
+        return 1;
+    } else {
+        reply("OSMSG_LMDB_SNAPSHOT_FAILED");
+        return 0;
+    }
+#else
+    reply("OSMSG_LMDB_NOT_AVAILABLE");
+    return 0;
+#endif
+}
+
+static MODCMD_FUNC(cmd_lmdb_export)
+{
+#ifdef WITH_LMDB
+    char path_out[256];
+
+    if (!x3_lmdb_is_available()) {
+        reply("OSMSG_LMDB_NOT_AVAILABLE");
+        return 0;
+    }
+
+    reply("OSMSG_LMDB_EXPORT_STARTED");
+
+    if (x3_lmdb_export_json_auto("x3data/backups", path_out) == LMDB_SUCCESS) {
+        reply("OSMSG_LMDB_EXPORT_SUCCESS", path_out);
+        return 1;
+    } else {
+        reply("OSMSG_LMDB_EXPORT_FAILED");
+        return 0;
+    }
+#else
+    reply("OSMSG_LMDB_NOT_AVAILABLE");
+    return 0;
+#endif
+}
+
+static MODCMD_FUNC(cmd_lmdb_stats)
+{
+#ifdef WITH_LMDB
+    const struct lmdb_snapshot_stats *snap_stats;
+    const struct lmdb_purge_stats *purge_stats;
+    char time_buf[64];
+    struct tm *tm_info;
+
+    if (!x3_lmdb_is_available()) {
+        reply("OSMSG_LMDB_NOT_AVAILABLE");
+        return 0;
+    }
+
+    reply("OSMSG_LMDB_STATS_HEADER");
+
+    snap_stats = x3_lmdb_get_snapshot_stats();
+    purge_stats = x3_lmdb_get_purge_stats();
+
+    if (snap_stats && snap_stats->last_snapshot > 0) {
+        tm_info = localtime(&snap_stats->last_snapshot);
+        strftime(time_buf, sizeof(time_buf), "%Y-%m-%d %H:%M:%S", tm_info);
+        reply("OSMSG_LMDB_STATS_SNAPSHOT", time_buf,
+              (unsigned long)snap_stats->last_size_bytes,
+              snap_stats->snapshots_retained);
+    }
+
+    if (purge_stats && purge_stats->last_run > 0) {
+        tm_info = localtime(&purge_stats->last_run);
+        strftime(time_buf, sizeof(time_buf), "%Y-%m-%d %H:%M:%S", tm_info);
+        reply("OSMSG_LMDB_STATS_PURGE", time_buf,
+              purge_stats->total_purged);
+    }
+
+    if ((!snap_stats || snap_stats->last_snapshot == 0) &&
+        (!purge_stats || purge_stats->last_run == 0)) {
+        reply("OSMSG_LMDB_STATS_NONE");
+    }
+
+    return 1;
+#else
+    reply("OSMSG_LMDB_NOT_AVAILABLE");
+    return 0;
+#endif
+}
 
 static MODCMD_FUNC(cmd_dump)
 {
@@ -7525,6 +7638,10 @@ init_opserv(const char *nick)
 #if defined(WITH_MALLOC_X3) || defined(WITH_MALLOC_SLAB)
     opserv_define_func("STATS MEMORY", cmd_stats_memory, 0, 0, 0);
 #endif
+    /* LMDB commands */
+    opserv_define_func("LMDB SNAPSHOT", cmd_lmdb_snapshot, 600, 0, 0);
+    opserv_define_func("LMDB EXPORT", cmd_lmdb_export, 600, 0, 0);
+    opserv_define_func("LMDB STATS", cmd_lmdb_stats, 100, 0, 0);
     opserv_define_func("TRACE", cmd_trace, 100, 0, 3);
     opserv_define_func("TRACE PRINT", NULL, 0, 0, 0);
     opserv_define_func("TRACE COUNT", NULL, 0, 0, 0);
