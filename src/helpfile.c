@@ -1181,10 +1181,12 @@ static void helpfile_read_languages(void)
     /* If the user has a strings.db in their languages directory,
      * allow that to override C language strings.
      */
-    dict = parse_database("languages/strings.db");
-    if (dict) {
-        language_set_messages(lang_C, dict);
-        free_database(dict);
+    if (access("languages/strings.db", R_OK) == 0) {
+        dict = parse_database("languages/strings.db");
+        if (dict) {
+            language_set_messages(lang_C, dict);
+            free_database(dict);
+        }
     }
 }
 

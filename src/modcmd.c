@@ -3006,6 +3006,9 @@ import_aliases_db() {
     struct service *service;
     struct module *module;
 
+    /* aliases.db is optional - only used for legacy migration */
+    if (access("aliases.db", R_OK) != 0)
+        return;
     if (!(db = parse_database("aliases.db")))
         return;
     for (it = dict_first(db); it; it = iter_next(it)) {

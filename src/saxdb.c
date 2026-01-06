@@ -23,6 +23,7 @@
 #include "modcmd.h"
 #include "saxdb.h"
 #include "timeq.h"
+#include "x3_lmdb.h"
 
 #if !defined(SAXDB_BUFFER_SIZE)
 # define SAXDB_BUFFER_SIZE (32 * 1024)
@@ -66,6 +67,13 @@ saxdb_read_db(struct saxdb *db) {
 
     assert(db);
     assert(db->filename);
+
+    /* Skip SAXDB reads when in LMDB-only mode */
+    if (!x3_lmdb_saxdb_enabled()) {
+        log_module(MAIN_LOG, LOG_DEBUG, "Skipping SAXDB read for %s (LMDB-only mode)", db->name);
+        return;
+    }
+
     data = parse_database(db->filename);
     if (!data)
         return;
@@ -136,6 +144,12 @@ saxdb_write_db(struct saxdb *db) {
     char tmp_fname[MAXLEN];
     int res, res2;
     time_t start, finish;
+
+    /* Skip SAXDB writes when in LMDB-only mode */
+    if (!x3_lmdb_saxdb_enabled()) {
+        log_module(MAIN_LOG, LOG_DEBUG, "Skipping SAXDB write for %s (LMDB-only mode)", db->name);
+        return 0;
+    }
 
     assert(db->filename);
     sprintf(tmp_fname, "%s.new", db->filename);
@@ -537,9 +551,18 @@ saxdb_expand_help(const char *variable) {
 
 void
 saxdb_init(void) {
+    const char *saxdb_str;
+
     reg_exit_func(saxdb_cleanup, NULL);
     saxdbs = dict_new();
     dict_set_free_data(saxdbs, saxdb_free);
+
+    /* Read SAXDB enabled flag early, before any saxdb_register() calls */
+    saxdb_str = conf_get_data("services/x3/saxdb_enabled", RECDB_QSTRING);
+    if (saxdb_str) {
+        x3_lmdb_set_saxdb_enabled(atoi(saxdb_str));
+    }
+
     saxdb_register("mondo", saxdb_mondo_reader, saxdb_mondo_writer);
     saxdb_module = module_register("saxdb", MAIN_LOG, "saxdb.help", saxdb_expand_help);
     modcmd_register(saxdb_module, "write", cmd_write, 2, MODCMD_REQUIRE_AUTHED, "level", "800", NULL);
