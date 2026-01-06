@@ -1184,6 +1184,102 @@ int x3_lmdb_cookie_get(const char *handle, char *type_out, size_t type_size,
  */
 int x3_lmdb_cookie_delete(const char *handle);
 
+/* ========== Core Channel Data (SAXDB-optional) ========== */
+
+/**
+ * Store channel registration data
+ * @param channel Channel name (with #)
+ * @param json_data JSON-encoded channel data
+ * @return LMDB_SUCCESS on success, LMDB_ERROR on failure
+ */
+int x3_lmdb_chanreg_set(const char *channel, const char *json_data);
+
+/**
+ * Get channel registration data
+ * @param channel Channel name (with #)
+ * @param json_out Buffer for JSON data
+ * @param json_size Size of buffer
+ * @return LMDB_SUCCESS on success, LMDB_NOT_FOUND if not found, LMDB_ERROR on failure
+ */
+int x3_lmdb_chanreg_get(const char *channel, char *json_out, size_t json_size);
+
+/**
+ * Delete channel registration data
+ * @param channel Channel name (with #)
+ * @return LMDB_SUCCESS on success, LMDB_NOT_FOUND if not found, LMDB_ERROR on failure
+ */
+int x3_lmdb_chanreg_delete(const char *channel);
+
+/**
+ * Check if channel registration exists
+ * @param channel Channel name (with #)
+ * @return 1 if exists, 0 if not
+ */
+int x3_lmdb_chanreg_exists(const char *channel);
+
+/**
+ * Store channel user (access list entry)
+ * @param channel Channel name (with #)
+ * @param handle Account handle
+ * @param json_data JSON-encoded user data (access, flags, seen, info)
+ * @return LMDB_SUCCESS on success, LMDB_ERROR on failure
+ */
+int x3_lmdb_chanuser_reg_set(const char *channel, const char *handle, const char *json_data);
+
+/**
+ * Get channel user data
+ * @param channel Channel name (with #)
+ * @param handle Account handle
+ * @param json_out Buffer for JSON data
+ * @param json_size Size of buffer
+ * @return LMDB_SUCCESS on success, LMDB_NOT_FOUND if not found, LMDB_ERROR on failure
+ */
+int x3_lmdb_chanuser_reg_get(const char *channel, const char *handle, char *json_out, size_t json_size);
+
+/**
+ * Delete channel user
+ * @param channel Channel name (with #)
+ * @param handle Account handle
+ * @return LMDB_SUCCESS on success, LMDB_NOT_FOUND if not found, LMDB_ERROR on failure
+ */
+int x3_lmdb_chanuser_reg_delete(const char *channel, const char *handle);
+
+/**
+ * Clear all users for a channel
+ * @param channel Channel name (with #)
+ * @return Number of users deleted, LMDB_ERROR on failure
+ */
+int x3_lmdb_chanuser_reg_clear(const char *channel);
+
+/**
+ * Add channel ban
+ * @param channel Channel name (with #)
+ * @param json_data JSON-encoded ban data (mask, owner, reason, set_time, expires)
+ * @return Index of ban added, LMDB_ERROR on failure
+ */
+int x3_lmdb_chanban_add(const char *channel, const char *json_data);
+
+/**
+ * Clear all bans for a channel
+ * @param channel Channel name (with #)
+ * @return Number of bans deleted, LMDB_ERROR on failure
+ */
+int x3_lmdb_chanban_clear(const char *channel);
+
+/**
+ * List all bans for a channel
+ * @param channel Channel name (with #)
+ * @param json_out Array of JSON strings (caller must free each and the array)
+ * @param count_out Output for number of bans
+ * @return LMDB_SUCCESS on success, LMDB_ERROR on failure
+ */
+int x3_lmdb_chanban_list(const char *channel, char ***json_out, unsigned int *count_out);
+
+/**
+ * Free ban list returned by x3_lmdb_chanban_list
+ */
+void x3_lmdb_free_chanban_list(char **bans, unsigned int count);
+
 /* ========== SAXDB Configuration ========== */
 
 /**
@@ -1309,6 +1405,18 @@ void init_x3_lmdb(void);
 #define x3_lmdb_cookie_set(h, t, v, d, e) (-1)
 #define x3_lmdb_cookie_get(h, t, ts, c, cs, d, ds, e) (-2)
 #define x3_lmdb_cookie_delete(h)        (-2)
+#define x3_lmdb_chanreg_set(c, j)       (-1)
+#define x3_lmdb_chanreg_get(c, j, s)    (-2)
+#define x3_lmdb_chanreg_delete(c)       (-2)
+#define x3_lmdb_chanreg_exists(c)       (0)
+#define x3_lmdb_chanuser_reg_set(c, h, j) (-1)
+#define x3_lmdb_chanuser_reg_get(c, h, j, s) (-2)
+#define x3_lmdb_chanuser_reg_delete(c, h) (-2)
+#define x3_lmdb_chanuser_reg_clear(c)   (-1)
+#define x3_lmdb_chanban_add(c, j)       (-1)
+#define x3_lmdb_chanban_clear(c)        (-1)
+#define x3_lmdb_chanban_list(c, j, n)   (-1)
+#define x3_lmdb_free_chanban_list(b, c) do {} while(0)
 #define x3_lmdb_saxdb_enabled()         (1)
 #define x3_lmdb_set_saxdb_enabled(e)    do {} while(0)
 #define init_x3_lmdb()                  do {} while(0)

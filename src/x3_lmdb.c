@@ -5590,4 +5590,284 @@ int x3_lmdb_cookie_delete(const char *handle)
     return x3_lmdb_delete(LMDB_DB_ACCOUNTS, lmdb_key);
 }
 
+/* ========== Core Channel Data (SAXDB-optional) ========== */
+
+/**
+ * Store channel registration data
+ */
+int x3_lmdb_chanreg_set(const char *channel, const char *json_data)
+{
+    char lmdb_key[LMDB_KEY_BUFFER_SIZE];
+
+    if (!lmdb_initialized || !channel || !json_data) {
+        return LMDB_ERROR;
+    }
+
+    snprintf(lmdb_key, sizeof(lmdb_key), "%s%s", LMDB_PREFIX_CHANREG, channel);
+
+    return x3_lmdb_set(LMDB_DB_CHANNELS, lmdb_key, json_data);
+}
+
+/**
+ * Get channel registration data
+ */
+int x3_lmdb_chanreg_get(const char *channel, char *json_out, size_t json_size)
+{
+    char lmdb_key[LMDB_KEY_BUFFER_SIZE];
+
+    if (!lmdb_initialized || !channel || !json_out) {
+        return LMDB_ERROR;
+    }
+
+    snprintf(lmdb_key, sizeof(lmdb_key), "%s%s", LMDB_PREFIX_CHANREG, channel);
+
+    return x3_lmdb_get(LMDB_DB_CHANNELS, lmdb_key, json_out, json_size);
+}
+
+/**
+ * Delete channel registration data
+ */
+int x3_lmdb_chanreg_delete(const char *channel)
+{
+    char lmdb_key[LMDB_KEY_BUFFER_SIZE];
+
+    if (!lmdb_initialized || !channel) {
+        return LMDB_ERROR;
+    }
+
+    /* First clear all users for this channel */
+    x3_lmdb_chanuser_reg_clear(channel);
+
+    /* Clear all bans for this channel */
+    x3_lmdb_chanban_clear(channel);
+
+    snprintf(lmdb_key, sizeof(lmdb_key), "%s%s", LMDB_PREFIX_CHANREG, channel);
+
+    return x3_lmdb_delete(LMDB_DB_CHANNELS, lmdb_key);
+}
+
+/**
+ * Check if channel registration exists
+ */
+int x3_lmdb_chanreg_exists(const char *channel)
+{
+    char lmdb_key[LMDB_KEY_BUFFER_SIZE];
+    char buf[32];
+
+    if (!lmdb_initialized || !channel) {
+        return 0;
+    }
+
+    snprintf(lmdb_key, sizeof(lmdb_key), "%s%s", LMDB_PREFIX_CHANREG, channel);
+
+    return (x3_lmdb_get(LMDB_DB_CHANNELS, lmdb_key, buf, sizeof(buf)) == LMDB_SUCCESS) ? 1 : 0;
+}
+
+/**
+ * Store channel user (access list entry)
+ */
+int x3_lmdb_chanuser_reg_set(const char *channel, const char *handle, const char *json_data)
+{
+    char lmdb_key[LMDB_KEY_BUFFER_SIZE];
+
+    if (!lmdb_initialized || !channel || !handle || !json_data) {
+        return LMDB_ERROR;
+    }
+
+    /* Key format: chanuser:#channel:handle */
+    snprintf(lmdb_key, sizeof(lmdb_key), "%s%s:%s", LMDB_PREFIX_CHANUSER, channel, handle);
+
+    return x3_lmdb_set(LMDB_DB_CHANNELS, lmdb_key, json_data);
+}
+
+/**
+ * Get channel user data
+ */
+int x3_lmdb_chanuser_reg_get(const char *channel, const char *handle, char *json_out, size_t json_size)
+{
+    char lmdb_key[LMDB_KEY_BUFFER_SIZE];
+
+    if (!lmdb_initialized || !channel || !handle || !json_out) {
+        return LMDB_ERROR;
+    }
+
+    snprintf(lmdb_key, sizeof(lmdb_key), "%s%s:%s", LMDB_PREFIX_CHANUSER, channel, handle);
+
+    return x3_lmdb_get(LMDB_DB_CHANNELS, lmdb_key, json_out, json_size);
+}
+
+/**
+ * Delete channel user
+ */
+int x3_lmdb_chanuser_reg_delete(const char *channel, const char *handle)
+{
+    char lmdb_key[LMDB_KEY_BUFFER_SIZE];
+
+    if (!lmdb_initialized || !channel || !handle) {
+        return LMDB_ERROR;
+    }
+
+    snprintf(lmdb_key, sizeof(lmdb_key), "%s%s:%s", LMDB_PREFIX_CHANUSER, channel, handle);
+
+    return x3_lmdb_delete(LMDB_DB_CHANNELS, lmdb_key);
+}
+
+/**
+ * Clear all users for a channel
+ */
+int x3_lmdb_chanuser_reg_clear(const char *channel)
+{
+    char prefix[LMDB_KEY_BUFFER_SIZE];
+
+    if (!lmdb_initialized || !channel) {
+        return LMDB_ERROR;
+    }
+
+    /* Prefix for all users of this channel: chanuser:#channel: */
+    snprintf(prefix, sizeof(prefix), "%s%s:", LMDB_PREFIX_CHANUSER, channel);
+
+    return x3_lmdb_prefix_delete_all(LMDB_DB_CHANNELS, prefix);
+}
+
+/**
+ * Add channel ban
+ */
+int x3_lmdb_chanban_add(const char *channel, const char *json_data)
+{
+    char count_key[LMDB_KEY_BUFFER_SIZE];
+    char ban_key[LMDB_KEY_BUFFER_SIZE];
+    char count_str[32];
+    unsigned int count = 0;
+    int rc;
+
+    if (!lmdb_initialized || !channel || !json_data) {
+        return LMDB_ERROR;
+    }
+
+    /* Get current ban count */
+    snprintf(count_key, sizeof(count_key), "%s%s:count", LMDB_PREFIX_CHANBAN, channel);
+    if (x3_lmdb_get(LMDB_DB_CHANNELS, count_key, count_str, sizeof(count_str)) == LMDB_SUCCESS) {
+        count = (unsigned int)strtoul(count_str, NULL, 10);
+    }
+
+    /* Store the ban at index */
+    snprintf(ban_key, sizeof(ban_key), "%s%s:%u", LMDB_PREFIX_CHANBAN, channel, count);
+    rc = x3_lmdb_set(LMDB_DB_CHANNELS, ban_key, json_data);
+    if (rc != LMDB_SUCCESS) {
+        return LMDB_ERROR;
+    }
+
+    /* Update count */
+    count++;
+    snprintf(count_str, sizeof(count_str), "%u", count);
+    x3_lmdb_set(LMDB_DB_CHANNELS, count_key, count_str);
+
+    return (int)(count - 1); /* Return index */
+}
+
+/**
+ * Clear all bans for a channel
+ */
+int x3_lmdb_chanban_clear(const char *channel)
+{
+    char count_key[LMDB_KEY_BUFFER_SIZE];
+    char prefix[LMDB_KEY_BUFFER_SIZE];
+    int deleted;
+
+    if (!lmdb_initialized || !channel) {
+        return LMDB_ERROR;
+    }
+
+    /* Delete all bans with prefix chanban:#channel: */
+    snprintf(prefix, sizeof(prefix), "%s%s:", LMDB_PREFIX_CHANBAN, channel);
+    deleted = x3_lmdb_prefix_delete_all(LMDB_DB_CHANNELS, prefix);
+
+    /* Delete the count key */
+    snprintf(count_key, sizeof(count_key), "%s%s:count", LMDB_PREFIX_CHANBAN, channel);
+    x3_lmdb_delete(LMDB_DB_CHANNELS, count_key);
+
+    return deleted;
+}
+
+/**
+ * Callback context for listing bans
+ */
+struct chanban_list_ctx {
+    char **bans;
+    unsigned int count;
+    unsigned int capacity;
+};
+
+/**
+ * Callback for ban list iteration
+ */
+static int chanban_list_callback(const char *key, const char *value, void *ctx)
+{
+    struct chanban_list_ctx *list_ctx = (struct chanban_list_ctx *)ctx;
+    (void)key; /* Unused */
+
+    /* Skip count keys */
+    if (strstr(key, ":count")) {
+        return 0; /* Continue */
+    }
+
+    /* Grow array if needed */
+    if (list_ctx->count >= list_ctx->capacity) {
+        unsigned int new_cap = list_ctx->capacity ? list_ctx->capacity * 2 : 16;
+        char **new_bans = realloc(list_ctx->bans, new_cap * sizeof(char *));
+        if (!new_bans) {
+            return -1; /* Stop iteration */
+        }
+        list_ctx->bans = new_bans;
+        list_ctx->capacity = new_cap;
+    }
+
+    list_ctx->bans[list_ctx->count] = strdup(value);
+    if (!list_ctx->bans[list_ctx->count]) {
+        return -1;
+    }
+    list_ctx->count++;
+
+    return 0; /* Continue */
+}
+
+/**
+ * List all bans for a channel
+ */
+int x3_lmdb_chanban_list(const char *channel, char ***json_out, unsigned int *count_out)
+{
+    char prefix[LMDB_KEY_BUFFER_SIZE];
+    struct chanban_list_ctx ctx = {NULL, 0, 0};
+    int rc;
+
+    if (!lmdb_initialized || !channel || !json_out || !count_out) {
+        return LMDB_ERROR;
+    }
+
+    snprintf(prefix, sizeof(prefix), "%s%s:", LMDB_PREFIX_CHANBAN, channel);
+
+    rc = x3_lmdb_prefix_iterate(LMDB_DB_CHANNELS, prefix, chanban_list_callback, &ctx);
+    if (rc < 0 && ctx.count == 0) {
+        return LMDB_ERROR;
+    }
+
+    *json_out = ctx.bans;
+    *count_out = ctx.count;
+    return LMDB_SUCCESS;
+}
+
+/**
+ * Free ban list
+ */
+void x3_lmdb_free_chanban_list(char **bans, unsigned int count)
+{
+    unsigned int i;
+    if (!bans) return;
+
+    for (i = 0; i < count; i++) {
+        free(bans[i]);
+    }
+    free(bans);
+}
+
 #endif /* WITH_LMDB */
