@@ -4980,6 +4980,126 @@ static NICKSERV_FUNC(cmd_vacation)
     return 1;
 }
 
+#ifdef WITH_LMDB
+/**
+ * Serialize handle_info to JSON and write to LMDB
+ * This is called during saxdb_write for dual-write mode
+ */
+static void
+nickserv_lmdb_write_handle(struct handle_info *hi)
+{
+    char json_buf[8192];
+    char flags_str[33];
+    int len, ii, flen;
+    unsigned int idx;
+    struct nick_info *ni;
+
+    if (!x3_lmdb_is_available()) {
+        return;
+    }
+
+    /* Build flags string */
+    for (ii = flen = 0; handle_flags[ii]; ++ii) {
+        if (hi->flags & (1 << ii))
+            flags_str[flen++] = handle_flags[ii];
+    }
+    flags_str[flen] = '\0';
+
+    /* Serialize to JSON - escape strings properly */
+    len = snprintf(json_buf, sizeof(json_buf),
+        "{"
+        "\"passwd\":\"%s\","
+        "\"registered\":%lu,"
+        "\"lastseen\":%lu,"
+        "\"last_present\":%lu,"
+        "\"flags\":\"%s\","
+        "\"opserv_level\":%u,"
+        "\"karma\":%d,"
+        "\"maxlogins\":%u,"
+        "\"screen_width\":%u,"
+        "\"table_width\":%u,"
+        "\"userlist_style\":\"%c\","
+        "\"announcements\":\"%c\"",
+        hi->passwd,
+        (unsigned long)hi->registered,
+        (unsigned long)hi->lastseen,
+        (unsigned long)hi->last_present,
+        flags_str,
+        hi->opserv_level,
+        hi->karma,
+        hi->maxlogins,
+        hi->screen_width,
+        hi->table_width,
+        hi->userlist_style ? hi->userlist_style : 'n',
+        hi->announcements ? hi->announcements : '?');
+
+    /* Add optional string fields */
+    if (hi->email_addr) {
+        len += snprintf(json_buf + len, sizeof(json_buf) - len,
+                       ",\"email\":\"%s\"", hi->email_addr);
+    }
+    if (hi->epithet) {
+        len += snprintf(json_buf + len, sizeof(json_buf) - len,
+                       ",\"epithet\":\"%s\"", hi->epithet);
+    }
+    if (hi->infoline) {
+        len += snprintf(json_buf + len, sizeof(json_buf) - len,
+                       ",\"infoline\":\"%s\"", hi->infoline);
+    }
+    if (hi->fakehost) {
+        len += snprintf(json_buf + len, sizeof(json_buf) - len,
+                       ",\"fakehost\":\"%s\"", hi->fakehost);
+    }
+    if (hi->last_quit_host[0]) {
+        len += snprintf(json_buf + len, sizeof(json_buf) - len,
+                       ",\"last_quit_host\":\"%s\"", hi->last_quit_host);
+    }
+    if (hi->language && hi->language != lang_C) {
+        len += snprintf(json_buf + len, sizeof(json_buf) - len,
+                       ",\"language\":\"%s\"", hi->language->name);
+    }
+
+    /* Close JSON object */
+    snprintf(json_buf + len, sizeof(json_buf) - len, "}");
+
+    /* Write core handle data */
+    x3_lmdb_handle_set(hi->handle, json_buf);
+
+    /* Clear and write masks */
+    x3_lmdb_mask_clear(hi->handle);
+    for (idx = 0; idx < hi->masks->used; idx++) {
+        x3_lmdb_mask_add(hi->handle, hi->masks->list[idx]);
+    }
+
+    /* Clear and write ignores */
+    x3_lmdb_ignore_clear(hi->handle);
+    for (idx = 0; idx < hi->ignores->used; idx++) {
+        x3_lmdb_ignore_add(hi->handle, hi->ignores->list[idx]);
+    }
+
+    /* Write nicks */
+    for (ni = hi->nicks; ni; ni = ni->next) {
+        x3_lmdb_nick_register(ni->nick, hi->handle);
+    }
+
+    /* Write cookie if present */
+    if (hi->cookie) {
+        const char *type;
+        switch (hi->cookie->type) {
+        case ACTIVATION: type = "ACTIVATION"; break;
+        case PASSWORD_CHANGE: type = "PASSWORD_CHANGE"; break;
+        case EMAIL_CHANGE: type = "EMAIL_CHANGE"; break;
+        case ALLOWAUTH: type = "ALLOWAUTH"; break;
+        default: type = "UNKNOWN"; break;
+        }
+        x3_lmdb_cookie_set(hi->handle, type, hi->cookie->cookie,
+                          hi->cookie->data, hi->cookie->expires);
+    } else {
+        x3_lmdb_cookie_delete(hi->handle);
+    }
+}
+#endif /* WITH_LMDB */
+
 static int
 nickserv_saxdb_write(struct saxdb_context *ctx) {
     dict_iterator_t it;
@@ -5081,6 +5201,11 @@ nickserv_saxdb_write(struct saxdb_context *ctx) {
         flags[1] = 0;
         saxdb_write_string(ctx, KEY_USERLIST_STYLE, flags);
         saxdb_end_record(ctx);
+
+#ifdef WITH_LMDB
+        /* Dual-write to LMDB for SAXDB-optional migration */
+        nickserv_lmdb_write_handle(hi);
+#endif
     }
 
     return 0;
@@ -5952,11 +6077,252 @@ nickserv_db_read_handle(char *handle, dict_t obj)
 #endif
 }
 
+#ifdef WITH_LMDB
+/**
+ * Simple JSON string value extractor
+ * Returns pointer to value (null-terminated in place) or NULL if not found
+ */
+static char *
+json_extract_string(char *json, const char *key, char *out, size_t out_size)
+{
+    char search_key[128];
+    char *p, *end;
+
+    snprintf(search_key, sizeof(search_key), "\"%s\":\"", key);
+    p = strstr(json, search_key);
+    if (!p) return NULL;
+
+    p += strlen(search_key);
+    end = strchr(p, '"');
+    if (!end) return NULL;
+
+    size_t len = end - p;
+    if (len >= out_size) len = out_size - 1;
+    memcpy(out, p, len);
+    out[len] = '\0';
+    return out;
+}
+
+/**
+ * Simple JSON integer value extractor
+ */
+static long
+json_extract_int(const char *json, const char *key)
+{
+    char search_key[128];
+    const char *p;
+
+    snprintf(search_key, sizeof(search_key), "\"%s\":", key);
+    p = strstr(json, search_key);
+    if (!p) return 0;
+
+    p += strlen(search_key);
+    return strtol(p, NULL, 10);
+}
+
+/**
+ * Read a single handle from LMDB and register it
+ */
+static int
+nickserv_lmdb_read_handle(const char *handle_name)
+{
+    char json_buf[8192];
+    char value_buf[1024];
+    struct handle_info *hi;
+    char **masks = NULL, **ignores = NULL;
+    unsigned int mask_count = 0, ignore_count = 0;
+    unsigned int idx;
+    int rc;
+
+    /* Read core handle data */
+    rc = x3_lmdb_handle_get(handle_name, json_buf, sizeof(json_buf));
+    if (rc != LMDB_SUCCESS) {
+        return -1;
+    }
+
+    /* Extract password (required) */
+    if (!json_extract_string(json_buf, "passwd", value_buf, sizeof(value_buf))) {
+        log_module(NS_LOG, LOG_WARNING, "LMDB: No password for handle %s", handle_name);
+        return -1;
+    }
+
+    /* Check if handle already exists (from SAXDB or previous load) */
+    if ((hi = get_handle_info(handle_name))) {
+        /* Already loaded - skip */
+        return 0;
+    }
+
+    /* Register the handle with password */
+    hi = register_handle(handle_name, value_buf, 0);
+    if (!hi) {
+        log_module(NS_LOG, LOG_ERROR, "LMDB: Failed to register handle %s", handle_name);
+        return -1;
+    }
+
+    /* Load timestamps */
+    hi->registered = (time_t)json_extract_int(json_buf, "registered");
+    hi->lastseen = (time_t)json_extract_int(json_buf, "lastseen");
+    hi->last_present = (time_t)json_extract_int(json_buf, "last_present");
+
+    /* Load numeric fields */
+    hi->opserv_level = (unsigned short)json_extract_int(json_buf, "opserv_level");
+    hi->karma = (int)json_extract_int(json_buf, "karma");
+    hi->maxlogins = (unsigned char)json_extract_int(json_buf, "maxlogins");
+    hi->screen_width = (unsigned short)json_extract_int(json_buf, "screen_width");
+    hi->table_width = (unsigned short)json_extract_int(json_buf, "table_width");
+
+    /* Load flags */
+    if (json_extract_string(json_buf, "flags", value_buf, sizeof(value_buf))) {
+        char *p;
+        for (p = value_buf; *p; p++) {
+            int ii;
+            for (ii = 0; handle_flags[ii]; ii++) {
+                if (*p == handle_flags[ii]) {
+                    hi->flags |= (1 << ii);
+                    break;
+                }
+            }
+        }
+    }
+
+    /* Load single-char fields */
+    if (json_extract_string(json_buf, "userlist_style", value_buf, sizeof(value_buf))) {
+        hi->userlist_style = value_buf[0];
+    }
+    if (json_extract_string(json_buf, "announcements", value_buf, sizeof(value_buf))) {
+        hi->announcements = value_buf[0];
+    }
+
+    /* Load optional string fields */
+    if (json_extract_string(json_buf, "email", value_buf, sizeof(value_buf))) {
+        hi->email_addr = strdup(value_buf);
+    }
+    if (json_extract_string(json_buf, "epithet", value_buf, sizeof(value_buf))) {
+        hi->epithet = strdup(value_buf);
+    }
+    if (json_extract_string(json_buf, "infoline", value_buf, sizeof(value_buf))) {
+        hi->infoline = strdup(value_buf);
+    }
+    if (json_extract_string(json_buf, "fakehost", value_buf, sizeof(value_buf))) {
+        hi->fakehost = strdup(value_buf);
+    }
+    if (json_extract_string(json_buf, "last_quit_host", value_buf, sizeof(value_buf))) {
+        strncpy(hi->last_quit_host, value_buf, sizeof(hi->last_quit_host) - 1);
+        hi->last_quit_host[sizeof(hi->last_quit_host) - 1] = '\0';
+    }
+    if (json_extract_string(json_buf, "language", value_buf, sizeof(value_buf))) {
+        hi->language = language_find(value_buf);
+    }
+
+    /* Load masks */
+    if (x3_lmdb_mask_list(handle_name, &masks, &mask_count) == LMDB_SUCCESS) {
+        for (idx = 0; idx < mask_count; idx++) {
+            string_list_append(hi->masks, strdup(masks[idx]));
+        }
+        x3_lmdb_free_mask_list(masks, mask_count);
+    }
+
+    /* Load ignores */
+    if (x3_lmdb_ignore_list(handle_name, &ignores, &ignore_count) == LMDB_SUCCESS) {
+        for (idx = 0; idx < ignore_count; idx++) {
+            string_list_append(hi->ignores, strdup(ignores[idx]));
+        }
+        x3_lmdb_free_mask_list(ignores, ignore_count);
+    }
+
+    /* Load cookie if present */
+    {
+        char cookie_type[32], cookie_value[64], cookie_data[256];
+        time_t cookie_expires;
+
+        if (x3_lmdb_cookie_get(handle_name, cookie_type, sizeof(cookie_type),
+                               cookie_value, sizeof(cookie_value),
+                               cookie_data, sizeof(cookie_data),
+                               &cookie_expires) == LMDB_SUCCESS) {
+            if (cookie_expires > now) {
+                struct handle_cookie *cookie;
+                cookie = calloc(1, sizeof(*cookie));
+                if (cookie) {
+                    if (strcmp(cookie_type, "ACTIVATION") == 0)
+                        cookie->type = ACTIVATION;
+                    else if (strcmp(cookie_type, "PASSWORD_CHANGE") == 0)
+                        cookie->type = PASSWORD_CHANGE;
+                    else if (strcmp(cookie_type, "EMAIL_CHANGE") == 0)
+                        cookie->type = EMAIL_CHANGE;
+                    else if (strcmp(cookie_type, "ALLOWAUTH") == 0)
+                        cookie->type = ALLOWAUTH;
+
+                    strncpy(cookie->cookie, cookie_value, sizeof(cookie->cookie) - 1);
+                    cookie->expires = cookie_expires;
+                    if (cookie_data[0]) {
+                        cookie->data = strdup(cookie_data);
+                    }
+                    cookie->hi = hi;
+                    hi->cookie = cookie;
+                }
+            }
+        }
+    }
+
+    return 0;
+}
+
+/**
+ * Callback for prefix iteration to read all handles from LMDB
+ */
+static int
+lmdb_handle_read_callback(const char *key, const char *value, void *ctx)
+{
+    const char *handle_name;
+    (void)value;
+    (void)ctx;
+
+    /* Key format is "handle:<handle_name>" */
+    if (strncmp(key, LMDB_PREFIX_HANDLE, strlen(LMDB_PREFIX_HANDLE)) == 0) {
+        handle_name = key + strlen(LMDB_PREFIX_HANDLE);
+        nickserv_lmdb_read_handle(handle_name);
+    }
+    return 0; /* Continue iteration */
+}
+
+/**
+ * Read all handles from LMDB instead of SAXDB
+ */
+static int
+nickserv_lmdb_read_all(void)
+{
+    int count;
+
+    if (!x3_lmdb_is_available()) {
+        log_module(NS_LOG, LOG_ERROR, "LMDB not available for SAXDB-optional read");
+        return -1;
+    }
+
+    log_module(NS_LOG, LOG_INFO, "Reading NickServ data from LMDB (SAXDB disabled)");
+
+    count = x3_lmdb_prefix_iterate(LMDB_DB_ACCOUNTS, LMDB_PREFIX_HANDLE,
+                                   lmdb_handle_read_callback, NULL);
+
+    if (count >= 0) {
+        log_module(NS_LOG, LOG_INFO, "Loaded %d handles from LMDB", count);
+    }
+
+    return count >= 0 ? 0 : -1;
+}
+#endif /* WITH_LMDB */
+
 static int
 nickserv_saxdb_read(dict_t db) {
     dict_iterator_t it;
     struct record_data *rd;
     char *handle;
+
+#ifdef WITH_LMDB
+    /* If SAXDB is disabled, read from LMDB instead */
+    if (!x3_lmdb_saxdb_enabled() && x3_lmdb_is_available()) {
+        return nickserv_lmdb_read_all();
+    }
+#endif
 
     for (it=dict_first(db); it; it=iter_next(it)) {
         rd = iter_data(it);
