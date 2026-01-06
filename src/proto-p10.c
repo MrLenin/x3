@@ -387,6 +387,25 @@ static const char *his_servername;
 static const char *his_servercomment;
 static int extended_accounts;
 
+/* CHATHISTORY query infrastructure */
+#define CHATHISTORY_MAX_RESULTS 100
+#define CHATHISTORY_REQID_LEN 64
+
+/* struct chathistory_result and chathistory_callback_t defined in proto.h */
+
+struct chathistory_pending {
+    char reqid[CHATHISTORY_REQID_LEN];
+    char target[CHANNELLEN + 1];
+    chathistory_callback_t callback;
+    void *extra;
+    struct chathistory_result *results;
+    struct chathistory_result *results_tail;
+    int count;
+    time_t created;
+};
+
+static struct dict *chathistory_pending_queries;
+
 /* These correspond to 1 << X:      01234567890123456789012345 */
 const char irc_user_mode_chars[] = "oOiw dkgh    x  BnIX  azDRWHLq";
 
@@ -3307,6 +3326,80 @@ static CMD_FUNC(cmd_markread)
     return 1;
 }
 
+/* CHATHISTORY query helper functions */
+
+static void
+chathistory_pending_free(void *data)
+{
+    struct chathistory_pending *pending = data;
+    struct chathistory_result *result, *next;
+
+    for (result = pending->results; result; result = next) {
+        next = result->next;
+        free(result->msgid);
+        free(result->timestamp);
+        free(result->sender);
+        free(result->account);
+        free(result->content);
+        free(result);
+    }
+    free(pending);
+}
+
+static unsigned int chathistory_reqid_counter = 0;
+
+int
+send_chathistory_query(const char *target, char subcmd, const char *ref,
+                       int limit, chathistory_callback_t callback, void *extra)
+{
+    struct chathistory_pending *pending;
+    char reqid[CHATHISTORY_REQID_LEN];
+
+    if (!chathistory_pending_queries) {
+        chathistory_pending_queries = dict_new();
+        dict_set_free_data(chathistory_pending_queries, chathistory_pending_free);
+    }
+
+    /* Generate unique request ID */
+    snprintf(reqid, sizeof(reqid), "hs-%u-%lu",
+             chathistory_reqid_counter++, (unsigned long)now);
+
+    /* Create pending query tracker */
+    pending = calloc(1, sizeof(*pending));
+    strncpy(pending->reqid, reqid, sizeof(pending->reqid) - 1);
+    strncpy(pending->target, target, sizeof(pending->target) - 1);
+    pending->callback = callback;
+    pending->extra = extra;
+    pending->created = now;
+
+    dict_insert(chathistory_pending_queries, pending->reqid, pending);
+
+    /* Send query to IRC server */
+    putsock("%s " P10_CHATHISTORY " Q %s %c %s %d %s",
+            self->numeric, target, subcmd, ref, limit, reqid);
+
+    log_module(MAIN_LOG, LOG_DEBUG,
+               "CHATHISTORY: Sent query %s for %s (subcmd=%c ref=%s limit=%d)",
+               reqid, target, subcmd, ref, limit);
+
+    return 1;
+}
+
+void
+chathistory_result_free(struct chathistory_result *results)
+{
+    struct chathistory_result *result, *next;
+    for (result = results; result; result = next) {
+        next = result->next;
+        free(result->msgid);
+        free(result->timestamp);
+        free(result->sender);
+        free(result->account);
+        free(result->content);
+        free(result);
+    }
+}
+
 /** Handle TM (TAGMSG) command - P10 client-only tag message.
  * Format: <source> TM @<tags> <target>
  * TAGMSG delivers client-only tags without a message body.
@@ -3334,13 +3427,14 @@ static CMD_FUNC(cmd_tagmsg)
  * Ref format: <timestamp> (starts with digit), <msgid> (starts with letter), or *
  * Timestamps (<ts>) are Unix format: seconds.milliseconds (e.g., "1735689600.123")
  *
- * X3 doesn't store chat history, so for queries we respond immediately
- * with an end response indicating 0 messages.
+ * X3 handles both incoming queries (responds with 0 messages since X3 doesn't store)
+ * and outgoing query responses (for HistServ functionality).
  */
 static CMD_FUNC(cmd_chathistory)
 {
     const char *subcmd;
     const char *reqid;
+    struct chathistory_pending *pending;
 
     (void)origin;
 
@@ -3364,12 +3458,74 @@ static CMD_FUNC(cmd_chathistory)
         log_module(MAIN_LOG, LOG_DEBUG, "CHATHISTORY: Responded to query %s with 0 messages", reqid);
 
     } else if (subcmd[0] == 'R' && subcmd[1] == '\0') {
-        /* Response: ignore - we don't initiate queries */
-        log_module(MAIN_LOG, LOG_DEBUG, "CHATHISTORY: Ignoring response");
+        /* Response: CH R <reqid> <msgid> <ts> <type> <sender> <account> :<content> */
+        struct chathistory_result *result;
+
+        if (argc < 8) {
+            log_module(MAIN_LOG, LOG_DEBUG, "CHATHISTORY R: Not enough parameters (%d)", argc);
+            return 0;
+        }
+
+        reqid = argv[2];
+
+        if (!chathistory_pending_queries ||
+            !(pending = dict_find(chathistory_pending_queries, reqid, NULL))) {
+            log_module(MAIN_LOG, LOG_DEBUG, "CHATHISTORY R: Unknown reqid %s", reqid);
+            return 1;
+        }
+
+        /* Add result to pending query */
+        result = calloc(1, sizeof(*result));
+        result->msgid = strdup(argv[3]);
+        result->timestamp = strdup(argv[4]);
+        result->type = atoi(argv[5]);
+        result->sender = strdup(argv[6]);
+        result->account = strdup(argv[7]);
+        result->content = (argc > 8) ? strdup(argv[8]) : strdup("");
+
+        /* Append to results list */
+        if (pending->results_tail) {
+            pending->results_tail->next = result;
+        } else {
+            pending->results = result;
+        }
+        pending->results_tail = result;
+        pending->count++;
+
+        log_module(MAIN_LOG, LOG_DEBUG,
+                   "CHATHISTORY R: Added result %d for %s (msgid=%s)",
+                   pending->count, reqid, result->msgid);
 
     } else if (subcmd[0] == 'E' && subcmd[1] == '\0') {
-        /* End: ignore - we don't initiate queries */
-        log_module(MAIN_LOG, LOG_DEBUG, "CHATHISTORY: Ignoring end marker");
+        /* End: CH E <reqid> <count> */
+        if (argc < 4) {
+            log_module(MAIN_LOG, LOG_DEBUG, "CHATHISTORY E: Not enough parameters (%d)", argc);
+            return 0;
+        }
+
+        reqid = argv[2];
+
+        if (!chathistory_pending_queries ||
+            !(pending = dict_find(chathistory_pending_queries, reqid, NULL))) {
+            log_module(MAIN_LOG, LOG_DEBUG, "CHATHISTORY E: Unknown reqid %s", reqid);
+            return 1;
+        }
+
+        log_module(MAIN_LOG, LOG_DEBUG,
+                   "CHATHISTORY E: Completing query %s with %d results",
+                   reqid, pending->count);
+
+        /* Call the callback with results */
+        if (pending->callback) {
+            pending->callback(pending->reqid, pending->target,
+                             pending->results, pending->count, pending->extra);
+        }
+
+        /* Clear results pointer before removing (callback owns them now) */
+        pending->results = NULL;
+        pending->results_tail = NULL;
+
+        dict_remove(chathistory_pending_queries, reqid);
 
     } else {
         log_module(MAIN_LOG, LOG_DEBUG, "CHATHISTORY: Unknown subcommand %s", subcmd);

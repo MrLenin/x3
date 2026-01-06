@@ -43,6 +43,7 @@ EXTRA_x3_SOURCES = \
 	mod-snoop.c \
 	mod-track.c \
 	mod-memoserv.c \
+	mod-histserv.c \
 	mod-helpserv.c \
 	mod-sockcheck.c \
 	mod-webtv.c \

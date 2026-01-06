@@ -188,6 +188,32 @@ void irc_sasl_mechs_broadcast(const char *mechs);
 void irc_regreply(const char *user_numeric, char status, const char *account, const char *message);
 void irc_vapid_broadcast(const char *vapid_pubkey);
 
+/* CHATHISTORY query functions (for HistServ) */
+struct chathistory_result {
+    char *msgid;
+    char *timestamp;
+    int type;           /* 0=privmsg, 1=notice, 2=action */
+    char *sender;       /* nick!user@host */
+    char *account;
+    char *content;
+    struct chathistory_result *next;
+};
+
+typedef void (*chathistory_callback_t)(const char *reqid, const char *target,
+                                       struct chathistory_result *results,
+                                       int count, void *extra);
+
+/* Send a CHATHISTORY query to the IRC server
+ * subcmd: 'L'=LATEST, 'B'=BEFORE, 'A'=AFTER, 'R'=AROUND
+ * ref: timestamp or msgid, or "*" for LATEST
+ * callback: called when response is complete
+ */
+int send_chathistory_query(const char *target, char subcmd, const char *ref,
+                           int limit, chathistory_callback_t callback, void *extra);
+
+/* Free a chain of chathistory results */
+void chathistory_result_free(struct chathistory_result *results);
+
 /* numeric messages */
 void irc_numeric(struct userNode *user, unsigned int num, const char *format, ...);
 /* RFC1459-compliant numeric responses */
