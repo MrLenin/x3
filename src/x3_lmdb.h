@@ -55,6 +55,8 @@ enum lmdb_error {
 #define LMDB_PREFIX_GLINE "gline:"        /* G-line: mask → JSON {issuer, reason, expires, ...} */
 #define LMDB_PREFIX_SHUN "shun:"          /* Shun: mask → JSON {issuer, reason, expires, ...} */
 #define LMDB_PREFIX_TRUSTED "trusted:"    /* Trusted host: mask → JSON {issuer, limit, ...} */
+#define LMDB_PREFIX_GAG "gag:"            /* Gag: mask → JSON {owner, reason, expires} */
+#define LMDB_PREFIX_ALERT "alert:"        /* Alert: name → JSON {discrim, owner, reaction, ...} */
 
 /* Metadata entry for iteration */
 struct lmdb_metadata_entry {
@@ -1280,6 +1282,80 @@ int x3_lmdb_chanban_list(const char *channel, char ***json_out, unsigned int *co
  */
 void x3_lmdb_free_chanban_list(char **bans, unsigned int count);
 
+/* ========== OpServ Data (SAXDB-optional) ========== */
+
+/**
+ * Store trusted host
+ * @param ipaddr IP address/mask
+ * @param json_data JSON-encoded trusted host data (issuer, reason, limit, issued, expires)
+ * @return LMDB_SUCCESS on success, LMDB_ERROR on failure
+ */
+int x3_lmdb_trusted_set(const char *ipaddr, const char *json_data);
+
+/**
+ * Get trusted host data
+ * @param ipaddr IP address/mask
+ * @param json_out Buffer for JSON data
+ * @param json_size Size of buffer
+ * @return LMDB_SUCCESS on success, LMDB_NOT_FOUND if not found, LMDB_ERROR on failure
+ */
+int x3_lmdb_trusted_get(const char *ipaddr, char *json_out, size_t json_size);
+
+/**
+ * Delete trusted host
+ * @param ipaddr IP address/mask
+ * @return LMDB_SUCCESS on success, LMDB_NOT_FOUND if not found, LMDB_ERROR on failure
+ */
+int x3_lmdb_trusted_delete(const char *ipaddr);
+
+/**
+ * Store gag entry
+ * @param mask Gag mask
+ * @param json_data JSON-encoded gag data (owner, reason, expires)
+ * @return LMDB_SUCCESS on success, LMDB_ERROR on failure
+ */
+int x3_lmdb_gag_set(const char *mask, const char *json_data);
+
+/**
+ * Get gag entry
+ * @param mask Gag mask
+ * @param json_out Buffer for JSON data
+ * @param json_size Size of buffer
+ * @return LMDB_SUCCESS on success, LMDB_NOT_FOUND if not found, LMDB_ERROR on failure
+ */
+int x3_lmdb_gag_get(const char *mask, char *json_out, size_t json_size);
+
+/**
+ * Delete gag entry
+ * @param mask Gag mask
+ * @return LMDB_SUCCESS on success, LMDB_NOT_FOUND if not found, LMDB_ERROR on failure
+ */
+int x3_lmdb_gag_delete(const char *mask);
+
+/**
+ * Store alert
+ * @param name Alert name
+ * @param json_data JSON-encoded alert data (discrim, owner, reaction, last, expire)
+ * @return LMDB_SUCCESS on success, LMDB_ERROR on failure
+ */
+int x3_lmdb_alert_set(const char *name, const char *json_data);
+
+/**
+ * Get alert
+ * @param name Alert name
+ * @param json_out Buffer for JSON data
+ * @param json_size Size of buffer
+ * @return LMDB_SUCCESS on success, LMDB_NOT_FOUND if not found, LMDB_ERROR on failure
+ */
+int x3_lmdb_alert_get(const char *name, char *json_out, size_t json_size);
+
+/**
+ * Delete alert
+ * @param name Alert name
+ * @return LMDB_SUCCESS on success, LMDB_NOT_FOUND if not found, LMDB_ERROR on failure
+ */
+int x3_lmdb_alert_delete(const char *name);
+
 /* ========== SAXDB Configuration ========== */
 
 /**
@@ -1417,6 +1493,15 @@ void init_x3_lmdb(void);
 #define x3_lmdb_chanban_clear(c)        (-1)
 #define x3_lmdb_chanban_list(c, j, n)   (-1)
 #define x3_lmdb_free_chanban_list(b, c) do {} while(0)
+#define x3_lmdb_trusted_set(i, j)       (-1)
+#define x3_lmdb_trusted_get(i, j, s)    (-2)
+#define x3_lmdb_trusted_delete(i)       (-2)
+#define x3_lmdb_gag_set(m, j)           (-1)
+#define x3_lmdb_gag_get(m, j, s)        (-2)
+#define x3_lmdb_gag_delete(m)           (-2)
+#define x3_lmdb_alert_set(n, j)         (-1)
+#define x3_lmdb_alert_get(n, j, s)      (-2)
+#define x3_lmdb_alert_delete(n)         (-2)
 #define x3_lmdb_saxdb_enabled()         (1)
 #define x3_lmdb_set_saxdb_enabled(e)    do {} while(0)
 #define init_x3_lmdb()                  do {} while(0)

@@ -5870,4 +5870,150 @@ void x3_lmdb_free_chanban_list(char **bans, unsigned int count)
     free(bans);
 }
 
+/* ========== OpServ Data (SAXDB-optional) ========== */
+
+/**
+ * Store trusted host
+ */
+int x3_lmdb_trusted_set(const char *ipaddr, const char *json_data)
+{
+    char lmdb_key[LMDB_KEY_BUFFER_SIZE];
+
+    if (!lmdb_initialized || !ipaddr || !json_data) {
+        return LMDB_ERROR;
+    }
+
+    snprintf(lmdb_key, sizeof(lmdb_key), "%s%s", LMDB_PREFIX_TRUSTED, ipaddr);
+
+    return x3_lmdb_set(LMDB_DB_METADATA, lmdb_key, json_data);
+}
+
+/**
+ * Get trusted host data
+ */
+int x3_lmdb_trusted_get(const char *ipaddr, char *json_out, size_t json_size)
+{
+    char lmdb_key[LMDB_KEY_BUFFER_SIZE];
+
+    if (!lmdb_initialized || !ipaddr || !json_out) {
+        return LMDB_ERROR;
+    }
+
+    snprintf(lmdb_key, sizeof(lmdb_key), "%s%s", LMDB_PREFIX_TRUSTED, ipaddr);
+
+    return x3_lmdb_get(LMDB_DB_METADATA, lmdb_key, json_out, json_size);
+}
+
+/**
+ * Delete trusted host
+ */
+int x3_lmdb_trusted_delete(const char *ipaddr)
+{
+    char lmdb_key[LMDB_KEY_BUFFER_SIZE];
+
+    if (!lmdb_initialized || !ipaddr) {
+        return LMDB_ERROR;
+    }
+
+    snprintf(lmdb_key, sizeof(lmdb_key), "%s%s", LMDB_PREFIX_TRUSTED, ipaddr);
+
+    return x3_lmdb_delete(LMDB_DB_METADATA, lmdb_key);
+}
+
+/**
+ * Store gag entry
+ */
+int x3_lmdb_gag_set(const char *mask, const char *json_data)
+{
+    char lmdb_key[LMDB_KEY_BUFFER_SIZE];
+
+    if (!lmdb_initialized || !mask || !json_data) {
+        return LMDB_ERROR;
+    }
+
+    snprintf(lmdb_key, sizeof(lmdb_key), "%s%s", LMDB_PREFIX_GAG, mask);
+
+    return x3_lmdb_set(LMDB_DB_METADATA, lmdb_key, json_data);
+}
+
+/**
+ * Get gag entry
+ */
+int x3_lmdb_gag_get(const char *mask, char *json_out, size_t json_size)
+{
+    char lmdb_key[LMDB_KEY_BUFFER_SIZE];
+
+    if (!lmdb_initialized || !mask || !json_out) {
+        return LMDB_ERROR;
+    }
+
+    snprintf(lmdb_key, sizeof(lmdb_key), "%s%s", LMDB_PREFIX_GAG, mask);
+
+    return x3_lmdb_get(LMDB_DB_METADATA, lmdb_key, json_out, json_size);
+}
+
+/**
+ * Delete gag entry
+ */
+int x3_lmdb_gag_delete(const char *mask)
+{
+    char lmdb_key[LMDB_KEY_BUFFER_SIZE];
+
+    if (!lmdb_initialized || !mask) {
+        return LMDB_ERROR;
+    }
+
+    snprintf(lmdb_key, sizeof(lmdb_key), "%s%s", LMDB_PREFIX_GAG, mask);
+
+    return x3_lmdb_delete(LMDB_DB_METADATA, lmdb_key);
+}
+
+/**
+ * Store alert
+ */
+int x3_lmdb_alert_set(const char *name, const char *json_data)
+{
+    char lmdb_key[LMDB_KEY_BUFFER_SIZE];
+
+    if (!lmdb_initialized || !name || !json_data) {
+        return LMDB_ERROR;
+    }
+
+    snprintf(lmdb_key, sizeof(lmdb_key), "%s%s", LMDB_PREFIX_ALERT, name);
+
+    return x3_lmdb_set(LMDB_DB_METADATA, lmdb_key, json_data);
+}
+
+/**
+ * Get alert
+ */
+int x3_lmdb_alert_get(const char *name, char *json_out, size_t json_size)
+{
+    char lmdb_key[LMDB_KEY_BUFFER_SIZE];
+
+    if (!lmdb_initialized || !name || !json_out) {
+        return LMDB_ERROR;
+    }
+
+    snprintf(lmdb_key, sizeof(lmdb_key), "%s%s", LMDB_PREFIX_ALERT, name);
+
+    return x3_lmdb_get(LMDB_DB_METADATA, lmdb_key, json_out, json_size);
+}
+
+/**
+ * Delete alert
+ */
+int x3_lmdb_alert_delete(const char *name)
+{
+    char lmdb_key[LMDB_KEY_BUFFER_SIZE];
+
+    if (!lmdb_initialized || !name) {
+        return LMDB_ERROR;
+    }
+
+    snprintf(lmdb_key, sizeof(lmdb_key), "%s%s", LMDB_PREFIX_ALERT, name);
+
+    return x3_lmdb_delete(LMDB_DB_METADATA, lmdb_key);
+}
+
 #endif /* WITH_LMDB */
