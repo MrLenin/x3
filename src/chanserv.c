@@ -10156,6 +10156,10 @@ write_dnrs_helper(struct saxdb_context *ctx, struct dict *dnrs)
     }
 }
 
+#ifdef WITH_LMDB
+static void chanserv_lmdb_write_all(void);
+#endif
+
 static int
 chanserv_saxdb_write(struct saxdb_context *ctx)
 {
@@ -10186,8 +10190,142 @@ chanserv_saxdb_write(struct saxdb_context *ctx)
         chanserv_write_channel(ctx, channel);
     saxdb_end_record(ctx);
 
+#ifdef WITH_LMDB
+    /* Dual-write to LMDB for SAXDB-optional migration */
+    chanserv_lmdb_write_all();
+#endif
+
     return 0;
 }
+
+#ifdef WITH_LMDB
+/**
+ * Write a single channel to LMDB (dual-write for SAXDB-optional migration)
+ */
+static void
+chanserv_lmdb_write_channel(struct chanData *channel)
+{
+    char json_buf[16384];
+    char modes_buf[MAXLEN];
+    char flags_str[33];
+    char lvlopts_buf[1024];
+    char chopts_buf[128];
+    struct userData *uData;
+    struct banData *bData;
+    int offset = 0;
+    unsigned int i;
+    enum levelOption lvlOpt;
+    enum charOption chOpt;
+
+    if (!channel || !channel->channel || !channel->channel->name) {
+        return;
+    }
+
+    /* Build lvlOpts JSON array */
+    offset = 0;
+    lvlopts_buf[offset++] = '[';
+    for (lvlOpt = 0; lvlOpt < NUM_LEVEL_OPTIONS; ++lvlOpt) {
+        if (lvlOpt > 0) lvlopts_buf[offset++] = ',';
+        offset += snprintf(lvlopts_buf + offset, sizeof(lvlopts_buf) - offset,
+                          "%u", channel->lvlOpts[lvlOpt]);
+    }
+    lvlopts_buf[offset++] = ']';
+    lvlopts_buf[offset] = '\0';
+
+    /* Build chOpts JSON array */
+    offset = 0;
+    chopts_buf[offset++] = '[';
+    for (chOpt = 0; chOpt < NUM_CHAR_OPTIONS; ++chOpt) {
+        if (chOpt > 0) chopts_buf[offset++] = ',';
+        offset += snprintf(chopts_buf + offset, sizeof(chopts_buf) - offset,
+                          "%d", (int)channel->chOpts[chOpt]);
+    }
+    chopts_buf[offset++] = ']';
+    chopts_buf[offset] = '\0';
+
+    /* Format modes */
+    if (channel->modes.modes_set || channel->modes.modes_clear) {
+        mod_chanmode_format(&channel->modes, modes_buf);
+    } else {
+        modes_buf[0] = '\0';
+    }
+
+    /* Convert flags to string for JSON */
+    snprintf(flags_str, sizeof(flags_str), "%u", channel->flags);
+
+    /* Build channel JSON */
+    snprintf(json_buf, sizeof(json_buf),
+        "{\"registered\":%lu,\"visited\":%lu,\"max\":%u,\"flags\":%s,"
+        "\"topic\":\"%s\",\"registrar\":\"%s\",\"greeting\":\"%s\","
+        "\"user_greeting\":\"%s\",\"topic_mask\":\"%s\",\"modes\":\"%s\","
+        "\"ownerTransfer\":%lu,\"maxsetinfo\":%u,\"lvlOpts\":%s,\"chOpts\":%s}",
+        (unsigned long)channel->registered,
+        (unsigned long)channel->visited,
+        channel->max,
+        flags_str,
+        channel->topic ? channel->topic : "",
+        channel->registrar ? channel->registrar : "",
+        channel->greeting ? channel->greeting : "",
+        channel->user_greeting ? channel->user_greeting : "",
+        channel->topic_mask ? channel->topic_mask : "",
+        modes_buf,
+        (unsigned long)channel->ownerTransfer,
+        channel->maxsetinfo,
+        lvlopts_buf,
+        chopts_buf);
+
+    /* Store channel registration */
+    x3_lmdb_chanreg_set(channel->channel->name, json_buf);
+
+    /* Store channel users */
+    for (uData = channel->users; uData; uData = uData->next) {
+        if (!uData->handle || !uData->handle->handle) continue;
+
+        snprintf(json_buf, sizeof(json_buf),
+            "{\"access\":%u,\"seen\":%lu,\"flags\":%u,\"expires\":%lu,"
+            "\"accessexpiry\":%lu,\"clvlexpiry\":%lu,\"lastaccess\":%u,"
+            "\"info\":\"%s\"}",
+            uData->access,
+            (unsigned long)uData->seen,
+            uData->flags,
+            (unsigned long)uData->expires,
+            (unsigned long)uData->accessexpiry,
+            (unsigned long)uData->clvlexpiry,
+            uData->lastaccess,
+            uData->info ? uData->info : "");
+
+        x3_lmdb_chanuser_reg_set(channel->channel->name, uData->handle->handle, json_buf);
+    }
+
+    /* Store channel bans */
+    x3_lmdb_chanban_clear(channel->channel->name); /* Clear existing, rebuild */
+    for (bData = channel->bans, i = 0; bData; bData = bData->next, i++) {
+        snprintf(json_buf, sizeof(json_buf),
+            "{\"mask\":\"%s\",\"owner\":\"%s\",\"reason\":\"%s\","
+            "\"set\":%lu,\"triggered\":%lu,\"expires\":%lu}",
+            bData->mask,
+            bData->owner,
+            bData->reason ? bData->reason : "",
+            (unsigned long)bData->set,
+            (unsigned long)bData->triggered,
+            (unsigned long)bData->expires);
+
+        x3_lmdb_chanban_add(channel->channel->name, json_buf);
+    }
+}
+
+/**
+ * Write all channels to LMDB
+ */
+static void
+chanserv_lmdb_write_all(void)
+{
+    struct chanData *channel;
+    for (channel = channelList; channel; channel = channel->next) {
+        chanserv_lmdb_write_channel(channel);
+    }
+}
+#endif /* WITH_LMDB */
 
 static void
 chanserv_db_cleanup(UNUSED_ARG(void *extra)) {
