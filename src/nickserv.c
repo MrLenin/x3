@@ -47,6 +47,13 @@
 #include "md5.h"  /* For negative auth cache hash */
 #endif
 
+#ifdef WITH_SSL
+#include <openssl/rand.h>  /* For SCRAM nonce generation */
+#endif
+
+/* Keycloak webhook needs both Keycloak and LMDB */
+#include "keycloak_webhook.h"
+
 #ifdef WITH_ZSTD
 #include "x3_compress.h"
 #endif
@@ -184,6 +191,9 @@
 #define KEY_KEYCLOAK_OPER_GROUP_LEVEL "keycloak_oper_group_level"
 #define KEY_KEYCLOAK_ATTR_OSLEVEL "keycloak_attr_oslevel"
 #define KEY_KEYCLOAK_EMAIL_POLICY "keycloak_email_policy"
+#define KEY_KEYCLOAK_WEBHOOK_PORT "keycloak_webhook_port"
+#define KEY_KEYCLOAK_WEBHOOK_SECRET "keycloak_webhook_secret"
+#define KEY_KEYCLOAK_WEBHOOK_BIND "keycloak_webhook_bind"
 #endif
 
 /* Metadata TTL configuration keys */
@@ -201,6 +211,9 @@
 #define KEY_PASSWORD_PBKDF2_ITERATIONS "password_pbkdf2_iterations"
 #define KEY_PASSWORD_BCRYPT_COST     "password_bcrypt_cost"
 #define KEY_PASSWORD_LAZY_MIGRATION  "password_lazy_migration"
+
+/* Certificate auto-registration */
+#define KEY_CERT_AUTOREGISTER        "cert_autoregister"
 
 /* Default immutable keys (space-separated) that never expire */
 #define DEFAULT_IMMUTABLE_KEYS "avatar pronouns bot homepage"
@@ -238,7 +251,7 @@ static char handle_inverse_flags[256];
 static unsigned int flag_access_levels[32];
 
 /* Track last-broadcast SASL mechanism list for change detection */
-static char last_sasl_mechs[128] = "";
+static char last_sasl_mechs[192] = "";  /* Must match nickserv_get_sasl_mechanisms buffer */
 
 #ifdef WITH_KEYCLOAK
 /* Keycloak client state - cached token for admin operations */
@@ -318,7 +331,7 @@ static const struct message_entry msgtab[] = {
     { "NSMSG_REGISTER_HN_SUCCESS", "Account and nick have been registered to you." },
     { "NSMSG_REQUIRE_OPER", "You must be an $bIRC Operator$b to register the first account." },
     { "NSMSG_ROOT_HANDLE", "Account %s has been granted $broot-level privileges$b." },
-    { "NSMSG_USE_COOKIE_REGISTER", "To activate your account, you must check your email for the \"cookie\" that has been mailed to it.  When you have it, use the $bcookie$b command to complete registration." },
+    { "NSMSG_USE_COOKIE_REGISTER", "To activate your account, you must check your email for the \"cookie\" that has been mailed to it.  When you have it, use $bCOOKIE <handle> <cookie> <password>$b to confirm your password and complete registration." },
     { "NSMSG_USE_COOKIE_RESETPASS", "A cookie has been mailed to your account's email address.  You must check your email and use the $bcookie$b command to confirm the password change." },
     { "NSMSG_USE_COOKIE_EMAIL_1", "A cookie has been mailed to the new address you requested.  To finish setting your email address, please check your email for the cookie and use the $bcookie$b command to verify." },
     { "NSMSG_USE_COOKIE_EMAIL_2", "A cookie has been generated, and half mailed to each your old and new addresses.  To finish changing your email address, please check your email for the cookie and use the $bcookie$b command to verify." },
@@ -329,7 +342,9 @@ static const struct message_entry msgtab[] = {
     { "NSMSG_NO_COOKIE_FOREIGN", "The account $b%s$b does not have any cookie issued right now." },
     { "NSMSG_CANNOT_COOKIE", "You cannot use that kind of cookie when you are logged in." },
     { "NSMSG_BAD_COOKIE", "That cookie is not the right one.  Please make sure you are copying it EXACTLY from the email; it is case-sensitive, so $bABC$b is different from $babc$b." },
-    { "NSMSG_HANDLE_ACTIVATED", "Your account is now activated (with the password you entered when you registered).  You are now authenticated to your account." },
+    { "NSMSG_NEED_PASSWORD", "You must provide a password to activate your account: $bCOOKIE <handle> <cookie> <password>$b" },
+    { "NSMSG_PASSWORD_MISMATCH", "The password you provided does not match the one you registered with. Please try again." },
+    { "NSMSG_HANDLE_ACTIVATED", "Your account is now activated.  You are now authenticated to your account." },
     { "NSMSG_PASSWORD_CHANGED", "You have successfully changed your password to what you requested with the $bresetpass$b command." },
     { "NSMSG_EMAIL_PROHIBITED", "%s may not be used as an email address: %s" },
     { "NSMSG_EMAIL_OVERUSED", "That email address already has an account. Use RESETPASS if you forgot your password." },
@@ -436,6 +451,14 @@ static const struct message_entry msgtab[] = {
     { "NSMSG_DELMASK_NOT_FOUND", "Unable to find mask to be deleted." },
     { "NSMSG_DELSSLFP_SUCCESS", "Client certificate fingerprint %s deleted." },
     { "NSMSG_DELSSLFP_NOT_FOUND", "Unable to find client certificate fingerprint to be deleted." },
+    { "NSMSG_LISTSSLFP_HEADER", "$bCertificate fingerprints for %s:$b" },
+    { "NSMSG_LISTSSLFP_ENTRY", "  %d. %s" },
+    { "NSMSG_LISTSSLFP_ENTRY_LMDB", "  %d. %s (registered: %s, last used: %s)" },
+    { "NSMSG_LISTSSLFP_NONE", "No certificate fingerprints registered." },
+    { "NSMSG_LISTSSLFP_COUNT", "Total: %d fingerprint(s)" },
+    { "NSMSG_SEARCHSSLFP_FOUND", "Certificate %s is registered to account $b%s$b." },
+    { "NSMSG_SEARCHSSLFP_FOUND_LMDB", "Certificate %s is cached for account $b%s$b (last used: %s)." },
+    { "NSMSG_SEARCHSSLFP_NOTFOUND", "Certificate %s is not registered to any account." },
     { "NSMSG_OPSERV_LEVEL_BAD", "You may not promote another oper above your level." },
     { "NSMSG_USE_CMD_PASS", "Please use the PASS command to change your password." },
     { "NSMSG_UNKNOWN_NICK", "I know nothing about nick $b%s$b." },
@@ -509,14 +532,14 @@ static const struct message_entry msgtab[] = {
     { "NSMSG_AUTO_OPER_ADMIN", "You have been auto-admined" },
 
     { "NSEMAIL_ACTIVATION_SUBJECT", "Account verification for %s" },
-    { "NSEMAIL_ACTIVATION_BODY", 
+    { "NSEMAIL_ACTIVATION_BODY",
         "This email has been sent to verify that this email address belongs to the person who tried to register an account on %1$s.  Your cookie is:\n"
         "%2$s\n"
         "To verify your email address and complete the account registration, log on to %1$s and type the following command:\n"
-        "/msg %3$s@%4$s COOKIE %5$s %2$s\n"
-        "This command is only used once to complete your account registration, and never again. Once you have run this command, you will need to authenticate everytime you reconnect to the network. To do this, you will have to type this command every time you reconnect:\n"
-        "/msg %3$s@%4$s AUTH %5$s your-password\n"
-        "(Please remember to fill in 'your-password' with the actual password you gave to us when you registered.)\n"
+        "/msg %3$s@%4$s COOKIE %5$s %2$s <your-password>\n"
+        "(Replace <your-password> with the password you used when you registered.)\n"
+        "This command is only used once to complete your account registration. After activation, you will need to authenticate each time you reconnect:\n"
+        "/msg %3$s@%4$s AUTH %5$s <your-password>\n"
         "OR configure Login-On-Connect (see http://www.afternet.org/login-on-connect for instructions) to connect pre-logged in every time.\n"
         "\n"
         "If you did NOT request this account, you do not need to do anything.\n"
@@ -1371,6 +1394,16 @@ nickserv_register(struct userNode *user, struct userNode *settee, const char *ha
     hi->registered = now;
     hi->lastseen = now;
     hi->flags = HI_DEFAULT_FLAGS;
+
+#if defined(WITH_LMDB) && defined(WITH_SSL)
+    /* Create SCRAM credentials for password-based registration.
+     * Only create if no_auth is false - if email verification is required,
+     * the password is invalidated until cookie verification, so we should
+     * not create SCRAM credentials until after activation. */
+    if (passwd && *passwd && !no_auth) {
+        x3_lmdb_scram_acct_create_all(handle, passwd);
+    }
+#endif
     if (settee && !no_auth)
         set_user_handle_info(settee, hi, 1);
 
@@ -1708,7 +1741,7 @@ static NICKSERV_FUNC(cmd_register)
         nickserv_make_cookie(user, hi, ACTIVATION, hi->passwd, weblink);
 
     /* Set registering flag.. */
-    user->modes |= FLAGS_REGISTERING; 
+    user->modes |= FLAGS_REGISTERING;
 
     if (nickserv_conf.sync_log) {
       pw_cryptpass(password, syncpass);
@@ -2599,13 +2632,22 @@ struct handle_info *loc_auth(char *sslfp, char *handle, char *password, char *us
  */
 const char *nickserv_get_sasl_mechanisms(void)
 {
-    static char mechs[128];
+    static char mechs[192];  /* Increased for all SCRAM variants */
 
     /* Always support PLAIN */
     strcpy(mechs, "PLAIN");
 
     /* Add EXTERNAL if SSL is available (client cert auth) */
     strcat(mechs, ",EXTERNAL");
+
+#if defined(WITH_LMDB) && defined(WITH_SSL)
+    /* Add all SCRAM variants for session token auth (requires LMDB + SSL) */
+    if (x3_lmdb_is_available()) {
+        strcat(mechs, ",SCRAM-SHA-1");
+        strcat(mechs, ",SCRAM-SHA-256");
+        strcat(mechs, ",SCRAM-SHA-512");
+    }
+#endif
 
 #ifdef WITH_KEYCLOAK
     /* Add OAUTHBEARER if Keycloak is enabled AND available */
@@ -3209,16 +3251,23 @@ static NICKSERV_FUNC(cmd_cookie)
 {
     struct handle_info *hi;
     const char *cookie;
+    const char *password = NULL;
 
     if ((argc == 2) && (hi = user->handle_info) && hi->cookie && (hi->cookie->type == EMAIL_CHANGE)) {
         cookie = argv[1];
     } else {
+        /* For ACTIVATION: COOKIE handle cookie password
+         * For others: COOKIE handle cookie */
         NICKSERV_MIN_PARMS(3);
         if (!(hi = get_handle_info(argv[1]))) {
             reply("MSG_HANDLE_UNKNOWN", argv[1]);
             return 0;
         }
         cookie = argv[2];
+        if (argc >= 4) {
+            password = argv[3];
+            argv[3] = "****";
+        }
     }
 
     if (HANDLE_FLAGGED(hi, SUSPENDED)) {
@@ -3246,7 +3295,55 @@ static NICKSERV_FUNC(cmd_cookie)
     }
 
     switch (hi->cookie->type) {
-    case ACTIVATION:
+    case ACTIVATION: {
+        /* Password is required at activation to confirm registration and enable SCRAM.
+         * We verify it matches what was provided at registration time. */
+        if (!password) {
+            reply("NSMSG_NEED_PASSWORD");
+            return 0;
+        }
+
+        /* Verify the password matches what was registered (cookie->data has the hash) */
+        if (!hi->cookie->data || !checkpass(password, hi->cookie->data)) {
+            reply("NSMSG_PASSWORD_MISMATCH");
+            return 0;
+        }
+
+#ifdef WITH_LDAP
+        if(nickserv_conf.ldap_enable && nickserv_conf.ldap_admin_dn) {
+            int rc;
+            if((rc = ldap_do_modify(hi->handle, hi->cookie->data, NULL)) != LDAP_SUCCESS) {
+                /* Failed to update in ldap */
+               reply("NSMSG_LDAP_FAIL", ldap_err2string(rc));
+               return 0;
+            }
+        }
+#endif
+#ifdef WITH_KEYCLOAK
+        /* Create Keycloak user with password hash at activation time. */
+        if (nickserv_conf.keycloak_enable) {
+            int rc = kc_do_add_with_hash(hi->handle, hi->cookie->data, hi->email_addr);
+            if (rc != KC_SUCCESS && rc != KC_USER_EXISTS) {
+                reply("NSMSG_LDAP_FAIL", "keycloak error");
+                return 0;
+            }
+        }
+#endif
+        /* Restore the password hash from cookie */
+        safestrncpy(hi->passwd, hi->cookie->data, sizeof(hi->passwd));
+
+#if defined(WITH_LMDB) && defined(WITH_SSL)
+        /* Create SCRAM credentials - we have plaintext password here */
+        x3_lmdb_scram_acct_create_all(hi->handle, password);
+#endif
+
+        set_user_handle_info(user, hi, 1);
+        reply("NSMSG_HANDLE_ACTIVATED");
+        if (nickserv_conf.sync_log)
+          SyncLog("ACCOUNTACC %s", hi->handle);
+        break;
+    }
+    case PASSWORD_CHANGE:
 #ifdef WITH_LDAP
         if(nickserv_conf.ldap_enable && nickserv_conf.ldap_admin_dn) {
             int rc;
@@ -3258,39 +3355,15 @@ static NICKSERV_FUNC(cmd_cookie)
             }
         }
 #endif
-#ifdef WITH_KEYCLOAK
-        /* Create Keycloak user with password hash at activation time.
-         * This matches the non-Keycloak flow where password isn't set until
-         * activation, preventing authentication before email verification. */
-        if (nickserv_conf.keycloak_enable) {
-            int rc = kc_do_add_with_hash(hi->handle, hi->cookie->data, hi->email_addr);
-            if (rc != KC_SUCCESS && rc != KC_USER_EXISTS) {
-                reply("NSMSG_LDAP_FAIL", "keycloak error");
-                return 0;
-            }
-        }
-#endif
-        /* Apply the password hash from cookie */
-        safestrncpy(hi->passwd, hi->cookie->data, sizeof(hi->passwd));
-        set_user_handle_info(user, hi, 1);
-        reply("NSMSG_HANDLE_ACTIVATED");
-        if (nickserv_conf.sync_log)
-          SyncLog("ACCOUNTACC %s", hi->handle);
-        break;
-    case PASSWORD_CHANGE:
-#ifdef WITH_LDAP
-        if(nickserv_conf.ldap_enable && nickserv_conf.ldap_admin_dn) {
-            int rc;
-            if((rc = ldap_do_modify(hi->handle, hi->cookie->data, NULL)) != LDAP_SUCCESS) {
-                /* Falied to update email in ldap, but still 
-                 * updated it here.. what should we do? */
-               reply("NSMSG_LDAP_FAIL", ldap_err2string(rc));
-               return 0;
-            }
-        }
-#endif
         set_user_handle_info(user, hi, 1);
         safestrncpy(hi->passwd, hi->cookie->data, sizeof(hi->passwd));
+#ifdef WITH_LMDB
+        /* Revoke all session tokens on password change */
+        x3_lmdb_session_revoke_all(hi->handle);
+#ifdef WITH_SSL
+        x3_lmdb_scram_revoke_all(hi->handle);
+#endif
+#endif
         reply("NSMSG_PASSWORD_CHANGED");
         if (nickserv_conf.sync_log)
           SyncLog("PASSCHANGE %s %s", hi->handle, hi->passwd);
@@ -3464,6 +3537,17 @@ static NICKSERV_FUNC(cmd_pass)
     strcpy(hi->passwd, crypted);
     if (nickserv_conf.sync_log)
       SyncLog("PASSCHANGE %s %s", hi->handle, hi->passwd);
+
+#ifdef WITH_LMDB
+    /* Revoke all session tokens on password change */
+    x3_lmdb_session_revoke_all(hi->handle);
+#ifdef WITH_SSL
+    /* Revoke old SCRAM session tokens and create new password SCRAM credentials */
+    x3_lmdb_scram_revoke_all(hi->handle);
+    x3_lmdb_scram_acct_create_all(hi->handle, new_pass);
+#endif
+#endif
+
     argv[1] = "****";
     reply("NSMSG_PASS_SUCCESS");
     return 1;
@@ -3546,6 +3630,43 @@ static NICKSERV_FUNC(cmd_odelmask)
     if (!(hi = get_victim_oper(user, argv[1])))
         return 0;
     return nickserv_delmask(cmd, user, hi, argv[2], 1);
+}
+
+/**
+ * Add SSL fingerprint to account silently (no user messages)
+ * Used for auto-registration during SASL authentication
+ * @return 1 if added, 0 if already exists
+ */
+static int
+nickserv_addsslfp_silent(struct handle_info *hi, const char *sslfp)
+{
+    unsigned int i;
+
+    if (!hi || !sslfp || !sslfp[0])
+        return 0;
+
+    char *new_sslfp = strdup(sslfp);
+    for (i = 0; i < hi->sslfps->used; i++) {
+        if (!irccasecmp(new_sslfp, hi->sslfps->list[i])) {
+            free(new_sslfp);
+            return 0;  /* Already exists */
+        }
+    }
+    string_list_append(hi->sslfps, new_sslfp);
+
+#ifdef WITH_LMDB
+    /* Store fingerprint in LMDB with registration timestamp and 90-day TTL */
+    x3_lmdb_fingerprint_set(new_sslfp, hi->handle, now, now);
+#endif
+
+#ifdef WITH_KEYCLOAK
+    /* Sync fingerprints to Keycloak */
+    kc_sync_fingerprints(hi);
+#endif
+
+    log_module(NS_LOG, LOG_INFO, "Auto-registered certificate for %s: %s",
+               hi->handle, new_sslfp);
+    return 1;
 }
 
 static int
@@ -3642,6 +3763,107 @@ static NICKSERV_FUNC(cmd_odelsslfp)
     if (!(hi = get_victim_oper(user, argv[1])))
         return 0;
     return nickserv_delsslfp(cmd, user, hi, argv[2]);
+}
+
+/**
+ * List certificate fingerprints for an account
+ */
+static int
+nickserv_listsslfp(struct svccmd *cmd, struct userNode *user, struct handle_info *hi)
+{
+    unsigned int i;
+    char buff[256];
+
+    reply("NSMSG_LISTSSLFP_HEADER", hi->handle);
+
+    if (hi->sslfps->used == 0) {
+        reply("NSMSG_LISTSSLFP_NONE");
+        return 1;
+    }
+
+    for (i = 0; i < hi->sslfps->used; i++) {
+        const char *fp = hi->sslfps->list[i];
+
+#ifdef WITH_LMDB
+        /* Try to get additional info from LMDB */
+        char account_out[64];
+        time_t registered, last_used, expires;
+        int rc = x3_lmdb_fingerprint_get(fp, account_out, &registered, &last_used, &expires);
+
+        if (rc == LMDB_SUCCESS && last_used > 0) {
+            char reg_buf[32], last_buf[32];
+            strftime(reg_buf, sizeof(reg_buf), "%Y-%m-%d %H:%M", localtime(&registered));
+            strftime(last_buf, sizeof(last_buf), "%Y-%m-%d %H:%M", localtime(&last_used));
+            reply("NSMSG_LISTSSLFP_ENTRY_LMDB", i + 1, fp, reg_buf, last_buf);
+        } else {
+            reply("NSMSG_LISTSSLFP_ENTRY", i + 1, fp);
+        }
+#else
+        reply("NSMSG_LISTSSLFP_ENTRY", i + 1, fp);
+#endif
+    }
+
+    reply("NSMSG_LISTSSLFP_COUNT", hi->sslfps->used);
+    return 1;
+}
+
+static NICKSERV_FUNC(cmd_listsslfp)
+{
+    NICKSERV_MIN_PARMS(1);
+    return nickserv_listsslfp(cmd, user, user->handle_info);
+}
+
+static NICKSERV_FUNC(cmd_olistsslfp)
+{
+    struct handle_info *hi;
+    NICKSERV_MIN_PARMS(2);
+    if (!(hi = get_victim_oper(user, argv[1])))
+        return 0;
+    return nickserv_listsslfp(cmd, user, hi);
+}
+
+/**
+ * Search for account by certificate fingerprint (oper only)
+ */
+static NICKSERV_FUNC(cmd_searchsslfp)
+{
+    const char *fingerprint;
+    struct handle_info *hi;
+    dict_iterator_t it;
+
+    NICKSERV_MIN_PARMS(2);
+    fingerprint = argv[1];
+
+    /* First, search local accounts */
+    for (it = dict_first(nickserv_handle_dict); it; it = iter_next(it)) {
+        hi = iter_data(it);
+        if (hi->sslfps) {
+            unsigned int i;
+            for (i = 0; i < hi->sslfps->used; i++) {
+                if (!irccasecmp(fingerprint, hi->sslfps->list[i])) {
+                    reply("NSMSG_SEARCHSSLFP_FOUND", fingerprint, hi->handle);
+                    return 1;
+                }
+            }
+        }
+    }
+
+#ifdef WITH_LMDB
+    /* Check LMDB cache */
+    char account_out[64];
+    time_t registered, last_used, expires;
+    int rc = x3_lmdb_fingerprint_get(fingerprint, account_out, &registered, &last_used, &expires);
+
+    if (rc == LMDB_SUCCESS) {
+        char last_buf[32];
+        strftime(last_buf, sizeof(last_buf), "%Y-%m-%d %H:%M", localtime(&last_used));
+        reply("NSMSG_SEARCHSSLFP_FOUND_LMDB", fingerprint, account_out, last_buf);
+        return 1;
+    }
+#endif
+
+    reply("NSMSG_SEARCHSSLFP_NOTFOUND", fingerprint);
+    return 0;
 }
 
 int
@@ -4003,6 +4225,11 @@ static OPTION_FUNC(opt_password)
     strcpy(hi->passwd, crypted);
     if (nickserv_conf.sync_log)
         SyncLog("PASSCHANGE %s %s", hi->handle, hi->passwd);
+
+#if defined(WITH_LMDB) && defined(WITH_SSL)
+    /* Create SCRAM credentials for the new password */
+    x3_lmdb_scram_acct_create_all(hi->handle, argv[1]);
+#endif
 
     if (!(noreply))
         reply("NSMSG_SET_PASSWORD", "***");
@@ -7859,6 +8086,16 @@ nickserv_conf_read(void)
     str = database_get_data(conf_node, KEY_KEYCLOAK_EMAIL_POLICY, RECDB_QSTRING);
     nickserv_conf.keycloak_email_policy = str ? strtoul(str, NULL, 0) : 0;
 
+    /* Webhook configuration */
+    str = database_get_data(conf_node, KEY_KEYCLOAK_WEBHOOK_PORT, RECDB_QSTRING);
+    nickserv_conf.keycloak_webhook_port = str ? strtoul(str, NULL, 0) : 0;
+
+    str = database_get_data(conf_node, KEY_KEYCLOAK_WEBHOOK_SECRET, RECDB_QSTRING);
+    nickserv_conf.keycloak_webhook_secret = str ? str : NULL;
+
+    str = database_get_data(conf_node, KEY_KEYCLOAK_WEBHOOK_BIND, RECDB_QSTRING);
+    nickserv_conf.keycloak_webhook_bind = str ? str : NULL;
+
     /* Initialize Keycloak client if enabled */
     if (nickserv_conf.keycloak_enable) {
         memset(&kc_realm_config, 0, sizeof(kc_realm_config));
@@ -7868,6 +8105,19 @@ nickserv_conf_read(void)
         kc_client_config.client_id = nickserv_conf.keycloak_client_id;
         kc_client_config.client_secret = nickserv_conf.keycloak_client_secret;
         log_module(NS_LOG, LOG_INFO, "Keycloak integration enabled for realm %s", nickserv_conf.keycloak_realm);
+
+        /* Initialize webhook listener if configured */
+        keycloak_webhook_set_port(nickserv_conf.keycloak_webhook_port);
+        keycloak_webhook_set_secret(nickserv_conf.keycloak_webhook_secret);
+        if (nickserv_conf.keycloak_webhook_port > 0) {
+            if (keycloak_webhook_init() == 0) {
+                log_module(NS_LOG, LOG_INFO, "Keycloak webhook listener started on port %u",
+                           nickserv_conf.keycloak_webhook_port);
+            } else {
+                log_module(NS_LOG, LOG_ERROR, "Failed to start Keycloak webhook listener on port %u",
+                           nickserv_conf.keycloak_webhook_port);
+            }
+        }
     }
 #endif
 
@@ -7916,6 +8166,14 @@ nickserv_conf_read(void)
 
     str = database_get_data(conf_node, KEY_PASSWORD_LAZY_MIGRATION, RECDB_QSTRING);
     nickserv_conf.password_lazy_migration = str ? !disabled_string(str) : 1;  /* Enabled by default */
+
+    /* Certificate auto-registration */
+    str = database_get_data(conf_node, KEY_CERT_AUTOREGISTER, RECDB_QSTRING);
+    nickserv_conf.cert_autoregister = str ? !disabled_string(str) : 0;  /* Disabled by default */
+
+    if (nickserv_conf.cert_autoregister) {
+        log_module(NS_LOG, LOG_INFO, "Certificate auto-registration enabled");
+    }
 
     /* Apply password config to password module */
     pw_config.pbkdf2_iterations = nickserv_conf.password_pbkdf2_iterations;
@@ -8179,6 +8437,7 @@ struct RegSession {
     char account[NICKSERV_HANDLE_LEN + 1];
     char email[256];
     char password_hash[PASSWD_LEN];  /* Hashed password for X3 account */
+    char password_plain[PASSWD_LEN]; /* Plaintext password for SCRAM creation (wiped after use) */
     char result_msg[256];         /* Error/status message */
     time_t created;
     enum reg_state state;
@@ -8192,6 +8451,98 @@ static uint32_t reg_sequence_counter = 0;
 
 /* Registration session stale timeout in seconds */
 #define REG_STALE_TIMEOUT 120
+
+#if defined(WITH_LMDB) && defined(WITH_SSL)
+/* Pending SCRAM passwords - stores plaintext passwords for IRCv3 email verification flow.
+ * Keyed by account name (lowercase), stores password + creation time for cleanup. */
+struct pending_scram_entry {
+    char password[PASSWD_LEN];
+    time_t created;
+};
+static dict_t pending_scram_dict = NULL;
+#define PENDING_SCRAM_TIMEOUT 86400  /* 24 hours - matches typical cookie timeout */
+
+static void pending_scram_free(void *data) {
+    struct pending_scram_entry *entry = data;
+    if (entry) {
+        memset(entry->password, 0, sizeof(entry->password));  /* Secure wipe */
+        free(entry);
+    }
+}
+
+static void pending_scram_store(const char *account, const char *password) {
+    struct pending_scram_entry *entry;
+    char account_lower[NICKSERV_HANDLE_LEN + 1];
+
+    if (!pending_scram_dict) {
+        pending_scram_dict = dict_new();
+        dict_set_free_data(pending_scram_dict, pending_scram_free);
+    }
+
+    /* Lowercase the account name for consistent lookup */
+    safestrncpy(account_lower, account, sizeof(account_lower));
+    irc_strtolower(account_lower);
+
+    /* Remove any existing entry */
+    dict_remove(pending_scram_dict, account_lower);
+
+    entry = calloc(1, sizeof(*entry));
+    if (entry) {
+        safestrncpy(entry->password, password, sizeof(entry->password));
+        entry->created = now;
+        dict_insert(pending_scram_dict, strdup(account_lower), entry);
+    }
+}
+
+static const char *pending_scram_get(const char *account) {
+    struct pending_scram_entry *entry;
+    char account_lower[NICKSERV_HANDLE_LEN + 1];
+
+    if (!pending_scram_dict) return NULL;
+
+    safestrncpy(account_lower, account, sizeof(account_lower));
+    irc_strtolower(account_lower);
+
+    entry = dict_find(pending_scram_dict, account_lower, NULL);
+    if (entry && (now - entry->created) < PENDING_SCRAM_TIMEOUT) {
+        return entry->password;
+    }
+    return NULL;
+}
+
+static void pending_scram_remove(const char *account) {
+    char account_lower[NICKSERV_HANDLE_LEN + 1];
+
+    if (!pending_scram_dict) return;
+
+    safestrncpy(account_lower, account, sizeof(account_lower));
+    irc_strtolower(account_lower);
+    dict_remove(pending_scram_dict, account_lower);
+}
+
+static void pending_scram_cleanup_stale(UNUSED_ARG(void *data)) {
+    dict_iterator_t it, next;
+    struct pending_scram_entry *entry;
+    int cleaned = 0;
+
+    if (!pending_scram_dict) return;
+
+    for (it = dict_first(pending_scram_dict); it; it = next) {
+        next = iter_next(it);
+        entry = iter_data(it);
+        if ((now - entry->created) >= PENDING_SCRAM_TIMEOUT) {
+            dict_remove(pending_scram_dict, iter_key(it));
+            cleaned++;
+        }
+    }
+
+    if (cleaned)
+        log_module(NS_LOG, LOG_DEBUG, "Cleaned %d stale pending SCRAM entries", cleaned);
+
+    /* Reschedule cleanup */
+    timeq_add(now + 3600, pending_scram_cleanup_stale, NULL);
+}
+#endif /* WITH_LMDB && WITH_SSL */
 
 /**
  * Async callback context for registration
@@ -8284,6 +8635,7 @@ reg_delete_session(struct RegSession *session)
 
     /* Secure cleanup of sensitive data */
     memset(session->password_hash, 0, sizeof(session->password_hash));
+    memset(session->password_plain, 0, sizeof(session->password_plain));
     free(session);
 }
 
@@ -8447,6 +8799,13 @@ reg_complete_registration(struct RegSession *session)
         /* Create activation cookie with hashed password */
         nickserv_make_cookie(NULL, hi, ACTIVATION, session->password_hash, 0);
 
+#if defined(WITH_LMDB) && defined(WITH_SSL)
+        /* Store plaintext password for SCRAM creation at VERIFY time */
+        if (session->password_plain[0]) {
+            pending_scram_store(session->account, session->password_plain);
+        }
+#endif
+
         session->state = REG_STATE_COMPLETE;
         snprintf(session->result_msg, sizeof(session->result_msg),
                  "Verification email sent to %s", session->email);
@@ -8473,13 +8832,20 @@ reg_complete_registration(struct RegSession *session)
         if (session->use_email)
             nickserv_set_email_addr(hi, session->email);
 
+#if defined(WITH_LMDB) && defined(WITH_SSL)
+        /* Create SCRAM credentials - we have plaintext password in session */
+        if (session->password_plain[0]) {
+            x3_lmdb_scram_acct_create_all(session->account, session->password_plain);
+        }
+#endif
+
         session->state = REG_STATE_COMPLETE;
         snprintf(session->result_msg, sizeof(session->result_msg),
                  "Account %s registered successfully", session->account);
         irc_regreply(session->uid, 'S', session->account, session->result_msg);
     }
 
-    reg_delete_session(session);
+    reg_delete_session(session);  /* Securely wipes password_plain */
 }
 
 /**
@@ -8587,6 +8953,7 @@ nickserv_ircv3_register_p10(const char *uid, const char *handle,
     safestrncpy(session->account, actual_handle, sizeof(session->account));
     safestrncpy(session->email, use_email ? email : "", sizeof(session->email));
     safestrncpy(session->password_hash, crypted, sizeof(session->password_hash));
+    safestrncpy(session->password_plain, password, sizeof(session->password_plain));
     session->use_email = use_email;
 
     /* Clear password from stack */
@@ -8650,7 +9017,9 @@ enum sasl_state {
     SASL_STATE_COMPLETE,          /* Successfully authenticated */
     SASL_STATE_FAILED,            /* Authentication failed */
     SASL_STATE_CANCELLED,         /* Client disconnected during auth */
-    SASL_STATE_TIMEOUT            /* Session timed out */
+    SASL_STATE_TIMEOUT,           /* Session timed out */
+    SASL_STATE_SCRAM_CHALLENGE,   /* SCRAM: sent server-first, waiting for client-final */
+    SASL_STATE_SCRAM_VERIFY       /* SCRAM: verifying client proof */
 };
 
 struct SASLSession
@@ -8661,7 +9030,7 @@ struct SASLSession
     char *buf, *p;
     int buflen;
     char uid[128];
-    char mech[16];  /* Increased from 10 to hold "OAUTHBEARER" + null */
+    char mech[16];  /* Increased from 10 to hold "SCRAM-SHA-256" + null */
     char *sslclifp;
     char *hostmask;
     time_t created;       /* When session was created */
@@ -8671,6 +9040,9 @@ struct SASLSession
     char *authzid;          /* Authorization identity for impersonation */
     char cred_hash[33];     /* MD5 hash of credentials for negative cache (hex string) */
     uint32_t sequence;      /* Unique sequence number for async callback validation */
+#ifdef WITH_LMDB
+    struct scram_session *scram;  /* SCRAM-SHA-256 session state (if using SCRAM) */
+#endif
 };
 
 struct SASLSession *saslsessions = NULL;
@@ -8910,6 +9282,12 @@ sasl_delete_session(struct SASLSession *session)
         free(session->authzid);
     session->authzid = NULL;
 
+#ifdef WITH_LMDB
+    if (session->scram)
+        free(session->scram);
+    session->scram = NULL;
+#endif
+
     if (session->next)
         session->next->prev = session->prev;
     if (session->prev)
@@ -9129,6 +9507,44 @@ sasl_async_auth_callback(void *ctx_ptr, int result)
         }
         snprintf(buffer, sizeof(buffer), "%s " FMT_TIME_T, hi->handle, hi->registered);
         irc_sasl(session->source, session->uid, "L", buffer);
+
+#ifdef WITH_LMDB
+        /* Issue session token for faster reconnects (only for non-impersonating users) */
+        if (!hii) {
+            char session_token[128];
+            if (x3_lmdb_session_create(hi->handle, session_token, sizeof(session_token)) == LMDB_SUCCESS) {
+                /* Send token to client via NOTICE after auth completes */
+                /* The token is sent as a CAP-style note, clients can choose to cache it */
+                log_module(NS_LOG, LOG_DEBUG, "SASL async: Issued session token for %s", hi->handle);
+                /* Note: Token is stored in LMDB, client receives it via SASL DONE response extension */
+                /* Client can use this token as password for faster reconnects */
+
+#ifdef WITH_SSL
+                /* Create SCRAM credentials for all supported hash types */
+                if (x3_lmdb_is_session_token(session_token)) {
+                    const char *token_id = session_token + strlen(SESSION_TOKEN_PREFIX);
+                    int scram_created = 0;
+                    /* Create credentials for all three SCRAM variants */
+                    if (x3_lmdb_scram_create_ex(token_id, hi->handle, session_token, SCRAM_HASH_SHA1) == LMDB_SUCCESS)
+                        scram_created++;
+                    if (x3_lmdb_scram_create_ex(token_id, hi->handle, session_token, SCRAM_HASH_SHA256) == LMDB_SUCCESS)
+                        scram_created++;
+                    if (x3_lmdb_scram_create_ex(token_id, hi->handle, session_token, SCRAM_HASH_SHA512) == LMDB_SUCCESS)
+                        scram_created++;
+                    if (scram_created > 0) {
+                        log_module(NS_LOG, LOG_DEBUG, "SASL async: Created %d SCRAM credentials for %s", scram_created, hi->handle);
+                    }
+                }
+#endif
+            }
+        }
+#endif
+
+        /* Auto-register certificate if enabled and user has one */
+        if (nickserv_conf.cert_autoregister && session->sslclifp && session->sslclifp[0]) {
+            nickserv_addsslfp_silent(hi, session->sslclifp);
+        }
+
         irc_sasl(session->source, session->uid, "D", "S");
         log_module(NS_LOG, LOG_DEBUG, "SASL async: Success for %s", hi->handle);
     } else {
@@ -9712,6 +10128,372 @@ sasl_packet(struct SASLSession *session)
         return 1;
     }
 #endif /* WITH_KEYCLOAK */
+#if defined(WITH_LMDB) && defined(WITH_SSL)
+    else if (!strncmp(session->mech, "SCRAM-SHA-", 10))
+    {
+        /*
+         * SCRAM-SHA-* for session token authentication
+         *   - SCRAM-SHA-1   (RFC 5802)
+         *   - SCRAM-SHA-256 (RFC 7677)
+         *   - SCRAM-SHA-512
+         *
+         * Client-first:  n,,n=x3scram:tokenid,r=client_nonce
+         * Server-first:  r=client_nonce+server_nonce,s=salt_b64,i=iterations
+         * Client-final:  c=biws,r=combined_nonce,p=client_proof_b64
+         * Server-final:  v=server_signature_b64
+         */
+        char *raw = NULL;
+        size_t rawlen = 0;
+        static char response[512];
+        enum scram_hash_type mech_hash_type;
+        const char *mech_name = session->mech;
+
+        /* Determine hash type from mechanism name */
+        if (!strcmp(mech_name, "SCRAM-SHA-1")) {
+            mech_hash_type = SCRAM_HASH_SHA1;
+        } else if (!strcmp(mech_name, "SCRAM-SHA-256")) {
+            mech_hash_type = SCRAM_HASH_SHA256;
+        } else if (!strcmp(mech_name, "SCRAM-SHA-512")) {
+            mech_hash_type = SCRAM_HASH_SHA512;
+        } else {
+            log_module(NS_LOG, LOG_DEBUG, "SASL SCRAM: Unknown mechanism %s", mech_name);
+            irc_sasl(session->source, session->uid, "D", "F");
+            sasl_delete_session(session);
+            return 1;
+        }
+
+        base64_decode_alloc(session->buf, session->buflen, &raw, &rawlen);
+
+        if (!raw || rawlen == 0) {
+            log_module(NS_LOG, LOG_DEBUG, "SASL %s: Invalid base64 data", mech_name);
+            irc_sasl(session->source, session->uid, "D", "F");
+            sasl_delete_session(session);
+            return 1;
+        }
+
+        /* Null-terminate for string operations */
+        raw = realloc(raw, rawlen + 1);
+        raw[rawlen] = '\0';
+
+        if (session->state == SASL_STATE_MECH_SELECTED) {
+            /* Expecting client-first: n,,n=username,r=nonce */
+            char *gs2_header, *client_first_bare;
+            char *n_field, *r_field;
+            char *username, *client_nonce;
+            const char *token_id;
+            struct scram_credential cred;
+            unsigned char server_nonce_bytes[16];
+            char server_nonce_b64[32];
+            char salt_b64[32];
+
+            log_module(NS_LOG, LOG_DEBUG, "SASL %s: Processing client-first: %s", mech_name, raw);
+
+            /* Parse GS2 header and client-first-bare */
+            gs2_header = raw;
+            if (raw[0] != 'n' || raw[1] != ',' || raw[2] != ',') {
+                log_module(NS_LOG, LOG_DEBUG, "SASL %s: Invalid GS2 header", mech_name);
+                irc_sasl(session->source, session->uid, "D", "F");
+                sasl_delete_session(session);
+                free(raw);
+                return 1;
+            }
+            client_first_bare = raw + 3;
+
+            /* Parse n=username */
+            n_field = client_first_bare;
+            if (n_field[0] != 'n' || n_field[1] != '=') {
+                log_module(NS_LOG, LOG_DEBUG, "SASL %s: Missing n= field", mech_name);
+                irc_sasl(session->source, session->uid, "D", "F");
+                sasl_delete_session(session);
+                free(raw);
+                return 1;
+            }
+            username = n_field + 2;
+            r_field = strchr(username, ',');
+            if (!r_field) {
+                log_module(NS_LOG, LOG_DEBUG, "SASL %s: Missing r= field", mech_name);
+                irc_sasl(session->source, session->uid, "D", "F");
+                sasl_delete_session(session);
+                free(raw);
+                return 1;
+            }
+            *r_field++ = '\0';
+
+            /* Parse r=nonce */
+            if (r_field[0] != 'r' || r_field[1] != '=') {
+                log_module(NS_LOG, LOG_DEBUG, "SASL %s: Invalid r= field", mech_name);
+                irc_sasl(session->source, session->uid, "D", "F");
+                sasl_delete_session(session);
+                free(raw);
+                return 1;
+            }
+            client_nonce = r_field + 2;
+
+            /* Check if username is a session token (x3scram:tokenid) or regular account */
+            if (x3_lmdb_is_scram_token(username)) {
+                /* Session token flow: x3scram:tokenid */
+                token_id = username + strlen(SCRAM_TOKEN_PREFIX);
+
+                /* Look up SCRAM credentials for the specific hash type */
+                if (x3_lmdb_scram_get_ex(token_id, mech_hash_type, &cred) != LMDB_SUCCESS) {
+                    log_module(NS_LOG, LOG_DEBUG, "SASL %s: No SCRAM credential for token %s", mech_name, token_id);
+                    irc_sasl(session->source, session->uid, "D", "F");
+                    sasl_delete_session(session);
+                    free(raw);
+                    return 1;
+                }
+            } else {
+                /* Regular account flow: look up by account name */
+                if (x3_lmdb_scram_acct_get(username, mech_hash_type, &cred) != LMDB_SUCCESS) {
+                    log_module(NS_LOG, LOG_DEBUG, "SASL %s: No SCRAM credential for account %s", mech_name, username);
+                    irc_sasl(session->source, session->uid, "D", "F");
+                    sasl_delete_session(session);
+                    free(raw);
+                    return 1;
+                }
+            }
+
+            /* Allocate SCRAM session state */
+            session->scram = calloc(1, sizeof(struct scram_session));
+            if (!session->scram) {
+                log_module(NS_LOG, LOG_ERROR, "SASL %s: Failed to allocate SCRAM session", mech_name);
+                irc_sasl(session->source, session->uid, "D", "F");
+                sasl_delete_session(session);
+                free(raw);
+                return 1;
+            }
+
+            /* Store credential, hash type, and client nonce */
+            memcpy(&session->scram->cred, &cred, sizeof(cred));
+            session->scram->hash_type = mech_hash_type;
+            strncpy(session->scram->client_nonce, client_nonce, sizeof(session->scram->client_nonce) - 1);
+            session->scram->iteration = cred.iteration;
+
+            /* Generate server nonce */
+            if (RAND_bytes(server_nonce_bytes, sizeof(server_nonce_bytes)) != 1) {
+                log_module(NS_LOG, LOG_ERROR, "SASL %s: Failed to generate server nonce", mech_name);
+                irc_sasl(session->source, session->uid, "D", "F");
+                sasl_delete_session(session);
+                free(raw);
+                return 1;
+            }
+            {
+                char *server_nonce_ptr;
+                base64_encode_alloc((char *)server_nonce_bytes, sizeof(server_nonce_bytes), &server_nonce_ptr);
+                strncpy(session->scram->server_nonce, server_nonce_ptr, sizeof(session->scram->server_nonce) - 1);
+                session->scram->server_nonce[sizeof(session->scram->server_nonce) - 1] = '\0';
+                free(server_nonce_ptr);
+            }
+
+            /* Combined nonce */
+            snprintf(session->scram->combined_nonce, sizeof(session->scram->combined_nonce),
+                     "%s%s", client_nonce, session->scram->server_nonce);
+
+            /* Base64 encode salt */
+            {
+                char *salt_ptr;
+                base64_encode_alloc((char *)cred.salt, SCRAM_SALT_LEN, &salt_ptr);
+                strncpy(session->scram->salt_b64, salt_ptr, sizeof(session->scram->salt_b64) - 1);
+                session->scram->salt_b64[sizeof(session->scram->salt_b64) - 1] = '\0';
+                free(salt_ptr);
+            }
+
+            /* Build server-first message */
+            snprintf(response, sizeof(response), "r=%s,s=%s,i=%u",
+                     session->scram->combined_nonce,
+                     session->scram->salt_b64,
+                     session->scram->iteration);
+
+            /* Build auth message (client-first-bare + "," + server-first) */
+            session->scram->auth_message_len = snprintf(session->scram->auth_message,
+                sizeof(session->scram->auth_message),
+                "n=%s,r=%s,%s",
+                username, client_nonce, response);
+
+            log_module(NS_LOG, LOG_DEBUG, "SASL %s: Sending server-first: %s", mech_name, response);
+
+            /* Send base64-encoded server-first */
+            char *server_first_b64;
+            base64_encode_alloc(response, strlen(response), &server_first_b64);
+            irc_sasl(session->source, session->uid, "C", server_first_b64);
+            free(server_first_b64);
+
+            session->state = SASL_STATE_SCRAM_CHALLENGE;
+            free(raw);
+            return 0;  /* Continue - waiting for client-final */
+        }
+        else if (session->state == SASL_STATE_SCRAM_CHALLENGE) {
+            /* Expecting client-final: c=biws,r=combined_nonce,p=proof */
+            char *c_field, *r_field, *p_field;
+            char *channel_binding, *combined_nonce, *client_proof;
+            char client_final_without_proof[256];
+            unsigned char server_sig[SCRAM_MAX_HASH_LEN];
+            char server_sig_b64[128];  /* Large enough for SHA-512 base64 */
+            struct handle_info *hi;
+
+            log_module(NS_LOG, LOG_DEBUG, "SASL %s: Processing client-final: %s", mech_name, raw);
+
+            if (!session->scram) {
+                log_module(NS_LOG, LOG_ERROR, "SASL %s: No SCRAM session state", mech_name);
+                irc_sasl(session->source, session->uid, "D", "F");
+                sasl_delete_session(session);
+                free(raw);
+                return 1;
+            }
+
+            /* Parse c=channel_binding */
+            c_field = raw;
+            if (c_field[0] != 'c' || c_field[1] != '=') {
+                log_module(NS_LOG, LOG_DEBUG, "SASL %s: Invalid c= field", mech_name);
+                irc_sasl(session->source, session->uid, "D", "F");
+                sasl_delete_session(session);
+                free(raw);
+                return 1;
+            }
+            channel_binding = c_field + 2;
+            r_field = strchr(channel_binding, ',');
+            if (!r_field) {
+                log_module(NS_LOG, LOG_DEBUG, "SASL %s: Missing r= field", mech_name);
+                irc_sasl(session->source, session->uid, "D", "F");
+                sasl_delete_session(session);
+                free(raw);
+                return 1;
+            }
+            *r_field++ = '\0';
+
+            /* Parse r=combined_nonce */
+            if (r_field[0] != 'r' || r_field[1] != '=') {
+                log_module(NS_LOG, LOG_DEBUG, "SASL %s: Invalid r= field", mech_name);
+                irc_sasl(session->source, session->uid, "D", "F");
+                sasl_delete_session(session);
+                free(raw);
+                return 1;
+            }
+            combined_nonce = r_field + 2;
+            p_field = strchr(combined_nonce, ',');
+            if (!p_field) {
+                log_module(NS_LOG, LOG_DEBUG, "SASL %s: Missing p= field", mech_name);
+                irc_sasl(session->source, session->uid, "D", "F");
+                sasl_delete_session(session);
+                free(raw);
+                return 1;
+            }
+            *p_field++ = '\0';
+
+            /* Parse p=proof */
+            if (p_field[0] != 'p' || p_field[1] != '=') {
+                log_module(NS_LOG, LOG_DEBUG, "SASL %s: Invalid p= field", mech_name);
+                irc_sasl(session->source, session->uid, "D", "F");
+                sasl_delete_session(session);
+                free(raw);
+                return 1;
+            }
+            client_proof = p_field + 2;
+
+            /* Verify combined nonce matches */
+            if (strcmp(combined_nonce, session->scram->combined_nonce) != 0) {
+                log_module(NS_LOG, LOG_DEBUG, "SASL %s: Nonce mismatch", mech_name);
+                irc_sasl(session->source, session->uid, "D", "F");
+                sasl_delete_session(session);
+                free(raw);
+                return 1;
+            }
+
+            /* Build complete auth message */
+            snprintf(client_final_without_proof, sizeof(client_final_without_proof),
+                     "c=%s,r=%s", channel_binding, combined_nonce);
+
+            /* Append client-final-without-proof to auth message */
+            session->scram->auth_message_len += snprintf(
+                session->scram->auth_message + session->scram->auth_message_len,
+                sizeof(session->scram->auth_message) - session->scram->auth_message_len,
+                ",%s", client_final_without_proof);
+
+            log_module(NS_LOG, LOG_DEBUG, "SASL %s: AuthMessage: %s", mech_name, session->scram->auth_message);
+
+            /* Verify client proof using generic function */
+            int verify_result = scram_verify_proof(
+                session->scram->hash_type,
+                session->scram->cred.stored_key,
+                session->scram->auth_message,
+                session->scram->auth_message_len,
+                client_proof);
+
+            if (verify_result != 1) {
+                log_module(NS_LOG, LOG_DEBUG, "SASL %s: Proof verification failed (result=%d)", mech_name, verify_result);
+                irc_sasl(session->source, session->uid, "D", "F");
+                sasl_delete_session(session);
+                free(raw);
+                return 1;
+            }
+
+            log_module(NS_LOG, LOG_DEBUG, "SASL %s: Proof verified for %s", mech_name, session->scram->cred.username);
+
+            /* Look up account */
+            hi = get_handle_info(session->scram->cred.username);
+            if (!hi) {
+                log_module(NS_LOG, LOG_DEBUG, "SASL %s: Account %s not found", mech_name, session->scram->cred.username);
+                irc_sasl(session->source, session->uid, "D", "F");
+                sasl_delete_session(session);
+                free(raw);
+                return 1;
+            }
+
+            if (HANDLE_FLAGGED(hi, SUSPENDED)) {
+                log_module(NS_LOG, LOG_DEBUG, "SASL %s: Account %s is suspended", mech_name, hi->handle);
+                irc_sasl(session->source, session->uid, "D", "F");
+                sasl_delete_session(session);
+                free(raw);
+                return 1;
+            }
+
+            /* Compute server signature using generic function */
+            if (scram_server_signature(session->scram->hash_type,
+                                       session->scram->cred.server_key,
+                                       session->scram->auth_message,
+                                       session->scram->auth_message_len,
+                                       server_sig) != 0) {
+                log_module(NS_LOG, LOG_ERROR, "SASL %s: Failed to compute server signature", mech_name);
+                irc_sasl(session->source, session->uid, "D", "F");
+                sasl_delete_session(session);
+                free(raw);
+                return 1;
+            }
+
+            /* Base64 encode server signature using the correct hash length */
+            char *sig_b64;
+            base64_encode_alloc((char *)server_sig, session->scram->cred.hash_len, &sig_b64);
+            snprintf(server_sig_b64, sizeof(server_sig_b64), "%s", sig_b64);
+            free(sig_b64);
+
+            /* Build and send server-final: v=signature */
+            snprintf(response, sizeof(response), "v=%s", server_sig_b64);
+
+            char *server_final_b64;
+            base64_encode_alloc(response, strlen(response), &server_final_b64);
+
+            log_module(NS_LOG, LOG_DEBUG, "SASL %s: Authentication succeeded for %s", mech_name, hi->handle);
+
+            /* Send L (login) then D S (done success) */
+            static char buffer[256];
+            snprintf(buffer, sizeof(buffer), "%s "FMT_TIME_T, hi->handle, hi->registered);
+            irc_sasl(session->source, session->uid, "L", buffer);
+            irc_sasl(session->source, session->uid, "D", "S");
+
+            free(server_final_b64);
+            sasl_delete_session(session);
+            free(raw);
+            return 1;
+        }
+        else {
+            log_module(NS_LOG, LOG_DEBUG, "SASL %s: Unexpected state %d", mech_name, session->state);
+            irc_sasl(session->source, session->uid, "D", "F");
+            sasl_delete_session(session);
+            free(raw);
+            return 1;
+        }
+    }
+#endif /* WITH_LMDB && WITH_SSL */
     else if (!strcmp(session->mech, "PLAIN"))
     {
         char *raw = NULL;
@@ -9757,6 +10539,43 @@ sasl_packet(struct SASLSession *session)
             log_module(NS_LOG, LOG_DEBUG, "SASL: Starting async Keycloak auth for %s", authcid);
 
 #ifdef WITH_LMDB
+            /* Check if password is a session token (x3tok:...) */
+            if (x3_lmdb_is_session_token(passwd)) {
+                char token_username[128];
+                log_module(NS_LOG, LOG_DEBUG, "SASL: Detected session token for %s", authcid);
+
+                if (x3_lmdb_session_validate(passwd, token_username, sizeof(token_username)) == LMDB_SUCCESS) {
+                    /* Token valid - verify username matches */
+                    if (irccasecmp(token_username, authcid) == 0) {
+                        struct handle_info *token_hi = get_handle_info(authcid);
+                        if (token_hi) {
+                            /* Check if suspended */
+                            if (!HANDLE_FLAGGED(token_hi, SUSPENDED)) {
+                                static char buffer[256];
+                                log_module(NS_LOG, LOG_DEBUG, "SASL: Session token valid for %s", authcid);
+                                snprintf(buffer, sizeof(buffer), "%s "FMT_TIME_T, token_hi->handle, token_hi->registered);
+                                irc_sasl(session->source, session->uid, "L", buffer);
+                                irc_sasl(session->source, session->uid, "D", "S");
+                                sasl_delete_session(session);
+                                free(raw);
+                                return 1;
+                            } else {
+                                log_module(NS_LOG, LOG_DEBUG, "SASL: Account %s is suspended", authcid);
+                            }
+                        }
+                    } else {
+                        log_module(NS_LOG, LOG_WARNING, "SASL: Session token username mismatch (%s vs %s)",
+                                   token_username, authcid);
+                    }
+                }
+                /* Token invalid or user mismatch - fail auth */
+                log_module(NS_LOG, LOG_DEBUG, "SASL: Invalid session token for %s", authcid);
+                irc_sasl(session->source, session->uid, "D", "F");
+                sasl_delete_session(session);
+                free(raw);
+                return 1;
+            }
+
             /* Compute credential hash for negative cache */
             compute_cred_hash(authcid, passwd, session->cred_hash);
 
@@ -9835,6 +10654,12 @@ sasl_packet(struct SASLSession *session)
                     log_module(NS_LOG, LOG_DEBUG, "SASL: Valid credentials supplied");
                     snprintf(buffer, sizeof(buffer), "%s "FMT_TIME_T, hi->handle, hi->registered);
                     irc_sasl(session->source, session->uid, "L", buffer);
+
+                    /* Auto-register certificate if enabled and user has one */
+                    if (nickserv_conf.cert_autoregister && session->sslclifp && session->sslclifp[0]) {
+                        nickserv_addsslfp_silent(hi, session->sslclifp);
+                    }
+
                     irc_sasl(session->source, session->uid, "D", "S");
                 }
                 else
@@ -10301,6 +11126,17 @@ nickserv_ircv3_verify(struct userNode *user, const char *handle,
 #endif
     safestrncpy(hi->passwd, hi->cookie->data, sizeof(hi->passwd));
 
+#if defined(WITH_LMDB) && defined(WITH_SSL)
+    /* Create SCRAM credentials if we have the pending plaintext password */
+    {
+        const char *pending_password = pending_scram_get(handle);
+        if (pending_password) {
+            x3_lmdb_scram_acct_create_all(hi->handle, pending_password);
+            pending_scram_remove(handle);
+        }
+    }
+#endif
+
     /* Authenticate the user (only if we have a user - pre-reg clients will be authed later) */
     if (user)
         set_user_handle_info(user, hi, 1);
@@ -10344,6 +11180,11 @@ init_nickserv(const char *nick)
                    SASL_STALE_CHECK_INTERVAL, SASL_STALE_TIMEOUT);
     }
 
+#if defined(WITH_LMDB) && defined(WITH_SSL)
+    /* Start pending SCRAM password cleanup timer - runs hourly */
+    timeq_add(now + 3600, pending_scram_cleanup_stale, NULL);
+#endif
+
     /* set up handle_inverse_flags */
     memset(handle_inverse_flags, 0, sizeof(handle_inverse_flags));
     for (i=0; handle_flags[i]; i++) {
@@ -10380,6 +11221,9 @@ init_nickserv(const char *nick)
     nickserv_define_func("OADDCERTFP", cmd_oaddsslfp, 0, 1, 0);
     nickserv_define_func("DELCERTFP", cmd_delsslfp, -1, 1, 0);
     nickserv_define_func("ODELCERTFP", cmd_odelsslfp, 0, 1, 0);
+    nickserv_define_func("LISTCERTFP", cmd_listsslfp, -1, 1, 0);
+    nickserv_define_func("OLISTCERTFP", cmd_olistsslfp, 0, 1, 0);
+    nickserv_define_func("SEARCHCERTFP", cmd_searchsslfp, 0, 1, 0);  /* Oper only */
     nickserv_define_func("PASS", cmd_pass, -1, 1, 0);
     nickserv_define_func("SET", cmd_set, -1, 1, 0);
     nickserv_define_func("OSET", cmd_oset, 0, 1, 0);

@@ -229,6 +229,9 @@ struct nickserv_config {
     unsigned int keycloak_oper_group_level; // Min level to add to oper group
     const char *keycloak_attr_oslevel;      // Attribute name for opserv_level
     unsigned int keycloak_email_policy;     // 0=trust KC, 1=always X3 cookie, 2=check emailVerified
+    unsigned int keycloak_webhook_port;     // Port for Keycloak webhook listener (0=disabled)
+    const char *keycloak_webhook_secret;    // Shared secret for webhook authentication
+    const char *keycloak_webhook_bind;      // Bind address for webhook (NULL = all interfaces)
 #endif
     /* Metadata TTL configuration */
     unsigned int metadata_ttl_enabled;      // Enable metadata expiry
@@ -240,6 +243,8 @@ struct nickserv_config {
     unsigned long password_pbkdf2_iterations; // PBKDF2 iterations (default: 100000)
     unsigned int password_bcrypt_cost;      // bcrypt cost factor (default: 12)
     unsigned int password_lazy_migration;   // Rehash legacy passwords on login (default: 1)
+    /* Certificate auto-registration */
+    unsigned int cert_autoregister;         // Auto-register certs on SASL PLAIN auth (default: 0)
 };
 
 void init_nickserv(const char *nick);

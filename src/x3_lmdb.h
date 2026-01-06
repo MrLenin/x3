@@ -37,6 +37,9 @@ enum lmdb_error {
 #define LMDB_PREFIX_FINGERPRINT "fp:"  /* Certificate fingerprint → username cache */
 #define LMDB_PREFIX_AUTHFAIL "authfail:"  /* Failed auth attempts cache (hash → timestamp) */
 #define LMDB_PREFIX_FPFAIL "fpfail:"  /* Failed fingerprint lookups cache (fingerprint → timestamp) */
+#define LMDB_PREFIX_SESSION "session:"  /* Session tokens: token_id → expiry:username */
+#define LMDB_PREFIX_SESSVER "sessver:"  /* Session version: username → version_number */
+#define LMDB_PREFIX_SCRAM_ACCT "scram_acct:"  /* Account SCRAM: hash_type:account → SCRAM verifier */
 
 /* Metadata entry for iteration */
 struct lmdb_metadata_entry {
@@ -625,6 +628,334 @@ const struct lmdb_purge_stats *x3_lmdb_get_purge_stats(void);
  */
 void x3_lmdb_set_purge_interval(unsigned int interval_secs);
 
+/* ========== Session Token API ========== */
+
+/* Session token TTL (24 hours) */
+#define SESSION_TOKEN_TTL (24 * 3600)
+
+/* Session token ID length (before base64 encoding) */
+#define SESSION_TOKEN_ID_LEN 24
+
+/* Session token prefix for detection in passwords */
+#define SESSION_TOKEN_PREFIX "x3tok:"
+
+/**
+ * Generate a new session token for an authenticated user
+ * @param username Account name to issue token for
+ * @param token_out Buffer for the generated token (at least 64 bytes)
+ * @param token_size Size of token_out buffer
+ * @return LMDB_SUCCESS on success, LMDB_ERROR on failure
+ */
+int x3_lmdb_session_create(const char *username, char *token_out, size_t token_size);
+
+/**
+ * Validate a session token
+ * @param token Token to validate (full token including "x3tok:" prefix)
+ * @param username_out Buffer for username (at least 64 bytes, can be NULL)
+ * @param username_size Size of username_out buffer
+ * @return LMDB_SUCCESS if valid, LMDB_NOT_FOUND if not found/expired, LMDB_ERROR on failure
+ */
+int x3_lmdb_session_validate(const char *token, char *username_out, size_t username_size);
+
+/**
+ * Delete/revoke a specific session token
+ * @param token Token to revoke (full token including "x3tok:" prefix)
+ * @return LMDB_SUCCESS on success, LMDB_NOT_FOUND if not found, LMDB_ERROR on failure
+ */
+int x3_lmdb_session_revoke(const char *token);
+
+/**
+ * Revoke all session tokens for a user by incrementing session version
+ * @param username Account name
+ * @return LMDB_SUCCESS on success, LMDB_ERROR on failure
+ */
+int x3_lmdb_session_revoke_all(const char *username);
+
+/**
+ * Get current session version for a user
+ * @param username Account name
+ * @param version_out Output for current version number
+ * @return LMDB_SUCCESS on success, LMDB_NOT_FOUND if no version set, LMDB_ERROR on failure
+ */
+int x3_lmdb_session_get_version(const char *username, unsigned int *version_out);
+
+/**
+ * Check if a token looks like a session token (starts with x3tok:)
+ * @param password Password/token string to check
+ * @return 1 if it's a session token, 0 otherwise
+ */
+int x3_lmdb_is_session_token(const char *password);
+
+/* ========== SCRAM Session Token API ========== */
+
+/* SCRAM hash algorithm types */
+enum scram_hash_type {
+    SCRAM_HASH_SHA1 = 1,      /* SCRAM-SHA-1 (RFC 5802) - 20 byte output */
+    SCRAM_HASH_SHA256 = 2,    /* SCRAM-SHA-256 (RFC 7677) - 32 byte output */
+    SCRAM_HASH_SHA512 = 3     /* SCRAM-SHA-512 - 64 byte output */
+};
+
+/* SCRAM iteration count (RFC 7677 recommends at least 4096) */
+#define SCRAM_ITERATION_COUNT 4096
+
+/* SCRAM salt length in bytes */
+#define SCRAM_SALT_LEN 16
+
+/* Hash output lengths */
+#define SCRAM_SHA1_LEN 20
+#define SCRAM_SHA256_LEN 32
+#define SCRAM_SHA512_LEN 64
+#define SCRAM_MAX_HASH_LEN 64  /* Maximum of all hash types (SHA-512) */
+
+/* SCRAM token prefix */
+#define SCRAM_TOKEN_PREFIX "x3scram:"
+
+/* SCRAM credential structure */
+struct scram_credential {
+    unsigned char salt[SCRAM_SALT_LEN];              /* Random salt */
+    unsigned char stored_key[SCRAM_MAX_HASH_LEN];    /* H(ClientKey) */
+    unsigned char server_key[SCRAM_MAX_HASH_LEN];    /* ServerKey */
+    unsigned int iteration;                           /* Iteration count */
+    enum scram_hash_type hash_type;                   /* Which hash algorithm */
+    size_t hash_len;                                  /* Hash output length */
+    char username[64];                                /* Associated account */
+    time_t expiry;                                    /* When credential expires */
+};
+
+/* SCRAM session state for multi-step auth */
+struct scram_session {
+    char client_nonce[48];          /* r= from client-first */
+    char server_nonce[48];          /* Server-generated nonce */
+    char combined_nonce[96];        /* client_nonce + server_nonce */
+    char salt_b64[32];              /* Base64-encoded salt */
+    unsigned int iteration;         /* Iteration count */
+    enum scram_hash_type hash_type; /* Which hash algorithm */
+    char auth_message[512];         /* For computing signatures */
+    size_t auth_message_len;        /* Current auth_message length */
+    struct scram_credential cred;   /* Retrieved credential */
+    int step;                       /* Current step (1=client-first, 2=client-final) */
+};
+
+/**
+ * Create SCRAM credential for a session token with specified hash type
+ * @param token_id Token ID (the part after x3tok:)
+ * @param username Account name
+ * @param password The session token value (will be used as SCRAM password)
+ * @param hash_type SCRAM hash algorithm (SCRAM_HASH_SHA1, SCRAM_HASH_SHA256, SCRAM_HASH_SHA512)
+ * @return LMDB_SUCCESS on success, LMDB_ERROR on failure
+ */
+int x3_lmdb_scram_create_ex(const char *token_id, const char *username,
+                             const char *password, enum scram_hash_type hash_type);
+
+/**
+ * Create SCRAM-SHA-256 credential for a session token (legacy wrapper)
+ * @param token_id Token ID (the part after x3tok:)
+ * @param username Account name
+ * @param password The session token value (will be used as SCRAM password)
+ * @return LMDB_SUCCESS on success, LMDB_ERROR on failure
+ */
+int x3_lmdb_scram_create(const char *token_id, const char *username, const char *password);
+
+/**
+ * Get SCRAM credential for a token with specified hash type
+ * @param token_id Token ID to look up
+ * @param hash_type SCRAM hash algorithm
+ * @param cred_out Output credential structure
+ * @return LMDB_SUCCESS on success, LMDB_NOT_FOUND if not found, LMDB_ERROR on failure
+ */
+int x3_lmdb_scram_get_ex(const char *token_id, enum scram_hash_type hash_type,
+                          struct scram_credential *cred_out);
+
+/**
+ * Get SCRAM credential for a token (legacy SHA-256 wrapper)
+ * @param token_id Token ID to look up
+ * @param cred_out Output credential structure
+ * @return LMDB_SUCCESS on success, LMDB_NOT_FOUND if not found, LMDB_ERROR on failure
+ */
+int x3_lmdb_scram_get(const char *token_id, struct scram_credential *cred_out);
+
+/**
+ * Delete SCRAM credential for a specific hash type
+ * @param token_id Token ID to delete
+ * @param hash_type SCRAM hash algorithm
+ * @return LMDB_SUCCESS on success, LMDB_NOT_FOUND if not found, LMDB_ERROR on failure
+ */
+int x3_lmdb_scram_delete_ex(const char *token_id, enum scram_hash_type hash_type);
+
+/**
+ * Delete all SCRAM credentials for a token (all hash types)
+ * @param token_id Token ID to delete
+ * @return LMDB_SUCCESS on success, LMDB_NOT_FOUND if not found, LMDB_ERROR on failure
+ */
+int x3_lmdb_scram_delete(const char *token_id);
+
+/**
+ * Revoke all SCRAM credentials for a user
+ * This is called when session version is incremented
+ * @param username Account name
+ * @return Number of credentials deleted, or -1 on error
+ */
+int x3_lmdb_scram_revoke_all(const char *username);
+
+/**
+ * Check if password looks like a SCRAM token (starts with x3scram:)
+ * @param password Password string to check
+ * @return 1 if it's a SCRAM token, 0 otherwise
+ */
+int x3_lmdb_is_scram_token(const char *password);
+
+/* ========== Account Password SCRAM API ========== */
+
+/**
+ * Create SCRAM credentials for an account password (all hash types)
+ * This should be called whenever a password is set/changed.
+ * @param account Account name
+ * @param password The plaintext password
+ * @return Number of credentials created (0-3), -1 on error
+ */
+int x3_lmdb_scram_acct_create_all(const char *account, const char *password);
+
+/**
+ * Create SCRAM credential for an account password with specified hash type
+ * @param account Account name
+ * @param password The plaintext password
+ * @param hash_type SCRAM hash algorithm
+ * @return LMDB_SUCCESS on success, LMDB_ERROR on failure
+ */
+int x3_lmdb_scram_acct_create(const char *account, const char *password,
+                               enum scram_hash_type hash_type);
+
+/**
+ * Get SCRAM credential for an account with specified hash type
+ * @param account Account name to look up
+ * @param hash_type SCRAM hash algorithm
+ * @param cred_out Output credential structure
+ * @return LMDB_SUCCESS on success, LMDB_NOT_FOUND if not found, LMDB_ERROR on failure
+ */
+int x3_lmdb_scram_acct_get(const char *account, enum scram_hash_type hash_type,
+                            struct scram_credential *cred_out);
+
+/**
+ * Delete all SCRAM credentials for an account (all hash types)
+ * @param account Account name
+ * @return Number of credentials deleted, -1 on error
+ */
+int x3_lmdb_scram_acct_delete_all(const char *account);
+
+/**
+ * Derive SCRAM keys from password and salt (generic for any hash type)
+ * @param hash_type Hash algorithm (SCRAM_HASH_SHA1, SCRAM_HASH_SHA256, SCRAM_HASH_SHA512)
+ * @param password Password to derive from
+ * @param salt Salt bytes
+ * @param salt_len Salt length
+ * @param iteration Iteration count
+ * @param stored_key_out Output for StoredKey (size depends on hash type)
+ * @param server_key_out Output for ServerKey (size depends on hash type)
+ * @return 0 on success, -1 on failure
+ */
+int scram_derive_keys(enum scram_hash_type hash_type,
+                      const char *password,
+                      const unsigned char *salt, size_t salt_len,
+                      unsigned int iteration,
+                      unsigned char *stored_key_out,
+                      unsigned char *server_key_out);
+
+/**
+ * Compute SCRAM client signature (generic for any hash type)
+ * @param hash_type Hash algorithm
+ * @param stored_key The StoredKey
+ * @param auth_message The AuthMessage string
+ * @param auth_message_len Length of AuthMessage
+ * @param client_sig_out Output for ClientSignature
+ * @return 0 on success, -1 on failure
+ */
+int scram_client_signature(enum scram_hash_type hash_type,
+                           const unsigned char *stored_key,
+                           const char *auth_message, size_t auth_message_len,
+                           unsigned char *client_sig_out);
+
+/**
+ * Compute SCRAM server signature (generic for any hash type)
+ * @param hash_type Hash algorithm
+ * @param server_key The ServerKey
+ * @param auth_message The AuthMessage string
+ * @param auth_message_len Length of AuthMessage
+ * @param server_sig_out Output for ServerSignature
+ * @return 0 on success, -1 on failure
+ */
+int scram_server_signature(enum scram_hash_type hash_type,
+                           const unsigned char *server_key,
+                           const char *auth_message, size_t auth_message_len,
+                           unsigned char *server_sig_out);
+
+/**
+ * Verify SCRAM client proof (generic for any hash type)
+ * @param hash_type Hash algorithm
+ * @param stored_key The StoredKey
+ * @param auth_message The AuthMessage string
+ * @param auth_message_len Length of AuthMessage
+ * @param client_proof Base64-encoded client proof from client-final
+ * @return 1 if valid, 0 if invalid, -1 on error
+ */
+int scram_verify_proof(enum scram_hash_type hash_type,
+                       const unsigned char *stored_key,
+                       const char *auth_message, size_t auth_message_len,
+                       const char *client_proof);
+
+/* Legacy SHA-256 specific wrappers (for backward compatibility) */
+
+/**
+ * Derive SCRAM-SHA-256 keys from password and salt
+ * @param password Password to derive from
+ * @param salt Salt bytes
+ * @param salt_len Salt length
+ * @param iteration Iteration count
+ * @param stored_key_out Output for StoredKey (32 bytes)
+ * @param server_key_out Output for ServerKey (32 bytes)
+ * @return 0 on success, -1 on failure
+ */
+int scram_sha256_derive_keys(const char *password,
+                             const unsigned char *salt, size_t salt_len,
+                             unsigned int iteration,
+                             unsigned char *stored_key_out,
+                             unsigned char *server_key_out);
+
+/**
+ * Compute SCRAM-SHA-256 client signature
+ * @param stored_key The StoredKey (32 bytes)
+ * @param auth_message The AuthMessage string
+ * @param auth_message_len Length of AuthMessage
+ * @param client_sig_out Output for ClientSignature (32 bytes)
+ * @return 0 on success, -1 on failure
+ */
+int scram_sha256_client_signature(const unsigned char *stored_key,
+                                  const char *auth_message, size_t auth_message_len,
+                                  unsigned char *client_sig_out);
+
+/**
+ * Compute SCRAM-SHA-256 server signature
+ * @param server_key The ServerKey (32 bytes)
+ * @param auth_message The AuthMessage string
+ * @param auth_message_len Length of AuthMessage
+ * @param server_sig_out Output for ServerSignature (32 bytes)
+ * @return 0 on success, -1 on failure
+ */
+int scram_sha256_server_signature(const unsigned char *server_key,
+                                  const char *auth_message, size_t auth_message_len,
+                                  unsigned char *server_sig_out);
+
+/**
+ * Verify SCRAM-SHA-256 client proof
+ * @param stored_key The StoredKey (32 bytes)
+ * @param auth_message The AuthMessage string
+ * @param auth_message_len Length of AuthMessage
+ * @param client_proof Base64-encoded client proof from client-final
+ * @return 1 if valid, 0 if invalid, -1 on error
+ */
+int scram_sha256_verify_proof(const unsigned char *stored_key,
+                              const char *auth_message, size_t auth_message_len,
+                              const char *client_proof);
+
 /* ========== Module Registration ========== */
 
 /**
@@ -690,6 +1021,32 @@ void init_x3_lmdb(void);
 #define x3_lmdb_cleanup_old_snapshots(p) (0)
 #define x3_lmdb_export_json(p)          (-1)
 #define x3_lmdb_export_json_auto(p, o)  (-1)
+#define x3_lmdb_session_create(u, t, s) (-1)
+#define x3_lmdb_session_validate(t, u, s) (-2)
+#define x3_lmdb_session_revoke(t)       (-2)
+#define x3_lmdb_session_revoke_all(u)   (-1)
+#define x3_lmdb_session_get_version(u, v) (-2)
+#define x3_lmdb_is_session_token(p)     (0)
+#define x3_lmdb_scram_create_ex(t, u, p, h) (-1)
+#define x3_lmdb_scram_create(t, u, p)   (-1)
+#define x3_lmdb_scram_get_ex(t, h, c)   (-2)
+#define x3_lmdb_scram_get(t, c)         (-2)
+#define x3_lmdb_scram_delete_ex(t, h)   (-2)
+#define x3_lmdb_scram_delete(t)         (-2)
+#define x3_lmdb_scram_revoke_all(u)     (-1)
+#define x3_lmdb_is_scram_token(p)       (0)
+#define x3_lmdb_scram_acct_create_all(a, p) (-1)
+#define x3_lmdb_scram_acct_create(a, p, h) (-1)
+#define x3_lmdb_scram_acct_get(a, h, c) (-2)
+#define x3_lmdb_scram_acct_delete_all(a) (-1)
+#define scram_derive_keys(h, p, s, l, i, sk, svk) (-1)
+#define scram_client_signature(h, sk, m, l, o) (-1)
+#define scram_server_signature(h, sk, m, l, o) (-1)
+#define scram_verify_proof(h, sk, m, l, p) (-1)
+#define scram_sha256_derive_keys(p, s, l, i, sk, svk) (-1)
+#define scram_sha256_client_signature(sk, m, l, o) (-1)
+#define scram_sha256_server_signature(sk, m, l, o) (-1)
+#define scram_sha256_verify_proof(sk, m, l, p) (-1)
 #define init_x3_lmdb()                  do {} while(0)
 
 #endif /* WITH_LMDB */

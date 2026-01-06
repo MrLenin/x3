@@ -23,6 +23,12 @@
 #include <errno.h>
 #include <sys/stat.h>
 
+#ifdef WITH_SSL
+#include <openssl/evp.h>
+#include <openssl/hmac.h>
+#include <openssl/rand.h>
+#endif
+
 /* LMDB Environment */
 static MDB_env *lmdb_env = NULL;
 static MDB_dbi dbi_accounts = 0;
@@ -3032,6 +3038,355 @@ void x3_lmdb_set_purge_interval(unsigned int interval_secs)
     }
 }
 
+/* ========== Session Token API ========== */
+
+/* Standard base64 alphabet for token encoding */
+static const char base64_chars[] =
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+/* Base64 encode without padding */
+static int session_base64_encode(const unsigned char *input, int input_len, char *output, size_t output_size)
+{
+    int i, j;
+    unsigned int triplet;
+
+    /* Check output buffer size */
+    int needed = ((input_len + 2) / 3) * 4 + 1;
+    if ((size_t)needed > output_size) {
+        return -1;
+    }
+
+    for (i = 0, j = 0; i < input_len; ) {
+        triplet = (i < input_len ? input[i++] : 0) << 16;
+        triplet |= (i < input_len ? input[i++] : 0) << 8;
+        triplet |= (i < input_len ? input[i++] : 0);
+
+        output[j++] = base64_chars[(triplet >> 18) & 0x3f];
+        output[j++] = base64_chars[(triplet >> 12) & 0x3f];
+        output[j++] = base64_chars[(triplet >> 6) & 0x3f];
+        output[j++] = base64_chars[triplet & 0x3f];
+    }
+
+    /* Adjust for no padding */
+    if (input_len % 3 == 1) j -= 2;
+    else if (input_len % 3 == 2) j -= 1;
+
+    output[j] = '\0';
+    return j;
+}
+
+int x3_lmdb_is_session_token(const char *password)
+{
+    if (!password) return 0;
+    return strncmp(password, SESSION_TOKEN_PREFIX, strlen(SESSION_TOKEN_PREFIX)) == 0;
+}
+
+int x3_lmdb_session_create(const char *username, char *token_out, size_t token_size)
+{
+    MDB_txn *txn;
+    MDB_val key, data;
+    unsigned char random_bytes[SESSION_TOKEN_ID_LEN];
+    char token_id[64];
+    char lmdb_key[LMDB_KEY_BUFFER_SIZE];
+    char lmdb_value[256];
+    unsigned int version = 0;
+    int rc;
+    int i;
+
+    if (!lmdb_initialized || !username || !token_out || token_size < 64) {
+        return LMDB_ERROR;
+    }
+
+    /* Generate random bytes for token ID */
+    /* Use /dev/urandom for cryptographic randomness */
+    FILE *urandom = fopen("/dev/urandom", "rb");
+    if (!urandom) {
+        log_module(MAIN_LOG, LOG_ERROR, "x3_lmdb: Failed to open /dev/urandom");
+        return LMDB_ERROR;
+    }
+    if (fread(random_bytes, 1, SESSION_TOKEN_ID_LEN, urandom) != SESSION_TOKEN_ID_LEN) {
+        fclose(urandom);
+        log_module(MAIN_LOG, LOG_ERROR, "x3_lmdb: Failed to read random bytes");
+        return LMDB_ERROR;
+    }
+    fclose(urandom);
+
+    /* Encode to base64 */
+    if (session_base64_encode(random_bytes, SESSION_TOKEN_ID_LEN, token_id, sizeof(token_id)) < 0) {
+        return LMDB_ERROR;
+    }
+
+    /* Get current session version for the user (if any) */
+    x3_lmdb_session_get_version(username, &version);
+
+    /* Build LMDB key: session:<token_id> */
+    snprintf(lmdb_key, sizeof(lmdb_key), "%s%s", LMDB_PREFIX_SESSION, token_id);
+
+    /* Build LMDB value: expiry:version:username */
+    time_t expiry = now + SESSION_TOKEN_TTL;
+    snprintf(lmdb_value, sizeof(lmdb_value), "%lu:%u:%s", (unsigned long)expiry, version, username);
+
+    /* Start write transaction */
+    rc = mdb_txn_begin(lmdb_env, NULL, 0, &txn);
+    if (rc != 0) {
+        log_module(MAIN_LOG, LOG_ERROR, "x3_lmdb: session_create txn_begin failed: %s",
+                   mdb_strerror(rc));
+        return LMDB_ERROR;
+    }
+
+    /* Store the token */
+    key.mv_size = strlen(lmdb_key);
+    key.mv_data = lmdb_key;
+    data.mv_size = strlen(lmdb_value) + 1;
+    data.mv_data = lmdb_value;
+
+    rc = mdb_put(txn, dbi_metadata, &key, &data, 0);
+    if (rc != 0) {
+        mdb_txn_abort(txn);
+        log_module(MAIN_LOG, LOG_ERROR, "x3_lmdb: session_create mdb_put failed: %s",
+                   mdb_strerror(rc));
+        return LMDB_ERROR;
+    }
+
+    /* Commit transaction */
+    rc = mdb_txn_commit(txn);
+    if (rc != 0) {
+        log_module(MAIN_LOG, LOG_ERROR, "x3_lmdb: session_create commit failed: %s",
+                   mdb_strerror(rc));
+        return LMDB_ERROR;
+    }
+
+    /* Build full token: x3tok:<token_id> */
+    snprintf(token_out, token_size, "%s%s", SESSION_TOKEN_PREFIX, token_id);
+
+    log_module(MAIN_LOG, LOG_DEBUG, "x3_lmdb: Created session token for %s (expires %lu)",
+               username, (unsigned long)expiry);
+
+    return LMDB_SUCCESS;
+}
+
+int x3_lmdb_session_validate(const char *token, char *username_out, size_t username_size)
+{
+    MDB_txn *txn;
+    MDB_val key, data;
+    char lmdb_key[LMDB_KEY_BUFFER_SIZE];
+    const char *token_id;
+    char *value_copy;
+    char *expiry_str, *version_str, *username;
+    time_t expiry;
+    unsigned int stored_version, current_version = 0;
+    int rc;
+
+    if (!lmdb_initialized || !token) {
+        return LMDB_ERROR;
+    }
+
+    /* Check token format */
+    if (!x3_lmdb_is_session_token(token)) {
+        return LMDB_NOT_FOUND;
+    }
+
+    /* Extract token ID (skip "x3tok:" prefix) */
+    token_id = token + strlen(SESSION_TOKEN_PREFIX);
+    if (!*token_id) {
+        return LMDB_NOT_FOUND;
+    }
+
+    /* Build LMDB key */
+    snprintf(lmdb_key, sizeof(lmdb_key), "%s%s", LMDB_PREFIX_SESSION, token_id);
+
+    /* Start read transaction */
+    rc = mdb_txn_begin(lmdb_env, NULL, MDB_RDONLY, &txn);
+    if (rc != 0) {
+        return LMDB_ERROR;
+    }
+
+    /* Look up token */
+    key.mv_size = strlen(lmdb_key);
+    key.mv_data = lmdb_key;
+
+    rc = mdb_get(txn, dbi_metadata, &key, &data);
+    mdb_txn_abort(txn);
+
+    if (rc == MDB_NOTFOUND) {
+        return LMDB_NOT_FOUND;
+    }
+    if (rc != 0) {
+        return LMDB_ERROR;
+    }
+
+    /* Parse value: expiry:version:username */
+    value_copy = strndup(data.mv_data, data.mv_size);
+    if (!value_copy) {
+        return LMDB_ERROR;
+    }
+
+    expiry_str = value_copy;
+    version_str = strchr(expiry_str, ':');
+    if (!version_str) {
+        free(value_copy);
+        return LMDB_ERROR;
+    }
+    *version_str++ = '\0';
+
+    username = strchr(version_str, ':');
+    if (!username) {
+        free(value_copy);
+        return LMDB_ERROR;
+    }
+    *username++ = '\0';
+
+    expiry = (time_t)strtoul(expiry_str, NULL, 10);
+    stored_version = (unsigned int)strtoul(version_str, NULL, 10);
+
+    /* Check if token has expired */
+    if (now >= expiry) {
+        log_module(MAIN_LOG, LOG_DEBUG, "x3_lmdb: Session token expired for %s", username);
+        /* Delete expired token */
+        x3_lmdb_session_revoke(token);
+        free(value_copy);
+        return LMDB_NOT_FOUND;
+    }
+
+    /* Check session version (for revoke-all support) */
+    x3_lmdb_session_get_version(username, &current_version);
+    if (stored_version < current_version) {
+        log_module(MAIN_LOG, LOG_DEBUG, "x3_lmdb: Session token version mismatch for %s (%u < %u)",
+                   username, stored_version, current_version);
+        /* Delete revoked token */
+        x3_lmdb_session_revoke(token);
+        free(value_copy);
+        return LMDB_NOT_FOUND;
+    }
+
+    /* Token is valid - copy username if requested */
+    if (username_out && username_size > 0) {
+        strncpy(username_out, username, username_size - 1);
+        username_out[username_size - 1] = '\0';
+    }
+
+    log_module(MAIN_LOG, LOG_DEBUG, "x3_lmdb: Session token validated for %s", username);
+
+    free(value_copy);
+    return LMDB_SUCCESS;
+}
+
+int x3_lmdb_session_revoke(const char *token)
+{
+    char lmdb_key[LMDB_KEY_BUFFER_SIZE];
+    const char *token_id;
+
+    if (!lmdb_initialized || !token) {
+        return LMDB_ERROR;
+    }
+
+    /* Check token format */
+    if (!x3_lmdb_is_session_token(token)) {
+        return LMDB_NOT_FOUND;
+    }
+
+    /* Extract token ID */
+    token_id = token + strlen(SESSION_TOKEN_PREFIX);
+    if (!*token_id) {
+        return LMDB_NOT_FOUND;
+    }
+
+    /* Build LMDB key and delete */
+    snprintf(lmdb_key, sizeof(lmdb_key), "%s%s", LMDB_PREFIX_SESSION, token_id);
+
+    return x3_lmdb_delete(LMDB_DB_METADATA, lmdb_key);
+}
+
+int x3_lmdb_session_revoke_all(const char *username)
+{
+    MDB_txn *txn;
+    MDB_val key, data;
+    char lmdb_key[LMDB_KEY_BUFFER_SIZE];
+    char version_str[32];
+    unsigned int version = 0;
+    int rc;
+
+    if (!lmdb_initialized || !username) {
+        return LMDB_ERROR;
+    }
+
+    /* Get current version and increment */
+    x3_lmdb_session_get_version(username, &version);
+    version++;
+
+    /* Build key: sessver:<username> */
+    snprintf(lmdb_key, sizeof(lmdb_key), "%s%s", LMDB_PREFIX_SESSVER, username);
+    snprintf(version_str, sizeof(version_str), "%u", version);
+
+    /* Start write transaction */
+    rc = mdb_txn_begin(lmdb_env, NULL, 0, &txn);
+    if (rc != 0) {
+        return LMDB_ERROR;
+    }
+
+    /* Store new version */
+    key.mv_size = strlen(lmdb_key);
+    key.mv_data = lmdb_key;
+    data.mv_size = strlen(version_str) + 1;
+    data.mv_data = version_str;
+
+    rc = mdb_put(txn, dbi_metadata, &key, &data, 0);
+    if (rc != 0) {
+        mdb_txn_abort(txn);
+        return LMDB_ERROR;
+    }
+
+    rc = mdb_txn_commit(txn);
+    if (rc != 0) {
+        return LMDB_ERROR;
+    }
+
+    log_module(MAIN_LOG, LOG_INFO, "x3_lmdb: Revoked all sessions for %s (version now %u)",
+               username, version);
+
+    return LMDB_SUCCESS;
+}
+
+int x3_lmdb_session_get_version(const char *username, unsigned int *version_out)
+{
+    MDB_txn *txn;
+    MDB_val key, data;
+    char lmdb_key[LMDB_KEY_BUFFER_SIZE];
+    int rc;
+
+    if (!lmdb_initialized || !username || !version_out) {
+        return LMDB_ERROR;
+    }
+
+    /* Build key: sessver:<username> */
+    snprintf(lmdb_key, sizeof(lmdb_key), "%s%s", LMDB_PREFIX_SESSVER, username);
+
+    /* Start read transaction */
+    rc = mdb_txn_begin(lmdb_env, NULL, MDB_RDONLY, &txn);
+    if (rc != 0) {
+        *version_out = 0;
+        return LMDB_ERROR;
+    }
+
+    key.mv_size = strlen(lmdb_key);
+    key.mv_data = lmdb_key;
+
+    rc = mdb_get(txn, dbi_metadata, &key, &data);
+    mdb_txn_abort(txn);
+
+    if (rc == MDB_NOTFOUND) {
+        *version_out = 0;
+        return LMDB_NOT_FOUND;
+    }
+    if (rc != 0) {
+        *version_out = 0;
+        return LMDB_ERROR;
+    }
+
+    *version_out = (unsigned int)strtoul(data.mv_data, NULL, 10);
+    return LMDB_SUCCESS;
+}
+
 /* ========== Module Registration ========== */
 
 static void lmdb_exit_handler(UNUSED_ARG(void *extra))
@@ -3106,5 +3461,1310 @@ void init_x3_lmdb(void)
         log_module(MAIN_LOG, LOG_WARNING, "x3_lmdb: Module initialization failed, metadata persistence disabled");
     }
 }
+
+/* ========== SCRAM-SHA-256 Implementation ========== */
+
+/* LMDB prefix for SCRAM credentials */
+#define LMDB_PREFIX_SCRAM "scram:"
+
+int x3_lmdb_is_scram_token(const char *password)
+{
+    if (!password) return 0;
+    return (strncmp(password, SCRAM_TOKEN_PREFIX, strlen(SCRAM_TOKEN_PREFIX)) == 0);
+}
+
+#ifdef WITH_SSL
+
+/**
+ * Base64 encode for SCRAM
+ */
+static int scram_base64_encode(const unsigned char *input, size_t input_len,
+                               char *output, size_t output_size)
+{
+    static const char base64_chars[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    size_t i, j;
+    size_t needed = ((input_len + 2) / 3) * 4 + 1;
+
+    if (output_size < needed) return -1;
+
+    for (i = 0, j = 0; i < input_len; ) {
+        unsigned int a = i < input_len ? input[i++] : 0;
+        unsigned int b = i < input_len ? input[i++] : 0;
+        unsigned int c = i < input_len ? input[i++] : 0;
+        unsigned int triple = (a << 16) | (b << 8) | c;
+
+        output[j++] = base64_chars[(triple >> 18) & 0x3F];
+        output[j++] = base64_chars[(triple >> 12) & 0x3F];
+        output[j++] = (i > input_len + 1) ? '=' : base64_chars[(triple >> 6) & 0x3F];
+        output[j++] = (i > input_len) ? '=' : base64_chars[triple & 0x3F];
+    }
+    output[j] = '\0';
+    return (int)j;
+}
+
+/**
+ * Base64 decode for SCRAM
+ */
+static int scram_base64_decode(const char *input, unsigned char *output, size_t output_size)
+{
+    static const unsigned char base64_index[256] = {
+        ['A'] = 0, ['B'] = 1, ['C'] = 2, ['D'] = 3, ['E'] = 4, ['F'] = 5,
+        ['G'] = 6, ['H'] = 7, ['I'] = 8, ['J'] = 9, ['K'] = 10, ['L'] = 11,
+        ['M'] = 12, ['N'] = 13, ['O'] = 14, ['P'] = 15, ['Q'] = 16, ['R'] = 17,
+        ['S'] = 18, ['T'] = 19, ['U'] = 20, ['V'] = 21, ['W'] = 22, ['X'] = 23,
+        ['Y'] = 24, ['Z'] = 25, ['a'] = 26, ['b'] = 27, ['c'] = 28, ['d'] = 29,
+        ['e'] = 30, ['f'] = 31, ['g'] = 32, ['h'] = 33, ['i'] = 34, ['j'] = 35,
+        ['k'] = 36, ['l'] = 37, ['m'] = 38, ['n'] = 39, ['o'] = 40, ['p'] = 41,
+        ['q'] = 42, ['r'] = 43, ['s'] = 44, ['t'] = 45, ['u'] = 46, ['v'] = 47,
+        ['w'] = 48, ['x'] = 49, ['y'] = 50, ['z'] = 51, ['0'] = 52, ['1'] = 53,
+        ['2'] = 54, ['3'] = 55, ['4'] = 56, ['5'] = 57, ['6'] = 58, ['7'] = 59,
+        ['8'] = 60, ['9'] = 61, ['+'] = 62, ['/'] = 63
+    };
+    size_t input_len = strlen(input);
+    size_t i, j;
+    size_t padding = 0;
+
+    if (input_len % 4 != 0) return -1;
+
+    if (input_len >= 1 && input[input_len - 1] == '=') padding++;
+    if (input_len >= 2 && input[input_len - 2] == '=') padding++;
+
+    size_t output_len = (input_len / 4) * 3 - padding;
+    if (output_size < output_len) return -1;
+
+    for (i = 0, j = 0; i < input_len; i += 4) {
+        unsigned int a = base64_index[(unsigned char)input[i]];
+        unsigned int b = base64_index[(unsigned char)input[i + 1]];
+        unsigned int c = base64_index[(unsigned char)input[i + 2]];
+        unsigned int d = base64_index[(unsigned char)input[i + 3]];
+        unsigned int triple = (a << 18) | (b << 12) | (c << 6) | d;
+
+        if (j < output_len) output[j++] = (triple >> 16) & 0xFF;
+        if (j < output_len) output[j++] = (triple >> 8) & 0xFF;
+        if (j < output_len) output[j++] = triple & 0xFF;
+    }
+    return (int)output_len;
+}
+
+/* Get OpenSSL digest function for SCRAM hash type */
+static const EVP_MD *scram_get_evp_md(enum scram_hash_type hash_type)
+{
+    switch (hash_type) {
+    case SCRAM_HASH_SHA1:
+        return EVP_sha1();
+    case SCRAM_HASH_SHA256:
+        return EVP_sha256();
+    case SCRAM_HASH_SHA512:
+        return EVP_sha512();
+    default:
+        return NULL;
+    }
+}
+
+/* Get hash length for SCRAM hash type */
+static size_t scram_get_hash_len(enum scram_hash_type hash_type)
+{
+    switch (hash_type) {
+    case SCRAM_HASH_SHA1:
+        return SCRAM_SHA1_LEN;
+    case SCRAM_HASH_SHA256:
+        return SCRAM_SHA256_LEN;
+    case SCRAM_HASH_SHA512:
+        return SCRAM_SHA512_LEN;
+    default:
+        return 0;
+    }
+}
+
+/* Generic SCRAM key derivation for any hash type */
+int scram_derive_keys(enum scram_hash_type hash_type,
+                      const char *password,
+                      const unsigned char *salt, size_t salt_len,
+                      unsigned int iteration,
+                      unsigned char *stored_key_out,
+                      unsigned char *server_key_out)
+{
+    const EVP_MD *md = scram_get_evp_md(hash_type);
+    size_t hash_len = scram_get_hash_len(hash_type);
+    unsigned char salted_password[SCRAM_MAX_HASH_LEN];
+    unsigned char client_key[SCRAM_MAX_HASH_LEN];
+    unsigned int hmac_len;
+
+    if (!md || hash_len == 0) {
+        return -1;
+    }
+
+    /* SaltedPassword = PBKDF2(password, salt, iteration, dkLen) */
+    if (!PKCS5_PBKDF2_HMAC(password, strlen(password),
+                          salt, salt_len,
+                          iteration, md,
+                          hash_len, salted_password)) {
+        return -1;
+    }
+
+    /* ClientKey = HMAC(SaltedPassword, "Client Key") */
+    if (!HMAC(md, salted_password, hash_len,
+              (unsigned char *)"Client Key", 10,
+              client_key, &hmac_len)) {
+        return -1;
+    }
+
+    /* StoredKey = Hash(ClientKey) */
+    EVP_MD_CTX *ctx = EVP_MD_CTX_new();
+    if (!ctx) return -1;
+    if (!EVP_DigestInit_ex(ctx, md, NULL) ||
+        !EVP_DigestUpdate(ctx, client_key, hash_len) ||
+        !EVP_DigestFinal_ex(ctx, stored_key_out, NULL)) {
+        EVP_MD_CTX_free(ctx);
+        return -1;
+    }
+    EVP_MD_CTX_free(ctx);
+
+    /* ServerKey = HMAC(SaltedPassword, "Server Key") */
+    if (!HMAC(md, salted_password, hash_len,
+              (unsigned char *)"Server Key", 10,
+              server_key_out, &hmac_len)) {
+        return -1;
+    }
+
+    return 0;
+}
+
+/* Generic SCRAM client signature */
+int scram_client_signature(enum scram_hash_type hash_type,
+                           const unsigned char *stored_key,
+                           const char *auth_message, size_t auth_message_len,
+                           unsigned char *client_sig_out)
+{
+    const EVP_MD *md = scram_get_evp_md(hash_type);
+    size_t hash_len = scram_get_hash_len(hash_type);
+    unsigned int hmac_len;
+
+    if (!md || hash_len == 0) {
+        return -1;
+    }
+
+    /* ClientSignature = HMAC(StoredKey, AuthMessage) */
+    if (!HMAC(md, stored_key, hash_len,
+              (unsigned char *)auth_message, auth_message_len,
+              client_sig_out, &hmac_len)) {
+        return -1;
+    }
+    return 0;
+}
+
+/* Generic SCRAM server signature */
+int scram_server_signature(enum scram_hash_type hash_type,
+                           const unsigned char *server_key,
+                           const char *auth_message, size_t auth_message_len,
+                           unsigned char *server_sig_out)
+{
+    const EVP_MD *md = scram_get_evp_md(hash_type);
+    size_t hash_len = scram_get_hash_len(hash_type);
+    unsigned int hmac_len;
+
+    if (!md || hash_len == 0) {
+        return -1;
+    }
+
+    /* ServerSignature = HMAC(ServerKey, AuthMessage) */
+    if (!HMAC(md, server_key, hash_len,
+              (unsigned char *)auth_message, auth_message_len,
+              server_sig_out, &hmac_len)) {
+        return -1;
+    }
+    return 0;
+}
+
+/* Generic SCRAM proof verification */
+int scram_verify_proof(enum scram_hash_type hash_type,
+                       const unsigned char *stored_key,
+                       const char *auth_message, size_t auth_message_len,
+                       const char *client_proof_b64)
+{
+    const EVP_MD *md = scram_get_evp_md(hash_type);
+    size_t hash_len = scram_get_hash_len(hash_type);
+    unsigned char client_proof[SCRAM_MAX_HASH_LEN];
+    unsigned char client_signature[SCRAM_MAX_HASH_LEN];
+    unsigned char recovered_client_key[SCRAM_MAX_HASH_LEN];
+    unsigned char computed_stored_key[SCRAM_MAX_HASH_LEN];
+    int proof_len;
+    size_t i;
+
+    if (!md || hash_len == 0) {
+        return -1;
+    }
+
+    /* Decode client proof from base64 */
+    proof_len = scram_base64_decode(client_proof_b64, client_proof, sizeof(client_proof));
+    if ((size_t)proof_len != hash_len) {
+        return -1;
+    }
+
+    /* Compute ClientSignature = HMAC(StoredKey, AuthMessage) */
+    if (scram_client_signature(hash_type, stored_key, auth_message, auth_message_len,
+                               client_signature) != 0) {
+        return -1;
+    }
+
+    /* Recover ClientKey = ClientProof XOR ClientSignature */
+    for (i = 0; i < hash_len; i++) {
+        recovered_client_key[i] = client_proof[i] ^ client_signature[i];
+    }
+
+    /* Verify: Hash(RecoveredClientKey) == StoredKey */
+    EVP_MD_CTX *ctx = EVP_MD_CTX_new();
+    if (!ctx) return -1;
+    if (!EVP_DigestInit_ex(ctx, md, NULL) ||
+        !EVP_DigestUpdate(ctx, recovered_client_key, hash_len) ||
+        !EVP_DigestFinal_ex(ctx, computed_stored_key, NULL)) {
+        EVP_MD_CTX_free(ctx);
+        return -1;
+    }
+    EVP_MD_CTX_free(ctx);
+
+    /* Constant-time comparison */
+    int result = 1;
+    for (i = 0; i < hash_len; i++) {
+        if (computed_stored_key[i] != stored_key[i]) {
+            result = 0;
+        }
+    }
+
+    return result;
+}
+
+/* Legacy SHA-256 specific wrappers for backward compatibility */
+int scram_sha256_derive_keys(const char *password,
+                             const unsigned char *salt, size_t salt_len,
+                             unsigned int iteration,
+                             unsigned char *stored_key_out,
+                             unsigned char *server_key_out)
+{
+    unsigned char salted_password[SCRAM_SHA256_LEN];
+    unsigned char client_key[SCRAM_SHA256_LEN];
+    unsigned int hmac_len;
+
+    /* SaltedPassword = PBKDF2(password, salt, iteration, dkLen=32) */
+    if (!PKCS5_PBKDF2_HMAC(password, strlen(password),
+                          salt, salt_len,
+                          iteration, EVP_sha256(),
+                          SCRAM_SHA256_LEN, salted_password)) {
+        return -1;
+    }
+
+    /* ClientKey = HMAC(SaltedPassword, "Client Key") */
+    if (!HMAC(EVP_sha256(), salted_password, SCRAM_SHA256_LEN,
+              (unsigned char *)"Client Key", 10,
+              client_key, &hmac_len)) {
+        return -1;
+    }
+
+    /* StoredKey = SHA256(ClientKey) */
+    EVP_MD_CTX *ctx = EVP_MD_CTX_new();
+    if (!ctx) return -1;
+    if (!EVP_DigestInit_ex(ctx, EVP_sha256(), NULL) ||
+        !EVP_DigestUpdate(ctx, client_key, SCRAM_SHA256_LEN) ||
+        !EVP_DigestFinal_ex(ctx, stored_key_out, NULL)) {
+        EVP_MD_CTX_free(ctx);
+        return -1;
+    }
+    EVP_MD_CTX_free(ctx);
+
+    /* ServerKey = HMAC(SaltedPassword, "Server Key") */
+    if (!HMAC(EVP_sha256(), salted_password, SCRAM_SHA256_LEN,
+              (unsigned char *)"Server Key", 10,
+              server_key_out, &hmac_len)) {
+        return -1;
+    }
+
+    return 0;
+}
+
+int scram_sha256_client_signature(const unsigned char *stored_key,
+                                  const char *auth_message, size_t auth_message_len,
+                                  unsigned char *client_sig_out)
+{
+    unsigned int hmac_len;
+
+    /* ClientSignature = HMAC(StoredKey, AuthMessage) */
+    if (!HMAC(EVP_sha256(), stored_key, SCRAM_SHA256_LEN,
+              (unsigned char *)auth_message, auth_message_len,
+              client_sig_out, &hmac_len)) {
+        return -1;
+    }
+    return 0;
+}
+
+int scram_sha256_server_signature(const unsigned char *server_key,
+                                  const char *auth_message, size_t auth_message_len,
+                                  unsigned char *server_sig_out)
+{
+    unsigned int hmac_len;
+
+    /* ServerSignature = HMAC(ServerKey, AuthMessage) */
+    if (!HMAC(EVP_sha256(), server_key, SCRAM_SHA256_LEN,
+              (unsigned char *)auth_message, auth_message_len,
+              server_sig_out, &hmac_len)) {
+        return -1;
+    }
+    return 0;
+}
+
+int scram_sha256_verify_proof(const unsigned char *stored_key,
+                              const char *auth_message, size_t auth_message_len,
+                              const char *client_proof_b64)
+{
+    unsigned char client_proof[SCRAM_SHA256_LEN];
+    unsigned char client_signature[SCRAM_SHA256_LEN];
+    unsigned char recovered_client_key[SCRAM_SHA256_LEN];
+    unsigned char computed_stored_key[SCRAM_SHA256_LEN];
+    int proof_len;
+    size_t i;
+
+    /* Decode client proof from base64 */
+    proof_len = scram_base64_decode(client_proof_b64, client_proof, sizeof(client_proof));
+    if (proof_len != SCRAM_SHA256_LEN) {
+        return -1;
+    }
+
+    /* Compute ClientSignature = HMAC(StoredKey, AuthMessage) */
+    if (scram_sha256_client_signature(stored_key, auth_message, auth_message_len,
+                                      client_signature) != 0) {
+        return -1;
+    }
+
+    /* Recover ClientKey = ClientProof XOR ClientSignature */
+    for (i = 0; i < SCRAM_SHA256_LEN; i++) {
+        recovered_client_key[i] = client_proof[i] ^ client_signature[i];
+    }
+
+    /* Verify: SHA256(RecoveredClientKey) == StoredKey */
+    EVP_MD_CTX *ctx = EVP_MD_CTX_new();
+    if (!ctx) return -1;
+    if (!EVP_DigestInit_ex(ctx, EVP_sha256(), NULL) ||
+        !EVP_DigestUpdate(ctx, recovered_client_key, SCRAM_SHA256_LEN) ||
+        !EVP_DigestFinal_ex(ctx, computed_stored_key, NULL)) {
+        EVP_MD_CTX_free(ctx);
+        return -1;
+    }
+    EVP_MD_CTX_free(ctx);
+
+    /* Constant-time comparison */
+    int result = 1;
+    for (i = 0; i < SCRAM_SHA256_LEN; i++) {
+        if (computed_stored_key[i] != stored_key[i]) {
+            result = 0;
+        }
+    }
+
+    return result;
+}
+
+int x3_lmdb_scram_create_ex(const char *token_id, const char *username,
+                             const char *password, enum scram_hash_type hash_type)
+{
+    MDB_txn *txn;
+    MDB_val key, data;
+    char lmdb_key[LMDB_KEY_BUFFER_SIZE];
+    unsigned char salt[SCRAM_SALT_LEN];
+    unsigned char stored_key[SCRAM_MAX_HASH_LEN];
+    unsigned char server_key[SCRAM_MAX_HASH_LEN];
+    char value_buf[768];  /* Larger for SHA-512 */
+    char salt_hex[SCRAM_SALT_LEN * 2 + 1];
+    char stored_key_hex[SCRAM_MAX_HASH_LEN * 2 + 1];
+    char server_key_hex[SCRAM_MAX_HASH_LEN * 2 + 1];
+    size_t hash_len;
+    time_t expiry;
+    int rc;
+    size_t i;
+
+    if (!lmdb_initialized || !token_id || !username || !password) {
+        return LMDB_ERROR;
+    }
+
+    /* Get hash length for this type */
+    switch (hash_type) {
+    case SCRAM_HASH_SHA1:
+        hash_len = SCRAM_SHA1_LEN;
+        break;
+    case SCRAM_HASH_SHA256:
+        hash_len = SCRAM_SHA256_LEN;
+        break;
+    case SCRAM_HASH_SHA512:
+        hash_len = SCRAM_SHA512_LEN;
+        break;
+    default:
+        log_module(MAIN_LOG, LOG_ERROR, "x3_lmdb: Invalid SCRAM hash type %d", hash_type);
+        return LMDB_ERROR;
+    }
+
+    /* Generate random salt */
+    if (RAND_bytes(salt, SCRAM_SALT_LEN) != 1) {
+        log_module(MAIN_LOG, LOG_ERROR, "x3_lmdb: Failed to generate SCRAM salt");
+        return LMDB_ERROR;
+    }
+
+    /* Derive SCRAM keys using the generic function */
+    if (scram_derive_keys(hash_type, password, salt, SCRAM_SALT_LEN,
+                          SCRAM_ITERATION_COUNT,
+                          stored_key, server_key) != 0) {
+        log_module(MAIN_LOG, LOG_ERROR, "x3_lmdb: Failed to derive SCRAM keys");
+        return LMDB_ERROR;
+    }
+
+    /* Convert to hex for storage */
+    for (i = 0; i < SCRAM_SALT_LEN; i++) {
+        sprintf(salt_hex + i * 2, "%02x", salt[i]);
+    }
+    for (i = 0; i < hash_len; i++) {
+        sprintf(stored_key_hex + i * 2, "%02x", stored_key[i]);
+        sprintf(server_key_hex + i * 2, "%02x", server_key[i]);
+    }
+    stored_key_hex[hash_len * 2] = '\0';
+    server_key_hex[hash_len * 2] = '\0';
+
+    /* Build LMDB key: scram:<hash_type>:<token_id> */
+    snprintf(lmdb_key, sizeof(lmdb_key), "%s%d:%s", LMDB_PREFIX_SCRAM, (int)hash_type, token_id);
+
+    /* Build value: expiry:hashtype:iteration:salt:storedkey:serverkey:username */
+    expiry = now + SESSION_TOKEN_TTL;
+    snprintf(value_buf, sizeof(value_buf), "%lu:%d:%u:%s:%s:%s:%s",
+             (unsigned long)expiry, (int)hash_type, SCRAM_ITERATION_COUNT,
+             salt_hex, stored_key_hex, server_key_hex, username);
+
+    /* Start write transaction */
+    rc = mdb_txn_begin(lmdb_env, NULL, 0, &txn);
+    if (rc != 0) {
+        log_module(MAIN_LOG, LOG_ERROR, "x3_lmdb: scram_create txn_begin failed: %s",
+                   mdb_strerror(rc));
+        return LMDB_ERROR;
+    }
+
+    /* Store the credential */
+    key.mv_size = strlen(lmdb_key);
+    key.mv_data = lmdb_key;
+    data.mv_size = strlen(value_buf) + 1;
+    data.mv_data = value_buf;
+
+    rc = mdb_put(txn, dbi_metadata, &key, &data, 0);
+    if (rc != 0) {
+        mdb_txn_abort(txn);
+        log_module(MAIN_LOG, LOG_ERROR, "x3_lmdb: scram_create mdb_put failed: %s",
+                   mdb_strerror(rc));
+        return LMDB_ERROR;
+    }
+
+    rc = mdb_txn_commit(txn);
+    if (rc != 0) {
+        log_module(MAIN_LOG, LOG_ERROR, "x3_lmdb: scram_create commit failed: %s",
+                   mdb_strerror(rc));
+        return LMDB_ERROR;
+    }
+
+    log_module(MAIN_LOG, LOG_DEBUG, "x3_lmdb: Created SCRAM-%s credential for %s (expires %lu)",
+               hash_type == SCRAM_HASH_SHA1 ? "SHA-1" :
+               hash_type == SCRAM_HASH_SHA256 ? "SHA-256" : "SHA-512",
+               username, (unsigned long)expiry);
+
+    return LMDB_SUCCESS;
+}
+
+/* Legacy wrapper for backward compatibility - creates SHA-256 credential */
+int x3_lmdb_scram_create(const char *token_id, const char *username, const char *password)
+{
+    return x3_lmdb_scram_create_ex(token_id, username, password, SCRAM_HASH_SHA256);
+}
+
+/**
+ * Helper to parse hex string to bytes
+ */
+static int hex_to_bytes(const char *hex, unsigned char *out, size_t out_len)
+{
+    size_t i;
+    for (i = 0; i < out_len && hex[i * 2] && hex[i * 2 + 1]; i++) {
+        char buf[3] = { hex[i * 2], hex[i * 2 + 1], '\0' };
+        out[i] = (unsigned char)strtoul(buf, NULL, 16);
+    }
+    return (i == out_len) ? 0 : -1;
+}
+
+int x3_lmdb_scram_get_ex(const char *token_id, enum scram_hash_type hash_type,
+                          struct scram_credential *cred_out)
+{
+    MDB_txn *txn;
+    MDB_val key, data;
+    char lmdb_key[LMDB_KEY_BUFFER_SIZE];
+    char *value_copy;
+    char *expiry_str, *field2, *iter_str, *salt_hex, *stored_key_hex, *server_key_hex, *username;
+    unsigned long field2_val;
+    int rc;
+
+    if (!lmdb_initialized || !token_id || !cred_out) {
+        return LMDB_ERROR;
+    }
+
+    /* Build LMDB key with hash type: scram:<hash_type>:<token_id> */
+    snprintf(lmdb_key, sizeof(lmdb_key), "%s%d:%s", LMDB_PREFIX_SCRAM, (int)hash_type, token_id);
+
+    /* Start read transaction */
+    rc = mdb_txn_begin(lmdb_env, NULL, MDB_RDONLY, &txn);
+    if (rc != 0) {
+        return LMDB_ERROR;
+    }
+
+    key.mv_size = strlen(lmdb_key);
+    key.mv_data = lmdb_key;
+
+    rc = mdb_get(txn, dbi_metadata, &key, &data);
+    mdb_txn_abort(txn);
+
+    if (rc == MDB_NOTFOUND) {
+        return LMDB_NOT_FOUND;
+    }
+    if (rc != 0) {
+        return LMDB_ERROR;
+    }
+
+    /*
+     * Parse value - two formats:
+     * Old: expiry:iteration:salt:storedkey:serverkey:username (6 fields)
+     * New: expiry:hashtype:iteration:salt:storedkey:serverkey:username (7 fields)
+     *
+     * We detect by checking field2: if it's 1-3, it's hash_type; if >= 100, it's iteration
+     */
+    value_copy = strndup(data.mv_data, data.mv_size);
+    if (!value_copy) {
+        return LMDB_ERROR;
+    }
+
+    expiry_str = value_copy;
+    field2 = strchr(expiry_str, ':');
+    if (!field2) { free(value_copy); return LMDB_ERROR; }
+    *field2++ = '\0';
+
+    /* Parse field2 to determine format */
+    field2_val = strtoul(field2, NULL, 10);
+
+    if (field2_val >= 1 && field2_val <= 3) {
+        /* New format: field2 is hash_type */
+        cred_out->hash_type = (enum scram_hash_type)field2_val;
+
+        iter_str = strchr(field2, ':');
+        if (!iter_str) { free(value_copy); return LMDB_ERROR; }
+        *iter_str++ = '\0';
+    } else {
+        /* Old format: field2 is iteration, assume SHA-256 */
+        cred_out->hash_type = SCRAM_HASH_SHA256;
+        iter_str = field2;
+    }
+
+    /* Set hash_len based on hash_type */
+    switch (cred_out->hash_type) {
+    case SCRAM_HASH_SHA1:
+        cred_out->hash_len = SCRAM_SHA1_LEN;
+        break;
+    case SCRAM_HASH_SHA256:
+        cred_out->hash_len = SCRAM_SHA256_LEN;
+        break;
+    case SCRAM_HASH_SHA512:
+        cred_out->hash_len = SCRAM_SHA512_LEN;
+        break;
+    default:
+        free(value_copy);
+        return LMDB_ERROR;
+    }
+
+    salt_hex = strchr(iter_str, ':');
+    if (!salt_hex) { free(value_copy); return LMDB_ERROR; }
+    *salt_hex++ = '\0';
+
+    stored_key_hex = strchr(salt_hex, ':');
+    if (!stored_key_hex) { free(value_copy); return LMDB_ERROR; }
+    *stored_key_hex++ = '\0';
+
+    server_key_hex = strchr(stored_key_hex, ':');
+    if (!server_key_hex) { free(value_copy); return LMDB_ERROR; }
+    *server_key_hex++ = '\0';
+
+    username = strchr(server_key_hex, ':');
+    if (!username) { free(value_copy); return LMDB_ERROR; }
+    *username++ = '\0';
+
+    /* Parse fields */
+    cred_out->expiry = (time_t)strtoul(expiry_str, NULL, 10);
+    cred_out->iteration = (unsigned int)strtoul(iter_str, NULL, 10);
+
+    /* Check expiry */
+    if (now >= cred_out->expiry) {
+        log_module(MAIN_LOG, LOG_DEBUG, "x3_lmdb: SCRAM credential expired for %s", username);
+        x3_lmdb_scram_delete(token_id);
+        free(value_copy);
+        return LMDB_NOT_FOUND;
+    }
+
+    /* Parse hex values based on hash length */
+    if (hex_to_bytes(salt_hex, cred_out->salt, SCRAM_SALT_LEN) != 0 ||
+        hex_to_bytes(stored_key_hex, cred_out->stored_key, cred_out->hash_len) != 0 ||
+        hex_to_bytes(server_key_hex, cred_out->server_key, cred_out->hash_len) != 0) {
+        free(value_copy);
+        return LMDB_ERROR;
+    }
+
+    strncpy(cred_out->username, username, sizeof(cred_out->username) - 1);
+    cred_out->username[sizeof(cred_out->username) - 1] = '\0';
+
+    free(value_copy);
+    return LMDB_SUCCESS;
+}
+
+/* Legacy wrapper - defaults to SHA-256 for backward compatibility */
+int x3_lmdb_scram_get(const char *token_id, struct scram_credential *cred_out)
+{
+    return x3_lmdb_scram_get_ex(token_id, SCRAM_HASH_SHA256, cred_out);
+}
+
+/* Delete SCRAM credential for a specific hash type */
+int x3_lmdb_scram_delete_ex(const char *token_id, enum scram_hash_type hash_type)
+{
+    MDB_txn *txn;
+    MDB_val key;
+    char lmdb_key[LMDB_KEY_BUFFER_SIZE];
+    int rc;
+
+    if (!lmdb_initialized || !token_id) {
+        return LMDB_ERROR;
+    }
+
+    snprintf(lmdb_key, sizeof(lmdb_key), "%s%d:%s", LMDB_PREFIX_SCRAM, (int)hash_type, token_id);
+
+    rc = mdb_txn_begin(lmdb_env, NULL, 0, &txn);
+    if (rc != 0) {
+        return LMDB_ERROR;
+    }
+
+    key.mv_size = strlen(lmdb_key);
+    key.mv_data = lmdb_key;
+
+    rc = mdb_del(txn, dbi_metadata, &key, NULL);
+    if (rc == MDB_NOTFOUND) {
+        mdb_txn_abort(txn);
+        return LMDB_NOT_FOUND;
+    }
+    if (rc != 0) {
+        mdb_txn_abort(txn);
+        return LMDB_ERROR;
+    }
+
+    rc = mdb_txn_commit(txn);
+    if (rc != 0) {
+        return LMDB_ERROR;
+    }
+
+    return LMDB_SUCCESS;
+}
+
+/* Delete all SCRAM credentials for a token (all hash types) */
+int x3_lmdb_scram_delete(const char *token_id)
+{
+    int deleted = 0;
+
+    if (!lmdb_initialized || !token_id) {
+        return LMDB_ERROR;
+    }
+
+    /* Delete credentials for all hash types */
+    if (x3_lmdb_scram_delete_ex(token_id, SCRAM_HASH_SHA1) == LMDB_SUCCESS)
+        deleted++;
+    if (x3_lmdb_scram_delete_ex(token_id, SCRAM_HASH_SHA256) == LMDB_SUCCESS)
+        deleted++;
+    if (x3_lmdb_scram_delete_ex(token_id, SCRAM_HASH_SHA512) == LMDB_SUCCESS)
+        deleted++;
+
+    return deleted > 0 ? LMDB_SUCCESS : LMDB_NOT_FOUND;
+}
+
+/* Legacy delete for old key format (used during migration) */
+static int x3_lmdb_scram_delete_legacy(const char *token_id)
+{
+    MDB_txn *txn;
+    MDB_val key;
+    char lmdb_key[LMDB_KEY_BUFFER_SIZE];
+    int rc;
+
+    if (!lmdb_initialized || !token_id) {
+        return LMDB_ERROR;
+    }
+
+    /* Old key format without hash type */
+    snprintf(lmdb_key, sizeof(lmdb_key), "%s%s", LMDB_PREFIX_SCRAM, token_id);
+
+    rc = mdb_txn_begin(lmdb_env, NULL, 0, &txn);
+    if (rc != 0) {
+        return LMDB_ERROR;
+    }
+
+    key.mv_size = strlen(lmdb_key);
+    key.mv_data = lmdb_key;
+
+    rc = mdb_del(txn, dbi_metadata, &key, NULL);
+    if (rc == MDB_NOTFOUND) {
+        mdb_txn_abort(txn);
+        return LMDB_NOT_FOUND;
+    }
+    if (rc != 0) {
+        mdb_txn_abort(txn);
+        return LMDB_ERROR;
+    }
+
+    rc = mdb_txn_commit(txn);
+    if (rc != 0) {
+        return LMDB_ERROR;
+    }
+
+    return LMDB_SUCCESS;
+}
+
+int x3_lmdb_scram_revoke_all(const char *username)
+{
+    MDB_txn *txn;
+    MDB_cursor *cursor;
+    MDB_val key, data;
+    int rc, count = 0;
+    char prefix[64];
+    size_t prefix_len;
+
+    if (!lmdb_initialized || !username) {
+        return -1;
+    }
+
+    snprintf(prefix, sizeof(prefix), "%s", LMDB_PREFIX_SCRAM);
+    prefix_len = strlen(prefix);
+
+    rc = mdb_txn_begin(lmdb_env, NULL, 0, &txn);
+    if (rc != 0) {
+        return -1;
+    }
+
+    rc = mdb_cursor_open(txn, dbi_metadata, &cursor);
+    if (rc != 0) {
+        mdb_txn_abort(txn);
+        return -1;
+    }
+
+    /* Iterate through all SCRAM entries */
+    rc = mdb_cursor_get(cursor, &key, &data, MDB_FIRST);
+    while (rc == 0) {
+        if (key.mv_size > prefix_len &&
+            memcmp(key.mv_data, prefix, prefix_len) == 0) {
+            /* Check if this credential belongs to the user */
+            char *value_copy = strndup(data.mv_data, data.mv_size);
+            if (value_copy) {
+                /* Parse to find username (last field) */
+                char *p = value_copy;
+                int colons = 0;
+                while (*p && colons < 5) {
+                    if (*p == ':') colons++;
+                    p++;
+                }
+                if (colons == 5 && strcasecmp(p, username) == 0) {
+                    mdb_cursor_del(cursor, 0);
+                    count++;
+                }
+                free(value_copy);
+            }
+        }
+        rc = mdb_cursor_get(cursor, &key, &data, MDB_NEXT);
+    }
+
+    mdb_cursor_close(cursor);
+    rc = mdb_txn_commit(txn);
+    if (rc != 0) {
+        return -1;
+    }
+
+    if (count > 0) {
+        log_module(MAIN_LOG, LOG_DEBUG, "x3_lmdb: Revoked %d SCRAM credential(s) for %s",
+                   count, username);
+    }
+
+    return count;
+}
+
+/* ========== Account Password SCRAM Implementation ========== */
+
+/**
+ * Create SCRAM credential for an account password with specified hash type.
+ * Uses key format: scram_acct:<hash_type>:<account>
+ * Value format: 0:<hash_type>:<iteration>:<salt_hex>:<storedkey_hex>:<serverkey_hex>:<account>
+ * Note: expiry=0 means no expiry (password SCRAM credentials don't expire)
+ */
+int x3_lmdb_scram_acct_create(const char *account, const char *password,
+                               enum scram_hash_type hash_type)
+{
+    MDB_txn *txn;
+    MDB_val key, data;
+    char lmdb_key[LMDB_KEY_BUFFER_SIZE];
+    unsigned char salt[SCRAM_SALT_LEN];
+    unsigned char stored_key[SCRAM_MAX_HASH_LEN];
+    unsigned char server_key[SCRAM_MAX_HASH_LEN];
+    char value_buf[768];
+    char salt_hex[SCRAM_SALT_LEN * 2 + 1];
+    char stored_key_hex[SCRAM_MAX_HASH_LEN * 2 + 1];
+    char server_key_hex[SCRAM_MAX_HASH_LEN * 2 + 1];
+    size_t hash_len;
+    int rc;
+    size_t i;
+
+    if (!lmdb_initialized || !account || !password) {
+        return LMDB_ERROR;
+    }
+
+    /* Get hash length for this type */
+    switch (hash_type) {
+    case SCRAM_HASH_SHA1:
+        hash_len = SCRAM_SHA1_LEN;
+        break;
+    case SCRAM_HASH_SHA256:
+        hash_len = SCRAM_SHA256_LEN;
+        break;
+    case SCRAM_HASH_SHA512:
+        hash_len = SCRAM_SHA512_LEN;
+        break;
+    default:
+        log_module(MAIN_LOG, LOG_ERROR, "x3_lmdb: Invalid SCRAM hash type %d", hash_type);
+        return LMDB_ERROR;
+    }
+
+    /* Generate random salt */
+    if (RAND_bytes(salt, SCRAM_SALT_LEN) != 1) {
+        log_module(MAIN_LOG, LOG_ERROR, "x3_lmdb: Failed to generate SCRAM salt for account");
+        return LMDB_ERROR;
+    }
+
+    /* Derive SCRAM keys */
+    if (scram_derive_keys(hash_type, password, salt, SCRAM_SALT_LEN,
+                          SCRAM_ITERATION_COUNT,
+                          stored_key, server_key) != 0) {
+        log_module(MAIN_LOG, LOG_ERROR, "x3_lmdb: Failed to derive SCRAM keys for account");
+        return LMDB_ERROR;
+    }
+
+    /* Convert to hex for storage */
+    for (i = 0; i < SCRAM_SALT_LEN; i++) {
+        sprintf(salt_hex + i * 2, "%02x", salt[i]);
+    }
+    for (i = 0; i < hash_len; i++) {
+        sprintf(stored_key_hex + i * 2, "%02x", stored_key[i]);
+        sprintf(server_key_hex + i * 2, "%02x", server_key[i]);
+    }
+    stored_key_hex[hash_len * 2] = '\0';
+    server_key_hex[hash_len * 2] = '\0';
+
+    /* Build LMDB key: scram_acct:<hash_type>:<account> (lowercase for consistency) */
+    snprintf(lmdb_key, sizeof(lmdb_key), "%s%d:%s", LMDB_PREFIX_SCRAM_ACCT, (int)hash_type, account);
+
+    /* Build value: 0:hashtype:iteration:salt:storedkey:serverkey:account
+     * Note: expiry=0 means no expiry for password-based SCRAM */
+    snprintf(value_buf, sizeof(value_buf), "0:%d:%u:%s:%s:%s:%s",
+             (int)hash_type, SCRAM_ITERATION_COUNT,
+             salt_hex, stored_key_hex, server_key_hex, account);
+
+    /* Start write transaction */
+    rc = mdb_txn_begin(lmdb_env, NULL, 0, &txn);
+    if (rc != 0) {
+        log_module(MAIN_LOG, LOG_ERROR, "x3_lmdb: scram_acct_create txn_begin failed: %s",
+                   mdb_strerror(rc));
+        return LMDB_ERROR;
+    }
+
+    /* Store the credential */
+    key.mv_size = strlen(lmdb_key);
+    key.mv_data = lmdb_key;
+    data.mv_size = strlen(value_buf) + 1;
+    data.mv_data = value_buf;
+
+    rc = mdb_put(txn, dbi_metadata, &key, &data, 0);
+    if (rc != 0) {
+        mdb_txn_abort(txn);
+        log_module(MAIN_LOG, LOG_ERROR, "x3_lmdb: scram_acct_create mdb_put failed: %s",
+                   mdb_strerror(rc));
+        return LMDB_ERROR;
+    }
+
+    rc = mdb_txn_commit(txn);
+    if (rc != 0) {
+        log_module(MAIN_LOG, LOG_ERROR, "x3_lmdb: scram_acct_create commit failed: %s",
+                   mdb_strerror(rc));
+        return LMDB_ERROR;
+    }
+
+    log_module(MAIN_LOG, LOG_DEBUG, "x3_lmdb: Created SCRAM-%s credential for account %s",
+               hash_type == SCRAM_HASH_SHA1 ? "SHA-1" :
+               hash_type == SCRAM_HASH_SHA256 ? "SHA-256" : "SHA-512",
+               account);
+
+    return LMDB_SUCCESS;
+}
+
+/**
+ * Create SCRAM credentials for an account password (all hash types).
+ * This should be called whenever a password is set/changed.
+ */
+int x3_lmdb_scram_acct_create_all(const char *account, const char *password)
+{
+    int count = 0;
+
+    if (!lmdb_initialized || !account || !password) {
+        return -1;
+    }
+
+    /* Create credentials for all three SCRAM variants */
+    if (x3_lmdb_scram_acct_create(account, password, SCRAM_HASH_SHA1) == LMDB_SUCCESS)
+        count++;
+    if (x3_lmdb_scram_acct_create(account, password, SCRAM_HASH_SHA256) == LMDB_SUCCESS)
+        count++;
+    if (x3_lmdb_scram_acct_create(account, password, SCRAM_HASH_SHA512) == LMDB_SUCCESS)
+        count++;
+
+    log_module(MAIN_LOG, LOG_DEBUG, "x3_lmdb: Created %d SCRAM credentials for account %s",
+               count, account);
+
+    return count;
+}
+
+/**
+ * Get SCRAM credential for an account with specified hash type.
+ */
+int x3_lmdb_scram_acct_get(const char *account, enum scram_hash_type hash_type,
+                            struct scram_credential *cred_out)
+{
+    MDB_txn *txn;
+    MDB_val key, data;
+    char lmdb_key[LMDB_KEY_BUFFER_SIZE];
+    char *value_copy, *p, *fields[7];
+    int field_count = 0;
+    size_t hash_len;
+    int rc, i;
+
+    if (!lmdb_initialized || !account || !cred_out) {
+        return LMDB_ERROR;
+    }
+
+    /* Get hash length for this type */
+    switch (hash_type) {
+    case SCRAM_HASH_SHA1:
+        hash_len = SCRAM_SHA1_LEN;
+        break;
+    case SCRAM_HASH_SHA256:
+        hash_len = SCRAM_SHA256_LEN;
+        break;
+    case SCRAM_HASH_SHA512:
+        hash_len = SCRAM_SHA512_LEN;
+        break;
+    default:
+        return LMDB_ERROR;
+    }
+
+    /* Build LMDB key: scram_acct:<hash_type>:<account> */
+    snprintf(lmdb_key, sizeof(lmdb_key), "%s%d:%s", LMDB_PREFIX_SCRAM_ACCT, (int)hash_type, account);
+
+    /* Start read transaction */
+    rc = mdb_txn_begin(lmdb_env, NULL, MDB_RDONLY, &txn);
+    if (rc != 0) {
+        return LMDB_ERROR;
+    }
+
+    key.mv_size = strlen(lmdb_key);
+    key.mv_data = lmdb_key;
+
+    rc = mdb_get(txn, dbi_metadata, &key, &data);
+    if (rc == MDB_NOTFOUND) {
+        mdb_txn_abort(txn);
+        return LMDB_NOT_FOUND;
+    }
+    if (rc != 0) {
+        mdb_txn_abort(txn);
+        return LMDB_ERROR;
+    }
+
+    /* Parse value: 0:hashtype:iteration:salt:storedkey:serverkey:account */
+    value_copy = strndup(data.mv_data, data.mv_size);
+    mdb_txn_abort(txn);
+
+    if (!value_copy) {
+        return LMDB_ERROR;
+    }
+
+    /* Split by colons */
+    p = value_copy;
+    fields[field_count++] = p;
+    while (*p && field_count < 7) {
+        if (*p == ':') {
+            *p = '\0';
+            fields[field_count++] = p + 1;
+        }
+        p++;
+    }
+
+    if (field_count != 7) {
+        free(value_copy);
+        log_module(MAIN_LOG, LOG_WARNING, "x3_lmdb: Invalid SCRAM acct format for %s", account);
+        return LMDB_ERROR;
+    }
+
+    /* Parse fields */
+    memset(cred_out, 0, sizeof(*cred_out));
+    cred_out->expiry = (time_t)strtoul(fields[0], NULL, 10);  /* 0 = no expiry */
+    cred_out->hash_type = (enum scram_hash_type)atoi(fields[1]);
+    cred_out->iteration = (unsigned int)strtoul(fields[2], NULL, 10);
+    cred_out->hash_len = hash_len;
+
+    /* Verify hash type matches requested */
+    if (cred_out->hash_type != hash_type) {
+        free(value_copy);
+        log_module(MAIN_LOG, LOG_WARNING, "x3_lmdb: SCRAM hash type mismatch for %s", account);
+        return LMDB_ERROR;
+    }
+
+    /* Parse salt from hex */
+    if (hex_to_bytes(fields[3], cred_out->salt, SCRAM_SALT_LEN) != SCRAM_SALT_LEN) {
+        free(value_copy);
+        log_module(MAIN_LOG, LOG_WARNING, "x3_lmdb: Invalid SCRAM salt for %s", account);
+        return LMDB_ERROR;
+    }
+
+    /* Parse stored_key from hex */
+    if ((i = hex_to_bytes(fields[4], cred_out->stored_key, hash_len)) != (int)hash_len) {
+        free(value_copy);
+        log_module(MAIN_LOG, LOG_WARNING, "x3_lmdb: Invalid SCRAM stored_key for %s", account);
+        return LMDB_ERROR;
+    }
+
+    /* Parse server_key from hex */
+    if ((i = hex_to_bytes(fields[5], cred_out->server_key, hash_len)) != (int)hash_len) {
+        free(value_copy);
+        log_module(MAIN_LOG, LOG_WARNING, "x3_lmdb: Invalid SCRAM server_key for %s", account);
+        return LMDB_ERROR;
+    }
+
+    /* Copy username */
+    strncpy(cred_out->username, fields[6], sizeof(cred_out->username) - 1);
+    cred_out->username[sizeof(cred_out->username) - 1] = '\0';
+
+    free(value_copy);
+
+    log_module(MAIN_LOG, LOG_DEBUG, "x3_lmdb: Retrieved SCRAM-%s credential for account %s",
+               hash_type == SCRAM_HASH_SHA1 ? "SHA-1" :
+               hash_type == SCRAM_HASH_SHA256 ? "SHA-256" : "SHA-512",
+               account);
+
+    return LMDB_SUCCESS;
+}
+
+/**
+ * Delete all SCRAM credentials for an account (all hash types).
+ */
+int x3_lmdb_scram_acct_delete_all(const char *account)
+{
+    MDB_txn *txn;
+    MDB_val key;
+    char lmdb_key[LMDB_KEY_BUFFER_SIZE];
+    int rc, count = 0;
+    enum scram_hash_type hash_types[] = { SCRAM_HASH_SHA1, SCRAM_HASH_SHA256, SCRAM_HASH_SHA512 };
+    size_t i;
+
+    if (!lmdb_initialized || !account) {
+        return -1;
+    }
+
+    rc = mdb_txn_begin(lmdb_env, NULL, 0, &txn);
+    if (rc != 0) {
+        return -1;
+    }
+
+    /* Delete each hash type */
+    for (i = 0; i < sizeof(hash_types) / sizeof(hash_types[0]); i++) {
+        snprintf(lmdb_key, sizeof(lmdb_key), "%s%d:%s",
+                 LMDB_PREFIX_SCRAM_ACCT, (int)hash_types[i], account);
+
+        key.mv_size = strlen(lmdb_key);
+        key.mv_data = lmdb_key;
+
+        rc = mdb_del(txn, dbi_metadata, &key, NULL);
+        if (rc == 0) {
+            count++;
+        }
+    }
+
+    rc = mdb_txn_commit(txn);
+    if (rc != 0) {
+        return -1;
+    }
+
+    if (count > 0) {
+        log_module(MAIN_LOG, LOG_DEBUG, "x3_lmdb: Deleted %d SCRAM credential(s) for account %s",
+                   count, account);
+    }
+
+    return count;
+}
+
+#else /* !WITH_SSL */
+
+/* Stub implementations when SSL is not available */
+
+/* Generic SCRAM stubs */
+int scram_derive_keys(enum scram_hash_type hash_type,
+                      const char *password,
+                      const unsigned char *salt, size_t salt_len,
+                      unsigned int iteration,
+                      unsigned char *stored_key_out,
+                      unsigned char *server_key_out)
+{
+    (void)hash_type; (void)password; (void)salt; (void)salt_len;
+    (void)iteration; (void)stored_key_out; (void)server_key_out;
+    return -1;
+}
+
+int scram_client_signature(enum scram_hash_type hash_type,
+                           const unsigned char *stored_key,
+                           const char *auth_message, size_t auth_message_len,
+                           unsigned char *client_sig_out)
+{
+    (void)hash_type; (void)stored_key; (void)auth_message;
+    (void)auth_message_len; (void)client_sig_out;
+    return -1;
+}
+
+int scram_server_signature(enum scram_hash_type hash_type,
+                           const unsigned char *server_key,
+                           const char *auth_message, size_t auth_message_len,
+                           unsigned char *server_sig_out)
+{
+    (void)hash_type; (void)server_key; (void)auth_message;
+    (void)auth_message_len; (void)server_sig_out;
+    return -1;
+}
+
+int scram_verify_proof(enum scram_hash_type hash_type,
+                       const unsigned char *stored_key,
+                       const char *auth_message, size_t auth_message_len,
+                       const char *client_proof)
+{
+    (void)hash_type; (void)stored_key; (void)auth_message;
+    (void)auth_message_len; (void)client_proof;
+    return -1;
+}
+
+/* Legacy SHA-256 specific stubs */
+int scram_sha256_derive_keys(const char *password,
+                             const unsigned char *salt, size_t salt_len,
+                             unsigned int iteration,
+                             unsigned char *stored_key_out,
+                             unsigned char *server_key_out)
+{
+    (void)password; (void)salt; (void)salt_len; (void)iteration;
+    (void)stored_key_out; (void)server_key_out;
+    return -1;
+}
+
+int scram_sha256_client_signature(const unsigned char *stored_key,
+                                  const char *auth_message, size_t auth_message_len,
+                                  unsigned char *client_sig_out)
+{
+    (void)stored_key; (void)auth_message; (void)auth_message_len; (void)client_sig_out;
+    return -1;
+}
+
+int scram_sha256_server_signature(const unsigned char *server_key,
+                                  const char *auth_message, size_t auth_message_len,
+                                  unsigned char *server_sig_out)
+{
+    (void)server_key; (void)auth_message; (void)auth_message_len; (void)server_sig_out;
+    return -1;
+}
+
+int scram_sha256_verify_proof(const unsigned char *stored_key,
+                              const char *auth_message, size_t auth_message_len,
+                              const char *client_proof)
+{
+    (void)stored_key; (void)auth_message; (void)auth_message_len; (void)client_proof;
+    return -1;
+}
+
+int x3_lmdb_scram_create_ex(const char *token_id, const char *username,
+                             const char *password, enum scram_hash_type hash_type)
+{
+    (void)token_id; (void)username; (void)password; (void)hash_type;
+    return LMDB_ERROR;
+}
+
+int x3_lmdb_scram_create(const char *token_id, const char *username, const char *password)
+{
+    (void)token_id; (void)username; (void)password;
+    return LMDB_ERROR;
+}
+
+int x3_lmdb_scram_get_ex(const char *token_id, enum scram_hash_type hash_type,
+                          struct scram_credential *cred_out)
+{
+    (void)token_id; (void)hash_type; (void)cred_out;
+    return LMDB_NOT_FOUND;
+}
+
+int x3_lmdb_scram_get(const char *token_id, struct scram_credential *cred_out)
+{
+    (void)token_id; (void)cred_out;
+    return LMDB_NOT_FOUND;
+}
+
+int x3_lmdb_scram_delete_ex(const char *token_id, enum scram_hash_type hash_type)
+{
+    (void)token_id; (void)hash_type;
+    return LMDB_NOT_FOUND;
+}
+
+int x3_lmdb_scram_delete(const char *token_id)
+{
+    (void)token_id;
+    return LMDB_NOT_FOUND;
+}
+
+int x3_lmdb_scram_revoke_all(const char *username)
+{
+    (void)username;
+    return 0;
+}
+
+/* Account SCRAM stubs */
+int x3_lmdb_scram_acct_create(const char *account, const char *password,
+                               enum scram_hash_type hash_type)
+{
+    (void)account; (void)password; (void)hash_type;
+    return LMDB_ERROR;
+}
+
+int x3_lmdb_scram_acct_create_all(const char *account, const char *password)
+{
+    (void)account; (void)password;
+    return -1;
+}
+
+int x3_lmdb_scram_acct_get(const char *account, enum scram_hash_type hash_type,
+                            struct scram_credential *cred_out)
+{
+    (void)account; (void)hash_type; (void)cred_out;
+    return LMDB_NOT_FOUND;
+}
+
+int x3_lmdb_scram_acct_delete_all(const char *account)
+{
+    (void)account;
+    return -1;
+}
+
+#endif /* WITH_SSL */
 
 #endif /* WITH_LMDB */

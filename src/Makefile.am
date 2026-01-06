@@ -76,6 +76,7 @@ x3_SOURCES = \
 	modules.c modules.h \
 	password.c password.h \
 	keycloak.c keycloak.h \
+	keycloak_webhook.c keycloak_webhook.h \
 	nickserv.c nickserv.h \
 	x3_lmdb.h \
 	opserv.c opserv.h \
