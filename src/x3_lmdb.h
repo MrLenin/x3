@@ -57,6 +57,7 @@ enum lmdb_error {
 #define LMDB_PREFIX_TRUSTED "trusted:"    /* Trusted host: mask → JSON {issuer, limit, ...} */
 #define LMDB_PREFIX_GAG "gag:"            /* Gag: mask → JSON {owner, reason, expires} */
 #define LMDB_PREFIX_ALERT "alert:"        /* Alert: name → JSON {discrim, owner, reaction, ...} */
+#define LMDB_PREFIX_GLOBAL "global:"      /* Global message: id → JSON {flags, posted, duration, from, message} */
 
 /* Metadata entry for iteration */
 struct lmdb_metadata_entry {
@@ -1356,6 +1357,38 @@ int x3_lmdb_alert_get(const char *name, char *json_out, size_t json_size);
  */
 int x3_lmdb_alert_delete(const char *name);
 
+/* ========== Global Messages (SAXDB-optional) ========== */
+
+/**
+ * Store global message
+ * @param id Message ID (as string)
+ * @param json_data JSON-encoded message data (flags, posted, duration, from, message)
+ * @return LMDB_SUCCESS on success, LMDB_ERROR on failure
+ */
+int x3_lmdb_global_set(const char *id, const char *json_data);
+
+/**
+ * Get global message
+ * @param id Message ID (as string)
+ * @param json_out Buffer for JSON data
+ * @param json_size Size of buffer
+ * @return LMDB_SUCCESS on success, LMDB_NOT_FOUND if not found, LMDB_ERROR on failure
+ */
+int x3_lmdb_global_get(const char *id, char *json_out, size_t json_size);
+
+/**
+ * Delete global message
+ * @param id Message ID (as string)
+ * @return LMDB_SUCCESS on success, LMDB_NOT_FOUND if not found, LMDB_ERROR on failure
+ */
+int x3_lmdb_global_delete(const char *id);
+
+/**
+ * Clear all global messages
+ * @return Number of messages deleted, LMDB_ERROR on failure
+ */
+int x3_lmdb_global_clear(void);
+
 /* ========== SAXDB Configuration ========== */
 
 /**
@@ -1502,6 +1535,10 @@ void init_x3_lmdb(void);
 #define x3_lmdb_alert_set(n, j)         (-1)
 #define x3_lmdb_alert_get(n, j, s)      (-2)
 #define x3_lmdb_alert_delete(n)         (-2)
+#define x3_lmdb_global_set(i, j)        (-1)
+#define x3_lmdb_global_get(i, j, s)     (-2)
+#define x3_lmdb_global_delete(i)        (-2)
+#define x3_lmdb_global_clear()          (-1)
 #define x3_lmdb_saxdb_enabled()         (1)
 #define x3_lmdb_set_saxdb_enabled(e)    do {} while(0)
 #define init_x3_lmdb()                  do {} while(0)

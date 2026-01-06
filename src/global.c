@@ -25,6 +25,10 @@
 #include "nickserv.h"
 #include "saxdb.h"
 #include "timeq.h"
+#include "x3_lmdb.h"
+#ifdef HAVE_JANSSON_H
+#include <jansson.h>
+#endif
 
 #define GLOBAL_CONF_NAME	"services/global"
 
@@ -775,6 +779,59 @@ global_conf_read(void)
         NickChange(global, str, 0);
 }
 
+#if defined(WITH_LMDB) && defined(HAVE_JANSSON_H)
+/* Forward declaration for LMDB read */
+static int global_lmdb_read_all(void);
+
+static int
+lmdb_global_read_callback(const char *key, const char *value, void *ctx)
+{
+    json_t *root;
+    json_error_t error;
+    long flags;
+    time_t posted;
+    unsigned long duration;
+    const char *from_str, *msg_str;
+    size_t prefix_len = strlen(LMDB_PREFIX_GLOBAL);
+
+    (void)ctx;
+
+    /* Skip prefix to get message ID - we don't need it, message_add generates new ones */
+    if (strlen(key) <= prefix_len)
+        return 0;
+
+    /* Parse JSON using jansson */
+    root = json_loads(value, 0, &error);
+    if (!root) {
+        log_module(G_LOG, LOG_WARNING, "Failed to parse global message JSON: %s", error.text);
+        return 0;
+    }
+
+    flags = json_integer_value(json_object_get(root, "flags"));
+    posted = (time_t)json_integer_value(json_object_get(root, "posted"));
+    duration = (unsigned long)json_integer_value(json_object_get(root, "duration"));
+    from_str = json_string_value(json_object_get(root, "from"));
+    msg_str = json_string_value(json_object_get(root, "message"));
+
+    message_add(flags, posted, duration, (char *)(from_str ? from_str : ""), msg_str ? msg_str : "");
+
+    json_decref(root);
+    return 0;
+}
+
+static int
+global_lmdb_read_all(void)
+{
+    if (!x3_lmdb_is_available()) {
+        return -1;
+    }
+
+    x3_lmdb_prefix_iterate(LMDB_DB_METADATA, LMDB_PREFIX_GLOBAL,
+                           lmdb_global_read_callback, NULL);
+    return 0;
+}
+#endif
+
 static int
 global_saxdb_read(struct dict *db)
 {
@@ -784,6 +841,13 @@ global_saxdb_read(struct dict *db)
     unsigned long duration;
     char *str, *from, *message;
     dict_iterator_t it;
+
+#if defined(WITH_LMDB) && defined(HAVE_JANSSON_H)
+    /* If SAXDB is disabled, read from LMDB instead */
+    if (!x3_lmdb_saxdb_enabled() && x3_lmdb_is_available()) {
+        return global_lmdb_read_all();
+    }
+#endif
 
     for(it=dict_first(db); it; it=iter_next(it))
     {
@@ -826,6 +890,27 @@ global_saxdb_write(struct saxdb_context *ctx)
         saxdb_write_string(ctx, KEY_FROM, message->from);
         saxdb_write_string(ctx, KEY_MESSAGE, message->message);
         saxdb_end_record(ctx);
+
+#if defined(WITH_LMDB) && defined(HAVE_JANSSON_H)
+        /* Dual-write to LMDB using jansson for proper JSON encoding */
+        if (x3_lmdb_is_available()) {
+            json_t *obj = json_object();
+            char *json_str;
+
+            json_object_set_new(obj, "flags", json_integer(message->flags));
+            json_object_set_new(obj, "posted", json_integer((json_int_t)message->posted));
+            json_object_set_new(obj, "duration", json_integer((json_int_t)message->duration));
+            json_object_set_new(obj, "from", json_string(message->from ? message->from : ""));
+            json_object_set_new(obj, "message", json_string(message->message ? message->message : ""));
+
+            json_str = json_dumps(obj, JSON_COMPACT);
+            if (json_str) {
+                x3_lmdb_global_set(str, json_str);
+                free(json_str);
+            }
+            json_decref(obj);
+        }
+#endif
     }
     return 0;
 }

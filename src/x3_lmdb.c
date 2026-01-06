@@ -6016,4 +6016,66 @@ int x3_lmdb_alert_delete(const char *name)
     return x3_lmdb_delete(LMDB_DB_METADATA, lmdb_key);
 }
 
+/* ========== Global Messages (SAXDB-optional) ========== */
+
+/**
+ * Store global message
+ */
+int x3_lmdb_global_set(const char *id, const char *json_data)
+{
+    char lmdb_key[LMDB_KEY_BUFFER_SIZE];
+
+    if (!lmdb_initialized || !id || !json_data) {
+        return LMDB_ERROR;
+    }
+
+    snprintf(lmdb_key, sizeof(lmdb_key), "%s%s", LMDB_PREFIX_GLOBAL, id);
+
+    return x3_lmdb_set(LMDB_DB_METADATA, lmdb_key, json_data);
+}
+
+/**
+ * Get global message
+ */
+int x3_lmdb_global_get(const char *id, char *json_out, size_t json_size)
+{
+    char lmdb_key[LMDB_KEY_BUFFER_SIZE];
+
+    if (!lmdb_initialized || !id || !json_out) {
+        return LMDB_ERROR;
+    }
+
+    snprintf(lmdb_key, sizeof(lmdb_key), "%s%s", LMDB_PREFIX_GLOBAL, id);
+
+    return x3_lmdb_get(LMDB_DB_METADATA, lmdb_key, json_out, json_size);
+}
+
+/**
+ * Delete global message
+ */
+int x3_lmdb_global_delete(const char *id)
+{
+    char lmdb_key[LMDB_KEY_BUFFER_SIZE];
+
+    if (!lmdb_initialized || !id) {
+        return LMDB_ERROR;
+    }
+
+    snprintf(lmdb_key, sizeof(lmdb_key), "%s%s", LMDB_PREFIX_GLOBAL, id);
+
+    return x3_lmdb_delete(LMDB_DB_METADATA, lmdb_key);
+}
+
+/**
+ * Clear all global messages
+ */
+int x3_lmdb_global_clear(void)
+{
+    if (!lmdb_initialized) {
+        return LMDB_ERROR;
+    }
+
+    return x3_lmdb_prefix_delete_all(LMDB_DB_METADATA, LMDB_PREFIX_GLOBAL);
+}
+
 #endif /* WITH_LMDB */

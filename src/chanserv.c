@@ -34,6 +34,9 @@
 #include "timeq.h"
 
 #include "x3_lmdb.h"
+#ifdef HAVE_JANSSON_H
+#include <jansson.h>
+#endif
 
 /* External access to nickserv configuration for Keycloak settings */
 extern struct nickserv_config nickserv_conf;

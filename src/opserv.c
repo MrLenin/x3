@@ -33,6 +33,9 @@
 #include "saxdb.h"
 #include "shun.h"
 #include "x3_lmdb.h"
+#ifdef HAVE_JANSSON_H
+#include <jansson.h>
+#endif
 
 #include <tre/regex.h>
 
@@ -5150,49 +5153,8 @@ add_routing_plan(const char *name, void *data, UNUSED_ARG(void *extra))
     return 0;
 }
 
-#ifdef WITH_LMDB
-/* ========== LMDB Read Functions (SAXDB-optional) ========== */
-
-/**
- * Simple JSON string value extractor for opserv
- */
-static char *
-os_json_extract_string(char *json, const char *key, char *out, size_t out_size)
-{
-    char search_key[128];
-    char *p, *end;
-
-    snprintf(search_key, sizeof(search_key), "\"%s\":\"", key);
-    p = strstr(json, search_key);
-    if (!p) return NULL;
-
-    p += strlen(search_key);
-    end = strchr(p, '"');
-    if (!end) return NULL;
-
-    size_t len = end - p;
-    if (len >= out_size) len = out_size - 1;
-    memcpy(out, p, len);
-    out[len] = '\0';
-    return out;
-}
-
-/**
- * Simple JSON integer value extractor for opserv
- */
-static long
-os_json_extract_int(const char *json, const char *key)
-{
-    char search_key[128];
-    const char *p;
-
-    snprintf(search_key, sizeof(search_key), "\"%s\":", key);
-    p = strstr(json, search_key);
-    if (!p) return 0;
-
-    p += strlen(search_key);
-    return strtol(p, NULL, 10);
-}
+#if defined(WITH_LMDB) && defined(HAVE_JANSSON_H)
+/* ========== LMDB Read Functions (SAXDB-optional) with jansson ========== */
 
 /**
  * Callback for reading trusted hosts from LMDB
@@ -5200,10 +5162,10 @@ os_json_extract_int(const char *json, const char *key)
 static int
 lmdb_trusted_read_callback(const char *key, const char *value, void *ctx)
 {
-    char json_buf[4096];
-    char issuer_buf[256];
-    char reason_buf[1024];
+    json_t *root;
+    json_error_t error;
     const char *ipaddr;
+    const char *issuer_str, *reason_str;
     unsigned long limit;
     time_t issued, expires;
     (void)ctx;
@@ -5212,24 +5174,31 @@ lmdb_trusted_read_callback(const char *key, const char *value, void *ctx)
     ipaddr = key + strlen(LMDB_PREFIX_TRUSTED);
     if (!ipaddr || !*ipaddr) return 0;
 
-    /* Copy JSON safely */
-    if (strlen(value) >= sizeof(json_buf)) return 0;
-    strcpy(json_buf, value);
+    /* Parse JSON using jansson */
+    root = json_loads(value, 0, &error);
+    if (!root) {
+        log_module(OS_LOG, LOG_WARNING, "Failed to parse trusted host JSON: %s", error.text);
+        return 0;
+    }
 
-    limit = (unsigned long)os_json_extract_int(json_buf, "limit");
-    expires = (time_t)os_json_extract_int(json_buf, "expires");
-    issued = (time_t)os_json_extract_int(json_buf, "issued");
+    limit = (unsigned long)json_integer_value(json_object_get(root, "limit"));
+    expires = (time_t)json_integer_value(json_object_get(root, "expires"));
+    issued = (time_t)json_integer_value(json_object_get(root, "issued"));
 
     /* Skip expired */
-    if (expires && expires < now) return 0;
+    if (expires && expires < now) {
+        json_decref(root);
+        return 0;
+    }
 
-    issuer_buf[0] = '\0';
-    reason_buf[0] = '\0';
-    os_json_extract_string(json_buf, "issuer", issuer_buf, sizeof(issuer_buf));
-    os_json_extract_string(json_buf, "reason", reason_buf, sizeof(reason_buf));
+    issuer_str = json_string_value(json_object_get(root, "issuer"));
+    reason_str = json_string_value(json_object_get(root, "reason"));
 
-    opserv_add_trusted_host(ipaddr, limit, issuer_buf[0] ? issuer_buf : NULL,
-                            issued, expires, reason_buf[0] ? reason_buf : NULL);
+    opserv_add_trusted_host(ipaddr, limit,
+                            (issuer_str && issuer_str[0]) ? issuer_str : NULL,
+                            issued, expires,
+                            (reason_str && reason_str[0]) ? reason_str : NULL);
+    json_decref(root);
     return 0;
 }
 
@@ -5239,10 +5208,10 @@ lmdb_trusted_read_callback(const char *key, const char *value, void *ctx)
 static int
 lmdb_gag_read_callback(const char *key, const char *value, void *ctx)
 {
-    char json_buf[4096];
-    char owner_buf[256];
-    char reason_buf[1024];
+    json_t *root;
+    json_error_t error;
     const char *mask;
+    const char *owner_str, *reason_str;
     time_t expires;
     (void)ctx;
 
@@ -5250,21 +5219,27 @@ lmdb_gag_read_callback(const char *key, const char *value, void *ctx)
     mask = key + strlen(LMDB_PREFIX_GAG);
     if (!mask || !*mask) return 0;
 
-    /* Copy JSON safely */
-    if (strlen(value) >= sizeof(json_buf)) return 0;
-    strcpy(json_buf, value);
+    /* Parse JSON using jansson */
+    root = json_loads(value, 0, &error);
+    if (!root) {
+        log_module(OS_LOG, LOG_WARNING, "Failed to parse gag JSON: %s", error.text);
+        return 0;
+    }
 
-    expires = (time_t)os_json_extract_int(json_buf, "expires");
+    expires = (time_t)json_integer_value(json_object_get(root, "expires"));
 
     /* Skip expired */
-    if (expires && expires < now) return 0;
+    if (expires && expires < now) {
+        json_decref(root);
+        return 0;
+    }
 
-    owner_buf[0] = '\0';
-    reason_buf[0] = '\0';
-    os_json_extract_string(json_buf, "owner", owner_buf, sizeof(owner_buf));
-    os_json_extract_string(json_buf, "reason", reason_buf, sizeof(reason_buf));
+    owner_str = json_string_value(json_object_get(root, "owner"));
+    reason_str = json_string_value(json_object_get(root, "reason"));
 
-    gag_create(mask, owner_buf, reason_buf[0] ? reason_buf : NULL, expires);
+    gag_create(mask, owner_str ? owner_str : "",
+               (reason_str && reason_str[0]) ? reason_str : NULL, expires);
+    json_decref(root);
     return 0;
 }
 
@@ -5274,11 +5249,10 @@ lmdb_gag_read_callback(const char *key, const char *value, void *ctx)
 static int
 lmdb_alert_read_callback(const char *key, const char *value, void *ctx)
 {
-    char json_buf[4096];
-    char discrim_buf[2048];
-    char owner_buf[256];
-    char reaction_buf[64];
+    json_t *root;
+    json_error_t error;
     const char *alert_name;
+    const char *discrim_str, *owner_str, *reaction_str;
     int last, expire;
     opserv_alert_reaction reaction;
     struct opserv_user_alert *alert;
@@ -5288,56 +5262,62 @@ lmdb_alert_read_callback(const char *key, const char *value, void *ctx)
     alert_name = key + strlen(LMDB_PREFIX_ALERT);
     if (!alert_name || !*alert_name) return 0;
 
-    /* Copy JSON safely */
-    if (strlen(value) >= sizeof(json_buf)) return 0;
-    strcpy(json_buf, value);
+    /* Parse JSON using jansson */
+    root = json_loads(value, 0, &error);
+    if (!root) {
+        log_module(OS_LOG, LOG_WARNING, "Failed to parse alert JSON: %s", error.text);
+        return 0;
+    }
 
-    discrim_buf[0] = '\0';
-    owner_buf[0] = '\0';
-    reaction_buf[0] = '\0';
-
-    os_json_extract_string(json_buf, "discrim", discrim_buf, sizeof(discrim_buf));
-    os_json_extract_string(json_buf, "owner", owner_buf, sizeof(owner_buf));
-    os_json_extract_string(json_buf, "reaction", reaction_buf, sizeof(reaction_buf));
-    last = (int)os_json_extract_int(json_buf, "last");
-    expire = (int)os_json_extract_int(json_buf, "expire");
+    discrim_str = json_string_value(json_object_get(root, "discrim"));
+    owner_str = json_string_value(json_object_get(root, "owner"));
+    reaction_str = json_string_value(json_object_get(root, "reaction"));
+    last = (int)json_integer_value(json_object_get(root, "last"));
+    expire = (int)json_integer_value(json_object_get(root, "expire"));
 
     /* Skip expired */
-    if (expire && expire < (int)now) return 0;
+    if (expire && expire < (int)now) {
+        json_decref(root);
+        return 0;
+    }
 
     /* Parse reaction */
-    if (!reaction_buf[0] || !irccasecmp(reaction_buf, "notice"))
+    if (!reaction_str || !reaction_str[0] || !irccasecmp(reaction_str, "notice"))
         reaction = REACT_NOTICE;
-    else if (!irccasecmp(reaction_buf, "kill"))
+    else if (!irccasecmp(reaction_str, "kill"))
         reaction = REACT_KILL;
-    else if (!irccasecmp(reaction_buf, "gline"))
+    else if (!irccasecmp(reaction_str, "gline"))
         reaction = REACT_GLINE;
-    else if (!irccasecmp(reaction_buf, "track"))
+    else if (!irccasecmp(reaction_str, "track"))
         reaction = REACT_TRACK;
-    else if (!irccasecmp(reaction_buf, "shun"))
+    else if (!irccasecmp(reaction_str, "shun"))
         reaction = REACT_SHUN;
-    else if (!irccasecmp(reaction_buf, "tempshun"))
+    else if (!irccasecmp(reaction_str, "tempshun"))
         reaction = REACT_TEMPSHUN;
-    else if (!irccasecmp(reaction_buf, "svsjoin"))
+    else if (!irccasecmp(reaction_str, "svsjoin"))
         reaction = REACT_SVSJOIN;
-    else if (!irccasecmp(reaction_buf, "svspart"))
+    else if (!irccasecmp(reaction_str, "svspart"))
         reaction = REACT_SVSPART;
-    else if (!irccasecmp(reaction_buf, "version"))
+    else if (!irccasecmp(reaction_str, "version"))
         reaction = REACT_VERSION;
-    else if (!irccasecmp(reaction_buf, "mark"))
+    else if (!irccasecmp(reaction_str, "mark"))
         reaction = REACT_MARK;
-    else if (!irccasecmp(reaction_buf, "noticeuser"))
+    else if (!irccasecmp(reaction_str, "noticeuser"))
         reaction = REACT_NOTICEUSER;
-    else if (!irccasecmp(reaction_buf, "msguser"))
+    else if (!irccasecmp(reaction_str, "msguser"))
         reaction = REACT_MSGUSER;
     else
         reaction = REACT_NOTICE;
 
-    alert = opserv_add_user_alert(opserv, alert_name, reaction, discrim_buf, last, expire, reaction_buf);
-    if (alert && owner_buf[0]) {
+    alert = opserv_add_user_alert(opserv, alert_name, reaction,
+                                  discrim_str ? discrim_str : "",
+                                  last, expire,
+                                  reaction_str ? reaction_str : "notice");
+    if (alert && owner_str && owner_str[0]) {
         free(alert->owner);
-        alert->owner = strdup(owner_buf);
+        alert->owner = strdup(owner_str);
     }
+    json_decref(root);
     return 0;
 }
 
@@ -5370,7 +5350,7 @@ opserv_lmdb_read_all(void)
 
     return 0;
 }
-#endif /* WITH_LMDB */
+#endif /* WITH_LMDB && HAVE_JANSSON_H */
 
 static int
 opserv_saxdb_read(struct dict *conf_db)
@@ -5380,7 +5360,7 @@ opserv_saxdb_read(struct dict *conf_db)
     dict_iterator_t it;
     unsigned int nn;
 
-#ifdef WITH_LMDB
+#if defined(WITH_LMDB) && defined(HAVE_JANSSON_H)
     /* If SAXDB is disabled, read from LMDB instead */
     if (!x3_lmdb_saxdb_enabled() && x3_lmdb_is_available()) {
         return opserv_lmdb_read_all();
@@ -5589,36 +5569,44 @@ opserv_saxdb_write(struct saxdb_context *ctx)
     saxdb_write_int(ctx, KEY_TIME, max_clients_time);
     saxdb_end_record(ctx);
 
-#ifdef WITH_LMDB
-    /* Dual-write to LMDB for SAXDB-optional migration */
+#if defined(WITH_LMDB) && defined(HAVE_JANSSON_H)
+    /* Dual-write to LMDB for SAXDB-optional migration using jansson */
     if (x3_lmdb_is_available()) {
         dict_iterator_t it;
-        char json_buf[4096];
+        json_t *obj;
+        char *json_str;
 
         /* Write trusted hosts to LMDB */
         for (it = dict_first(opserv_trusted_hosts); it; it = iter_next(it)) {
             struct trusted_host *th = iter_data(it);
-            snprintf(json_buf, sizeof(json_buf),
-                "{\"limit\":%lu,\"expires\":%lu,\"issued\":%lu,"
-                "\"issuer\":\"%s\",\"reason\":\"%s\"}",
-                th->limit,
-                (unsigned long)th->expires,
-                (unsigned long)th->issued,
-                th->issuer ? th->issuer : "",
-                th->reason ? th->reason : "");
-            x3_lmdb_trusted_set(iter_key(it), json_buf);
+            obj = json_object();
+            json_object_set_new(obj, "limit", json_integer((json_int_t)th->limit));
+            json_object_set_new(obj, "expires", json_integer((json_int_t)th->expires));
+            json_object_set_new(obj, "issued", json_integer((json_int_t)th->issued));
+            json_object_set_new(obj, "issuer", json_string(th->issuer ? th->issuer : ""));
+            json_object_set_new(obj, "reason", json_string(th->reason ? th->reason : ""));
+            json_str = json_dumps(obj, JSON_COMPACT);
+            if (json_str) {
+                x3_lmdb_trusted_set(iter_key(it), json_str);
+                free(json_str);
+            }
+            json_decref(obj);
         }
 
         /* Write gags to LMDB */
         if (gagList) {
             struct gag_entry *gag;
             for (gag = gagList; gag; gag = gag->next) {
-                snprintf(json_buf, sizeof(json_buf),
-                    "{\"owner\":\"%s\",\"reason\":\"%s\",\"expires\":%lu}",
-                    gag->owner,
-                    gag->reason ? gag->reason : "",
-                    (unsigned long)gag->expires);
-                x3_lmdb_gag_set(gag->mask, json_buf);
+                obj = json_object();
+                json_object_set_new(obj, "owner", json_string(gag->owner ? gag->owner : ""));
+                json_object_set_new(obj, "reason", json_string(gag->reason ? gag->reason : ""));
+                json_object_set_new(obj, "expires", json_integer((json_int_t)gag->expires));
+                json_str = json_dumps(obj, JSON_COMPACT);
+                if (json_str) {
+                    x3_lmdb_gag_set(gag->mask, json_str);
+                    free(json_str);
+                }
+                json_decref(obj);
             }
         }
 
@@ -5641,15 +5629,18 @@ opserv_saxdb_write(struct saxdb_context *ctx)
             case REACT_MSGUSER: reaction = "msguser"; break;
             default: reaction = "notice"; break;
             }
-            snprintf(json_buf, sizeof(json_buf),
-                "{\"discrim\":\"%s\",\"owner\":\"%s\",\"last\":%lu,"
-                "\"expire\":%lu,\"reaction\":\"%s\"}",
-                alert->text_discrim ? alert->text_discrim : "",
-                alert->owner ? alert->owner : "",
-                (unsigned long)alert->last,
-                (unsigned long)alert->expire,
-                reaction);
-            x3_lmdb_alert_set(iter_key(it), json_buf);
+            obj = json_object();
+            json_object_set_new(obj, "discrim", json_string(alert->text_discrim ? alert->text_discrim : ""));
+            json_object_set_new(obj, "owner", json_string(alert->owner ? alert->owner : ""));
+            json_object_set_new(obj, "last", json_integer((json_int_t)alert->last));
+            json_object_set_new(obj, "expire", json_integer((json_int_t)alert->expire));
+            json_object_set_new(obj, "reaction", json_string(reaction));
+            json_str = json_dumps(obj, JSON_COMPACT);
+            if (json_str) {
+                x3_lmdb_alert_set(iter_key(it), json_str);
+                free(json_str);
+            }
+            json_decref(obj);
         }
     }
 #endif
