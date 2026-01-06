@@ -183,6 +183,20 @@ int keycloak_update_user(struct kc_realm realm, struct kc_client client,
                          const char* new_email);
 
 /**
+ * Updates a user's password credentials using pre-hashed password (credential import).
+ * Uses Keycloak's credential import format to avoid sending plaintext passwords.
+ * @param realm       Keycloak realm configuration
+ * @param client      Client with admin access token
+ * @param user_id     User's Keycloak ID (UUID)
+ * @param cred_data   credentialData JSON from pw_export_keycloak()
+ * @param secret_data secretData JSON from pw_export_keycloak()
+ * @return KC_SUCCESS on success, KC_NOT_FOUND if user doesn't exist, KC_ERROR on failure
+ */
+int keycloak_update_user_credentials(struct kc_realm realm, struct kc_client client,
+                                     const char* user_id,
+                                     const char* cred_data, const char* secret_data);
+
+/**
  * Deletes a user from Keycloak
  * @param realm     Keycloak realm configuration
  * @param client    Client with admin access token

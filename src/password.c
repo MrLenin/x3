@@ -86,7 +86,7 @@ static int base64_encode(const unsigned char *input, int input_len, char *output
     return j;
 }
 
-/* Base64 decode */
+/* Base64 decode - writes only the actual decoded bytes (no buffer overflow) */
 static int base64_decode(const char *input, unsigned char *output)
 {
     int i, j, len;
@@ -94,26 +94,46 @@ static int base64_decode(const char *input, unsigned char *output)
     unsigned char d[4];
     const char *p;
 
+    if (!input)
+        return -1;
+
     len = strlen(input);
+    if (len == 0)
+        return 0;
+
     for (i = 0, j = 0; i < len; ) {
+        int remaining = len - i;
+        int bytes_this_block;
+
         for (int k = 0; k < 4; k++) {
             if (i < len) {
-                p = strchr(base64_chars, input[i++]);
-                if (p == NULL) return -1;
+                p = strchr(base64_chars, input[i]);
+                if (p == NULL)
+                    return -1;
                 d[k] = p - base64_chars;
+                i++;
             } else {
                 d[k] = 0;
             }
         }
 
         triplet = (d[0] << 18) | (d[1] << 12) | (d[2] << 6) | d[3];
-        output[j++] = (triplet >> 16) & 0xff;
-        output[j++] = (triplet >> 8) & 0xff;
-        output[j++] = triplet & 0xff;
-    }
 
-    if (len % 4 == 2) j -= 2;
-    else if (len % 4 == 3) j -= 1;
+        /* Only write the bytes we'll actually keep - avoids buffer overflow */
+        if (remaining >= 4) {
+            bytes_this_block = 3;
+        } else if (remaining == 3) {
+            bytes_this_block = 2;
+        } else if (remaining == 2) {
+            bytes_this_block = 1;
+        } else {
+            bytes_this_block = 0;
+        }
+
+        if (bytes_this_block >= 1) output[j++] = (triplet >> 16) & 0xff;
+        if (bytes_this_block >= 2) output[j++] = (triplet >> 8) & 0xff;
+        if (bytes_this_block >= 3) output[j++] = triplet & 0xff;
+    }
 
     return j;
 }
@@ -280,10 +300,12 @@ static int verify_pbkdf2_sha256(const char *password, const char *hash)
 
     /* Decode */
     salt_len = base64_decode(salt_b64, salt);
-    if (salt_len < 0) return 0;
+    if (salt_len < 0)
+        return 0;
 
     hash_len = base64_decode(hash_b64, stored_hash);
-    if (hash_len < 0 || hash_len != PBKDF2_SHA256_LEN) return 0;
+    if (hash_len < 0 || hash_len != PBKDF2_SHA256_LEN)
+        return 0;
 
     /* Compute and compare */
     if (!do_pbkdf2_sha256(password, salt, salt_len, iterations,
@@ -640,13 +662,24 @@ int pw_needs_rehash(const char *hash)
     return 0;
 }
 
+/* Add Base64 padding to make length a multiple of 4 */
+static void base64_add_padding(char *b64_str)
+{
+    size_t len = strlen(b64_str);
+    int padding = (4 - (len % 4)) % 4;
+    while (padding-- > 0) {
+        b64_str[len++] = '=';
+    }
+    b64_str[len] = '\0';
+}
+
 int pw_export_keycloak(const char *hash, char *cred_data, size_t cred_data_len,
                        char *secret_data, size_t secret_data_len)
 {
     enum pw_algorithm alg = pw_detect_algorithm(hash);
     const char *p;
     const char *alg_name;
-    char iter_str[16], salt_b64[64], hash_b64[128];
+    char iter_str[16], salt_b64[68], hash_b64[132];  /* Extra space for padding */
     int i, iterations;
 
     /* Only PBKDF2 variants can be exported to Keycloak */
@@ -682,6 +715,10 @@ int pw_export_keycloak(const char *hash, char *cred_data, size_t cred_data_len,
     for (i = 0; *p && i < 127; i++, p++)
         hash_b64[i] = *p;
     hash_b64[i] = '\0';
+
+    /* Keycloak requires proper Base64 padding */
+    base64_add_padding(salt_b64);
+    base64_add_padding(hash_b64);
 
     /* Keycloak credentialData format */
     snprintf(cred_data, cred_data_len,

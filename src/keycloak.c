@@ -937,6 +937,19 @@ kc_build_reset_password_endpoint(struct kc_realm realm, const char *user_id)
     return uri;
 }
 
+/* Credentials endpoint for hash import: /admin/realms/{realm}/users/{user_id}/credentials */
+static char *
+kc_build_credentials_endpoint(struct kc_realm realm, const char *user_id)
+{
+    static const char tmpl[] = "%s/admin/realms/%s/users/%s/credentials";
+    if (!realm.base_uri || !realm.realm || !user_id) return NULL;
+
+    int len = snprintf(NULL, 0, tmpl, realm.base_uri, realm.realm, user_id) + 1;
+    char *uri = malloc(len);
+    if (uri) snprintf(uri, len, tmpl, realm.base_uri, realm.realm, user_id);
+    return uri;
+}
+
 /* JWKS endpoint: /realms/{realm}/protocol/openid-connect/certs */
 static char *
 kc_build_jwks_endpoint(struct kc_realm realm)
@@ -3372,6 +3385,82 @@ cleanup:
     if (uri) {
         free(uri);
     }
+
+    return result;
+}
+
+int keycloak_update_user_credentials(struct kc_realm realm, struct kc_client client,
+                                     const char* user_id,
+                                     const char* cred_data, const char* secret_data)
+{
+    if (!realm.base_uri || !realm.realm || !client.access_token ||
+        !user_id || !cred_data || !secret_data) {
+        log_module(KC_LOG, LOG_DEBUG, "keycloak_update_user_credentials: Invalid arguments");
+        return KC_ERROR;
+    }
+
+    int result = KC_ERROR;
+    char *uri = kc_build_user_endpoint(realm, user_id);
+    char *json_body = NULL;
+    struct memory chunk = {0};
+
+    if (!uri) {
+        log_module(KC_LOG, LOG_DEBUG, "keycloak_update_user_credentials: Failed to build uri");
+        goto cleanup;
+    }
+
+    /* Build user update with credentials array
+     * Keycloak expects credentialData and secretData as JSON strings within each credential */
+    json_t* cred_obj = json_object();
+    json_object_set_new(cred_obj, "type", json_string("password"));
+    json_object_set_new(cred_obj, "credentialData", json_string(cred_data));
+    json_object_set_new(cred_obj, "secretData", json_string(secret_data));
+
+    json_t* creds_array = json_array();
+    json_array_append_new(creds_array, cred_obj);
+
+    json_t* user_obj = json_object();
+    json_object_set_new(user_obj, "credentials", creds_array);
+
+    json_body = json_dumps(user_obj, JSON_COMPACT);
+    json_decref(user_obj);
+
+    if (!json_body) {
+        log_module(KC_LOG, LOG_DEBUG, "keycloak_update_user_credentials: Failed to build JSON");
+        goto cleanup;
+    }
+
+    struct curl_opts opts = CURL_OPTS_INIT;
+    opts.uri = uri;
+    opts.method = HTTP_PUT;  /* PUT to /users/{id} with credentials array */
+    opts.post_fields = json_body;
+    opts.xoauth2_bearer = client.access_token->access_token;
+    opts.header_list[0] = "Content-Type: application/json";
+    opts.header_count = 1;
+
+    long http_code = curl_perform(opts, &chunk);
+
+    if (http_code == 204) {
+        log_module(KC_LOG, LOG_DEBUG, "keycloak_update_user_credentials: Credentials updated (HTTP 204)");
+        result = KC_SUCCESS;
+    } else if (http_code == 404) {
+        log_module(KC_LOG, LOG_DEBUG, "keycloak_update_user_credentials: User not found (HTTP 404)");
+        result = KC_NOT_FOUND;
+    } else {
+        log_module(KC_LOG, LOG_DEBUG, "keycloak_update_user_credentials: Failed with HTTP %ld: %s",
+            http_code, chunk.response ? chunk.response : "no response");
+    }
+
+cleanup:
+    if (chunk.response) {
+        memset(chunk.response, 0, chunk.size);
+        free(chunk.response);
+    }
+    if (json_body) {
+        memset(json_body, 0, strlen(json_body));
+        free(json_body);
+    }
+    free(uri);
 
     return result;
 }
