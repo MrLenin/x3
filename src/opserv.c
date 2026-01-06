@@ -5150,6 +5150,228 @@ add_routing_plan(const char *name, void *data, UNUSED_ARG(void *extra))
     return 0;
 }
 
+#ifdef WITH_LMDB
+/* ========== LMDB Read Functions (SAXDB-optional) ========== */
+
+/**
+ * Simple JSON string value extractor for opserv
+ */
+static char *
+os_json_extract_string(char *json, const char *key, char *out, size_t out_size)
+{
+    char search_key[128];
+    char *p, *end;
+
+    snprintf(search_key, sizeof(search_key), "\"%s\":\"", key);
+    p = strstr(json, search_key);
+    if (!p) return NULL;
+
+    p += strlen(search_key);
+    end = strchr(p, '"');
+    if (!end) return NULL;
+
+    size_t len = end - p;
+    if (len >= out_size) len = out_size - 1;
+    memcpy(out, p, len);
+    out[len] = '\0';
+    return out;
+}
+
+/**
+ * Simple JSON integer value extractor for opserv
+ */
+static long
+os_json_extract_int(const char *json, const char *key)
+{
+    char search_key[128];
+    const char *p;
+
+    snprintf(search_key, sizeof(search_key), "\"%s\":", key);
+    p = strstr(json, search_key);
+    if (!p) return 0;
+
+    p += strlen(search_key);
+    return strtol(p, NULL, 10);
+}
+
+/**
+ * Callback for reading trusted hosts from LMDB
+ */
+static int
+lmdb_trusted_read_callback(const char *key, const char *value, void *ctx)
+{
+    char json_buf[4096];
+    char issuer_buf[256];
+    char reason_buf[1024];
+    const char *ipaddr;
+    unsigned long limit;
+    time_t issued, expires;
+    (void)ctx;
+
+    /* Extract IP address from key (trusted:<ipaddr>) */
+    ipaddr = key + strlen(LMDB_PREFIX_TRUSTED);
+    if (!ipaddr || !*ipaddr) return 0;
+
+    /* Copy JSON safely */
+    if (strlen(value) >= sizeof(json_buf)) return 0;
+    strcpy(json_buf, value);
+
+    limit = (unsigned long)os_json_extract_int(json_buf, "limit");
+    expires = (time_t)os_json_extract_int(json_buf, "expires");
+    issued = (time_t)os_json_extract_int(json_buf, "issued");
+
+    /* Skip expired */
+    if (expires && expires < now) return 0;
+
+    issuer_buf[0] = '\0';
+    reason_buf[0] = '\0';
+    os_json_extract_string(json_buf, "issuer", issuer_buf, sizeof(issuer_buf));
+    os_json_extract_string(json_buf, "reason", reason_buf, sizeof(reason_buf));
+
+    opserv_add_trusted_host(ipaddr, limit, issuer_buf[0] ? issuer_buf : NULL,
+                            issued, expires, reason_buf[0] ? reason_buf : NULL);
+    return 0;
+}
+
+/**
+ * Callback for reading gags from LMDB
+ */
+static int
+lmdb_gag_read_callback(const char *key, const char *value, void *ctx)
+{
+    char json_buf[4096];
+    char owner_buf[256];
+    char reason_buf[1024];
+    const char *mask;
+    time_t expires;
+    (void)ctx;
+
+    /* Extract mask from key (gag:<mask>) */
+    mask = key + strlen(LMDB_PREFIX_GAG);
+    if (!mask || !*mask) return 0;
+
+    /* Copy JSON safely */
+    if (strlen(value) >= sizeof(json_buf)) return 0;
+    strcpy(json_buf, value);
+
+    expires = (time_t)os_json_extract_int(json_buf, "expires");
+
+    /* Skip expired */
+    if (expires && expires < now) return 0;
+
+    owner_buf[0] = '\0';
+    reason_buf[0] = '\0';
+    os_json_extract_string(json_buf, "owner", owner_buf, sizeof(owner_buf));
+    os_json_extract_string(json_buf, "reason", reason_buf, sizeof(reason_buf));
+
+    gag_create(mask, owner_buf, reason_buf[0] ? reason_buf : NULL, expires);
+    return 0;
+}
+
+/**
+ * Callback for reading alerts from LMDB
+ */
+static int
+lmdb_alert_read_callback(const char *key, const char *value, void *ctx)
+{
+    char json_buf[4096];
+    char discrim_buf[2048];
+    char owner_buf[256];
+    char reaction_buf[64];
+    const char *alert_name;
+    int last, expire;
+    opserv_alert_reaction reaction;
+    struct opserv_user_alert *alert;
+    (void)ctx;
+
+    /* Extract alert name from key (alert:<name>) */
+    alert_name = key + strlen(LMDB_PREFIX_ALERT);
+    if (!alert_name || !*alert_name) return 0;
+
+    /* Copy JSON safely */
+    if (strlen(value) >= sizeof(json_buf)) return 0;
+    strcpy(json_buf, value);
+
+    discrim_buf[0] = '\0';
+    owner_buf[0] = '\0';
+    reaction_buf[0] = '\0';
+
+    os_json_extract_string(json_buf, "discrim", discrim_buf, sizeof(discrim_buf));
+    os_json_extract_string(json_buf, "owner", owner_buf, sizeof(owner_buf));
+    os_json_extract_string(json_buf, "reaction", reaction_buf, sizeof(reaction_buf));
+    last = (int)os_json_extract_int(json_buf, "last");
+    expire = (int)os_json_extract_int(json_buf, "expire");
+
+    /* Skip expired */
+    if (expire && expire < (int)now) return 0;
+
+    /* Parse reaction */
+    if (!reaction_buf[0] || !irccasecmp(reaction_buf, "notice"))
+        reaction = REACT_NOTICE;
+    else if (!irccasecmp(reaction_buf, "kill"))
+        reaction = REACT_KILL;
+    else if (!irccasecmp(reaction_buf, "gline"))
+        reaction = REACT_GLINE;
+    else if (!irccasecmp(reaction_buf, "track"))
+        reaction = REACT_TRACK;
+    else if (!irccasecmp(reaction_buf, "shun"))
+        reaction = REACT_SHUN;
+    else if (!irccasecmp(reaction_buf, "tempshun"))
+        reaction = REACT_TEMPSHUN;
+    else if (!irccasecmp(reaction_buf, "svsjoin"))
+        reaction = REACT_SVSJOIN;
+    else if (!irccasecmp(reaction_buf, "svspart"))
+        reaction = REACT_SVSPART;
+    else if (!irccasecmp(reaction_buf, "version"))
+        reaction = REACT_VERSION;
+    else if (!irccasecmp(reaction_buf, "mark"))
+        reaction = REACT_MARK;
+    else if (!irccasecmp(reaction_buf, "noticeuser"))
+        reaction = REACT_NOTICEUSER;
+    else if (!irccasecmp(reaction_buf, "msguser"))
+        reaction = REACT_MSGUSER;
+    else
+        reaction = REACT_NOTICE;
+
+    alert = opserv_add_user_alert(opserv, alert_name, reaction, discrim_buf, last, expire, reaction_buf);
+    if (alert && owner_buf[0]) {
+        free(alert->owner);
+        alert->owner = strdup(owner_buf);
+    }
+    return 0;
+}
+
+/**
+ * Read all OpServ data from LMDB instead of SAXDB
+ */
+static int
+opserv_lmdb_read_all(void)
+{
+    int trusted_count, gag_count, alert_count;
+
+    if (!x3_lmdb_is_available()) {
+        log_module(OS_LOG, LOG_ERROR, "LMDB not available for SAXDB-optional read");
+        return -1;
+    }
+
+    log_module(OS_LOG, LOG_INFO, "Reading OpServ data from LMDB (SAXDB disabled)");
+
+    trusted_count = x3_lmdb_prefix_iterate(LMDB_DB_METADATA, LMDB_PREFIX_TRUSTED,
+                                           lmdb_trusted_read_callback, NULL);
+    gag_count = x3_lmdb_prefix_iterate(LMDB_DB_METADATA, LMDB_PREFIX_GAG,
+                                        lmdb_gag_read_callback, NULL);
+    alert_count = x3_lmdb_prefix_iterate(LMDB_DB_METADATA, LMDB_PREFIX_ALERT,
+                                          lmdb_alert_read_callback, NULL);
+
+    log_module(OS_LOG, LOG_INFO, "Loaded %d trusted hosts, %d gags, %d alerts from LMDB",
+               trusted_count >= 0 ? trusted_count : 0,
+               gag_count >= 0 ? gag_count : 0,
+               alert_count >= 0 ? alert_count : 0);
+
+    return 0;
+}
+#endif /* WITH_LMDB */
+
 static int
 opserv_saxdb_read(struct dict *conf_db)
 {
@@ -5157,6 +5379,13 @@ opserv_saxdb_read(struct dict *conf_db)
     struct record_data *rd;
     dict_iterator_t it;
     unsigned int nn;
+
+#ifdef WITH_LMDB
+    /* If SAXDB is disabled, read from LMDB instead */
+    if (!x3_lmdb_saxdb_enabled() && x3_lmdb_is_available()) {
+        return opserv_lmdb_read_all();
+    }
+#endif
 
     if ((object = database_get_data(conf_db, KEY_RESERVES, RECDB_OBJECT)))
         dict_foreach(object, add_reserved, opserv_reserved_nick_dict);
@@ -5359,6 +5588,72 @@ opserv_saxdb_write(struct saxdb_context *ctx)
     saxdb_write_int(ctx, KEY_MAX, max_clients);
     saxdb_write_int(ctx, KEY_TIME, max_clients_time);
     saxdb_end_record(ctx);
+
+#ifdef WITH_LMDB
+    /* Dual-write to LMDB for SAXDB-optional migration */
+    if (x3_lmdb_is_available()) {
+        dict_iterator_t it;
+        char json_buf[4096];
+
+        /* Write trusted hosts to LMDB */
+        for (it = dict_first(opserv_trusted_hosts); it; it = iter_next(it)) {
+            struct trusted_host *th = iter_data(it);
+            snprintf(json_buf, sizeof(json_buf),
+                "{\"limit\":%lu,\"expires\":%lu,\"issued\":%lu,"
+                "\"issuer\":\"%s\",\"reason\":\"%s\"}",
+                th->limit,
+                (unsigned long)th->expires,
+                (unsigned long)th->issued,
+                th->issuer ? th->issuer : "",
+                th->reason ? th->reason : "");
+            x3_lmdb_trusted_set(iter_key(it), json_buf);
+        }
+
+        /* Write gags to LMDB */
+        if (gagList) {
+            struct gag_entry *gag;
+            for (gag = gagList; gag; gag = gag->next) {
+                snprintf(json_buf, sizeof(json_buf),
+                    "{\"owner\":\"%s\",\"reason\":\"%s\",\"expires\":%lu}",
+                    gag->owner,
+                    gag->reason ? gag->reason : "",
+                    (unsigned long)gag->expires);
+                x3_lmdb_gag_set(gag->mask, json_buf);
+            }
+        }
+
+        /* Write alerts to LMDB */
+        for (it = dict_first(opserv_user_alerts); it; it = iter_next(it)) {
+            struct opserv_user_alert *alert = iter_data(it);
+            const char *reaction;
+            switch (alert->reaction) {
+            case REACT_NOTICE: reaction = "notice"; break;
+            case REACT_KILL: reaction = "kill"; break;
+            case REACT_GLINE: reaction = "gline"; break;
+            case REACT_TRACK: reaction = "track"; break;
+            case REACT_SHUN: reaction = "shun"; break;
+            case REACT_TEMPSHUN: reaction = "tempshun"; break;
+            case REACT_SVSJOIN: reaction = "svsjoin"; break;
+            case REACT_SVSPART: reaction = "svspart"; break;
+            case REACT_VERSION: reaction = "version"; break;
+            case REACT_MARK: reaction = "mark"; break;
+            case REACT_NOTICEUSER: reaction = "noticeuser"; break;
+            case REACT_MSGUSER: reaction = "msguser"; break;
+            default: reaction = "notice"; break;
+            }
+            snprintf(json_buf, sizeof(json_buf),
+                "{\"discrim\":\"%s\",\"owner\":\"%s\",\"last\":%lu,"
+                "\"expire\":%lu,\"reaction\":\"%s\"}",
+                alert->text_discrim ? alert->text_discrim : "",
+                alert->owner ? alert->owner : "",
+                (unsigned long)alert->last,
+                (unsigned long)alert->expire,
+                reaction);
+            x3_lmdb_alert_set(iter_key(it), json_buf);
+        }
+    }
+#endif
+
     return 0;
 }
 
