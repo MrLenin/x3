@@ -393,7 +393,16 @@ if test "${BROKEN_REGEX}" = yes -o "${ac_cv_func_regcomp}" = no; then
   RX_LIBS="../rx/librx.a"
 fi
 MY_SUBDIRS="$MY_SUBDIRS src"
-CFLAGS="$CFLAGS $ANSI_SRC -W -Wall"
+dnl Modern warning flags - use -Wextra (replacement for deprecated -W)
+dnl Additional warnings that catch common bugs:
+dnl   -Wformat=2: Extended format string checks
+dnl   -Wstrict-prototypes: Require function prototypes
+dnl   -Wmissing-prototypes: Warn if global function has no prototype
+dnl   -Wold-style-definition: Warn on K&R function definitions
+dnl   -Wuninitialized: Warn about uninitialized variables
+dnl   -Wshadow: Warn when variable shadows another (disabled - too noisy)
+dnl   -Wpointer-arith: Warn about sizeof(void)
+CFLAGS="$CFLAGS $ANSI_SRC -Wall -Wextra -Wformat=2 -Wstrict-prototypes -Wmissing-prototypes -Wold-style-definition -Wuninitialized -Wpointer-arith -Wno-unused-parameter"
 if test "z$USE_MAINTAINER_MODE" = zyes ; then
   CFLAGS="$CFLAGS -Werror"
 fi

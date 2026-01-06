@@ -124,11 +124,12 @@ am_x3_OBJECTS = base64.$(OBJEXT) chanserv.$(OBJEXT) compat.$(OBJEXT) \
 	helpfile.$(OBJEXT) ioset.$(OBJEXT) log.$(OBJEXT) \
 	main.$(OBJEXT) math.$(OBJEXT) md5.$(OBJEXT) modcmd.$(OBJEXT) \
 	modules.$(OBJEXT) password.$(OBJEXT) keycloak.$(OBJEXT) \
-	nickserv.$(OBJEXT) opserv.$(OBJEXT) policer.$(OBJEXT) \
-	recdb.$(OBJEXT) sar.$(OBJEXT) saxdb.$(OBJEXT) \
-	spamserv.$(OBJEXT) shun.$(OBJEXT) timeq.$(OBJEXT) \
-	tools.$(OBJEXT) x3ldap.$(OBJEXT) x3_ssl.$(OBJEXT) \
-	x3_compress.$(OBJEXT) webpush.$(OBJEXT) version.$(OBJEXT)
+	keycloak_webhook.$(OBJEXT) nickserv.$(OBJEXT) opserv.$(OBJEXT) \
+	policer.$(OBJEXT) recdb.$(OBJEXT) sar.$(OBJEXT) \
+	saxdb.$(OBJEXT) spamserv.$(OBJEXT) shun.$(OBJEXT) \
+	timeq.$(OBJEXT) tools.$(OBJEXT) x3ldap.$(OBJEXT) \
+	x3_ssl.$(OBJEXT) x3_compress.$(OBJEXT) webpush.$(OBJEXT) \
+	version.$(OBJEXT)
 x3_OBJECTS = $(am_x3_OBJECTS)
 AM_V_P = $(am__v_P_@AM_V@)
 am__v_P_ = $(am__v_P_@AM_DEFAULT_V@)
@@ -156,10 +157,10 @@ am__depfiles_remade = ./$(DEPDIR)/alloc-slab.Po \
 	./$(DEPDIR)/heap.Po ./$(DEPDIR)/helpfile.Po \
 	./$(DEPDIR)/ioset-epoll.Po ./$(DEPDIR)/ioset-kevent.Po \
 	./$(DEPDIR)/ioset-select.Po ./$(DEPDIR)/ioset.Po \
-	./$(DEPDIR)/keycloak.Po ./$(DEPDIR)/log.Po \
-	./$(DEPDIR)/mail-common.Po ./$(DEPDIR)/mail-sendmail.Po \
-	./$(DEPDIR)/main-common.Po ./$(DEPDIR)/main.Po \
-	./$(DEPDIR)/math.Po ./$(DEPDIR)/md5.Po \
+	./$(DEPDIR)/keycloak.Po ./$(DEPDIR)/keycloak_webhook.Po \
+	./$(DEPDIR)/log.Po ./$(DEPDIR)/mail-common.Po \
+	./$(DEPDIR)/mail-sendmail.Po ./$(DEPDIR)/main-common.Po \
+	./$(DEPDIR)/main.Po ./$(DEPDIR)/math.Po ./$(DEPDIR)/md5.Po \
 	./$(DEPDIR)/mod-blacklist.Po ./$(DEPDIR)/mod-helpserv.Po \
 	./$(DEPDIR)/mod-memoserv.Po ./$(DEPDIR)/mod-python.Po \
 	./$(DEPDIR)/mod-qserver.Po ./$(DEPDIR)/mod-snoop.Po \
@@ -406,6 +407,7 @@ x3_SOURCES = \
 	modules.c modules.h \
 	password.c password.h \
 	keycloak.c keycloak.h \
+	keycloak_webhook.c keycloak_webhook.h \
 	nickserv.c nickserv.h \
 	x3_lmdb.h \
 	opserv.c opserv.h \
@@ -523,6 +525,7 @@ distclean-compile:
 @AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/ioset-select.Po@am__quote@ # am--include-marker
 @AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/ioset.Po@am__quote@ # am--include-marker
 @AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/keycloak.Po@am__quote@ # am--include-marker
+@AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/keycloak_webhook.Po@am__quote@ # am--include-marker
 @AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/log.Po@am__quote@ # am--include-marker
 @AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/mail-common.Po@am__quote@ # am--include-marker
 @AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/mail-sendmail.Po@am__quote@ # am--include-marker
@@ -727,6 +730,7 @@ distclean: distclean-am
 	-rm -f ./$(DEPDIR)/ioset-select.Po
 	-rm -f ./$(DEPDIR)/ioset.Po
 	-rm -f ./$(DEPDIR)/keycloak.Po
+	-rm -f ./$(DEPDIR)/keycloak_webhook.Po
 	-rm -f ./$(DEPDIR)/log.Po
 	-rm -f ./$(DEPDIR)/mail-common.Po
 	-rm -f ./$(DEPDIR)/mail-sendmail.Po
@@ -832,6 +836,7 @@ maintainer-clean: maintainer-clean-am
 	-rm -f ./$(DEPDIR)/ioset-select.Po
 	-rm -f ./$(DEPDIR)/ioset.Po
 	-rm -f ./$(DEPDIR)/keycloak.Po
+	-rm -f ./$(DEPDIR)/keycloak_webhook.Po
 	-rm -f ./$(DEPDIR)/log.Po
 	-rm -f ./$(DEPDIR)/mail-common.Po
 	-rm -f ./$(DEPDIR)/mail-sendmail.Po

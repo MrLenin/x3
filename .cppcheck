@@ -1,0 +1,38 @@
+# cppcheck configuration for X3 IRC Services
+# Run with: cppcheck --project=.cppcheck src/
+
+# Enable additional checks
+enable=warning,style,performance,portability
+
+# C standard
+std=c11
+
+# Include paths (adjust based on build config)
+-I src
+-I /usr/include
+
+# Define macros for conditional code
+-D WITH_KEYCLOAK=1
+-D WITH_LMDB=1
+-D WITH_SSL=1
+-D WITH_PROTOCOL_P10=1
+-D WITH_IOSET_EPOLL=1
+-D _GNU_SOURCE=1
+
+# Suppress known false positives
+# Legacy code patterns that are intentional:
+suppress=variableScope
+suppress=unreadVariable:src/mail-sendmail.c
+suppress=unusedFunction:src/modules.c
+suppress=unusedStructMember
+
+# External library macros that cppcheck doesn't understand:
+suppress=unknownMacro:src/keycloak.c:*json_object_foreach*
+suppress=unknownMacro:src/keycloak.c:*json_array_foreach*
+
+# Intentional memory management patterns:
+# X3 uses custom memory allocation tracking
+suppress=memleak:src/alloc-x3.c
+
+# Error limit (0 = no limit)
+max-configs=12

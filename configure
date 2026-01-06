@@ -8319,7 +8319,7 @@ if test "${BROKEN_REGEX}" = yes -o "${ac_cv_func_regcomp}" = no; then
   RX_LIBS="../rx/librx.a"
 fi
 MY_SUBDIRS="$MY_SUBDIRS src"
-CFLAGS="$CFLAGS $ANSI_SRC -W -Wall"
+CFLAGS="$CFLAGS $ANSI_SRC -Wall -Wextra -Wformat=2 -Wstrict-prototypes -Wmissing-prototypes -Wold-style-definition -Wuninitialized -Wpointer-arith -Wno-unused-parameter"
 if test "z$USE_MAINTAINER_MODE" = zyes ; then
   CFLAGS="$CFLAGS -Werror"
 fi
