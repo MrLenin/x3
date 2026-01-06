@@ -31,3 +31,11 @@ src/x3
 src/*.orig
 x3
 
+# Autoconf cache
+autom4te.cache/
+
+# Editor backup files
+*~
+*.orig
+*.bak
+
