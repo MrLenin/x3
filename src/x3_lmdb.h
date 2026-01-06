@@ -35,6 +35,7 @@ enum lmdb_error {
 #define LMDB_PREFIX_META     "meta:"
 #define LMDB_PREFIX_CHANACCESS "chanaccess:"
 #define LMDB_PREFIX_FINGERPRINT "fp:"  /* Certificate fingerprint → username cache */
+#define LMDB_PREFIX_CERTEXP "certexp:"  /* Certificate expiry: fingerprint → expiry timestamp */
 #define LMDB_PREFIX_AUTHFAIL "authfail:"  /* Failed auth attempts cache (hash → timestamp) */
 #define LMDB_PREFIX_FPFAIL "fpfail:"  /* Failed fingerprint lookups cache (fingerprint → timestamp) */
 #define LMDB_PREFIX_SESSION "session:"  /* Session tokens: token_id → expiry:username */
@@ -461,6 +462,31 @@ int x3_lmdb_fingerprint_list_account(const char *account, struct lmdb_fingerprin
  * @param entries Head of the list to free (can be NULL)
  */
 void x3_lmdb_free_fingerprint_entries(struct lmdb_fingerprint_entry *entries);
+
+/* ========== Certificate Expiry ========== */
+
+/**
+ * Store certificate expiry timestamp for a fingerprint
+ * @param fingerprint SSL certificate fingerprint
+ * @param cert_expires Unix timestamp when certificate expires
+ * @return LMDB_SUCCESS on success, LMDB_ERROR on failure
+ */
+int x3_lmdb_certexp_set(const char *fingerprint, time_t cert_expires);
+
+/**
+ * Get certificate expiry timestamp for a fingerprint
+ * @param fingerprint SSL certificate fingerprint
+ * @param cert_expires_out Output for expiry timestamp
+ * @return LMDB_SUCCESS on success, LMDB_NOT_FOUND if not found, LMDB_ERROR on failure
+ */
+int x3_lmdb_certexp_get(const char *fingerprint, time_t *cert_expires_out);
+
+/**
+ * Delete certificate expiry record for a fingerprint
+ * @param fingerprint SSL certificate fingerprint
+ * @return LMDB_SUCCESS on success, LMDB_ERROR on failure
+ */
+int x3_lmdb_certexp_delete(const char *fingerprint);
 
 /* ========== Generic Key-Value Operations ========== */
 

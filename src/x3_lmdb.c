@@ -2254,6 +2254,115 @@ void x3_lmdb_free_fingerprint_entries(struct lmdb_fingerprint_entry *entries)
     }
 }
 
+/* ========== Certificate Expiry ========== */
+
+int x3_lmdb_certexp_set(const char *fingerprint, time_t cert_expires)
+{
+    MDB_txn *txn;
+    MDB_val mkey, mdata;
+    char keybuf[LMDB_KEY_BUFFER_SIZE];
+    char valuebuf[32];
+    int rc;
+
+    if (!x3_lmdb_is_available() || !fingerprint || cert_expires == 0) {
+        return LMDB_ERROR;
+    }
+
+    /* Build key: "certexp:<fingerprint>" */
+    snprintf(keybuf, sizeof(keybuf), "%s%s", LMDB_PREFIX_CERTEXP, fingerprint);
+
+    mkey.mv_size = strlen(keybuf) + 1;
+    mkey.mv_data = keybuf;
+
+    /* Store just the timestamp */
+    snprintf(valuebuf, sizeof(valuebuf), "%ld", (long)cert_expires);
+
+    mdata.mv_size = strlen(valuebuf) + 1;
+    mdata.mv_data = valuebuf;
+
+    rc = mdb_txn_begin(lmdb_env, NULL, 0, &txn);
+    if (rc != 0) {
+        return LMDB_ERROR;
+    }
+
+    rc = mdb_put(txn, lmdb_dbi, &mkey, &mdata, 0);
+    if (rc != 0) {
+        mdb_txn_abort(txn);
+        return LMDB_ERROR;
+    }
+
+    rc = mdb_txn_commit(txn);
+    return (rc == 0) ? LMDB_SUCCESS : LMDB_ERROR;
+}
+
+int x3_lmdb_certexp_get(const char *fingerprint, time_t *cert_expires_out)
+{
+    MDB_txn *txn;
+    MDB_val mkey, mdata;
+    char keybuf[LMDB_KEY_BUFFER_SIZE];
+    int rc;
+
+    if (!x3_lmdb_is_available() || !fingerprint) {
+        return LMDB_ERROR;
+    }
+
+    /* Build key: "certexp:<fingerprint>" */
+    snprintf(keybuf, sizeof(keybuf), "%s%s", LMDB_PREFIX_CERTEXP, fingerprint);
+
+    mkey.mv_size = strlen(keybuf) + 1;
+    mkey.mv_data = keybuf;
+
+    rc = mdb_txn_begin(lmdb_env, NULL, MDB_RDONLY, &txn);
+    if (rc != 0) {
+        return LMDB_ERROR;
+    }
+
+    rc = mdb_get(txn, lmdb_dbi, &mkey, &mdata);
+    if (rc != 0) {
+        mdb_txn_abort(txn);
+        return (rc == MDB_NOTFOUND) ? LMDB_NOT_FOUND : LMDB_ERROR;
+    }
+
+    if (cert_expires_out) {
+        *cert_expires_out = (time_t)strtol((const char*)mdata.mv_data, NULL, 10);
+    }
+
+    mdb_txn_abort(txn);
+    return LMDB_SUCCESS;
+}
+
+int x3_lmdb_certexp_delete(const char *fingerprint)
+{
+    MDB_txn *txn;
+    MDB_val mkey;
+    char keybuf[LMDB_KEY_BUFFER_SIZE];
+    int rc;
+
+    if (!x3_lmdb_is_available() || !fingerprint) {
+        return LMDB_ERROR;
+    }
+
+    /* Build key: "certexp:<fingerprint>" */
+    snprintf(keybuf, sizeof(keybuf), "%s%s", LMDB_PREFIX_CERTEXP, fingerprint);
+
+    mkey.mv_size = strlen(keybuf) + 1;
+    mkey.mv_data = keybuf;
+
+    rc = mdb_txn_begin(lmdb_env, NULL, 0, &txn);
+    if (rc != 0) {
+        return LMDB_ERROR;
+    }
+
+    rc = mdb_del(txn, lmdb_dbi, &mkey, NULL);
+    if (rc != 0 && rc != MDB_NOTFOUND) {
+        mdb_txn_abort(txn);
+        return LMDB_ERROR;
+    }
+
+    rc = mdb_txn_commit(txn);
+    return (rc == 0) ? LMDB_SUCCESS : LMDB_ERROR;
+}
+
 /* ========== Snapshot/Backup ========== */
 
 #include <dirent.h>

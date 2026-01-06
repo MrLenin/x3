@@ -253,6 +253,11 @@ static unsigned int flag_access_levels[32];
 /* Track last-broadcast SASL mechanism list for change detection */
 static char last_sasl_mechs[192] = "";  /* Must match nickserv_get_sasl_mechanisms buffer */
 
+/* Timer scheduling flags - timers are scheduled after config loads, not at init time */
+static int expire_handles_timer_set = 0;
+static int expire_nicks_timer_set = 0;
+static int metadata_purge_timer_set = 0;
+
 #ifdef WITH_KEYCLOAK
 /* Keycloak client state - cached token for admin operations */
 static struct kc_realm kc_realm_config;
@@ -260,11 +265,6 @@ static struct kc_client kc_client_config;
 static struct access_token *kc_admin_token = NULL;
 static time_t kc_token_expires = 0;
 static int keycloak_available = 1;  /* Track Keycloak availability */
-
-/* Timer scheduling flags - timers are scheduled after config loads, not at init time */
-static int expire_handles_timer_set = 0;
-static int expire_nicks_timer_set = 0;
-static int metadata_purge_timer_set = 0;
 
 /* Forward declarations for Keycloak wrapper functions */
 static int kc_ensure_token(void);
@@ -454,8 +454,12 @@ static const struct message_entry msgtab[] = {
     { "NSMSG_LISTSSLFP_HEADER", "$bCertificate fingerprints for %s:$b" },
     { "NSMSG_LISTSSLFP_ENTRY", "  %d. %s" },
     { "NSMSG_LISTSSLFP_ENTRY_LMDB", "  %d. %s (registered: %s, last used: %s)" },
+    { "NSMSG_LISTSSLFP_ENTRY_EXPIRY", "  %d. %s (expires: %s)" },
+    { "NSMSG_LISTSSLFP_ENTRY_FULL", "  %d. %s (registered: %s, expires: %s)" },
     { "NSMSG_LISTSSLFP_NONE", "No certificate fingerprints registered." },
     { "NSMSG_LISTSSLFP_COUNT", "Total: %d fingerprint(s)" },
+    { "NSMSG_CERT_EXPIRING_SOON", "$b[WARNING]$b Your client certificate will expire on %s (%d days remaining)." },
+    { "NSMSG_CERT_EXPIRED", "$b[WARNING]$b Your client certificate has EXPIRED. Please renew it." },
     { "NSMSG_SEARCHSSLFP_FOUND", "Certificate %s is registered to account $b%s$b." },
     { "NSMSG_SEARCHSSLFP_FOUND_LMDB", "Certificate %s is cached for account $b%s$b (last used: %s)." },
     { "NSMSG_SEARCHSSLFP_NOTFOUND", "Certificate %s is not registered to any account." },
@@ -2733,6 +2737,29 @@ void nickserv_do_autoauth(struct userNode *user)
     send_message_type(4, user, nickserv,
                       handle_find_message(hi, "NSMSG_AUTH_SUCCESS"));
 
+#ifdef WITH_LMDB
+    /* Check certificate expiry and warn if expiring soon */
+    if (user->sslfp) {
+        time_t cert_expires = 0;
+        if (x3_lmdb_certexp_get(user->sslfp, &cert_expires) == LMDB_SUCCESS && cert_expires > 0) {
+            time_t now = time(NULL);
+            if (cert_expires <= now) {
+                send_message_type(4, user, nickserv,
+                                  handle_find_message(hi, "NSMSG_CERT_EXPIRED"));
+            } else {
+                int days_remaining = (cert_expires - now) / 86400;
+                if (days_remaining <= 30) {  /* Warn if expiring within 30 days */
+                    char expiry_buf[32];
+                    strftime(expiry_buf, sizeof(expiry_buf), "%Y-%m-%d", localtime(&cert_expires));
+                    send_message_type(4, user, nickserv,
+                                      handle_find_message(hi, "NSMSG_CERT_EXPIRING_SOON"),
+                                      expiry_buf, days_remaining);
+                }
+            }
+        }
+    }
+#endif
+
     /* Set +x if autohide is on */
     if(HANDLE_FLAGGED(hi, AUTOHIDE))
         irc_umode(user, "+x");
@@ -3788,13 +3815,29 @@ nickserv_listsslfp(struct svccmd *cmd, struct userNode *user, struct handle_info
         /* Try to get additional info from LMDB */
         char account_out[64];
         time_t registered, last_used, expires;
+        time_t cert_expires = 0;
         int rc = x3_lmdb_fingerprint_get(fp, account_out, &registered, &last_used, &expires);
 
-        if (rc == LMDB_SUCCESS && last_used > 0) {
-            char reg_buf[32], last_buf[32];
-            strftime(reg_buf, sizeof(reg_buf), "%Y-%m-%d %H:%M", localtime(&registered));
-            strftime(last_buf, sizeof(last_buf), "%Y-%m-%d %H:%M", localtime(&last_used));
-            reply("NSMSG_LISTSSLFP_ENTRY_LMDB", i + 1, fp, reg_buf, last_buf);
+        /* Also check for certificate expiry */
+        x3_lmdb_certexp_get(fp, &cert_expires);
+
+        if (rc == LMDB_SUCCESS && registered > 0) {
+            char reg_buf[32];
+            strftime(reg_buf, sizeof(reg_buf), "%Y-%m-%d", localtime(&registered));
+
+            if (cert_expires > 0) {
+                char exp_buf[32];
+                strftime(exp_buf, sizeof(exp_buf), "%Y-%m-%d", localtime(&cert_expires));
+                reply("NSMSG_LISTSSLFP_ENTRY_FULL", i + 1, fp, reg_buf, exp_buf);
+            } else {
+                char last_buf[32];
+                strftime(last_buf, sizeof(last_buf), "%Y-%m-%d", localtime(&last_used));
+                reply("NSMSG_LISTSSLFP_ENTRY_LMDB", i + 1, fp, reg_buf, last_buf);
+            }
+        } else if (cert_expires > 0) {
+            char exp_buf[32];
+            strftime(exp_buf, sizeof(exp_buf), "%Y-%m-%d", localtime(&cert_expires));
+            reply("NSMSG_LISTSSLFP_ENTRY_EXPIRY", i + 1, fp, exp_buf);
         } else {
             reply("NSMSG_LISTSSLFP_ENTRY", i + 1, fp);
         }

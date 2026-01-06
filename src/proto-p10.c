@@ -2233,6 +2233,25 @@ static CMD_FUNC(cmd_mark)
 
         return 1;
     }
+    else if(!strcasecmp(argv[2], "SSLCLIEXP")) {
+        /* SSL certificate expiry mark */
+        target = GetUserH(argv[1]);
+        if(!target) {
+            log_module(MAIN_LOG, LOG_ERROR, "Unable to find user %s whose SSL certificate expiry is being set.", argv[1]);
+            return 0;
+        }
+
+        if (argc > 3) {
+            time_t cert_expires = (time_t)strtoul(argv[3], NULL, 10);
+            if (target->sslfp && cert_expires > 0) {
+#ifdef WITH_LMDB
+                x3_lmdb_certexp_set(target->sslfp, cert_expires);
+#endif
+            }
+        }
+
+        return 1;
+    }
     /* unknown type of mark */
     return 1;
 }
