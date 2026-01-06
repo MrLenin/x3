@@ -9915,11 +9915,22 @@ chanserv_version_read(struct dict *section)
     log_module(CS_LOG, LOG_DEBUG, "Chanserv db version is %d.", chanserv_read_version);
 }
 
+#ifdef WITH_LMDB
+static int chanserv_lmdb_read_all(void);
+#endif
+
 static int
 chanserv_saxdb_read(struct dict *database)
 {
     struct dict *section;
     dict_iterator_t it;
+
+#ifdef WITH_LMDB
+    /* If SAXDB is disabled, read from LMDB instead */
+    if (!x3_lmdb_saxdb_enabled() && x3_lmdb_is_available()) {
+        return chanserv_lmdb_read_all();
+    }
+#endif
 
     if((section = database_get_data(database, KEY_VERSION_CONTROL, RECDB_OBJECT)))
         chanserv_version_read(section);
@@ -10324,6 +10335,378 @@ chanserv_lmdb_write_all(void)
     for (channel = channelList; channel; channel = channel->next) {
         chanserv_lmdb_write_channel(channel);
     }
+}
+
+/* ========== LMDB Read Functions (SAXDB-optional) ========== */
+
+/**
+ * Simple JSON string value extractor for chanserv
+ */
+static char *
+cs_json_extract_string(char *json, const char *key, char *out, size_t out_size)
+{
+    char search_key[128];
+    char *p, *end;
+
+    snprintf(search_key, sizeof(search_key), "\"%s\":\"", key);
+    p = strstr(json, search_key);
+    if (!p) return NULL;
+
+    p += strlen(search_key);
+    end = strchr(p, '"');
+    if (!end) return NULL;
+
+    size_t len = end - p;
+    if (len >= out_size) len = out_size - 1;
+    memcpy(out, p, len);
+    out[len] = '\0';
+    return out;
+}
+
+/**
+ * Simple JSON integer value extractor for chanserv
+ */
+static long
+cs_json_extract_int(const char *json, const char *key)
+{
+    char search_key[128];
+    const char *p;
+
+    snprintf(search_key, sizeof(search_key), "\"%s\":", key);
+    p = strstr(json, search_key);
+    if (!p) return 0;
+
+    p += strlen(search_key);
+    return strtol(p, NULL, 10);
+}
+
+/**
+ * Extract JSON array of integers (for lvlOpts/chOpts)
+ * Returns number of elements extracted
+ */
+static int
+cs_json_extract_int_array(const char *json, const char *key, int *out, int max_count)
+{
+    char search_key[128];
+    const char *p;
+    int count = 0;
+
+    snprintf(search_key, sizeof(search_key), "\"%s\":[", key);
+    p = strstr(json, search_key);
+    if (!p) return 0;
+
+    p += strlen(search_key);
+    while (*p && *p != ']' && count < max_count) {
+        while (*p == ' ' || *p == ',') p++;
+        if (*p == ']') break;
+        out[count++] = (int)strtol(p, (char **)&p, 10);
+    }
+    return count;
+}
+
+/* Context for reading channel users from LMDB */
+struct chanuser_read_ctx {
+    struct chanData *cData;
+    const char *channel_name;
+    size_t prefix_len;
+    int count;
+};
+
+/**
+ * Callback for reading channel users from LMDB
+ */
+static int
+chanuser_read_callback(const char *key, const char *value, void *ctx)
+{
+    struct chanuser_read_ctx *rctx = (struct chanuser_read_ctx *)ctx;
+    char json_buf[4096];
+    char value_buf[512];
+    const char *handle_name;
+    struct handle_info *handle;
+    struct userData *uData;
+    size_t value_len;
+
+    /* Extract handle name from key (chanuser:#channel:handle) */
+    handle_name = key + rctx->prefix_len;
+    if (!handle_name || !*handle_name) return 0;
+
+    handle = get_handle_info(handle_name);
+    if (!handle) {
+        log_module(CS_LOG, LOG_WARNING, "LMDB: Unknown handle %s in channel %s",
+                   handle_name, rctx->channel_name);
+        return 0; /* Continue iteration */
+    }
+
+    /* Copy JSON data safely */
+    value_len = strlen(value);
+    if (value_len >= sizeof(json_buf)) {
+        log_module(CS_LOG, LOG_WARNING, "LMDB: User data too large for %s in %s",
+                   handle_name, rctx->channel_name);
+        return 0;
+    }
+    memcpy(json_buf, value, value_len + 1);
+
+    unsigned short access = (unsigned short)cs_json_extract_int(json_buf, "access");
+    time_t seen = (time_t)cs_json_extract_int(json_buf, "seen");
+    value_buf[0] = '\0';
+    cs_json_extract_string(json_buf, "info", value_buf, sizeof(value_buf));
+
+    uData = add_channel_user(rctx->cData, handle, access, seen,
+                             value_buf[0] ? value_buf : NULL, 0);
+    if (uData) {
+        uData->flags = (unsigned int)cs_json_extract_int(json_buf, "flags");
+        uData->expires = (time_t)cs_json_extract_int(json_buf, "expires");
+        uData->accessexpiry = (time_t)cs_json_extract_int(json_buf, "accessexpiry");
+        uData->clvlexpiry = (time_t)cs_json_extract_int(json_buf, "clvlexpiry");
+        uData->lastaccess = (unsigned short)cs_json_extract_int(json_buf, "lastaccess");
+
+        if (uData->accessexpiry > 0)
+            timeq_add(uData->accessexpiry, chanserv_expire_tempuser, uData);
+        if (uData->clvlexpiry > 0)
+            timeq_add(uData->clvlexpiry, chanserv_expire_tempclvl, uData);
+        if ((uData->flags & USER_SUSPENDED) && uData->expires) {
+            if (uData->expires > now)
+                timeq_add(uData->expires, chanserv_expire_user_suspension, uData);
+            else
+                uData->flags &= ~USER_SUSPENDED;
+        }
+        rctx->count++;
+    }
+
+    return 0; /* Continue iteration */
+}
+
+/**
+ * Read channel users from LMDB for a specific channel
+ */
+static int
+chanserv_lmdb_read_users(struct chanData *cData, const char *channel_name)
+{
+    char prefix[256];
+    struct chanuser_read_ctx ctx;
+
+    snprintf(prefix, sizeof(prefix), "%s%s:", LMDB_PREFIX_CHANUSER, channel_name);
+
+    ctx.cData = cData;
+    ctx.channel_name = channel_name;
+    ctx.prefix_len = strlen(prefix);
+    ctx.count = 0;
+
+    x3_lmdb_prefix_iterate(LMDB_DB_CHANNELS, prefix, chanuser_read_callback, &ctx);
+
+    return ctx.count;
+}
+
+/**
+ * Read channel bans from LMDB for a specific channel
+ */
+static int
+chanserv_lmdb_read_bans(struct chanData *cData, const char *channel_name)
+{
+    char **bans = NULL;
+    unsigned int ban_count = 0;
+    unsigned int i;
+    int loaded = 0;
+    char value_buf[512];
+    char owner_buf[128];
+    char reason_buf[512];
+
+    if (x3_lmdb_chanban_list(channel_name, &bans, &ban_count) != LMDB_SUCCESS) {
+        return 0;
+    }
+
+    for (i = 0; i < ban_count; i++) {
+        if (!bans[i]) continue;
+
+        if (!cs_json_extract_string(bans[i], "mask", value_buf, sizeof(value_buf)))
+            continue;
+        if (!cs_json_extract_string(bans[i], "owner", owner_buf, sizeof(owner_buf)))
+            continue;
+
+        time_t set_time = (time_t)cs_json_extract_int(bans[i], "set");
+        time_t triggered = (time_t)cs_json_extract_int(bans[i], "triggered");
+        time_t expires = (time_t)cs_json_extract_int(bans[i], "expires");
+
+        /* Skip expired bans */
+        if (expires && expires < now)
+            continue;
+
+        cs_json_extract_string(bans[i], "reason", reason_buf, sizeof(reason_buf));
+
+        add_channel_ban(cData, value_buf, owner_buf, set_time, triggered, expires,
+                       reason_buf[0] ? reason_buf : "No reason");
+        loaded++;
+    }
+
+    x3_lmdb_free_chanban_list(bans, ban_count);
+    return loaded;
+}
+
+/**
+ * Read a single channel from LMDB and register it
+ */
+static int
+chanserv_lmdb_read_channel(const char *channel_name)
+{
+    char json_buf[16384];
+    char value_buf[1024];
+    char modes_buf[MAXLEN];
+    struct chanNode *cNode;
+    struct chanData *cData;
+    int lvlOpts_arr[NUM_LEVEL_OPTIONS];
+    int chOpts_arr[NUM_CHAR_OPTIONS];
+    int rc;
+    enum levelOption lvlOpt;
+    enum charOption chOpt;
+
+    /* Read core channel data */
+    rc = x3_lmdb_chanreg_get(channel_name, json_buf, sizeof(json_buf));
+    if (rc != LMDB_SUCCESS) {
+        return -1;
+    }
+
+    /* Get registrar (required) */
+    if (!cs_json_extract_string(json_buf, "registrar", value_buf, sizeof(value_buf))) {
+        strcpy(value_buf, "<unknown>");
+    }
+
+    /* Create channel node */
+    cNode = AddChannel(channel_name, now, NULL, NULL, NULL);
+    if (!cNode) {
+        log_module(CS_LOG, LOG_ERROR, "LMDB: Unable to create channel %s.", channel_name);
+        return -1;
+    }
+
+    /* Register the channel */
+    cData = register_channel(cNode, value_buf);
+    if (!cData) {
+        log_module(CS_LOG, LOG_ERROR, "LMDB: Unable to register channel %s.", channel_name);
+        return -1;
+    }
+
+    /* Load timestamps */
+    cData->registered = (time_t)cs_json_extract_int(json_buf, "registered");
+    cData->visited = (time_t)cs_json_extract_int(json_buf, "visited");
+    cData->ownerTransfer = (time_t)cs_json_extract_int(json_buf, "ownerTransfer");
+
+    /* Load numeric fields */
+    cData->max = (unsigned int)cs_json_extract_int(json_buf, "max");
+    cData->maxsetinfo = (unsigned int)cs_json_extract_int(json_buf, "maxsetinfo");
+    cData->flags = (unsigned int)cs_json_extract_int(json_buf, "flags");
+
+    /* Load string fields */
+    if (cs_json_extract_string(json_buf, "topic", value_buf, sizeof(value_buf)) && value_buf[0]) {
+        cData->topic = strdup(value_buf);
+    }
+    if (cs_json_extract_string(json_buf, "greeting", value_buf, sizeof(value_buf)) && value_buf[0]) {
+        cData->greeting = strdup(value_buf);
+    }
+    if (cs_json_extract_string(json_buf, "user_greeting", value_buf, sizeof(value_buf)) && value_buf[0]) {
+        cData->user_greeting = strdup(value_buf);
+    }
+    if (cs_json_extract_string(json_buf, "topic_mask", value_buf, sizeof(value_buf)) && value_buf[0]) {
+        cData->topic_mask = strdup(value_buf);
+    }
+
+    /* Load lvlOpts array */
+    memset(lvlOpts_arr, 0, sizeof(lvlOpts_arr));
+    cs_json_extract_int_array(json_buf, "lvlOpts", lvlOpts_arr, NUM_LEVEL_OPTIONS);
+    for (lvlOpt = 0; lvlOpt < NUM_LEVEL_OPTIONS; ++lvlOpt) {
+        cData->lvlOpts[lvlOpt] = (unsigned short)lvlOpts_arr[lvlOpt];
+    }
+
+    /* Load chOpts array */
+    memset(chOpts_arr, 0, sizeof(chOpts_arr));
+    cs_json_extract_int_array(json_buf, "chOpts", chOpts_arr, NUM_CHAR_OPTIONS);
+    for (chOpt = 0; chOpt < NUM_CHAR_OPTIONS; ++chOpt) {
+        cData->chOpts[chOpt] = (char)chOpts_arr[chOpt];
+    }
+
+    /* Load channel modes */
+    if (cs_json_extract_string(json_buf, "modes", modes_buf, sizeof(modes_buf)) && modes_buf[0]) {
+        char *argv[10];
+        unsigned int argc = split_line(modes_buf, 0, ArrayLength(argv), argv);
+        if (argc > 0) {
+            struct mod_chanmode *modes = mod_chanmode_parse(cNode, argv, argc, MCP_KEY_FREE, 0);
+            if (modes) {
+                cData->modes = *modes;
+                if (off_channel > 0)
+                    cData->modes.modes_set |= MODE_REGISTERED;
+                if (cData->modes.argc > 1)
+                    cData->modes.argc = 1;
+                mod_chanmode_announce(chanserv, cNode, &cData->modes);
+                mod_chanmode_free(modes);
+            }
+        }
+    }
+
+    /* Join ChanServ to channel if needed */
+    if ((!off_channel || !IsOffChannel(cData)) && !IsSuspended(cData)) {
+        struct mod_chanmode change;
+        mod_chanmode_init(&change);
+        change.argc = 1;
+        change.args[0].mode = MODE_CHANOP;
+        change.args[0].u.member = AddChannelUser(chanserv, cNode);
+        mod_chanmode_announce(chanserv, cNode, &change);
+    }
+
+    /* Load channel users from LMDB */
+    chanserv_lmdb_read_users(cData, channel_name);
+
+    /* Check if channel has users */
+    if (!cData->users && !IsProtected(cData)) {
+        log_module(CS_LOG, LOG_ERROR, "LMDB: Channel %s has no users, unregistering.", channel_name);
+        unregister_channel(cData, "has empty user list.");
+        return -1;
+    }
+
+    /* Load channel bans from LMDB */
+    chanserv_lmdb_read_bans(cData, channel_name);
+
+    return 0;
+}
+
+/**
+ * Callback for LMDB prefix iteration - reads channels
+ */
+static int
+lmdb_channel_read_callback(const char *key, const char *value, void *ctx)
+{
+    const char *channel_name;
+    (void)value;
+    (void)ctx;
+
+    /* Key format is "chanreg:#channel" */
+    if (strncmp(key, LMDB_PREFIX_CHANREG, strlen(LMDB_PREFIX_CHANREG)) == 0) {
+        channel_name = key + strlen(LMDB_PREFIX_CHANREG);
+        chanserv_lmdb_read_channel(channel_name);
+    }
+    return 0; /* Continue iteration */
+}
+
+/**
+ * Read all channels from LMDB instead of SAXDB
+ */
+static int
+chanserv_lmdb_read_all(void)
+{
+    int count;
+
+    if (!x3_lmdb_is_available()) {
+        log_module(CS_LOG, LOG_ERROR, "LMDB not available for SAXDB-optional read");
+        return -1;
+    }
+
+    log_module(CS_LOG, LOG_INFO, "Reading ChanServ data from LMDB (SAXDB disabled)");
+
+    count = x3_lmdb_prefix_iterate(LMDB_DB_CHANNELS, LMDB_PREFIX_CHANREG,
+                                   lmdb_channel_read_callback, NULL);
+
+    if (count >= 0) {
+        log_module(CS_LOG, LOG_INFO, "Loaded %d channels from LMDB", count);
+    }
+
+    return count >= 0 ? 0 : -1;
 }
 #endif /* WITH_LMDB */
 
