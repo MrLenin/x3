@@ -2285,7 +2285,7 @@ int x3_lmdb_certexp_set(const char *fingerprint, time_t cert_expires)
         return LMDB_ERROR;
     }
 
-    rc = mdb_put(txn, dbi_accounts, &mkey, &mdata, 0);
+    rc = mdb_put(txn, dbi_metadata, &mkey, &mdata, 0);
     if (rc != 0) {
         mdb_txn_abort(txn);
         return LMDB_ERROR;
@@ -2317,7 +2317,7 @@ int x3_lmdb_certexp_get(const char *fingerprint, time_t *cert_expires_out)
         return LMDB_ERROR;
     }
 
-    rc = mdb_get(txn, dbi_accounts, &mkey, &mdata);
+    rc = mdb_get(txn, dbi_metadata, &mkey, &mdata);
     if (rc != 0) {
         mdb_txn_abort(txn);
         return (rc == MDB_NOTFOUND) ? LMDB_NOT_FOUND : LMDB_ERROR;
@@ -2353,7 +2353,7 @@ int x3_lmdb_certexp_delete(const char *fingerprint)
         return LMDB_ERROR;
     }
 
-    rc = mdb_del(txn, dbi_accounts, &mkey, NULL);
+    rc = mdb_del(txn, dbi_metadata, &mkey, NULL);
     if (rc != 0 && rc != MDB_NOTFOUND) {
         mdb_txn_abort(txn);
         return LMDB_ERROR;
