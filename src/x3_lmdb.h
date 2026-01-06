@@ -58,6 +58,12 @@ enum lmdb_error {
 #define LMDB_PREFIX_GAG "gag:"            /* Gag: mask → JSON {owner, reason, expires} */
 #define LMDB_PREFIX_ALERT "alert:"        /* Alert: name → JSON {discrim, owner, reaction, ...} */
 #define LMDB_PREFIX_GLOBAL "global:"      /* Global message: id → JSON {flags, posted, duration, from, message} */
+#define LMDB_PREFIX_MODCMD_BOT "modbot:"  /* Bot definition: nick → JSON {trigger, description, hostname, modes, privileged} */
+#define LMDB_PREFIX_MODCMD_CMD "modcmd:"  /* Service command: service:cmdname → JSON {command, aliased, oper_access, ...} */
+#define LMDB_PREFIX_MODCMD_HELP "modhelp:" /* Helpfile binding: service → JSON array of module names */
+#define LMDB_PREFIX_MEMO_ACCT "memoacct:" /* Memo account settings: handle → JSON {flags, limit} */
+#define LMDB_PREFIX_MEMO "memo:"          /* Memo: id → JSON {sent, recipient, from, message, read, reciept} */
+#define LMDB_PREFIX_MEMO_HIST "memohist:" /* Memo history: id → JSON {sent, recipient, from} */
 
 /* Metadata entry for iteration */
 struct lmdb_metadata_entry {
@@ -1389,6 +1395,150 @@ int x3_lmdb_global_delete(const char *id);
  */
 int x3_lmdb_global_clear(void);
 
+/* ========== ModCmd Data ========== */
+
+/**
+ * Set bot definition
+ * @param nick Bot nick
+ * @param json_data JSON data
+ * @return LMDB_SUCCESS on success, LMDB_ERROR on failure
+ */
+int x3_lmdb_modbot_set(const char *nick, const char *json_data);
+
+/**
+ * Get bot definition
+ * @param nick Bot nick
+ * @param json_out Buffer for JSON data
+ * @param json_size Size of buffer
+ * @return LMDB_SUCCESS on success, LMDB_NOT_FOUND if not found, LMDB_ERROR on failure
+ */
+int x3_lmdb_modbot_get(const char *nick, char *json_out, size_t json_size);
+
+/**
+ * Delete bot definition
+ * @param nick Bot nick
+ * @return LMDB_SUCCESS on success, LMDB_NOT_FOUND if not found, LMDB_ERROR on failure
+ */
+int x3_lmdb_modbot_delete(const char *nick);
+
+/**
+ * Set service command binding
+ * @param service Service nick
+ * @param cmdname Command name
+ * @param json_data JSON data
+ * @return LMDB_SUCCESS on success, LMDB_ERROR on failure
+ */
+int x3_lmdb_modcmd_set(const char *service, const char *cmdname, const char *json_data);
+
+/**
+ * Get service command binding
+ * @param service Service nick
+ * @param cmdname Command name
+ * @param json_out Buffer for JSON data
+ * @param json_size Size of buffer
+ * @return LMDB_SUCCESS on success, LMDB_NOT_FOUND if not found, LMDB_ERROR on failure
+ */
+int x3_lmdb_modcmd_get(const char *service, const char *cmdname, char *json_out, size_t json_size);
+
+/**
+ * Delete service command binding
+ * @param service Service nick
+ * @param cmdname Command name
+ * @return LMDB_SUCCESS on success, LMDB_NOT_FOUND if not found, LMDB_ERROR on failure
+ */
+int x3_lmdb_modcmd_delete(const char *service, const char *cmdname);
+
+/**
+ * Clear all command bindings for a service
+ * @param service Service nick
+ * @return Number of entries deleted, LMDB_ERROR on failure
+ */
+int x3_lmdb_modcmd_clear_service(const char *service);
+
+/**
+ * Set helpfile bindings for a service
+ * @param service Service nick
+ * @param json_data JSON array of module names
+ * @return LMDB_SUCCESS on success, LMDB_ERROR on failure
+ */
+int x3_lmdb_modhelp_set(const char *service, const char *json_data);
+
+/**
+ * Get helpfile bindings for a service
+ * @param service Service nick
+ * @param json_out Buffer for JSON data
+ * @param json_size Size of buffer
+ * @return LMDB_SUCCESS on success, LMDB_NOT_FOUND if not found, LMDB_ERROR on failure
+ */
+int x3_lmdb_modhelp_get(const char *service, char *json_out, size_t json_size);
+
+/* ========== MemoServ Data ========== */
+
+/**
+ * Set memo account settings
+ * @param handle Account handle
+ * @param json_data JSON data
+ * @return LMDB_SUCCESS on success, LMDB_ERROR on failure
+ */
+int x3_lmdb_memo_acct_set(const char *handle, const char *json_data);
+
+/**
+ * Get memo account settings
+ * @param handle Account handle
+ * @param json_out Buffer for JSON data
+ * @param json_size Size of buffer
+ * @return LMDB_SUCCESS on success, LMDB_NOT_FOUND if not found, LMDB_ERROR on failure
+ */
+int x3_lmdb_memo_acct_get(const char *handle, char *json_out, size_t json_size);
+
+/**
+ * Set memo
+ * @param id Memo ID (as string)
+ * @param json_data JSON data
+ * @return LMDB_SUCCESS on success, LMDB_ERROR on failure
+ */
+int x3_lmdb_memo_set(const char *id, const char *json_data);
+
+/**
+ * Get memo
+ * @param id Memo ID (as string)
+ * @param json_out Buffer for JSON data
+ * @param json_size Size of buffer
+ * @return LMDB_SUCCESS on success, LMDB_NOT_FOUND if not found, LMDB_ERROR on failure
+ */
+int x3_lmdb_memo_get(const char *id, char *json_out, size_t json_size);
+
+/**
+ * Delete memo
+ * @param id Memo ID (as string)
+ * @return LMDB_SUCCESS on success, LMDB_NOT_FOUND if not found, LMDB_ERROR on failure
+ */
+int x3_lmdb_memo_delete(const char *id);
+
+/**
+ * Set memo history entry
+ * @param id History ID (as string)
+ * @param json_data JSON data
+ * @return LMDB_SUCCESS on success, LMDB_ERROR on failure
+ */
+int x3_lmdb_memo_hist_set(const char *id, const char *json_data);
+
+/**
+ * Get memo history entry
+ * @param id History ID (as string)
+ * @param json_out Buffer for JSON data
+ * @param json_size Size of buffer
+ * @return LMDB_SUCCESS on success, LMDB_NOT_FOUND if not found, LMDB_ERROR on failure
+ */
+int x3_lmdb_memo_hist_get(const char *id, char *json_out, size_t json_size);
+
+/**
+ * Delete memo history entry
+ * @param id History ID (as string)
+ * @return LMDB_SUCCESS on success, LMDB_NOT_FOUND if not found, LMDB_ERROR on failure
+ */
+int x3_lmdb_memo_hist_delete(const char *id);
+
 /* ========== SAXDB Configuration ========== */
 
 /**
@@ -1539,6 +1689,23 @@ void init_x3_lmdb(void);
 #define x3_lmdb_global_get(i, j, s)     (-2)
 #define x3_lmdb_global_delete(i)        (-2)
 #define x3_lmdb_global_clear()          (-1)
+#define x3_lmdb_modbot_set(n, j)        (-1)
+#define x3_lmdb_modbot_get(n, j, s)     (-2)
+#define x3_lmdb_modbot_delete(n)        (-2)
+#define x3_lmdb_modcmd_set(s, c, j)     (-1)
+#define x3_lmdb_modcmd_get(s, c, j, sz) (-2)
+#define x3_lmdb_modcmd_delete(s, c)     (-2)
+#define x3_lmdb_modcmd_clear_service(s) (-1)
+#define x3_lmdb_modhelp_set(s, j)       (-1)
+#define x3_lmdb_modhelp_get(s, j, sz)   (-2)
+#define x3_lmdb_memo_acct_set(h, j)     (-1)
+#define x3_lmdb_memo_acct_get(h, j, s)  (-2)
+#define x3_lmdb_memo_set(i, j)          (-1)
+#define x3_lmdb_memo_get(i, j, s)       (-2)
+#define x3_lmdb_memo_delete(i)          (-2)
+#define x3_lmdb_memo_hist_set(i, j)     (-1)
+#define x3_lmdb_memo_hist_get(i, j, s)  (-2)
+#define x3_lmdb_memo_hist_delete(i)     (-2)
 #define x3_lmdb_saxdb_enabled()         (1)
 #define x3_lmdb_set_saxdb_enabled(e)    do {} while(0)
 #define init_x3_lmdb()                  do {} while(0)

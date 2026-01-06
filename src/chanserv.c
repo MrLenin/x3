@@ -9918,7 +9918,7 @@ chanserv_version_read(struct dict *section)
     log_module(CS_LOG, LOG_DEBUG, "Chanserv db version is %d.", chanserv_read_version);
 }
 
-#ifdef WITH_LMDB
+#if defined(WITH_LMDB) && defined(HAVE_JANSSON_H)
 static int chanserv_lmdb_read_all(void);
 #endif
 
@@ -9928,7 +9928,7 @@ chanserv_saxdb_read(struct dict *database)
     struct dict *section;
     dict_iterator_t it;
 
-#ifdef WITH_LMDB
+#if defined(WITH_LMDB) && defined(HAVE_JANSSON_H)
     /* If SAXDB is disabled, read from LMDB instead */
     if (!x3_lmdb_saxdb_enabled() && x3_lmdb_is_available()) {
         return chanserv_lmdb_read_all();
@@ -10170,7 +10170,7 @@ write_dnrs_helper(struct saxdb_context *ctx, struct dict *dnrs)
     }
 }
 
-#ifdef WITH_LMDB
+#if defined(WITH_LMDB) && defined(HAVE_JANSSON_H)
 static void chanserv_lmdb_write_all(void);
 #endif
 
@@ -10204,7 +10204,7 @@ chanserv_saxdb_write(struct saxdb_context *ctx)
         chanserv_write_channel(ctx, channel);
     saxdb_end_record(ctx);
 
-#ifdef WITH_LMDB
+#if defined(WITH_LMDB) && defined(HAVE_JANSSON_H)
     /* Dual-write to LMDB for SAXDB-optional migration */
     chanserv_lmdb_write_all();
 #endif
@@ -10212,22 +10212,18 @@ chanserv_saxdb_write(struct saxdb_context *ctx)
     return 0;
 }
 
-#ifdef WITH_LMDB
+#if defined(WITH_LMDB) && defined(HAVE_JANSSON_H)
 /**
  * Write a single channel to LMDB (dual-write for SAXDB-optional migration)
  */
 static void
 chanserv_lmdb_write_channel(struct chanData *channel)
 {
-    char json_buf[16384];
+    json_t *obj, *lvlOpts_arr, *chOpts_arr, *user_obj, *ban_obj;
+    char *json_str;
     char modes_buf[MAXLEN];
-    char flags_str[33];
-    char lvlopts_buf[1024];
-    char chopts_buf[128];
     struct userData *uData;
     struct banData *bData;
-    int offset = 0;
-    unsigned int i;
     enum levelOption lvlOpt;
     enum charOption chOpt;
 
@@ -10235,27 +10231,19 @@ chanserv_lmdb_write_channel(struct chanData *channel)
         return;
     }
 
-    /* Build lvlOpts JSON array */
-    offset = 0;
-    lvlopts_buf[offset++] = '[';
-    for (lvlOpt = 0; lvlOpt < NUM_LEVEL_OPTIONS; ++lvlOpt) {
-        if (lvlOpt > 0) lvlopts_buf[offset++] = ',';
-        offset += snprintf(lvlopts_buf + offset, sizeof(lvlopts_buf) - offset,
-                          "%u", channel->lvlOpts[lvlOpt]);
-    }
-    lvlopts_buf[offset++] = ']';
-    lvlopts_buf[offset] = '\0';
-
-    /* Build chOpts JSON array */
-    offset = 0;
-    chopts_buf[offset++] = '[';
-    for (chOpt = 0; chOpt < NUM_CHAR_OPTIONS; ++chOpt) {
-        if (chOpt > 0) chopts_buf[offset++] = ',';
-        offset += snprintf(chopts_buf + offset, sizeof(chopts_buf) - offset,
-                          "%d", (int)channel->chOpts[chOpt]);
-    }
-    chopts_buf[offset++] = ']';
-    chopts_buf[offset] = '\0';
+    /* Build channel JSON object */
+    obj = json_object();
+    json_object_set_new(obj, "registered", json_integer((json_int_t)channel->registered));
+    json_object_set_new(obj, "visited", json_integer((json_int_t)channel->visited));
+    json_object_set_new(obj, "max", json_integer(channel->max));
+    json_object_set_new(obj, "flags", json_integer(channel->flags));
+    json_object_set_new(obj, "topic", json_string(channel->topic ? channel->topic : ""));
+    json_object_set_new(obj, "registrar", json_string(channel->registrar ? channel->registrar : ""));
+    json_object_set_new(obj, "greeting", json_string(channel->greeting ? channel->greeting : ""));
+    json_object_set_new(obj, "user_greeting", json_string(channel->user_greeting ? channel->user_greeting : ""));
+    json_object_set_new(obj, "topic_mask", json_string(channel->topic_mask ? channel->topic_mask : ""));
+    json_object_set_new(obj, "ownerTransfer", json_integer((json_int_t)channel->ownerTransfer));
+    json_object_set_new(obj, "maxsetinfo", json_integer(channel->maxsetinfo));
 
     /* Format modes */
     if (channel->modes.modes_set || channel->modes.modes_clear) {
@@ -10263,68 +10251,69 @@ chanserv_lmdb_write_channel(struct chanData *channel)
     } else {
         modes_buf[0] = '\0';
     }
+    json_object_set_new(obj, "modes", json_string(modes_buf));
 
-    /* Convert flags to string for JSON */
-    snprintf(flags_str, sizeof(flags_str), "%u", channel->flags);
+    /* Build lvlOpts JSON array */
+    lvlOpts_arr = json_array();
+    for (lvlOpt = 0; lvlOpt < NUM_LEVEL_OPTIONS; ++lvlOpt) {
+        json_array_append_new(lvlOpts_arr, json_integer(channel->lvlOpts[lvlOpt]));
+    }
+    json_object_set_new(obj, "lvlOpts", lvlOpts_arr);
 
-    /* Build channel JSON */
-    snprintf(json_buf, sizeof(json_buf),
-        "{\"registered\":%lu,\"visited\":%lu,\"max\":%u,\"flags\":%s,"
-        "\"topic\":\"%s\",\"registrar\":\"%s\",\"greeting\":\"%s\","
-        "\"user_greeting\":\"%s\",\"topic_mask\":\"%s\",\"modes\":\"%s\","
-        "\"ownerTransfer\":%lu,\"maxsetinfo\":%u,\"lvlOpts\":%s,\"chOpts\":%s}",
-        (unsigned long)channel->registered,
-        (unsigned long)channel->visited,
-        channel->max,
-        flags_str,
-        channel->topic ? channel->topic : "",
-        channel->registrar ? channel->registrar : "",
-        channel->greeting ? channel->greeting : "",
-        channel->user_greeting ? channel->user_greeting : "",
-        channel->topic_mask ? channel->topic_mask : "",
-        modes_buf,
-        (unsigned long)channel->ownerTransfer,
-        channel->maxsetinfo,
-        lvlopts_buf,
-        chopts_buf);
+    /* Build chOpts JSON array */
+    chOpts_arr = json_array();
+    for (chOpt = 0; chOpt < NUM_CHAR_OPTIONS; ++chOpt) {
+        json_array_append_new(chOpts_arr, json_integer((int)channel->chOpts[chOpt]));
+    }
+    json_object_set_new(obj, "chOpts", chOpts_arr);
 
-    /* Store channel registration */
-    x3_lmdb_chanreg_set(channel->channel->name, json_buf);
+    /* Serialize and store channel registration */
+    json_str = json_dumps(obj, JSON_COMPACT);
+    if (json_str) {
+        x3_lmdb_chanreg_set(channel->channel->name, json_str);
+        free(json_str);
+    }
+    json_decref(obj);
 
     /* Store channel users */
     for (uData = channel->users; uData; uData = uData->next) {
         if (!uData->handle || !uData->handle->handle) continue;
 
-        snprintf(json_buf, sizeof(json_buf),
-            "{\"access\":%u,\"seen\":%lu,\"flags\":%u,\"expires\":%lu,"
-            "\"accessexpiry\":%lu,\"clvlexpiry\":%lu,\"lastaccess\":%u,"
-            "\"info\":\"%s\"}",
-            uData->access,
-            (unsigned long)uData->seen,
-            uData->flags,
-            (unsigned long)uData->expires,
-            (unsigned long)uData->accessexpiry,
-            (unsigned long)uData->clvlexpiry,
-            uData->lastaccess,
-            uData->info ? uData->info : "");
+        user_obj = json_object();
+        json_object_set_new(user_obj, "access", json_integer(uData->access));
+        json_object_set_new(user_obj, "seen", json_integer((json_int_t)uData->seen));
+        json_object_set_new(user_obj, "flags", json_integer(uData->flags));
+        json_object_set_new(user_obj, "expires", json_integer((json_int_t)uData->expires));
+        json_object_set_new(user_obj, "accessexpiry", json_integer((json_int_t)uData->accessexpiry));
+        json_object_set_new(user_obj, "clvlexpiry", json_integer((json_int_t)uData->clvlexpiry));
+        json_object_set_new(user_obj, "lastaccess", json_integer(uData->lastaccess));
+        json_object_set_new(user_obj, "info", json_string(uData->info ? uData->info : ""));
 
-        x3_lmdb_chanuser_reg_set(channel->channel->name, uData->handle->handle, json_buf);
+        json_str = json_dumps(user_obj, JSON_COMPACT);
+        if (json_str) {
+            x3_lmdb_chanuser_reg_set(channel->channel->name, uData->handle->handle, json_str);
+            free(json_str);
+        }
+        json_decref(user_obj);
     }
 
     /* Store channel bans */
     x3_lmdb_chanban_clear(channel->channel->name); /* Clear existing, rebuild */
-    for (bData = channel->bans, i = 0; bData; bData = bData->next, i++) {
-        snprintf(json_buf, sizeof(json_buf),
-            "{\"mask\":\"%s\",\"owner\":\"%s\",\"reason\":\"%s\","
-            "\"set\":%lu,\"triggered\":%lu,\"expires\":%lu}",
-            bData->mask,
-            bData->owner,
-            bData->reason ? bData->reason : "",
-            (unsigned long)bData->set,
-            (unsigned long)bData->triggered,
-            (unsigned long)bData->expires);
+    for (bData = channel->bans; bData; bData = bData->next) {
+        ban_obj = json_object();
+        json_object_set_new(ban_obj, "mask", json_string(bData->mask));
+        json_object_set_new(ban_obj, "owner", json_string(bData->owner));
+        json_object_set_new(ban_obj, "reason", json_string(bData->reason ? bData->reason : ""));
+        json_object_set_new(ban_obj, "set", json_integer((json_int_t)bData->set));
+        json_object_set_new(ban_obj, "triggered", json_integer((json_int_t)bData->triggered));
+        json_object_set_new(ban_obj, "expires", json_integer((json_int_t)bData->expires));
 
-        x3_lmdb_chanban_add(channel->channel->name, json_buf);
+        json_str = json_dumps(ban_obj, JSON_COMPACT);
+        if (json_str) {
+            x3_lmdb_chanban_add(channel->channel->name, json_str);
+            free(json_str);
+        }
+        json_decref(ban_obj);
     }
 }
 
@@ -10342,71 +10331,6 @@ chanserv_lmdb_write_all(void)
 
 /* ========== LMDB Read Functions (SAXDB-optional) ========== */
 
-/**
- * Simple JSON string value extractor for chanserv
- */
-static char *
-cs_json_extract_string(char *json, const char *key, char *out, size_t out_size)
-{
-    char search_key[128];
-    char *p, *end;
-
-    snprintf(search_key, sizeof(search_key), "\"%s\":\"", key);
-    p = strstr(json, search_key);
-    if (!p) return NULL;
-
-    p += strlen(search_key);
-    end = strchr(p, '"');
-    if (!end) return NULL;
-
-    size_t len = end - p;
-    if (len >= out_size) len = out_size - 1;
-    memcpy(out, p, len);
-    out[len] = '\0';
-    return out;
-}
-
-/**
- * Simple JSON integer value extractor for chanserv
- */
-static long
-cs_json_extract_int(const char *json, const char *key)
-{
-    char search_key[128];
-    const char *p;
-
-    snprintf(search_key, sizeof(search_key), "\"%s\":", key);
-    p = strstr(json, search_key);
-    if (!p) return 0;
-
-    p += strlen(search_key);
-    return strtol(p, NULL, 10);
-}
-
-/**
- * Extract JSON array of integers (for lvlOpts/chOpts)
- * Returns number of elements extracted
- */
-static int
-cs_json_extract_int_array(const char *json, const char *key, int *out, int max_count)
-{
-    char search_key[128];
-    const char *p;
-    int count = 0;
-
-    snprintf(search_key, sizeof(search_key), "\"%s\":[", key);
-    p = strstr(json, search_key);
-    if (!p) return 0;
-
-    p += strlen(search_key);
-    while (*p && *p != ']' && count < max_count) {
-        while (*p == ' ' || *p == ',') p++;
-        if (*p == ']') break;
-        out[count++] = (int)strtol(p, (char **)&p, 10);
-    }
-    return count;
-}
-
 /* Context for reading channel users from LMDB */
 struct chanuser_read_ctx {
     struct chanData *cData;
@@ -10416,18 +10340,18 @@ struct chanuser_read_ctx {
 };
 
 /**
- * Callback for reading channel users from LMDB
+ * Callback for reading channel users from LMDB (using jansson)
  */
 static int
 chanuser_read_callback(const char *key, const char *value, void *ctx)
 {
     struct chanuser_read_ctx *rctx = (struct chanuser_read_ctx *)ctx;
-    char json_buf[4096];
-    char value_buf[512];
     const char *handle_name;
     struct handle_info *handle;
     struct userData *uData;
-    size_t value_len;
+    json_t *root;
+    json_error_t error;
+    const char *info_str;
 
     /* Extract handle name from key (chanuser:#channel:handle) */
     handle_name = key + rctx->prefix_len;
@@ -10440,28 +10364,26 @@ chanuser_read_callback(const char *key, const char *value, void *ctx)
         return 0; /* Continue iteration */
     }
 
-    /* Copy JSON data safely */
-    value_len = strlen(value);
-    if (value_len >= sizeof(json_buf)) {
-        log_module(CS_LOG, LOG_WARNING, "LMDB: User data too large for %s in %s",
-                   handle_name, rctx->channel_name);
+    /* Parse JSON with jansson */
+    root = json_loads(value, 0, &error);
+    if (!root) {
+        log_module(CS_LOG, LOG_WARNING, "LMDB: Failed to parse user JSON for %s in %s: %s",
+                   handle_name, rctx->channel_name, error.text);
         return 0;
     }
-    memcpy(json_buf, value, value_len + 1);
 
-    unsigned short access = (unsigned short)cs_json_extract_int(json_buf, "access");
-    time_t seen = (time_t)cs_json_extract_int(json_buf, "seen");
-    value_buf[0] = '\0';
-    cs_json_extract_string(json_buf, "info", value_buf, sizeof(value_buf));
+    unsigned short access = (unsigned short)json_integer_value(json_object_get(root, "access"));
+    time_t seen = (time_t)json_integer_value(json_object_get(root, "seen"));
+    info_str = json_string_value(json_object_get(root, "info"));
 
     uData = add_channel_user(rctx->cData, handle, access, seen,
-                             value_buf[0] ? value_buf : NULL, 0);
+                             (info_str && info_str[0]) ? info_str : NULL, 0);
     if (uData) {
-        uData->flags = (unsigned int)cs_json_extract_int(json_buf, "flags");
-        uData->expires = (time_t)cs_json_extract_int(json_buf, "expires");
-        uData->accessexpiry = (time_t)cs_json_extract_int(json_buf, "accessexpiry");
-        uData->clvlexpiry = (time_t)cs_json_extract_int(json_buf, "clvlexpiry");
-        uData->lastaccess = (unsigned short)cs_json_extract_int(json_buf, "lastaccess");
+        uData->flags = (unsigned int)json_integer_value(json_object_get(root, "flags"));
+        uData->expires = (time_t)json_integer_value(json_object_get(root, "expires"));
+        uData->accessexpiry = (time_t)json_integer_value(json_object_get(root, "accessexpiry"));
+        uData->clvlexpiry = (time_t)json_integer_value(json_object_get(root, "clvlexpiry"));
+        uData->lastaccess = (unsigned short)json_integer_value(json_object_get(root, "lastaccess"));
 
         if (uData->accessexpiry > 0)
             timeq_add(uData->accessexpiry, chanserv_expire_tempuser, uData);
@@ -10476,6 +10398,7 @@ chanuser_read_callback(const char *key, const char *value, void *ctx)
         rctx->count++;
     }
 
+    json_decref(root);
     return 0; /* Continue iteration */
 }
 
@@ -10501,7 +10424,7 @@ chanserv_lmdb_read_users(struct chanData *cData, const char *channel_name)
 }
 
 /**
- * Read channel bans from LMDB for a specific channel
+ * Read channel bans from LMDB for a specific channel (using jansson)
  */
 static int
 chanserv_lmdb_read_bans(struct chanData *cData, const char *channel_name)
@@ -10510,35 +10433,46 @@ chanserv_lmdb_read_bans(struct chanData *cData, const char *channel_name)
     unsigned int ban_count = 0;
     unsigned int i;
     int loaded = 0;
-    char value_buf[512];
-    char owner_buf[128];
-    char reason_buf[512];
 
     if (x3_lmdb_chanban_list(channel_name, &bans, &ban_count) != LMDB_SUCCESS) {
         return 0;
     }
 
     for (i = 0; i < ban_count; i++) {
+        json_t *root;
+        json_error_t error;
+        const char *mask_str, *owner_str, *reason_str;
+        time_t set_time, triggered, expires;
+
         if (!bans[i]) continue;
 
-        if (!cs_json_extract_string(bans[i], "mask", value_buf, sizeof(value_buf)))
-            continue;
-        if (!cs_json_extract_string(bans[i], "owner", owner_buf, sizeof(owner_buf)))
-            continue;
+        root = json_loads(bans[i], 0, &error);
+        if (!root) continue;
 
-        time_t set_time = (time_t)cs_json_extract_int(bans[i], "set");
-        time_t triggered = (time_t)cs_json_extract_int(bans[i], "triggered");
-        time_t expires = (time_t)cs_json_extract_int(bans[i], "expires");
+        mask_str = json_string_value(json_object_get(root, "mask"));
+        owner_str = json_string_value(json_object_get(root, "owner"));
+        if (!mask_str || !owner_str) {
+            json_decref(root);
+            continue;
+        }
+
+        set_time = (time_t)json_integer_value(json_object_get(root, "set"));
+        triggered = (time_t)json_integer_value(json_object_get(root, "triggered"));
+        expires = (time_t)json_integer_value(json_object_get(root, "expires"));
 
         /* Skip expired bans */
-        if (expires && expires < now)
+        if (expires && expires < now) {
+            json_decref(root);
             continue;
+        }
 
-        cs_json_extract_string(bans[i], "reason", reason_buf, sizeof(reason_buf));
+        reason_str = json_string_value(json_object_get(root, "reason"));
 
-        add_channel_ban(cData, value_buf, owner_buf, set_time, triggered, expires,
-                       reason_buf[0] ? reason_buf : "No reason");
+        add_channel_ban(cData, mask_str, owner_str, set_time, triggered, expires,
+                       (reason_str && reason_str[0]) ? reason_str : "No reason");
         loaded++;
+
+        json_decref(root);
     }
 
     x3_lmdb_free_chanban_list(bans, ban_count);
@@ -10546,21 +10480,20 @@ chanserv_lmdb_read_bans(struct chanData *cData, const char *channel_name)
 }
 
 /**
- * Read a single channel from LMDB and register it
+ * Read a single channel from LMDB and register it (using jansson)
  */
 static int
 chanserv_lmdb_read_channel(const char *channel_name)
 {
     char json_buf[16384];
-    char value_buf[1024];
     char modes_buf[MAXLEN];
     struct chanNode *cNode;
     struct chanData *cData;
-    int lvlOpts_arr[NUM_LEVEL_OPTIONS];
-    int chOpts_arr[NUM_CHAR_OPTIONS];
     int rc;
-    enum levelOption lvlOpt;
-    enum charOption chOpt;
+    json_t *root, *arr;
+    json_error_t error;
+    const char *str_val;
+    size_t arr_idx;
 
     /* Read core channel data */
     rc = x3_lmdb_chanreg_get(channel_name, json_buf, sizeof(json_buf));
@@ -10568,65 +10501,81 @@ chanserv_lmdb_read_channel(const char *channel_name)
         return -1;
     }
 
+    /* Parse JSON with jansson */
+    root = json_loads(json_buf, 0, &error);
+    if (!root) {
+        log_module(CS_LOG, LOG_WARNING, "LMDB: Failed to parse channel JSON for %s: %s",
+                   channel_name, error.text);
+        return -1;
+    }
+
     /* Get registrar (required) */
-    if (!cs_json_extract_string(json_buf, "registrar", value_buf, sizeof(value_buf))) {
-        strcpy(value_buf, "<unknown>");
+    str_val = json_string_value(json_object_get(root, "registrar"));
+    if (!str_val || !str_val[0]) {
+        str_val = "<unknown>";
     }
 
     /* Create channel node */
     cNode = AddChannel(channel_name, now, NULL, NULL, NULL);
     if (!cNode) {
         log_module(CS_LOG, LOG_ERROR, "LMDB: Unable to create channel %s.", channel_name);
+        json_decref(root);
         return -1;
     }
 
     /* Register the channel */
-    cData = register_channel(cNode, value_buf);
+    cData = register_channel(cNode, str_val);
     if (!cData) {
         log_module(CS_LOG, LOG_ERROR, "LMDB: Unable to register channel %s.", channel_name);
+        json_decref(root);
         return -1;
     }
 
     /* Load timestamps */
-    cData->registered = (time_t)cs_json_extract_int(json_buf, "registered");
-    cData->visited = (time_t)cs_json_extract_int(json_buf, "visited");
-    cData->ownerTransfer = (time_t)cs_json_extract_int(json_buf, "ownerTransfer");
+    cData->registered = (time_t)json_integer_value(json_object_get(root, "registered"));
+    cData->visited = (time_t)json_integer_value(json_object_get(root, "visited"));
+    cData->ownerTransfer = (time_t)json_integer_value(json_object_get(root, "ownerTransfer"));
 
     /* Load numeric fields */
-    cData->max = (unsigned int)cs_json_extract_int(json_buf, "max");
-    cData->maxsetinfo = (unsigned int)cs_json_extract_int(json_buf, "maxsetinfo");
-    cData->flags = (unsigned int)cs_json_extract_int(json_buf, "flags");
+    cData->max = (unsigned int)json_integer_value(json_object_get(root, "max"));
+    cData->maxsetinfo = (unsigned int)json_integer_value(json_object_get(root, "maxsetinfo"));
+    cData->flags = (unsigned int)json_integer_value(json_object_get(root, "flags"));
 
     /* Load string fields */
-    if (cs_json_extract_string(json_buf, "topic", value_buf, sizeof(value_buf)) && value_buf[0]) {
-        cData->topic = strdup(value_buf);
-    }
-    if (cs_json_extract_string(json_buf, "greeting", value_buf, sizeof(value_buf)) && value_buf[0]) {
-        cData->greeting = strdup(value_buf);
-    }
-    if (cs_json_extract_string(json_buf, "user_greeting", value_buf, sizeof(value_buf)) && value_buf[0]) {
-        cData->user_greeting = strdup(value_buf);
-    }
-    if (cs_json_extract_string(json_buf, "topic_mask", value_buf, sizeof(value_buf)) && value_buf[0]) {
-        cData->topic_mask = strdup(value_buf);
-    }
+    str_val = json_string_value(json_object_get(root, "topic"));
+    if (str_val && str_val[0])
+        cData->topic = strdup(str_val);
+    str_val = json_string_value(json_object_get(root, "greeting"));
+    if (str_val && str_val[0])
+        cData->greeting = strdup(str_val);
+    str_val = json_string_value(json_object_get(root, "user_greeting"));
+    if (str_val && str_val[0])
+        cData->user_greeting = strdup(str_val);
+    str_val = json_string_value(json_object_get(root, "topic_mask"));
+    if (str_val && str_val[0])
+        cData->topic_mask = strdup(str_val);
 
     /* Load lvlOpts array */
-    memset(lvlOpts_arr, 0, sizeof(lvlOpts_arr));
-    cs_json_extract_int_array(json_buf, "lvlOpts", lvlOpts_arr, NUM_LEVEL_OPTIONS);
-    for (lvlOpt = 0; lvlOpt < NUM_LEVEL_OPTIONS; ++lvlOpt) {
-        cData->lvlOpts[lvlOpt] = (unsigned short)lvlOpts_arr[lvlOpt];
+    arr = json_object_get(root, "lvlOpts");
+    if (json_is_array(arr)) {
+        for (arr_idx = 0; arr_idx < json_array_size(arr) && arr_idx < NUM_LEVEL_OPTIONS; arr_idx++) {
+            cData->lvlOpts[arr_idx] = (unsigned short)json_integer_value(json_array_get(arr, arr_idx));
+        }
     }
 
     /* Load chOpts array */
-    memset(chOpts_arr, 0, sizeof(chOpts_arr));
-    cs_json_extract_int_array(json_buf, "chOpts", chOpts_arr, NUM_CHAR_OPTIONS);
-    for (chOpt = 0; chOpt < NUM_CHAR_OPTIONS; ++chOpt) {
-        cData->chOpts[chOpt] = (char)chOpts_arr[chOpt];
+    arr = json_object_get(root, "chOpts");
+    if (json_is_array(arr)) {
+        for (arr_idx = 0; arr_idx < json_array_size(arr) && arr_idx < NUM_CHAR_OPTIONS; arr_idx++) {
+            cData->chOpts[arr_idx] = (char)json_integer_value(json_array_get(arr, arr_idx));
+        }
     }
 
     /* Load channel modes */
-    if (cs_json_extract_string(json_buf, "modes", modes_buf, sizeof(modes_buf)) && modes_buf[0]) {
+    str_val = json_string_value(json_object_get(root, "modes"));
+    if (str_val && str_val[0]) {
+        strncpy(modes_buf, str_val, sizeof(modes_buf) - 1);
+        modes_buf[sizeof(modes_buf) - 1] = '\0';
         char *argv[10];
         unsigned int argc = split_line(modes_buf, 0, ArrayLength(argv), argv);
         if (argc > 0) {
@@ -10642,6 +10591,8 @@ chanserv_lmdb_read_channel(const char *channel_name)
             }
         }
     }
+
+    json_decref(root);
 
     /* Join ChanServ to channel if needed */
     if ((!off_channel || !IsOffChannel(cData)) && !IsSuspended(cData)) {
@@ -10711,7 +10662,7 @@ chanserv_lmdb_read_all(void)
 
     return count >= 0 ? 0 : -1;
 }
-#endif /* WITH_LMDB */
+#endif /* WITH_LMDB && HAVE_JANSSON_H */
 
 static void
 chanserv_db_cleanup(UNUSED_ARG(void *extra)) {

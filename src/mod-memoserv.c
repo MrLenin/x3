@@ -47,6 +47,13 @@
 #include "mail.h"
 #include "timeq.h"
 
+#ifdef WITH_LMDB
+#include "x3_lmdb.h"
+#ifdef HAVE_JANSSON_H
+#include <jansson.h>
+#endif
+#endif
+
 #define KEY_MAIN_ACCOUNTS "accounts"
 #define KEY_FLAGS "flags"
 #define KEY_LIMIT "limit"
@@ -1158,11 +1165,291 @@ memoserv_history_read(const char *key, struct record_data *hir)
     return 0;
 }
 
+#if defined(WITH_LMDB) && defined(HAVE_JANSSON_H)
+/* LMDB write helper: Write memo account settings */
+static void
+memoserv_lmdb_write_account(struct memo_account *ma)
+{
+    json_t *obj;
+    char *json_str;
+
+    obj = json_object();
+    if (!obj) return;
+
+    json_object_set_new(obj, "flags", json_integer(ma->flags));
+    json_object_set_new(obj, "limit", json_integer(ma->limit));
+
+    json_str = json_dumps(obj, JSON_COMPACT);
+    if (json_str) {
+        x3_lmdb_memo_acct_set(ma->handle->handle, json_str);
+        free(json_str);
+    }
+    json_decref(obj);
+}
+
+/* LMDB write helper: Write memo */
+static void
+memoserv_lmdb_write_memo(struct memo *memo)
+{
+    json_t *obj;
+    char *json_str;
+    char id_str[32];
+
+    obj = json_object();
+    if (!obj) return;
+
+    snprintf(id_str, sizeof(id_str), "%lu", memo->id);
+    json_object_set_new(obj, "sent", json_integer((json_int_t)memo->sent));
+    json_object_set_new(obj, "id", json_integer((json_int_t)memo->id));
+    json_object_set_new(obj, "recipient", json_string(memo->recipient->handle->handle));
+    json_object_set_new(obj, "from", json_string(memo->sender->handle->handle));
+    json_object_set_new(obj, "message", json_string(memo->message));
+    if (memo->is_read)
+        json_object_set_new(obj, "read", json_integer(1));
+    if (memo->reciept)
+        json_object_set_new(obj, "reciept", json_integer(1));
+
+    json_str = json_dumps(obj, JSON_COMPACT);
+    if (json_str) {
+        x3_lmdb_memo_set(id_str, json_str);
+        free(json_str);
+    }
+    json_decref(obj);
+}
+
+/* LMDB write helper: Write history entry */
+static void
+memoserv_lmdb_write_history(struct history *history)
+{
+    json_t *obj;
+    char *json_str;
+    char id_str[32];
+
+    obj = json_object();
+    if (!obj) return;
+
+    snprintf(id_str, sizeof(id_str), "%lu", history->id);
+    json_object_set_new(obj, "sent", json_integer((json_int_t)history->sent));
+    json_object_set_new(obj, "id", json_integer((json_int_t)history->id));
+    json_object_set_new(obj, "recipient", json_string(history->recipient->handle->handle));
+    json_object_set_new(obj, "from", json_string(history->sender->handle->handle));
+
+    json_str = json_dumps(obj, JSON_COMPACT);
+    if (json_str) {
+        x3_lmdb_memo_hist_set(id_str, json_str);
+        free(json_str);
+    }
+    json_decref(obj);
+}
+
+/* Write all memoserv data to LMDB */
+static void
+memoserv_lmdb_write_all(void)
+{
+    dict_iterator_t it;
+    struct memo_account *ma;
+    struct memo *memo;
+    struct history *history;
+    unsigned int ii;
+
+    /* Write accounts */
+    for (it = dict_first(memos); it; it = iter_next(it)) {
+        ma = iter_data(it);
+        memoserv_lmdb_write_account(ma);
+    }
+
+    /* Write memos */
+    for (it = dict_first(memos); it; it = iter_next(it)) {
+        ma = iter_data(it);
+        for (ii = 0; ii < ma->recvd.used; ++ii) {
+            memo = ma->recvd.list[ii];
+            memoserv_lmdb_write_memo(memo);
+        }
+    }
+
+    /* Write history */
+    for (it = dict_first(historys); it; it = iter_next(it)) {
+        ma = iter_data(it);
+        for (ii = 0; ii < ma->hrecvd.used; ++ii) {
+            history = ma->hrecvd.list[ii];
+            memoserv_lmdb_write_history(history);
+        }
+    }
+}
+
+/* LMDB read callback: Load memo account settings */
+static int
+lmdb_memo_acct_read_callback(const char *key, const char *value, void *ctx)
+{
+    json_t *root;
+    json_error_t error;
+    struct memo_account *ma;
+    struct handle_info *hi;
+    const char *handle;
+
+    (void)ctx;
+
+    /* key is "memoacct:<handle>" */
+    handle = key + strlen(LMDB_PREFIX_MEMO_ACCT);
+
+    if (!(hi = get_handle_info(handle)))
+        return 0;
+
+    ma = dict_find(memos, hi->handle, NULL);
+    if (ma)
+        return 0; /* Already exists */
+
+    root = json_loads(value, 0, &error);
+    if (!root) {
+        log_module(MS_LOG, LOG_ERROR, "Failed to parse LMDB memo account JSON for %s: %s", handle, error.text);
+        return 0;
+    }
+
+    ma = calloc(1, sizeof(*ma));
+    if (!ma) {
+        json_decref(root);
+        return 0;
+    }
+
+    ma->handle = hi;
+    ma->flags = (unsigned int)json_integer_value(json_object_get(root, "flags"));
+    ma->limit = (unsigned int)json_integer_value(json_object_get(root, "limit"));
+
+    dict_insert(memos, ma->handle->handle, ma);
+    dict_insert(historys, ma->handle->handle, ma);
+
+    json_decref(root);
+    return 0;
+}
+
+/* LMDB read callback: Load memo */
+static int
+lmdb_memo_read_callback(const char *key, const char *value, void *ctx)
+{
+    json_t *root;
+    json_error_t error;
+    struct memo *memo;
+    struct handle_info *sender_hi, *recipient_hi;
+    const char *sender_str, *recipient_str, *message;
+    time_t sent;
+    unsigned long id;
+
+    (void)ctx;
+    (void)key;
+
+    root = json_loads(value, 0, &error);
+    if (!root) {
+        log_module(MS_LOG, LOG_ERROR, "Failed to parse LMDB memo JSON: %s", error.text);
+        return 0;
+    }
+
+    sent = (time_t)json_integer_value(json_object_get(root, "sent"));
+    id = (unsigned long)json_integer_value(json_object_get(root, "id"));
+    recipient_str = json_string_value(json_object_get(root, "recipient"));
+    sender_str = json_string_value(json_object_get(root, "from"));
+    message = json_string_value(json_object_get(root, "message"));
+
+    if (!recipient_str || !sender_str || !message) {
+        json_decref(root);
+        return 0;
+    }
+
+    recipient_hi = get_handle_info(recipient_str);
+    sender_hi = get_handle_info(sender_str);
+
+    if (!recipient_hi || !sender_hi) {
+        json_decref(root);
+        return 0;
+    }
+
+    memo = add_memo(sent, memoserv_get_account(recipient_hi), memoserv_get_account(sender_hi), (char *)message, 0);
+    if (memo) {
+        memo->id = id;
+        if (id > memo_id)
+            memo_id = id;
+        if (json_integer_value(json_object_get(root, "read")))
+            memo->is_read = 1;
+        if (json_integer_value(json_object_get(root, "reciept")))
+            memo->reciept = 1;
+    }
+
+    json_decref(root);
+    return 0;
+}
+
+/* LMDB read callback: Load history */
+static int
+lmdb_history_read_callback(const char *key, const char *value, void *ctx)
+{
+    json_t *root;
+    json_error_t error;
+    struct handle_info *sender_hi, *recipient_hi;
+    const char *sender_str, *recipient_str;
+    time_t sent;
+    unsigned long id;
+
+    (void)ctx;
+    (void)key;
+
+    root = json_loads(value, 0, &error);
+    if (!root) {
+        log_module(MS_LOG, LOG_ERROR, "Failed to parse LMDB history JSON: %s", error.text);
+        return 0;
+    }
+
+    sent = (time_t)json_integer_value(json_object_get(root, "sent"));
+    id = (unsigned long)json_integer_value(json_object_get(root, "id"));
+    recipient_str = json_string_value(json_object_get(root, "recipient"));
+    sender_str = json_string_value(json_object_get(root, "from"));
+
+    if (!recipient_str || !sender_str) {
+        json_decref(root);
+        return 0;
+    }
+
+    recipient_hi = get_handle_info(recipient_str);
+    sender_hi = get_handle_info(sender_str);
+
+    if (!recipient_hi || !sender_hi) {
+        json_decref(root);
+        return 0;
+    }
+
+    add_history(sent, memoserv_get_account(recipient_hi), memoserv_get_account(sender_hi), id);
+
+    json_decref(root);
+    return 0;
+}
+
+/* Load all memoserv data from LMDB */
+static int
+memoserv_lmdb_read_all(void)
+{
+    /* Load accounts first */
+    x3_lmdb_prefix_iterate(LMDB_DB_METADATA, LMDB_PREFIX_MEMO_ACCT, lmdb_memo_acct_read_callback, NULL);
+
+    /* Load memos */
+    x3_lmdb_prefix_iterate(LMDB_DB_METADATA, LMDB_PREFIX_MEMO, lmdb_memo_read_callback, NULL);
+
+    /* Load history */
+    x3_lmdb_prefix_iterate(LMDB_DB_METADATA, LMDB_PREFIX_MEMO_HIST, lmdb_history_read_callback, NULL);
+
+    return 0;
+}
+#endif /* WITH_LMDB && HAVE_JANSSON_H */
+
 static int
 memoserv_saxdb_read(struct dict *database)
 {
     struct dict *section;
     dict_iterator_t it;
+
+#if defined(WITH_LMDB) && defined(HAVE_JANSSON_H)
+    /* If SAXDB is disabled, load from LMDB instead */
+    if (!x3_lmdb_saxdb_enabled()) {
+        return memoserv_lmdb_read_all();
+    }
+#endif
 
     if((section = database_get_data(database, KEY_MAIN_ACCOUNTS, RECDB_OBJECT)))
         for(it = dict_first(section); it; it = iter_next(it))
@@ -1270,6 +1557,11 @@ memoserv_saxdb_write(struct saxdb_context *ctx)
         }
     }
     saxdb_end_record(ctx);
+
+#if defined(WITH_LMDB) && defined(HAVE_JANSSON_H)
+    /* Dual-write to LMDB */
+    memoserv_lmdb_write_all();
+#endif
 
     return 0;
 }

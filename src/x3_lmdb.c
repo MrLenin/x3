@@ -6078,4 +6078,212 @@ int x3_lmdb_global_clear(void)
     return x3_lmdb_prefix_delete_all(LMDB_DB_METADATA, LMDB_PREFIX_GLOBAL);
 }
 
+/* ========== ModCmd Data ========== */
+
+int x3_lmdb_modbot_set(const char *nick, const char *json_data)
+{
+    char lmdb_key[LMDB_KEY_BUFFER_SIZE];
+
+    if (!lmdb_initialized || !nick || !json_data) {
+        return LMDB_ERROR;
+    }
+
+    snprintf(lmdb_key, sizeof(lmdb_key), "%s%s", LMDB_PREFIX_MODCMD_BOT, nick);
+    return x3_lmdb_set(LMDB_DB_METADATA, lmdb_key, json_data);
+}
+
+int x3_lmdb_modbot_get(const char *nick, char *json_out, size_t json_size)
+{
+    char lmdb_key[LMDB_KEY_BUFFER_SIZE];
+
+    if (!lmdb_initialized || !nick || !json_out) {
+        return LMDB_ERROR;
+    }
+
+    snprintf(lmdb_key, sizeof(lmdb_key), "%s%s", LMDB_PREFIX_MODCMD_BOT, nick);
+    return x3_lmdb_get(LMDB_DB_METADATA, lmdb_key, json_out, json_size);
+}
+
+int x3_lmdb_modbot_delete(const char *nick)
+{
+    char lmdb_key[LMDB_KEY_BUFFER_SIZE];
+
+    if (!lmdb_initialized || !nick) {
+        return LMDB_ERROR;
+    }
+
+    snprintf(lmdb_key, sizeof(lmdb_key), "%s%s", LMDB_PREFIX_MODCMD_BOT, nick);
+    return x3_lmdb_delete(LMDB_DB_METADATA, lmdb_key);
+}
+
+int x3_lmdb_modcmd_set(const char *service, const char *cmdname, const char *json_data)
+{
+    char lmdb_key[LMDB_KEY_BUFFER_SIZE];
+
+    if (!lmdb_initialized || !service || !cmdname || !json_data) {
+        return LMDB_ERROR;
+    }
+
+    snprintf(lmdb_key, sizeof(lmdb_key), "%s%s:%s", LMDB_PREFIX_MODCMD_CMD, service, cmdname);
+    return x3_lmdb_set(LMDB_DB_METADATA, lmdb_key, json_data);
+}
+
+int x3_lmdb_modcmd_get(const char *service, const char *cmdname, char *json_out, size_t json_size)
+{
+    char lmdb_key[LMDB_KEY_BUFFER_SIZE];
+
+    if (!lmdb_initialized || !service || !cmdname || !json_out) {
+        return LMDB_ERROR;
+    }
+
+    snprintf(lmdb_key, sizeof(lmdb_key), "%s%s:%s", LMDB_PREFIX_MODCMD_CMD, service, cmdname);
+    return x3_lmdb_get(LMDB_DB_METADATA, lmdb_key, json_out, json_size);
+}
+
+int x3_lmdb_modcmd_delete(const char *service, const char *cmdname)
+{
+    char lmdb_key[LMDB_KEY_BUFFER_SIZE];
+
+    if (!lmdb_initialized || !service || !cmdname) {
+        return LMDB_ERROR;
+    }
+
+    snprintf(lmdb_key, sizeof(lmdb_key), "%s%s:%s", LMDB_PREFIX_MODCMD_CMD, service, cmdname);
+    return x3_lmdb_delete(LMDB_DB_METADATA, lmdb_key);
+}
+
+int x3_lmdb_modcmd_clear_service(const char *service)
+{
+    char prefix[LMDB_KEY_BUFFER_SIZE];
+
+    if (!lmdb_initialized || !service) {
+        return LMDB_ERROR;
+    }
+
+    snprintf(prefix, sizeof(prefix), "%s%s:", LMDB_PREFIX_MODCMD_CMD, service);
+    return x3_lmdb_prefix_delete_all(LMDB_DB_METADATA, prefix);
+}
+
+int x3_lmdb_modhelp_set(const char *service, const char *json_data)
+{
+    char lmdb_key[LMDB_KEY_BUFFER_SIZE];
+
+    if (!lmdb_initialized || !service || !json_data) {
+        return LMDB_ERROR;
+    }
+
+    snprintf(lmdb_key, sizeof(lmdb_key), "%s%s", LMDB_PREFIX_MODCMD_HELP, service);
+    return x3_lmdb_set(LMDB_DB_METADATA, lmdb_key, json_data);
+}
+
+int x3_lmdb_modhelp_get(const char *service, char *json_out, size_t json_size)
+{
+    char lmdb_key[LMDB_KEY_BUFFER_SIZE];
+
+    if (!lmdb_initialized || !service || !json_out) {
+        return LMDB_ERROR;
+    }
+
+    snprintf(lmdb_key, sizeof(lmdb_key), "%s%s", LMDB_PREFIX_MODCMD_HELP, service);
+    return x3_lmdb_get(LMDB_DB_METADATA, lmdb_key, json_out, json_size);
+}
+
+/* ========== MemoServ Data ========== */
+
+int x3_lmdb_memo_acct_set(const char *handle, const char *json_data)
+{
+    char lmdb_key[LMDB_KEY_BUFFER_SIZE];
+
+    if (!lmdb_initialized || !handle || !json_data) {
+        return LMDB_ERROR;
+    }
+
+    snprintf(lmdb_key, sizeof(lmdb_key), "%s%s", LMDB_PREFIX_MEMO_ACCT, handle);
+    return x3_lmdb_set(LMDB_DB_METADATA, lmdb_key, json_data);
+}
+
+int x3_lmdb_memo_acct_get(const char *handle, char *json_out, size_t json_size)
+{
+    char lmdb_key[LMDB_KEY_BUFFER_SIZE];
+
+    if (!lmdb_initialized || !handle || !json_out) {
+        return LMDB_ERROR;
+    }
+
+    snprintf(lmdb_key, sizeof(lmdb_key), "%s%s", LMDB_PREFIX_MEMO_ACCT, handle);
+    return x3_lmdb_get(LMDB_DB_METADATA, lmdb_key, json_out, json_size);
+}
+
+int x3_lmdb_memo_set(const char *id, const char *json_data)
+{
+    char lmdb_key[LMDB_KEY_BUFFER_SIZE];
+
+    if (!lmdb_initialized || !id || !json_data) {
+        return LMDB_ERROR;
+    }
+
+    snprintf(lmdb_key, sizeof(lmdb_key), "%s%s", LMDB_PREFIX_MEMO, id);
+    return x3_lmdb_set(LMDB_DB_METADATA, lmdb_key, json_data);
+}
+
+int x3_lmdb_memo_get(const char *id, char *json_out, size_t json_size)
+{
+    char lmdb_key[LMDB_KEY_BUFFER_SIZE];
+
+    if (!lmdb_initialized || !id || !json_out) {
+        return LMDB_ERROR;
+    }
+
+    snprintf(lmdb_key, sizeof(lmdb_key), "%s%s", LMDB_PREFIX_MEMO, id);
+    return x3_lmdb_get(LMDB_DB_METADATA, lmdb_key, json_out, json_size);
+}
+
+int x3_lmdb_memo_delete(const char *id)
+{
+    char lmdb_key[LMDB_KEY_BUFFER_SIZE];
+
+    if (!lmdb_initialized || !id) {
+        return LMDB_ERROR;
+    }
+
+    snprintf(lmdb_key, sizeof(lmdb_key), "%s%s", LMDB_PREFIX_MEMO, id);
+    return x3_lmdb_delete(LMDB_DB_METADATA, lmdb_key);
+}
+
+int x3_lmdb_memo_hist_set(const char *id, const char *json_data)
+{
+    char lmdb_key[LMDB_KEY_BUFFER_SIZE];
+
+    if (!lmdb_initialized || !id || !json_data) {
+        return LMDB_ERROR;
+    }
+
+    snprintf(lmdb_key, sizeof(lmdb_key), "%s%s", LMDB_PREFIX_MEMO_HIST, id);
+    return x3_lmdb_set(LMDB_DB_METADATA, lmdb_key, json_data);
+}
+
+int x3_lmdb_memo_hist_get(const char *id, char *json_out, size_t json_size)
+{
+    char lmdb_key[LMDB_KEY_BUFFER_SIZE];
+
+    if (!lmdb_initialized || !id || !json_out) {
+        return LMDB_ERROR;
+    }
+
+    snprintf(lmdb_key, sizeof(lmdb_key), "%s%s", LMDB_PREFIX_MEMO_HIST, id);
+    return x3_lmdb_get(LMDB_DB_METADATA, lmdb_key, json_out, json_size);
+}
+
+int x3_lmdb_memo_hist_delete(const char *id)
+{
+    char lmdb_key[LMDB_KEY_BUFFER_SIZE];
+
+    if (!lmdb_initialized || !id) {
+        return LMDB_ERROR;
+    }
+
+    snprintf(lmdb_key, sizeof(lmdb_key), "%s%s", LMDB_PREFIX_MEMO_HIST, id);
+    return x3_lmdb_delete(LMDB_DB_METADATA, lmdb_key);
+}
+
 #endif /* WITH_LMDB */

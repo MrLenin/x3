@@ -27,6 +27,13 @@
 #include "timeq.h"
 #include "version.h"
 
+#ifdef WITH_LMDB
+#include "x3_lmdb.h"
+#ifdef HAVE_JANSSON_H
+#include <jansson.h>
+#endif
+#endif
+
 
 struct pending_template {
     struct svccmd *cmd;
@@ -2167,6 +2174,181 @@ modcmd_saxdb_write_command(struct saxdb_context *ctx, struct svccmd *cmd) {
     saxdb_end_record(ctx);
 }
 
+#if defined(WITH_LMDB) && defined(HAVE_JANSSON_H)
+/* LMDB dual-write helper: Write bot definition to LMDB */
+static void
+modcmd_lmdb_write_bot(struct service *service)
+{
+    json_t *obj;
+    char *json_str;
+    char modes[32];
+
+    obj = json_object();
+    if (!obj) return;
+
+    if (service->trigger) {
+        char trigger_str[2] = {service->trigger, '\0'};
+        json_object_set_new(obj, "trigger", json_string(trigger_str));
+    }
+    json_object_set_new(obj, "description", json_string(service->bot->info));
+    json_object_set_new(obj, "hostname", json_string(service->bot->hostname));
+    if (service->bot->modes) {
+        irc_user_modes(service->bot, modes, sizeof(modes));
+        json_object_set_new(obj, "modes", json_string(modes));
+    }
+    if (service->privileged) {
+        json_object_set_new(obj, "privileged", json_integer(1));
+    }
+
+    json_str = json_dumps(obj, JSON_COMPACT);
+    if (json_str) {
+        x3_lmdb_modbot_set(service->bot->nick, json_str);
+        free(json_str);
+    }
+    json_decref(obj);
+}
+
+/* LMDB dual-write helper: Write command binding to LMDB */
+static void
+modcmd_lmdb_write_command(struct service *service, struct svccmd *cmd)
+{
+    json_t *obj, *alias_arr;
+    char *json_str;
+    char buf[MAXLEN];
+    struct svccmd *template = cmd->command->defaults;
+    unsigned int nn, len, pos;
+
+    obj = json_object();
+    if (!obj) return;
+
+    /* command: module.command */
+    snprintf(buf, sizeof(buf), "%s.%s", cmd->command->parent->name, cmd->command->name);
+    json_object_set_new(obj, "command", json_string(buf));
+
+    /* aliased */
+    if (cmd->alias.used) {
+        alias_arr = json_array();
+        for (nn = 0; nn < cmd->alias.used; nn++) {
+            json_array_append_new(alias_arr, json_string(cmd->alias.list[nn]));
+        }
+        json_object_set_new(obj, "aliased", alias_arr);
+    }
+
+    /* oper_access (only if different from template) */
+    if (cmd->min_opserv_level != template->min_opserv_level) {
+        json_object_set_new(obj, "oper_access", json_integer(cmd->min_opserv_level));
+    }
+
+    /* channel_access (only if different from template) */
+    if (cmd->min_channel_access != template->min_channel_access) {
+        json_object_set_new(obj, "channel_access", json_integer(cmd->min_channel_access));
+    }
+
+    /* flags (only if different from template) */
+    if (cmd->flags != template->flags) {
+        if (cmd->flags) {
+            for (nn = pos = 0; modcmd_flags[nn].name; ++nn) {
+                const struct modcmd_flag *flag = &modcmd_flags[nn];
+                if (cmd->flags & flag->flag) {
+                    buf[pos++] = '+';
+                    len = strlen(flag->name);
+                    memcpy(buf + pos, flag->name, len);
+                    pos += len;
+                    buf[pos++] = ',';
+                }
+            }
+            if (pos > 0) pos--; /* remove trailing comma */
+        } else {
+            pos = 0;
+        }
+        buf[pos] = 0;
+        json_object_set_new(obj, "flags", json_string(buf));
+    }
+
+    /* account_flags (only if different from template) */
+    if ((cmd->req_account_flags != template->req_account_flags)
+        || (cmd->deny_account_flags != template->deny_account_flags)) {
+        pos = 0;
+        if (cmd->req_account_flags) {
+            buf[pos++] = '+';
+            for (nn = 0; nn < 32; nn++) {
+                if (cmd->req_account_flags & (1 << nn))
+                    buf[pos++] = handle_flags[nn];
+            }
+        }
+        if (cmd->deny_account_flags) {
+            buf[pos++] = '-';
+            for (nn = 0; nn < 32; nn++) {
+                if (cmd->deny_account_flags & (1 << nn))
+                    buf[pos++] = handle_flags[nn];
+            }
+        }
+        buf[pos] = 0;
+        json_object_set_new(obj, "account_flags", json_string(buf));
+    }
+
+    json_str = json_dumps(obj, JSON_COMPACT);
+    if (json_str) {
+        x3_lmdb_modcmd_set(service->bot->nick, cmd->name, json_str);
+        free(json_str);
+    }
+    json_decref(obj);
+}
+
+/* LMDB dual-write helper: Write helpfile bindings to LMDB */
+static void
+modcmd_lmdb_write_helpfiles(struct service *service)
+{
+    json_t *arr;
+    char *json_str;
+    unsigned int ii;
+
+    arr = json_array();
+    if (!arr) return;
+
+    for (ii = 0; ii < service->modules.used; ++ii) {
+        json_array_append_new(arr, json_string(service->modules.list[ii]->name));
+    }
+
+    json_str = json_dumps(arr, JSON_COMPACT);
+    if (json_str) {
+        x3_lmdb_modhelp_set(service->bot->nick, json_str);
+        free(json_str);
+    }
+    json_decref(arr);
+}
+
+/* Write all modcmd data to LMDB */
+static void
+modcmd_lmdb_write_all(void)
+{
+    dict_iterator_t it, it2;
+    struct service *service;
+
+    /* Write all bots */
+    for (it = dict_first(services); it; it = iter_next(it)) {
+        service = iter_data(it);
+        modcmd_lmdb_write_bot(service);
+    }
+
+    /* Write all service commands */
+    for (it = dict_first(services); it; it = iter_next(it)) {
+        service = iter_data(it);
+        /* Clear existing commands for this service first */
+        x3_lmdb_modcmd_clear_service(service->bot->nick);
+        for (it2 = dict_first(service->commands); it2; it2 = iter_next(it2)) {
+            modcmd_lmdb_write_command(service, iter_data(it2));
+        }
+    }
+
+    /* Write all helpfile bindings */
+    for (it = dict_first(services); it; it = iter_next(it)) {
+        service = iter_data(it);
+        modcmd_lmdb_write_helpfiles(service);
+    }
+}
+#endif /* WITH_LMDB && HAVE_JANSSON_H */
+
 static int
 modcmd_saxdb_write(struct saxdb_context *ctx) {
     struct string_list slist;
@@ -2220,6 +2402,11 @@ modcmd_saxdb_write(struct saxdb_context *ctx) {
     if (slist.list)
         free(slist.list);
     saxdb_end_record(ctx);
+
+#if defined(WITH_LMDB) && defined(HAVE_JANSSON_H)
+    /* Dual-write to LMDB */
+    modcmd_lmdb_write_all();
+#endif
 
     return 0;
 }
@@ -2452,12 +2639,235 @@ service_make_alias(struct service *service, const char *alias, ...) {
 
 static int saxdb_present;
 
+#if defined(WITH_LMDB) && defined(HAVE_JANSSON_H)
+/* LMDB read helper: Load bot definition from JSON */
+static int
+lmdb_bot_read_callback(const char *key, const char *value, void *ctx)
+{
+    json_t *root;
+    json_error_t error;
+    const char *nick, *desc, *hostname, *modes, *trigger_str;
+    struct service *svc;
+    char trigger;
+
+    (void)ctx; /* unused */
+
+    /* key is "modbot:<nick>" - extract nick */
+    nick = key + strlen(LMDB_PREFIX_MODCMD_BOT);
+
+    root = json_loads(value, 0, &error);
+    if (!root) {
+        log_module(MAIN_LOG, LOG_ERROR, "Failed to parse LMDB modbot JSON for %s: %s", nick, error.text);
+        return 0;
+    }
+
+    svc = service_find(nick);
+    desc = json_string_value(json_object_get(root, "description"));
+    hostname = json_string_value(json_object_get(root, "hostname"));
+    modes = json_string_value(json_object_get(root, "modes"));
+    trigger_str = json_string_value(json_object_get(root, "trigger"));
+    trigger = trigger_str ? trigger_str[0] : '\0';
+
+    if (desc) {
+        if (!svc) {
+            svc = service_register(AddLocalUser(nick, nick, hostname, desc, modes));
+        } else if (hostname) {
+            strcpy(svc->bot->hostname, hostname);
+        }
+        if (trigger && svc) {
+            svc->trigger = trigger;
+        }
+        if (json_integer_value(json_object_get(root, "privileged")) && svc) {
+            svc->privileged = 1;
+        }
+    }
+
+    json_decref(root);
+    return 0;
+}
+
+/* LMDB read helper: Load command from JSON */
+static int
+lmdb_cmd_read_callback(const char *key, const char *value, void *ctx)
+{
+    json_t *root, *arr;
+    json_error_t error;
+    struct service *service = (struct service *)ctx;
+    struct svccmd *svccmd;
+    struct module *module;
+    struct modcmd *modcmd;
+    const char *cmdname, *str, *sep;
+    char buf[MAXLEN];
+    char intbuf[32];
+    size_t ii;
+
+    /* key is "modcmd:<service>:<cmdname>" - extract cmdname */
+    /* Skip past prefix and service name to get cmdname */
+    cmdname = strrchr(key, ':');
+    if (!cmdname) return 0;
+    cmdname++; /* skip past ':' */
+
+    root = json_loads(value, 0, &error);
+    if (!root) {
+        log_module(MAIN_LOG, LOG_ERROR, "Failed to parse LMDB modcmd JSON for %s: %s", key, error.text);
+        return 0;
+    }
+
+    str = json_string_value(json_object_get(root, "command"));
+    if (!str) {
+        log_module(MAIN_LOG, LOG_ERROR, "Missing command in LMDB modcmd %s", key);
+        json_decref(root);
+        return 0;
+    }
+
+    sep = strchr(str, '.');
+    if (!sep) {
+        log_module(MAIN_LOG, LOG_ERROR, "Invalid command %s in LMDB modcmd %s", str, key);
+        json_decref(root);
+        return 0;
+    }
+
+    memcpy(buf, str, sep - str);
+    buf[sep - str] = 0;
+    if (!(module = module_find(buf))) {
+        log_module(MAIN_LOG, LOG_ERROR, "Unknown module %s in LMDB modcmd %s", buf, key);
+        json_decref(root);
+        return 0;
+    }
+    if (!(modcmd = dict_find(module->commands, sep + 1, NULL))) {
+        log_module(MAIN_LOG, LOG_ERROR, "Unknown command %s in module %s for LMDB modcmd %s", sep + 1, module->name, key);
+        json_decref(root);
+        return 0;
+    }
+
+    /* Create and configure the command */
+    svccmd = calloc(1, sizeof(*svccmd));
+    svccmd_insert(service, strdup(cmdname), svccmd, modcmd);
+    svccmd_copy_rules(svccmd, modcmd->defaults);
+
+    /* Load aliased array */
+    arr = json_object_get(root, "aliased");
+    if (json_is_array(arr)) {
+        svccmd->alias.used = svccmd->alias.size = json_array_size(arr);
+        svccmd->alias.list = calloc(svccmd->alias.size, sizeof(svccmd->alias.list[0]));
+        for (ii = 0; ii < json_array_size(arr); ii++) {
+            const char *alias_str = json_string_value(json_array_get(arr, ii));
+            if (alias_str)
+                svccmd->alias.list[ii] = strdup(alias_str);
+        }
+    }
+
+    /* Load account_flags */
+    str = json_string_value(json_object_get(root, "account_flags"));
+    if (str) {
+        svccmd->req_account_flags = svccmd->deny_account_flags = 0;
+        svccmd_configure(svccmd, NULL, service->bot, "account_flags", str);
+    }
+
+    /* Load flags */
+    str = json_string_value(json_object_get(root, "flags"));
+    if (str) {
+        svccmd->flags = 0;
+        svccmd_configure(svccmd, NULL, service->bot, "flags", str);
+    }
+
+    /* Load oper_access */
+    if (json_object_get(root, "oper_access")) {
+        snprintf(intbuf, sizeof(intbuf), "%lld", (long long)json_integer_value(json_object_get(root, "oper_access")));
+        svccmd_configure(svccmd, NULL, service->bot, "oper_access", intbuf);
+    }
+
+    /* Load channel_access */
+    if (json_object_get(root, "channel_access")) {
+        snprintf(intbuf, sizeof(intbuf), "%lld", (long long)json_integer_value(json_object_get(root, "channel_access")));
+        svccmd_configure(svccmd, NULL, service->bot, "channel_access", intbuf);
+    }
+
+    json_decref(root);
+    return 0;
+}
+
+/* LMDB read helper: Load helpfile bindings from JSON */
+static int
+lmdb_help_read_callback(const char *key, const char *value, void *ctx)
+{
+    json_t *root;
+    json_error_t error;
+    struct service *service;
+    struct module *module;
+    const char *svcname;
+    size_t ii;
+
+    (void)ctx; /* unused */
+
+    /* key is "modhelp:<service>" - extract service name */
+    svcname = key + strlen(LMDB_PREFIX_MODCMD_HELP);
+
+    service = service_find(svcname);
+    if (!service) return 0;
+
+    root = json_loads(value, 0, &error);
+    if (!root || !json_is_array(root)) {
+        log_module(MAIN_LOG, LOG_ERROR, "Failed to parse LMDB modhelp JSON for %s: %s", svcname, error.text);
+        if (root) json_decref(root);
+        return 0;
+    }
+
+    service->modules.used = 0;
+    for (ii = 0; ii < json_array_size(root); ii++) {
+        const char *modname = json_string_value(json_array_get(root, ii));
+        if (!modname) continue;
+        if (!(module = dict_find(modules, modname, NULL))) {
+            log_module(MAIN_LOG, LOG_ERROR, "Unknown module '%s' in LMDB helpfiles/%s", modname, svcname);
+            continue;
+        }
+        module_list_append(&service->modules, module);
+    }
+
+    json_decref(root);
+    return 0;
+}
+
+/* Load all modcmd data from LMDB */
+static int
+modcmd_lmdb_read_all(void)
+{
+    dict_iterator_t it;
+    struct service *service;
+    char prefix[128];
+
+    /* Load bots */
+    x3_lmdb_prefix_iterate(LMDB_DB_METADATA, LMDB_PREFIX_MODCMD_BOT, lmdb_bot_read_callback, NULL);
+
+    /* Load commands for each service */
+    for (it = dict_first(services); it; it = iter_next(it)) {
+        service = iter_data(it);
+        snprintf(prefix, sizeof(prefix), "%s%s:", LMDB_PREFIX_MODCMD_CMD, service->bot->nick);
+        x3_lmdb_prefix_iterate(LMDB_DB_METADATA, prefix, lmdb_cmd_read_callback, service);
+    }
+
+    /* Load helpfiles */
+    x3_lmdb_prefix_iterate(LMDB_DB_METADATA, LMDB_PREFIX_MODCMD_HELP, lmdb_help_read_callback, NULL);
+
+    return 0;
+}
+#endif /* WITH_LMDB && HAVE_JANSSON_H */
+
 static int
 modcmd_saxdb_read(struct dict *db) {
     struct dict *db2;
     dict_iterator_t it, it2;
     struct record_data *rd, *rd2;
     struct service *service;
+
+#if defined(WITH_LMDB) && defined(HAVE_JANSSON_H)
+    /* If SAXDB is disabled, load from LMDB instead */
+    if (!x3_lmdb_saxdb_enabled()) {
+        modcmd_lmdb_read_all();
+        saxdb_present = 1;
+        return 0;
+    }
+#endif
 
     modcmd_load_bots(database_get_data(db, "bots", RECDB_OBJECT), 1);
     db2 = database_get_data(db, "services", RECDB_OBJECT);
