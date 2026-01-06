@@ -3516,6 +3516,7 @@ void init_x3_lmdb(void)
     const char *snapshot_str;
     const char *retention_str;
     const char *snapshot_path_str;
+    const char *saxdb_str;
 
     /* Get database path from configuration */
     dbpath = conf_get_data("services/x3/lmdb_path", RECDB_QSTRING);
@@ -3525,6 +3526,12 @@ void init_x3_lmdb(void)
 
     if (x3_lmdb_init(dbpath, 0) == LMDB_SUCCESS) {
         log_module(MAIN_LOG, LOG_INFO, "x3_lmdb: Module initialized");
+
+        /* Configure SAXDB mode - default is enabled for backward compatibility */
+        saxdb_str = conf_get_data("services/x3/saxdb_enabled", RECDB_QSTRING);
+        if (saxdb_str) {
+            x3_lmdb_set_saxdb_enabled(atoi(saxdb_str));
+        }
         reg_exit_func(lmdb_exit_handler, NULL);
 
         /* Configure purge interval from config (default 1 hour) */
@@ -4875,5 +4882,712 @@ int x3_lmdb_scram_acct_delete_all(const char *account)
 }
 
 #endif /* WITH_SSL */
+
+/* ========== Prefix Iteration Functions ========== */
+
+/**
+ * Iterate over all keys with a given prefix
+ */
+int x3_lmdb_prefix_iterate(const char *db, const char *prefix,
+                           lmdb_prefix_callback_t callback, void *ctx)
+{
+    MDB_txn *txn;
+    MDB_cursor *cursor;
+    MDB_dbi dbi;
+    MDB_val key, data;
+    int rc, count = 0;
+    size_t prefix_len;
+
+    if (!lmdb_initialized || !prefix || !callback) {
+        return LMDB_ERROR;
+    }
+
+    prefix_len = strlen(prefix);
+
+    /* Determine database */
+    if (!db || strcmp(db, LMDB_DB_ACCOUNTS) == 0) {
+        dbi = dbi_accounts;
+    } else if (strcmp(db, LMDB_DB_CHANNELS) == 0) {
+        dbi = dbi_channels;
+    } else if (strcmp(db, LMDB_DB_METADATA) == 0) {
+        dbi = dbi_metadata;
+    } else {
+        return LMDB_ERROR;
+    }
+
+    rc = mdb_txn_begin(lmdb_env, NULL, MDB_RDONLY, &txn);
+    if (rc != 0) {
+        return LMDB_ERROR;
+    }
+
+    rc = mdb_cursor_open(txn, dbi, &cursor);
+    if (rc != 0) {
+        mdb_txn_abort(txn);
+        return LMDB_ERROR;
+    }
+
+    /* Position cursor at first key >= prefix */
+    key.mv_size = prefix_len;
+    key.mv_data = (void *)prefix;
+    rc = mdb_cursor_get(cursor, &key, &data, MDB_SET_RANGE);
+
+    while (rc == 0) {
+        /* Check if key still has our prefix */
+        if (key.mv_size < prefix_len ||
+            memcmp(key.mv_data, prefix, prefix_len) != 0) {
+            break;
+        }
+
+        /* Make null-terminated copies for callback */
+        char key_buf[LMDB_KEY_BUFFER_SIZE];
+        char val_buf[LMDB_MAX_VALUE_SIZE];
+
+        if (key.mv_size >= sizeof(key_buf) || data.mv_size >= sizeof(val_buf)) {
+            rc = mdb_cursor_get(cursor, &key, &data, MDB_NEXT);
+            continue;
+        }
+
+        memcpy(key_buf, key.mv_data, key.mv_size);
+        key_buf[key.mv_size] = '\0';
+        memcpy(val_buf, data.mv_data, data.mv_size);
+        val_buf[data.mv_size] = '\0';
+
+        /* Call user callback */
+        int cb_result = callback(key_buf, val_buf, ctx);
+        count++;
+
+        if (cb_result != 0) {
+            break; /* User requested stop */
+        }
+
+        rc = mdb_cursor_get(cursor, &key, &data, MDB_NEXT);
+    }
+
+    mdb_cursor_close(cursor);
+    mdb_txn_abort(txn);
+
+    return count;
+}
+
+/**
+ * Delete all keys with a given prefix
+ */
+int x3_lmdb_prefix_delete_all(const char *db, const char *prefix)
+{
+    MDB_txn *txn;
+    MDB_cursor *cursor;
+    MDB_dbi dbi;
+    MDB_val key, data;
+    int rc, count = 0;
+    size_t prefix_len;
+
+    if (!lmdb_initialized || !prefix) {
+        return LMDB_ERROR;
+    }
+
+    prefix_len = strlen(prefix);
+
+    /* Determine database */
+    if (!db || strcmp(db, LMDB_DB_ACCOUNTS) == 0) {
+        dbi = dbi_accounts;
+    } else if (strcmp(db, LMDB_DB_CHANNELS) == 0) {
+        dbi = dbi_channels;
+    } else if (strcmp(db, LMDB_DB_METADATA) == 0) {
+        dbi = dbi_metadata;
+    } else {
+        return LMDB_ERROR;
+    }
+
+    rc = mdb_txn_begin(lmdb_env, NULL, 0, &txn);
+    if (rc != 0) {
+        return LMDB_ERROR;
+    }
+
+    rc = mdb_cursor_open(txn, dbi, &cursor);
+    if (rc != 0) {
+        mdb_txn_abort(txn);
+        return LMDB_ERROR;
+    }
+
+    /* Position cursor at first key >= prefix */
+    key.mv_size = prefix_len;
+    key.mv_data = (void *)prefix;
+    rc = mdb_cursor_get(cursor, &key, &data, MDB_SET_RANGE);
+
+    while (rc == 0) {
+        /* Check if key still has our prefix */
+        if (key.mv_size < prefix_len ||
+            memcmp(key.mv_data, prefix, prefix_len) != 0) {
+            break;
+        }
+
+        /* Delete current entry */
+        rc = mdb_cursor_del(cursor, 0);
+        if (rc == 0) {
+            count++;
+        }
+
+        /* Move to next (cursor auto-advances after delete) */
+        rc = mdb_cursor_get(cursor, &key, &data, MDB_NEXT);
+    }
+
+    mdb_cursor_close(cursor);
+
+    rc = mdb_txn_commit(txn);
+    if (rc != 0) {
+        return LMDB_ERROR;
+    }
+
+    if (count > 0) {
+        log_module(MAIN_LOG, LOG_DEBUG, "x3_lmdb: Deleted %d entries with prefix '%s'",
+                   count, prefix);
+    }
+
+    return count;
+}
+
+/**
+ * Count all keys with a given prefix
+ */
+int x3_lmdb_prefix_count(const char *db, const char *prefix)
+{
+    MDB_txn *txn;
+    MDB_cursor *cursor;
+    MDB_dbi dbi;
+    MDB_val key, data;
+    int rc, count = 0;
+    size_t prefix_len;
+
+    if (!lmdb_initialized || !prefix) {
+        return LMDB_ERROR;
+    }
+
+    prefix_len = strlen(prefix);
+
+    /* Determine database */
+    if (!db || strcmp(db, LMDB_DB_ACCOUNTS) == 0) {
+        dbi = dbi_accounts;
+    } else if (strcmp(db, LMDB_DB_CHANNELS) == 0) {
+        dbi = dbi_channels;
+    } else if (strcmp(db, LMDB_DB_METADATA) == 0) {
+        dbi = dbi_metadata;
+    } else {
+        return LMDB_ERROR;
+    }
+
+    rc = mdb_txn_begin(lmdb_env, NULL, MDB_RDONLY, &txn);
+    if (rc != 0) {
+        return LMDB_ERROR;
+    }
+
+    rc = mdb_cursor_open(txn, dbi, &cursor);
+    if (rc != 0) {
+        mdb_txn_abort(txn);
+        return LMDB_ERROR;
+    }
+
+    /* Position cursor at first key >= prefix */
+    key.mv_size = prefix_len;
+    key.mv_data = (void *)prefix;
+    rc = mdb_cursor_get(cursor, &key, &data, MDB_SET_RANGE);
+
+    while (rc == 0) {
+        /* Check if key still has our prefix */
+        if (key.mv_size < prefix_len ||
+            memcmp(key.mv_data, prefix, prefix_len) != 0) {
+            break;
+        }
+
+        count++;
+        rc = mdb_cursor_get(cursor, &key, &data, MDB_NEXT);
+    }
+
+    mdb_cursor_close(cursor);
+    mdb_txn_abort(txn);
+
+    return count;
+}
+
+/* ========== SAXDB Configuration ========== */
+
+static int saxdb_enabled_flag = 1; /* Enabled by default for backward compatibility */
+
+int x3_lmdb_saxdb_enabled(void)
+{
+    return saxdb_enabled_flag;
+}
+
+void x3_lmdb_set_saxdb_enabled(int enabled)
+{
+    saxdb_enabled_flag = enabled ? 1 : 0;
+    log_module(MAIN_LOG, LOG_INFO, "x3_lmdb: SAXDB %s",
+               saxdb_enabled_flag ? "enabled" : "disabled (LMDB-only mode)");
+}
+
+/* ========== Core Account Data (SAXDB-optional) ========== */
+
+/**
+ * Store account handle data as JSON
+ */
+int x3_lmdb_handle_set(const char *handle, const char *json_data)
+{
+    char lmdb_key[LMDB_KEY_BUFFER_SIZE];
+
+    if (!lmdb_initialized || !handle || !json_data) {
+        return LMDB_ERROR;
+    }
+
+    snprintf(lmdb_key, sizeof(lmdb_key), "%s%s", LMDB_PREFIX_HANDLE, handle);
+
+    return x3_lmdb_set(LMDB_DB_ACCOUNTS, lmdb_key, json_data);
+}
+
+/**
+ * Get account handle data as JSON
+ */
+int x3_lmdb_handle_get(const char *handle, char *json_out, size_t json_size)
+{
+    char lmdb_key[LMDB_KEY_BUFFER_SIZE];
+
+    if (!lmdb_initialized || !handle || !json_out) {
+        return LMDB_ERROR;
+    }
+
+    snprintf(lmdb_key, sizeof(lmdb_key), "%s%s", LMDB_PREFIX_HANDLE, handle);
+
+    return x3_lmdb_get(LMDB_DB_ACCOUNTS, lmdb_key, json_out, json_size);
+}
+
+/**
+ * Delete account handle data
+ */
+int x3_lmdb_handle_delete(const char *handle)
+{
+    char lmdb_key[LMDB_KEY_BUFFER_SIZE];
+
+    if (!lmdb_initialized || !handle) {
+        return LMDB_ERROR;
+    }
+
+    snprintf(lmdb_key, sizeof(lmdb_key), "%s%s", LMDB_PREFIX_HANDLE, handle);
+
+    return x3_lmdb_delete(LMDB_DB_ACCOUNTS, lmdb_key);
+}
+
+/**
+ * Check if account handle exists
+ */
+int x3_lmdb_handle_exists(const char *handle)
+{
+    char lmdb_key[LMDB_KEY_BUFFER_SIZE];
+    char dummy[64];
+    int rc;
+
+    if (!lmdb_initialized || !handle) {
+        return 0;
+    }
+
+    snprintf(lmdb_key, sizeof(lmdb_key), "%s%s", LMDB_PREFIX_HANDLE, handle);
+
+    rc = x3_lmdb_get(LMDB_DB_ACCOUNTS, lmdb_key, dummy, sizeof(dummy));
+    return (rc == LMDB_SUCCESS) ? 1 : 0;
+}
+
+/**
+ * Register a nick to a handle
+ */
+int x3_lmdb_nick_register(const char *nick, const char *handle)
+{
+    char lmdb_key[LMDB_KEY_BUFFER_SIZE];
+
+    if (!lmdb_initialized || !nick || !handle) {
+        return LMDB_ERROR;
+    }
+
+    snprintf(lmdb_key, sizeof(lmdb_key), "%s%s", LMDB_PREFIX_NICK, nick);
+
+    return x3_lmdb_set(LMDB_DB_ACCOUNTS, lmdb_key, handle);
+}
+
+/**
+ * Get handle for a registered nick
+ */
+int x3_lmdb_nick_get_handle(const char *nick, char *handle_out)
+{
+    char lmdb_key[LMDB_KEY_BUFFER_SIZE];
+    char value_buf[256];
+    int rc;
+
+    if (!lmdb_initialized || !nick || !handle_out) {
+        return LMDB_ERROR;
+    }
+
+    snprintf(lmdb_key, sizeof(lmdb_key), "%s%s", LMDB_PREFIX_NICK, nick);
+
+    rc = x3_lmdb_get(LMDB_DB_ACCOUNTS, lmdb_key, value_buf, sizeof(value_buf));
+    if (rc == LMDB_SUCCESS) {
+        strncpy(handle_out, value_buf, 63);
+        handle_out[63] = '\0';
+    }
+
+    return rc;
+}
+
+/**
+ * Unregister a nick
+ */
+int x3_lmdb_nick_unregister(const char *nick)
+{
+    char lmdb_key[LMDB_KEY_BUFFER_SIZE];
+
+    if (!lmdb_initialized || !nick) {
+        return LMDB_ERROR;
+    }
+
+    snprintf(lmdb_key, sizeof(lmdb_key), "%s%s", LMDB_PREFIX_NICK, nick);
+
+    return x3_lmdb_delete(LMDB_DB_ACCOUNTS, lmdb_key);
+}
+
+/* ========== Account Masks ========== */
+
+/**
+ * Add a mask to an account
+ */
+int x3_lmdb_mask_add(const char *handle, const char *mask)
+{
+    char lmdb_key[LMDB_KEY_BUFFER_SIZE];
+    char count_key[LMDB_KEY_BUFFER_SIZE];
+    char count_buf[32];
+    unsigned int count = 0;
+    int rc;
+
+    if (!lmdb_initialized || !handle || !mask) {
+        return LMDB_ERROR;
+    }
+
+    /* Get current count */
+    snprintf(count_key, sizeof(count_key), "%s%s:count", LMDB_PREFIX_MASK, handle);
+    rc = x3_lmdb_get(LMDB_DB_ACCOUNTS, count_key, count_buf, sizeof(count_buf));
+    if (rc == LMDB_SUCCESS) {
+        count = (unsigned int)strtoul(count_buf, NULL, 10);
+    }
+
+    /* Store mask at next index */
+    snprintf(lmdb_key, sizeof(lmdb_key), "%s%s:%u", LMDB_PREFIX_MASK, handle, count);
+    rc = x3_lmdb_set(LMDB_DB_ACCOUNTS, lmdb_key, mask);
+    if (rc != LMDB_SUCCESS) {
+        return rc;
+    }
+
+    /* Update count */
+    snprintf(count_buf, sizeof(count_buf), "%u", count + 1);
+    return x3_lmdb_set(LMDB_DB_ACCOUNTS, count_key, count_buf);
+}
+
+/**
+ * Delete all masks for an account
+ */
+int x3_lmdb_mask_clear(const char *handle)
+{
+    char prefix[LMDB_KEY_BUFFER_SIZE];
+
+    if (!lmdb_initialized || !handle) {
+        return LMDB_ERROR;
+    }
+
+    snprintf(prefix, sizeof(prefix), "%s%s:", LMDB_PREFIX_MASK, handle);
+    return x3_lmdb_prefix_delete_all(LMDB_DB_ACCOUNTS, prefix);
+}
+
+/**
+ * Callback context for mask list
+ */
+struct mask_list_ctx {
+    char **masks;
+    unsigned int count;
+    unsigned int capacity;
+};
+
+static int mask_list_callback(const char *key, const char *value, void *ctx)
+{
+    struct mask_list_ctx *mctx = ctx;
+
+    /* Skip count keys */
+    if (strstr(key, ":count")) {
+        return 0;
+    }
+
+    if (mctx->count >= mctx->capacity) {
+        mctx->capacity = mctx->capacity ? mctx->capacity * 2 : 16;
+        mctx->masks = realloc(mctx->masks, mctx->capacity * sizeof(char *));
+        if (!mctx->masks) {
+            return -1;
+        }
+    }
+
+    mctx->masks[mctx->count++] = strdup(value);
+    return 0;
+}
+
+/**
+ * List all masks for an account
+ * @param handle Account handle
+ * @param masks_out Output array of masks (caller must free with x3_lmdb_free_mask_list)
+ * @param count_out Number of masks returned
+ * @return LMDB_SUCCESS on success, LMDB_ERROR on failure
+ */
+int x3_lmdb_mask_list(const char *handle, char ***masks_out, unsigned int *count_out)
+{
+    char prefix[LMDB_KEY_BUFFER_SIZE];
+    struct mask_list_ctx ctx = {NULL, 0, 0};
+    int rc;
+
+    if (!lmdb_initialized || !handle || !masks_out || !count_out) {
+        return LMDB_ERROR;
+    }
+
+    snprintf(prefix, sizeof(prefix), "%s%s:", LMDB_PREFIX_MASK, handle);
+    rc = x3_lmdb_prefix_iterate(LMDB_DB_ACCOUNTS, prefix, mask_list_callback, &ctx);
+
+    if (rc < 0) {
+        if (ctx.masks) {
+            unsigned int i;
+            for (i = 0; i < ctx.count; i++) {
+                free(ctx.masks[i]);
+            }
+            free(ctx.masks);
+        }
+        return LMDB_ERROR;
+    }
+
+    *masks_out = ctx.masks;
+    *count_out = ctx.count;
+    return LMDB_SUCCESS;
+}
+
+/**
+ * Free mask list returned by x3_lmdb_mask_list
+ */
+void x3_lmdb_free_mask_list(char **masks, unsigned int count)
+{
+    unsigned int i;
+    if (masks) {
+        for (i = 0; i < count; i++) {
+            free(masks[i]);
+        }
+        free(masks);
+    }
+}
+
+/* ========== Account Ignores ========== */
+
+/**
+ * Add an ignore to an account
+ */
+int x3_lmdb_ignore_add(const char *handle, const char *ignore)
+{
+    char lmdb_key[LMDB_KEY_BUFFER_SIZE];
+    char count_key[LMDB_KEY_BUFFER_SIZE];
+    char count_buf[32];
+    unsigned int count = 0;
+    int rc;
+
+    if (!lmdb_initialized || !handle || !ignore) {
+        return LMDB_ERROR;
+    }
+
+    /* Get current count */
+    snprintf(count_key, sizeof(count_key), "%s%s:count", LMDB_PREFIX_IGNORE, handle);
+    rc = x3_lmdb_get(LMDB_DB_ACCOUNTS, count_key, count_buf, sizeof(count_buf));
+    if (rc == LMDB_SUCCESS) {
+        count = (unsigned int)strtoul(count_buf, NULL, 10);
+    }
+
+    /* Store ignore at next index */
+    snprintf(lmdb_key, sizeof(lmdb_key), "%s%s:%u", LMDB_PREFIX_IGNORE, handle, count);
+    rc = x3_lmdb_set(LMDB_DB_ACCOUNTS, lmdb_key, ignore);
+    if (rc != LMDB_SUCCESS) {
+        return rc;
+    }
+
+    /* Update count */
+    snprintf(count_buf, sizeof(count_buf), "%u", count + 1);
+    return x3_lmdb_set(LMDB_DB_ACCOUNTS, count_key, count_buf);
+}
+
+/**
+ * Delete all ignores for an account
+ */
+int x3_lmdb_ignore_clear(const char *handle)
+{
+    char prefix[LMDB_KEY_BUFFER_SIZE];
+
+    if (!lmdb_initialized || !handle) {
+        return LMDB_ERROR;
+    }
+
+    snprintf(prefix, sizeof(prefix), "%s%s:", LMDB_PREFIX_IGNORE, handle);
+    return x3_lmdb_prefix_delete_all(LMDB_DB_ACCOUNTS, prefix);
+}
+
+/**
+ * List all ignores for an account
+ */
+int x3_lmdb_ignore_list(const char *handle, char ***ignores_out, unsigned int *count_out)
+{
+    char prefix[LMDB_KEY_BUFFER_SIZE];
+    struct mask_list_ctx ctx = {NULL, 0, 0};
+    int rc;
+
+    if (!lmdb_initialized || !handle || !ignores_out || !count_out) {
+        return LMDB_ERROR;
+    }
+
+    snprintf(prefix, sizeof(prefix), "%s%s:", LMDB_PREFIX_IGNORE, handle);
+    rc = x3_lmdb_prefix_iterate(LMDB_DB_ACCOUNTS, prefix, mask_list_callback, &ctx);
+
+    if (rc < 0) {
+        if (ctx.masks) {
+            unsigned int i;
+            for (i = 0; i < ctx.count; i++) {
+                free(ctx.masks[i]);
+            }
+            free(ctx.masks);
+        }
+        return LMDB_ERROR;
+    }
+
+    *ignores_out = ctx.masks;
+    *count_out = ctx.count;
+    return LMDB_SUCCESS;
+}
+
+/* ========== Account Cookies ========== */
+
+/**
+ * Store a cookie for an account
+ * @param handle Account handle
+ * @param cookie_type Cookie type string (ACTIVATION, PASSWORD_CHANGE, etc.)
+ * @param cookie_value Cookie value
+ * @param cookie_data Additional data (can be NULL)
+ * @param expires Expiry timestamp
+ */
+int x3_lmdb_cookie_set(const char *handle, const char *cookie_type,
+                       const char *cookie_value, const char *cookie_data,
+                       time_t expires)
+{
+    char lmdb_key[LMDB_KEY_BUFFER_SIZE];
+    char json_buf[1024];
+    int len;
+
+    if (!lmdb_initialized || !handle || !cookie_type || !cookie_value) {
+        return LMDB_ERROR;
+    }
+
+    snprintf(lmdb_key, sizeof(lmdb_key), "%s%s", LMDB_PREFIX_COOKIE, handle);
+
+    /* Simple JSON format */
+    len = snprintf(json_buf, sizeof(json_buf),
+                   "{\"type\":\"%s\",\"cookie\":\"%s\",\"expires\":%lu",
+                   cookie_type, cookie_value, (unsigned long)expires);
+
+    if (cookie_data) {
+        len += snprintf(json_buf + len, sizeof(json_buf) - len,
+                       ",\"data\":\"%s\"", cookie_data);
+    }
+
+    snprintf(json_buf + len, sizeof(json_buf) - len, "}");
+
+    return x3_lmdb_set(LMDB_DB_ACCOUNTS, lmdb_key, json_buf);
+}
+
+/**
+ * Get cookie for an account
+ */
+int x3_lmdb_cookie_get(const char *handle, char *type_out, size_t type_size,
+                       char *cookie_out, size_t cookie_size,
+                       char *data_out, size_t data_size,
+                       time_t *expires_out)
+{
+    char lmdb_key[LMDB_KEY_BUFFER_SIZE];
+    char json_buf[1024];
+    char *p, *end;
+    int rc;
+
+    if (!lmdb_initialized || !handle) {
+        return LMDB_ERROR;
+    }
+
+    snprintf(lmdb_key, sizeof(lmdb_key), "%s%s", LMDB_PREFIX_COOKIE, handle);
+
+    rc = x3_lmdb_get(LMDB_DB_ACCOUNTS, lmdb_key, json_buf, sizeof(json_buf));
+    if (rc != LMDB_SUCCESS) {
+        return rc;
+    }
+
+    /* Simple JSON parsing */
+    if (type_out) {
+        p = strstr(json_buf, "\"type\":\"");
+        if (p) {
+            p += 8;
+            end = strchr(p, '"');
+            if (end && (size_t)(end - p) < type_size) {
+                memcpy(type_out, p, end - p);
+                type_out[end - p] = '\0';
+            }
+        }
+    }
+
+    if (cookie_out) {
+        p = strstr(json_buf, "\"cookie\":\"");
+        if (p) {
+            p += 10;
+            end = strchr(p, '"');
+            if (end && (size_t)(end - p) < cookie_size) {
+                memcpy(cookie_out, p, end - p);
+                cookie_out[end - p] = '\0';
+            }
+        }
+    }
+
+    if (expires_out) {
+        p = strstr(json_buf, "\"expires\":");
+        if (p) {
+            *expires_out = (time_t)strtoul(p + 10, NULL, 10);
+        }
+    }
+
+    if (data_out) {
+        data_out[0] = '\0';
+        p = strstr(json_buf, "\"data\":\"");
+        if (p) {
+            p += 8;
+            end = strchr(p, '"');
+            if (end && (size_t)(end - p) < data_size) {
+                memcpy(data_out, p, end - p);
+                data_out[end - p] = '\0';
+            }
+        }
+    }
+
+    return LMDB_SUCCESS;
+}
+
+/**
+ * Delete cookie for an account
+ */
+int x3_lmdb_cookie_delete(const char *handle)
+{
+    char lmdb_key[LMDB_KEY_BUFFER_SIZE];
+
+    if (!lmdb_initialized || !handle) {
+        return LMDB_ERROR;
+    }
+
+    snprintf(lmdb_key, sizeof(lmdb_key), "%s%s", LMDB_PREFIX_COOKIE, handle);
+
+    return x3_lmdb_delete(LMDB_DB_ACCOUNTS, lmdb_key);
+}
 
 #endif /* WITH_LMDB */

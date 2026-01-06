@@ -42,6 +42,20 @@ enum lmdb_error {
 #define LMDB_PREFIX_SESSVER "sessver:"  /* Session version: username → version_number */
 #define LMDB_PREFIX_SCRAM_ACCT "scram_acct:"  /* Account SCRAM: hash_type:account → SCRAM verifier */
 
+/* Core data prefixes (for SAXDB-optional mode) */
+#define LMDB_PREFIX_HANDLE "handle:"      /* Account core: handle → JSON {passwd, email, flags, ...} */
+#define LMDB_PREFIX_NICK "nick:"          /* Nick mapping: nick → handle */
+#define LMDB_PREFIX_MASK "mask:"          /* Account mask: handle:index → mask_string */
+#define LMDB_PREFIX_IGNORE "ignore:"      /* Account ignore: handle:index → ignore_mask */
+#define LMDB_PREFIX_COOKIE "cookie:"      /* Auth cookie: handle → JSON {type, data, expires} */
+#define LMDB_PREFIX_CHANREG "chanreg:"    /* Channel registration: #channel → JSON {...} */
+#define LMDB_PREFIX_CHANUSER "chanuser:"  /* Channel user: #channel:handle → JSON {access, flags, ...} */
+#define LMDB_PREFIX_CHANBAN "chanban:"    /* Channel ban: #channel:index → JSON {mask, reason, ...} */
+#define LMDB_PREFIX_CHANNOTE "channote:"  /* Channel note: #channel:id → JSON {setter, text, ...} */
+#define LMDB_PREFIX_GLINE "gline:"        /* G-line: mask → JSON {issuer, reason, expires, ...} */
+#define LMDB_PREFIX_SHUN "shun:"          /* Shun: mask → JSON {issuer, reason, expires, ...} */
+#define LMDB_PREFIX_TRUSTED "trusted:"    /* Trusted host: mask → JSON {issuer, limit, ...} */
+
 /* Metadata entry for iteration */
 struct lmdb_metadata_entry {
     char *key;
@@ -982,6 +996,208 @@ int scram_sha256_verify_proof(const unsigned char *stored_key,
                               const char *auth_message, size_t auth_message_len,
                               const char *client_proof);
 
+/* ========== Prefix Iteration ========== */
+
+/* Callback type for prefix iteration */
+typedef int (*lmdb_prefix_callback_t)(const char *key, const char *value, void *ctx);
+
+/**
+ * Iterate over all keys with a given prefix
+ * @param db Database name
+ * @param prefix Key prefix to match
+ * @param callback Function to call for each matching key/value
+ * @param ctx User context passed to callback
+ * @return Number of entries iterated, or negative on error
+ *
+ * Callback should return 0 to continue iteration, non-zero to stop.
+ */
+int x3_lmdb_prefix_iterate(const char *db, const char *prefix,
+                           lmdb_prefix_callback_t callback, void *ctx);
+
+/**
+ * Delete all keys with a given prefix
+ * @param db Database name
+ * @param prefix Key prefix to match
+ * @return Number of entries deleted, or negative on error
+ */
+int x3_lmdb_prefix_delete_all(const char *db, const char *prefix);
+
+/**
+ * Count all keys with a given prefix
+ * @param db Database name
+ * @param prefix Key prefix to match
+ * @return Number of entries, or negative on error
+ */
+int x3_lmdb_prefix_count(const char *db, const char *prefix);
+
+/* ========== Core Account Data (SAXDB-optional) ========== */
+
+/**
+ * Store account handle data as JSON
+ * @param handle Account handle name
+ * @param json_data JSON string containing account data
+ * @return LMDB_SUCCESS on success, LMDB_ERROR on failure
+ */
+int x3_lmdb_handle_set(const char *handle, const char *json_data);
+
+/**
+ * Get account handle data as JSON
+ * @param handle Account handle name
+ * @param json_out Output buffer for JSON string (must be at least 8192 bytes)
+ * @param json_size Size of output buffer
+ * @return LMDB_SUCCESS on success, LMDB_NOT_FOUND if not found, LMDB_ERROR on failure
+ */
+int x3_lmdb_handle_get(const char *handle, char *json_out, size_t json_size);
+
+/**
+ * Delete account handle data
+ * @param handle Account handle name
+ * @return LMDB_SUCCESS on success, LMDB_NOT_FOUND if not found, LMDB_ERROR on failure
+ */
+int x3_lmdb_handle_delete(const char *handle);
+
+/**
+ * Check if account handle exists
+ * @param handle Account handle name
+ * @return 1 if exists, 0 if not, negative on error
+ */
+int x3_lmdb_handle_exists(const char *handle);
+
+/**
+ * Register a nick to a handle
+ * @param nick Nick name
+ * @param handle Account handle
+ * @return LMDB_SUCCESS on success, LMDB_ERROR on failure
+ */
+int x3_lmdb_nick_register(const char *nick, const char *handle);
+
+/**
+ * Get handle for a registered nick
+ * @param nick Nick name
+ * @param handle_out Output buffer for handle (must be at least 64 bytes)
+ * @return LMDB_SUCCESS on success, LMDB_NOT_FOUND if not found, LMDB_ERROR on failure
+ */
+int x3_lmdb_nick_get_handle(const char *nick, char *handle_out);
+
+/**
+ * Unregister a nick
+ * @param nick Nick name
+ * @return LMDB_SUCCESS on success, LMDB_NOT_FOUND if not found, LMDB_ERROR on failure
+ */
+int x3_lmdb_nick_unregister(const char *nick);
+
+/* ========== Account Masks ========== */
+
+/**
+ * Add a mask to an account
+ * @param handle Account handle
+ * @param mask Hostmask string
+ * @return LMDB_SUCCESS on success, LMDB_ERROR on failure
+ */
+int x3_lmdb_mask_add(const char *handle, const char *mask);
+
+/**
+ * Delete all masks for an account
+ * @param handle Account handle
+ * @return Number of masks deleted, LMDB_ERROR on failure
+ */
+int x3_lmdb_mask_clear(const char *handle);
+
+/**
+ * List all masks for an account
+ * @param handle Account handle
+ * @param masks_out Output array of mask strings
+ * @param count_out Number of masks returned
+ * @return LMDB_SUCCESS on success, LMDB_ERROR on failure
+ */
+int x3_lmdb_mask_list(const char *handle, char ***masks_out, unsigned int *count_out);
+
+/**
+ * Free mask list returned by x3_lmdb_mask_list
+ * @param masks Array of mask strings
+ * @param count Number of masks
+ */
+void x3_lmdb_free_mask_list(char **masks, unsigned int count);
+
+/* ========== Account Ignores ========== */
+
+/**
+ * Add an ignore to an account
+ * @param handle Account handle
+ * @param ignore Ignore pattern string
+ * @return LMDB_SUCCESS on success, LMDB_ERROR on failure
+ */
+int x3_lmdb_ignore_add(const char *handle, const char *ignore);
+
+/**
+ * Delete all ignores for an account
+ * @param handle Account handle
+ * @return Number of ignores deleted, LMDB_ERROR on failure
+ */
+int x3_lmdb_ignore_clear(const char *handle);
+
+/**
+ * List all ignores for an account
+ * @param handle Account handle
+ * @param ignores_out Output array of ignore strings
+ * @param count_out Number of ignores returned
+ * @return LMDB_SUCCESS on success, LMDB_ERROR on failure
+ */
+int x3_lmdb_ignore_list(const char *handle, char ***ignores_out, unsigned int *count_out);
+
+/* ========== Account Cookies ========== */
+
+/**
+ * Store a cookie for an account
+ * @param handle Account handle
+ * @param cookie_type Cookie type string (ACTIVATION, PASSWORD_CHANGE, etc.)
+ * @param cookie_value Cookie value
+ * @param cookie_data Additional data (can be NULL)
+ * @param expires Expiry timestamp
+ * @return LMDB_SUCCESS on success, LMDB_ERROR on failure
+ */
+int x3_lmdb_cookie_set(const char *handle, const char *cookie_type,
+                       const char *cookie_value, const char *cookie_data,
+                       time_t expires);
+
+/**
+ * Get cookie for an account
+ * @param handle Account handle
+ * @param type_out Output for cookie type
+ * @param type_size Size of type_out buffer
+ * @param cookie_out Output for cookie value
+ * @param cookie_size Size of cookie_out buffer
+ * @param data_out Output for cookie data (can be NULL)
+ * @param data_size Size of data_out buffer
+ * @param expires_out Output for expiry timestamp (can be NULL)
+ * @return LMDB_SUCCESS on success, LMDB_NOT_FOUND if not found, LMDB_ERROR on failure
+ */
+int x3_lmdb_cookie_get(const char *handle, char *type_out, size_t type_size,
+                       char *cookie_out, size_t cookie_size,
+                       char *data_out, size_t data_size,
+                       time_t *expires_out);
+
+/**
+ * Delete cookie for an account
+ * @param handle Account handle
+ * @return LMDB_SUCCESS on success, LMDB_NOT_FOUND if not found, LMDB_ERROR on failure
+ */
+int x3_lmdb_cookie_delete(const char *handle);
+
+/* ========== SAXDB Configuration ========== */
+
+/**
+ * Check if SAXDB is enabled
+ * @return 1 if enabled (default), 0 if disabled
+ */
+int x3_lmdb_saxdb_enabled(void);
+
+/**
+ * Set SAXDB enabled flag (called from config reader)
+ * @param enabled 1 to enable, 0 to disable
+ */
+void x3_lmdb_set_saxdb_enabled(int enabled);
+
 /* ========== Module Registration ========== */
 
 /**
@@ -1073,6 +1289,28 @@ void init_x3_lmdb(void);
 #define scram_sha256_client_signature(sk, m, l, o) (-1)
 #define scram_sha256_server_signature(sk, m, l, o) (-1)
 #define scram_sha256_verify_proof(sk, m, l, p) (-1)
+#define x3_lmdb_prefix_iterate(d, p, c, x) (-1)
+#define x3_lmdb_prefix_delete_all(d, p) (-1)
+#define x3_lmdb_prefix_count(d, p)      (-1)
+#define x3_lmdb_handle_set(h, j)        (-1)
+#define x3_lmdb_handle_get(h, j, s)     (-2)
+#define x3_lmdb_handle_delete(h)        (-2)
+#define x3_lmdb_handle_exists(h)        (0)
+#define x3_lmdb_nick_register(n, h)     (-1)
+#define x3_lmdb_nick_get_handle(n, h)   (-2)
+#define x3_lmdb_nick_unregister(n)      (-2)
+#define x3_lmdb_mask_add(h, m)          (-1)
+#define x3_lmdb_mask_clear(h)           (-1)
+#define x3_lmdb_mask_list(h, m, c)      (-1)
+#define x3_lmdb_free_mask_list(m, c)    do {} while(0)
+#define x3_lmdb_ignore_add(h, i)        (-1)
+#define x3_lmdb_ignore_clear(h)         (-1)
+#define x3_lmdb_ignore_list(h, i, c)    (-1)
+#define x3_lmdb_cookie_set(h, t, v, d, e) (-1)
+#define x3_lmdb_cookie_get(h, t, ts, c, cs, d, ds, e) (-2)
+#define x3_lmdb_cookie_delete(h)        (-2)
+#define x3_lmdb_saxdb_enabled()         (1)
+#define x3_lmdb_set_saxdb_enabled(e)    do {} while(0)
 #define init_x3_lmdb()                  do {} while(0)
 
 #endif /* WITH_LMDB */
