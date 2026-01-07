@@ -3428,6 +3428,7 @@ static NICKSERV_FUNC(cmd_cookie)
                     cookie_ctx->password_hash = strdup(hi->cookie->data);
                     cookie_ctx->plaintext_password = strdup(password);
                     cookie_ctx->state = COOKIE_STATE_LOOKUP;
+                    cookie_ctx->cookie_type = ACTIVATION;
                     cookie_ctx->started = now;
 
                     /* Start async user lookup (Phase 1) */
@@ -3464,15 +3465,56 @@ static NICKSERV_FUNC(cmd_cookie)
           SyncLog("ACCOUNTACC %s", hi->handle);
         break;
     }
-    case PASSWORD_CHANGE:
+    case PASSWORD_CHANGE: {
+        /* Optional: If password provided, verify it matches cookie->data for SCRAM creation */
+        const char *pw_for_scram = NULL;
+        if (password && hi->cookie->data && pw_verify(password, hi->cookie->data) == 1) {
+            pw_for_scram = password;
+        }
 #ifdef WITH_LDAP
         if(nickserv_conf.ldap_enable && nickserv_conf.ldap_admin_dn) {
             int rc;
             if((rc = ldap_do_modify(hi->handle, hi->cookie->data, NULL)) != LDAP_SUCCESS) {
-                /* Falied to update email in ldap, but still
-                 * updated it here.. what should we do? */
+                /* Failed to update password in ldap */
                reply("NSMSG_LDAP_FAIL", ldap_err2string(rc));
                return 0;
+            }
+        }
+#endif
+#ifdef WITH_KEYCLOAK
+        /* Sync password hash to Keycloak */
+        if (nickserv_conf.keycloak_enable) {
+            /* Try async path for users with numerics */
+            if (user->numeric[0] != '\0') {
+                struct cookie_async_ctx *cookie_ctx = calloc(1, sizeof(*cookie_ctx));
+                if (cookie_ctx) {
+                    safestrncpy(cookie_ctx->handle, hi->handle, sizeof(cookie_ctx->handle));
+                    safestrncpy(cookie_ctx->nick, user->nick, sizeof(cookie_ctx->nick));
+                    safestrncpy(cookie_ctx->numeric, user->numeric, sizeof(cookie_ctx->numeric));
+                    cookie_ctx->user = user;
+                    cookie_ctx->hi = hi;
+                    cookie_ctx->password_hash = strdup(hi->cookie->data);
+                    cookie_ctx->plaintext_password = pw_for_scram ? strdup(pw_for_scram) : NULL;
+                    cookie_ctx->state = COOKIE_STATE_LOOKUP;
+                    cookie_ctx->cookie_type = PASSWORD_CHANGE;
+                    cookie_ctx->started = now;
+
+                    /* Start async user lookup */
+                    if (keycloak_get_user_async(kc_realm_config, kc_client_config,
+                                                hi->handle, cookie_ctx,
+                                                cookie_async_lookup_callback) == 0) {
+                        log_module(NS_LOG, LOG_DEBUG, "COOKIE async: Started PASSWORD_CHANGE for %s", hi->handle);
+                        return 1;  /* Async started - response will come via callback */
+                    }
+                    log_module(NS_LOG, LOG_WARNING, "COOKIE async: Failed to start, falling back to sync for %s", hi->handle);
+                    cookie_async_ctx_free(cookie_ctx);
+                }
+            }
+            /* Synchronous fallback */
+            int rc = kc_do_modify(hi->handle, hi->cookie->data, NULL);
+            if (rc != KC_SUCCESS) {
+                reply("NSMSG_KEYCLOAK_FAIL", kc_strerror(rc));
+                return 0;
             }
         }
 #endif
@@ -3483,12 +3525,18 @@ static NICKSERV_FUNC(cmd_cookie)
         x3_lmdb_session_revoke_all(hi->handle);
 #ifdef WITH_SSL
         x3_lmdb_scram_revoke_all(hi->handle);
+        /* Create new SCRAM credentials if we have plaintext password */
+        if (pw_for_scram) {
+            x3_lmdb_scram_acct_create_all(hi->handle, pw_for_scram);
+        }
 #endif
 #endif
+        nickserv_eat_cookie(hi->cookie);
         reply("NSMSG_PASSWORD_CHANGED");
         if (nickserv_conf.sync_log)
           SyncLog("PASSCHANGE %s %s", hi->handle, hi->passwd);
         break;
+    }
     case EMAIL_CHANGE:
 #ifdef WITH_LDAP
         if(nickserv_conf.ldap_enable && nickserv_conf.ldap_admin_dn) {
@@ -6619,6 +6667,7 @@ struct cookie_async_ctx {
     char *password_hash;                     /* Password hash to set */
     char *plaintext_password;                /* Plaintext password for SCRAM creation */
     enum cookie_async_state state;           /* Current state */
+    enum cookie_type cookie_type;            /* ACTIVATION or PASSWORD_CHANGE */
     time_t started;                          /* When request started */
 };
 
@@ -6764,8 +6813,8 @@ cookie_async_update_callback(void *session, int result)
         return 1;
     }
 
-    log_module(NS_LOG, LOG_DEBUG, "COOKIE async update callback: handle=%s result=%d",
-               ctx->handle, result);
+    log_module(NS_LOG, LOG_DEBUG, "COOKIE async update callback: handle=%s type=%d result=%d",
+               ctx->handle, ctx->cookie_type, result);
 
     if (result != KC_SUCCESS) {
         send_message(user, nickserv, "NSMSG_KEYCLOAK_FAIL", kc_strerror(result));
@@ -6773,36 +6822,62 @@ cookie_async_update_callback(void *session, int result)
         return 0;
     }
 
-    /* Verify handle still exists and has cookie */
+    /* Verify handle still exists and has matching cookie type */
     hi = dict_find(nickserv_handle_dict, ctx->handle, NULL);
-    if (!hi || !hi->cookie || hi->cookie->type != ACTIVATION) {
+    if (!hi || !hi->cookie || hi->cookie->type != ctx->cookie_type) {
         log_module(NS_LOG, LOG_DEBUG, "COOKIE async update: Handle state changed for %s", ctx->handle);
-        /* Don't send message - account may have been activated another way */
+        /* Don't send message - account may have been processed another way */
         cookie_async_ctx_free(ctx);
         return 0;
     }
 
-    /* Complete activation - same as sync path */
-    /* Restore the password hash from cookie */
-    safestrncpy(hi->passwd, hi->cookie->data, sizeof(hi->passwd));
+    /* Complete based on cookie type */
+    if (ctx->cookie_type == ACTIVATION) {
+        /* Complete activation - same as sync path */
+        /* Restore the password hash from cookie */
+        safestrncpy(hi->passwd, hi->cookie->data, sizeof(hi->passwd));
 
 #if defined(WITH_LMDB) && defined(WITH_SSL)
-    /* Create SCRAM credentials if we have plaintext password */
-    if (ctx->plaintext_password) {
-        x3_lmdb_scram_acct_create_all(hi->handle, ctx->plaintext_password);
-    }
+        /* Create SCRAM credentials if we have plaintext password */
+        if (ctx->plaintext_password) {
+            x3_lmdb_scram_acct_create_all(hi->handle, ctx->plaintext_password);
+        }
 #endif
 
-    set_user_handle_info(user, hi, 1);
+        set_user_handle_info(user, hi, 1);
+        nickserv_eat_cookie(hi->cookie);
 
-    /* Eat the cookie */
-    nickserv_eat_cookie(hi->cookie);
+        send_message(user, nickserv, "NSMSG_HANDLE_ACTIVATED");
+        if (nickserv_conf.sync_log)
+            SyncLog("ACCOUNTACC %s", hi->handle);
 
-    send_message(user, nickserv, "NSMSG_HANDLE_ACTIVATED");
-    if (nickserv_conf.sync_log)
-        SyncLog("ACCOUNTACC %s", hi->handle);
+        log_module(NS_LOG, LOG_DEBUG, "COOKIE async: Activation completed for %s", ctx->handle);
 
-    log_module(NS_LOG, LOG_DEBUG, "COOKIE async: Activation completed for %s", ctx->handle);
+    } else if (ctx->cookie_type == PASSWORD_CHANGE) {
+        /* Complete password change - same as sync path */
+        set_user_handle_info(user, hi, 1);
+        safestrncpy(hi->passwd, hi->cookie->data, sizeof(hi->passwd));
+
+#ifdef WITH_LMDB
+        /* Revoke all session tokens on password change */
+        x3_lmdb_session_revoke_all(hi->handle);
+#ifdef WITH_SSL
+        x3_lmdb_scram_revoke_all(hi->handle);
+        /* Create new SCRAM credentials if we have plaintext password */
+        if (ctx->plaintext_password) {
+            x3_lmdb_scram_acct_create_all(hi->handle, ctx->plaintext_password);
+        }
+#endif
+#endif
+
+        nickserv_eat_cookie(hi->cookie);
+
+        send_message(user, nickserv, "NSMSG_PASSWORD_CHANGED");
+        if (nickserv_conf.sync_log)
+            SyncLog("PASSCHANGE %s %s", hi->handle, hi->passwd);
+
+        log_module(NS_LOG, LOG_DEBUG, "COOKIE async: Password change completed for %s", ctx->handle);
+    }
 
     cookie_async_ctx_free(ctx);
     return 0;
