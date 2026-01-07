@@ -606,6 +606,24 @@ typedef int (*kc_get_user_callback)(void *session, int result, struct kc_user *u
 typedef int (*kc_update_user_callback)(void *session, int result);
 
 /**
+ * Async get group by path callback type (Phase 4)
+ * @param session   Opaque session pointer
+ * @param result    KC_SUCCESS, KC_NOT_FOUND, or KC_ERROR
+ * @param group_id  Group UUID (only valid if result==KC_SUCCESS, caller must free)
+ * @return 0 if session may continue processing, 1 if session is terminal
+ */
+typedef int (*kc_get_group_path_callback)(void *session, int result, char *group_id);
+
+/**
+ * Async create subgroup callback type (Phase 4)
+ * @param session   Opaque session pointer
+ * @param result    KC_SUCCESS, KC_USER_EXISTS (group already exists), or KC_ERROR
+ * @param group_id  New group UUID (only valid if result==KC_SUCCESS, caller must free)
+ * @return 0 if session may continue processing, 1 if session is terminal
+ */
+typedef int (*kc_create_subgroup_callback)(void *session, int result, char *group_id);
+
+/**
  * Start async authentication check against Keycloak
  * This function returns immediately and invokes the callback when complete.
  * Uses curl_multi integrated with X3's ioset event loop.
@@ -867,6 +885,55 @@ int keycloak_update_user_representation_async(struct kc_realm realm, struct kc_c
                                                const struct kc_user_update *update,
                                                void *session,
                                                kc_update_user_callback callback);
+
+/**
+ * Get a group by its path asynchronously. (Phase 4)
+ * This function returns immediately and invokes the callback when complete.
+ *
+ * @param realm       Keycloak realm configuration
+ * @param client      Client with admin access token
+ * @param group_path  Full group path (e.g., "/irc-channels/#test")
+ * @param session     Opaque session pointer (passed to callback)
+ * @param callback    Function to call when lookup completes
+ * @return 0 on success (request started), -1 on error
+ */
+int keycloak_get_group_by_path_async(struct kc_realm realm, struct kc_client client,
+                                      const char *group_path, void *session,
+                                      kc_get_group_path_callback callback);
+
+/**
+ * Create a subgroup asynchronously. (Phase 4)
+ * This function returns immediately and invokes the callback when complete.
+ *
+ * @param realm       Keycloak realm configuration
+ * @param client      Client with admin access token
+ * @param parent_id   Parent group UUID
+ * @param name        Name for the new subgroup
+ * @param session     Opaque session pointer (passed to callback)
+ * @param callback    Function to call when creation completes
+ * @return 0 on success (request started), -1 on error
+ */
+int keycloak_create_subgroup_async(struct kc_realm realm, struct kc_client client,
+                                    const char *parent_id, const char *name,
+                                    void *session, kc_create_subgroup_callback callback);
+
+/**
+ * Set a group attribute asynchronously. (Phase 4)
+ * Uses the generic kc_async_callback for success/failure notification.
+ *
+ * @param realm       Keycloak realm configuration
+ * @param client      Client with admin access token
+ * @param group_id    Group UUID
+ * @param attr_name   Attribute name
+ * @param attr_value  Attribute value
+ * @param session     Opaque session pointer (passed to callback)
+ * @param callback    Function to call when operation completes
+ * @return 0 on success (request started), -1 on error
+ */
+int keycloak_set_group_attribute_async(struct kc_realm realm, struct kc_client client,
+                                        const char *group_id, const char *attr_name,
+                                        const char *attr_value, void *session,
+                                        kc_async_callback callback);
 
 #endif /* WITH_KEYCLOAK */
 

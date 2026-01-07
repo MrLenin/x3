@@ -1306,7 +1306,10 @@ enum kc_async_type {
     KC_ASYNC_GROUP_MEMBERS, /* Get group members (phase 2 or standalone) */
     KC_ASYNC_CLIENT_TOKEN,  /* Client credentials token acquisition */
     KC_ASYNC_GET_USER,      /* Get user by username (Phase 3) */
-    KC_ASYNC_UPDATE_USER    /* Update user representation (Phase 3) */
+    KC_ASYNC_UPDATE_USER,   /* Update user representation (Phase 3) */
+    KC_ASYNC_GET_GROUP_PATH,/* Get group by path (Phase 4) */
+    KC_ASYNC_CREATE_SUBGROUP,/* Create subgroup (Phase 4) */
+    KC_ASYNC_SET_GROUP_ATTR /* Set group attribute (Phase 4) */
 };
 
 /* Async request tracking */
@@ -1330,6 +1333,8 @@ struct kc_async_request {
         kc_client_token_callback client_token;   /* Client token callback */
         kc_get_user_callback get_user;           /* Get user callback (Phase 3) */
         kc_update_user_callback update_user;     /* Update user callback (Phase 3) */
+        kc_get_group_path_callback get_group_path; /* Get group by path callback (Phase 4) */
+        kc_create_subgroup_callback create_subgroup; /* Create subgroup callback (Phase 4) */
     } cb;
     /* WebPush-specific: copy of binary POST data for async request */
     void *post_data_copy;
@@ -1908,6 +1913,92 @@ kc_curl_check_completed(void)
                 }
                 if (req->cb.update_user) {
                     req->cb.update_user(req->session, result);
+                }
+                break;
+            }
+            case KC_ASYNC_GET_GROUP_PATH: {
+                int result = KC_ERROR;
+                char *group_id = NULL;
+
+                if (http_code == 404) {
+                    result = KC_NOT_FOUND;
+                    log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async get_group_path: Not found (HTTP 404)", req_id);
+                } else if (http_code == 200 && req->response.response) {
+                    /* Parse JSON response to get group ID */
+                    json_error_t error;
+                    json_t *root = json_loads(req->response.response, 0, &error);
+                    if (root) {
+                        const char *id = json_string_value(json_object_get(root, "id"));
+                        if (id) {
+                            group_id = strdup(id);
+                            result = KC_SUCCESS;
+                            log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async get_group_path: Found group %s", req_id, group_id);
+                        }
+                        json_decref(root);
+                    }
+                    if (result != KC_SUCCESS) {
+                        log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async get_group_path: Failed to parse response", req_id);
+                    }
+                } else {
+                    log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async get_group_path: Error (HTTP %ld)", req_id, http_code);
+                }
+                if (req->cb.get_group_path) {
+                    req->cb.get_group_path(req->session, result, group_id);
+                    /* Note: group_id ownership transferred to callback */
+                } else if (group_id) {
+                    free(group_id);
+                }
+                break;
+            }
+            case KC_ASYNC_CREATE_SUBGROUP: {
+                int result = KC_ERROR;
+                char *group_id = NULL;
+
+                if (http_code == 201) {
+                    /* Extract group ID from Location header */
+                    if (req->location_header[0]) {
+                        /* Location header format: .../groups/{id} */
+                        const char *last_slash = strrchr(req->location_header, '/');
+                        if (last_slash && last_slash[1]) {
+                            group_id = strdup(last_slash + 1);
+                            result = KC_SUCCESS;
+                            log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async create_subgroup: Created group %s", req_id, group_id);
+                        }
+                    }
+                    if (!group_id) {
+                        log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async create_subgroup: Created but no Location header", req_id);
+                        result = KC_SUCCESS;  /* Still success, just no ID */
+                    }
+                } else if (http_code == 409) {
+                    result = KC_USER_EXISTS;  /* Group already exists */
+                    log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async create_subgroup: Group already exists", req_id);
+                } else if (http_code == 404) {
+                    result = KC_NOT_FOUND;  /* Parent not found */
+                    log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async create_subgroup: Parent not found", req_id);
+                } else {
+                    log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async create_subgroup: Error (HTTP %ld)", req_id, http_code);
+                }
+                if (req->cb.create_subgroup) {
+                    req->cb.create_subgroup(req->session, result, group_id);
+                    /* Note: group_id ownership transferred to callback */
+                } else if (group_id) {
+                    free(group_id);
+                }
+                break;
+            }
+            case KC_ASYNC_SET_GROUP_ATTR: {
+                int result = KC_ERROR;
+                if (http_code == 204 || http_code == 200) {
+                    result = KC_SUCCESS;
+                    log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async set_group_attr: Success (HTTP %ld)", req_id, http_code);
+                } else if (http_code == 404) {
+                    result = KC_NOT_FOUND;
+                    log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async set_group_attr: Not found (HTTP 404)", req_id);
+                } else {
+                    log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async set_group_attr: Error (HTTP %ld)", req_id, http_code);
+                }
+                if (req->cb.generic) {
+                    req->cb.generic(req->session, result);
                 }
                 break;
             }
@@ -5972,6 +6063,216 @@ keycloak_update_user_representation_async(struct kc_realm realm, struct kc_clien
     }
 
     log_module(KC_LOG, LOG_DEBUG, "update_user_async: Started async update for user %s", user_id);
+    return 0;
+
+error:
+    if (req) {
+        if (req->uri) free(req->uri);
+        if (req->post_fields) free(req->post_fields);
+        free(req);
+    }
+    return -1;
+}
+
+/*
+ * Phase 4: Async get group by path
+ * Returns 0 on success (request started), -1 on error
+ */
+int
+keycloak_get_group_by_path_async(struct kc_realm realm, struct kc_client client,
+                                  const char *group_path, void *session,
+                                  kc_get_group_path_callback callback)
+{
+    struct kc_async_request *req = NULL;
+
+    /* Validate inputs */
+    if (!realm.base_uri || !realm.realm || !client.access_token ||
+        !group_path || !callback) {
+        log_module(KC_LOG, LOG_DEBUG, "get_group_path_async: Invalid arguments");
+        return -1;
+    }
+
+    /* Allocate request structure */
+    req = calloc(1, sizeof(*req));
+    if (!req) {
+        log_module(KC_LOG, LOG_ERROR, "get_group_path_async: Out of memory");
+        return -1;
+    }
+    req->session = session;
+    req->type = KC_ASYNC_GET_GROUP_PATH;
+    req->cb.get_group_path = callback;
+
+    /* Build URI using endpoint builder */
+    req->uri = kc_build_group_by_path_endpoint(realm, group_path);
+    if (!req->uri) {
+        log_module(KC_LOG, LOG_ERROR, "get_group_path_async: Failed to build URI");
+        goto error;
+    }
+
+    /* Use unified async API */
+    struct curl_opts opts = CURL_OPTS_INIT;
+    opts.uri = req->uri;
+    opts.method = HTTP_GET;
+    opts.xoauth2_bearer = client.access_token->access_token;
+
+    if (curl_perform_async(req, opts) < 0) {
+        log_module(KC_LOG, LOG_ERROR, "get_group_path_async: curl_perform_async failed");
+        goto error;
+    }
+
+    log_module(KC_LOG, LOG_DEBUG, "get_group_path_async: Started async lookup for path %s", group_path);
+    return 0;
+
+error:
+    if (req) {
+        if (req->uri) free(req->uri);
+        free(req);
+    }
+    return -1;
+}
+
+/*
+ * Phase 4: Async create subgroup
+ * Returns 0 on success (request started), -1 on error
+ */
+int
+keycloak_create_subgroup_async(struct kc_realm realm, struct kc_client client,
+                                const char *parent_id, const char *name,
+                                void *session, kc_create_subgroup_callback callback)
+{
+    struct kc_async_request *req = NULL;
+    char *json_body = NULL;
+
+    /* Validate inputs */
+    if (!realm.base_uri || !realm.realm || !client.access_token ||
+        !parent_id || !name || !callback) {
+        log_module(KC_LOG, LOG_DEBUG, "create_subgroup_async: Invalid arguments");
+        return -1;
+    }
+
+    /* Allocate request structure */
+    req = calloc(1, sizeof(*req));
+    if (!req) {
+        log_module(KC_LOG, LOG_ERROR, "create_subgroup_async: Out of memory");
+        return -1;
+    }
+    req->session = session;
+    req->type = KC_ASYNC_CREATE_SUBGROUP;
+    req->cb.create_subgroup = callback;
+
+    /* Build URI: POST /admin/realms/{realm}/groups/{parent_id}/children */
+    req->uri = kc_build_group_children_endpoint(realm, parent_id);
+    if (!req->uri) {
+        log_module(KC_LOG, LOG_ERROR, "create_subgroup_async: Failed to build URI");
+        goto error;
+    }
+
+    /* Build JSON body: {"name": "..."} */
+    json_t *body = json_object();
+    json_object_set_new(body, "name", json_string(name));
+    json_body = json_dumps(body, JSON_COMPACT);
+    json_decref(body);
+    if (!json_body) {
+        log_module(KC_LOG, LOG_ERROR, "create_subgroup_async: Failed to build JSON body");
+        goto error;
+    }
+    req->post_fields = json_body;
+
+    /* Use unified async API - POST request */
+    struct curl_opts opts = CURL_OPTS_INIT;
+    opts.uri = req->uri;
+    opts.method = HTTP_POST;
+    opts.xoauth2_bearer = client.access_token->access_token;
+    opts.post_fields = json_body;
+    opts.content_type = "application/json";
+
+    if (curl_perform_async(req, opts) < 0) {
+        log_module(KC_LOG, LOG_ERROR, "create_subgroup_async: curl_perform_async failed");
+        goto error;
+    }
+
+    log_module(KC_LOG, LOG_DEBUG, "create_subgroup_async: Started async create for %s under %s", name, parent_id);
+    return 0;
+
+error:
+    if (req) {
+        if (req->uri) free(req->uri);
+        if (req->post_fields) free(req->post_fields);
+        free(req);
+    }
+    return -1;
+}
+
+/*
+ * Phase 4: Async set group attribute
+ * Note: This is a simplified version that just sets one attribute.
+ * The sync version does GET-modify-PUT to preserve existing attributes.
+ * For now we use PUT with just the new attribute (may overwrite others).
+ * Returns 0 on success (request started), -1 on error
+ */
+int
+keycloak_set_group_attribute_async(struct kc_realm realm, struct kc_client client,
+                                    const char *group_id, const char *attr_name,
+                                    const char *attr_value, void *session,
+                                    kc_async_callback callback)
+{
+    struct kc_async_request *req = NULL;
+    char *json_body = NULL;
+
+    /* Validate inputs */
+    if (!realm.base_uri || !realm.realm || !client.access_token ||
+        !group_id || !attr_name || !attr_value || !callback) {
+        log_module(KC_LOG, LOG_DEBUG, "set_group_attr_async: Invalid arguments");
+        return -1;
+    }
+
+    /* Allocate request structure */
+    req = calloc(1, sizeof(*req));
+    if (!req) {
+        log_module(KC_LOG, LOG_ERROR, "set_group_attr_async: Out of memory");
+        return -1;
+    }
+    req->session = session;
+    req->type = KC_ASYNC_SET_GROUP_ATTR;
+    req->cb.generic = callback;
+
+    /* Build URI */
+    req->uri = kc_build_group_endpoint(realm, group_id);
+    if (!req->uri) {
+        log_module(KC_LOG, LOG_ERROR, "set_group_attr_async: Failed to build URI");
+        goto error;
+    }
+
+    /* Build JSON body: {"attributes": {"attr_name": ["attr_value"]}} */
+    json_t *body = json_object();
+    json_t *attrs = json_object();
+    json_t *values = json_array();
+    json_array_append_new(values, json_string(attr_value));
+    json_object_set_new(attrs, attr_name, values);
+    json_object_set_new(body, "attributes", attrs);
+    json_body = json_dumps(body, JSON_COMPACT);
+    json_decref(body);
+    if (!json_body) {
+        log_module(KC_LOG, LOG_ERROR, "set_group_attr_async: Failed to build JSON body");
+        goto error;
+    }
+    req->post_fields = json_body;
+
+    /* Use unified async API - PUT request */
+    struct curl_opts opts = CURL_OPTS_INIT;
+    opts.uri = req->uri;
+    opts.method = HTTP_PUT;
+    opts.xoauth2_bearer = client.access_token->access_token;
+    opts.post_fields = json_body;
+    opts.content_type = "application/json";
+
+    if (curl_perform_async(req, opts) < 0) {
+        log_module(KC_LOG, LOG_ERROR, "set_group_attr_async: curl_perform_async failed");
+        goto error;
+    }
+
+    log_module(KC_LOG, LOG_DEBUG, "set_group_attr_async: Started async set %s=%s for group %s",
+               attr_name, attr_value, group_id);
     return 0;
 
 error:

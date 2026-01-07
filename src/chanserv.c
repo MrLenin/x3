@@ -11371,6 +11371,412 @@ kc_async_sync_next_channel_delayed(UNUSED_ARG(void *data))
 }
 
 /*
+ * Phase 4: ADDUSER async state machine
+ * Multi-step state machine for async channel access synchronization
+ */
+enum adduser_state {
+    ADDUSER_LOOKUP_USER,     /* Look up Keycloak user UUID */
+    ADDUSER_LOOKUP_GROUP,    /* Check if channel group exists */
+    ADDUSER_ENSURE_PARENT,   /* Ensure irc-channels parent exists */
+    ADDUSER_CREATE_GROUP,    /* Create channel group if needed */
+    ADDUSER_SET_LEVEL,       /* Set access level attribute */
+    ADDUSER_ADD_USER,        /* Add user to group (final step) */
+    ADDUSER_REMOVE_USER,     /* Remove user from group (access=0) */
+    ADDUSER_DONE
+};
+
+struct adduser_async_ctx {
+    /* Input parameters (copied) */
+    char *channel;               /* Channel name */
+    char *username;              /* Account username */
+    unsigned short access;       /* Access level (0 = remove) */
+
+    /* Keycloak connection info (pointers to static config) */
+    struct kc_realm realm;
+    struct kc_client client;
+
+    /* Intermediate state */
+    enum adduser_state state;
+    char *user_id;               /* Keycloak user UUID (from lookup) */
+    char *group_id;              /* Channel group UUID (from lookup or create) */
+    char *parent_id;             /* Parent group UUID (irc-channels) */
+    time_t started;              /* When operation started */
+};
+
+/* Forward declarations for state machine callbacks */
+static int adduser_lookup_user_cb(void *session, int result, struct kc_user *user);
+static int adduser_lookup_group_cb(void *session, int result, char *group_id);
+static int adduser_ensure_parent_cb(void *session, int result, char *group_id);
+static int adduser_create_group_cb(void *session, int result, char *group_id);
+static int adduser_set_level_cb(void *session, int result);
+static int adduser_final_cb(void *session, int result);
+
+/* Free ADDUSER async context */
+static void
+adduser_async_ctx_free(struct adduser_async_ctx *ctx)
+{
+    if (!ctx) return;
+    if (ctx->channel) free(ctx->channel);
+    if (ctx->username) free(ctx->username);
+    if (ctx->user_id) free(ctx->user_id);
+    if (ctx->group_id) free(ctx->group_id);
+    if (ctx->parent_id) free(ctx->parent_id);
+    /* Note: realm and client are borrowed pointers, don't free */
+    free(ctx);
+}
+
+/* Phase 1: User lookup completed */
+static int
+adduser_lookup_user_cb(void *session, int result, struct kc_user *user)
+{
+    struct adduser_async_ctx *ctx = session;
+    if (!ctx) return 1;
+
+    log_module(CS_LOG, LOG_DEBUG, "adduser_async[%s/%s]: User lookup result=%d",
+               ctx->channel, ctx->username, result);
+
+    if (result != KC_SUCCESS || !user || !user->id) {
+        if (result == KC_NOT_FOUND) {
+            /* User not in Keycloak - not an error, they may not have Keycloak account */
+            log_module(CS_LOG, LOG_DEBUG, "adduser_async[%s/%s]: User not in Keycloak, skipping",
+                       ctx->channel, ctx->username);
+        } else {
+            log_module(CS_LOG, LOG_DEBUG, "adduser_async[%s/%s]: User lookup failed",
+                       ctx->channel, ctx->username);
+        }
+        adduser_async_ctx_free(ctx);
+        return 0;
+    }
+
+    /* Save user ID */
+    ctx->user_id = strdup(user->id);
+    keycloak_user_free_fields(user);
+
+    if (!ctx->user_id) {
+        log_module(CS_LOG, LOG_ERROR, "adduser_async[%s/%s]: Out of memory",
+                   ctx->channel, ctx->username);
+        adduser_async_ctx_free(ctx);
+        return 0;
+    }
+
+    /* Next: Look up the channel group */
+    ctx->state = ADDUSER_LOOKUP_GROUP;
+    char group_path[256];
+    snprintf(group_path, sizeof(group_path), "/irc-channels/%s", ctx->channel);
+
+    if (keycloak_get_group_by_path_async(ctx->realm, ctx->client, group_path,
+                                          ctx, adduser_lookup_group_cb) < 0) {
+        log_module(CS_LOG, LOG_WARNING, "adduser_async[%s/%s]: Failed to start group lookup",
+                   ctx->channel, ctx->username);
+        adduser_async_ctx_free(ctx);
+        return 0;
+    }
+
+    return 0;
+}
+
+/* Phase 2: Group lookup completed */
+static int
+adduser_lookup_group_cb(void *session, int result, char *group_id)
+{
+    struct adduser_async_ctx *ctx = session;
+    if (!ctx) {
+        if (group_id) free(group_id);
+        return 1;
+    }
+
+    log_module(CS_LOG, LOG_DEBUG, "adduser_async[%s/%s]: Group lookup result=%d group_id=%s",
+               ctx->channel, ctx->username, result, group_id ? group_id : "(null)");
+
+    if (ctx->access == 0) {
+        /* REMOVAL: If group exists, remove user; if not, nothing to do */
+        if (result == KC_SUCCESS && group_id) {
+            ctx->group_id = group_id;
+            ctx->state = ADDUSER_REMOVE_USER;
+
+            if (keycloak_remove_user_from_group_async(ctx->realm, ctx->client,
+                                                       ctx->user_id, ctx->group_id,
+                                                       ctx, adduser_final_cb) < 0) {
+                log_module(CS_LOG, LOG_WARNING, "adduser_async[%s/%s]: Failed to start remove",
+                           ctx->channel, ctx->username);
+                adduser_async_ctx_free(ctx);
+                return 0;
+            }
+        } else {
+            /* Group doesn't exist - nothing to remove */
+            log_module(CS_LOG, LOG_DEBUG, "adduser_async[%s/%s]: Group not found, nothing to remove",
+                       ctx->channel, ctx->username);
+            if (group_id) free(group_id);
+            adduser_async_ctx_free(ctx);
+        }
+        return 0;
+    }
+
+    /* ADD: Need to ensure group exists */
+    if (result == KC_SUCCESS && group_id) {
+        /* Group exists - proceed to set level and add user */
+        ctx->group_id = group_id;
+        ctx->state = ADDUSER_SET_LEVEL;
+
+        char level_str[16];
+        snprintf(level_str, sizeof(level_str), "%u", ctx->access);
+
+        if (keycloak_set_group_attribute_async(ctx->realm, ctx->client, ctx->group_id,
+                                                chanserv_conf.keycloak_access_level_attr,
+                                                level_str, ctx, adduser_set_level_cb) < 0) {
+            log_module(CS_LOG, LOG_WARNING, "adduser_async[%s/%s]: Failed to start set level",
+                       ctx->channel, ctx->username);
+            adduser_async_ctx_free(ctx);
+            return 0;
+        }
+    } else {
+        /* Group doesn't exist - need to create it */
+        if (group_id) free(group_id);
+        ctx->state = ADDUSER_ENSURE_PARENT;
+
+        /* First ensure parent group exists */
+        if (keycloak_get_group_by_path_async(ctx->realm, ctx->client, "/irc-channels",
+                                              ctx, adduser_ensure_parent_cb) < 0) {
+            log_module(CS_LOG, LOG_WARNING, "adduser_async[%s/%s]: Failed to start parent lookup",
+                       ctx->channel, ctx->username);
+            adduser_async_ctx_free(ctx);
+            return 0;
+        }
+    }
+    return 0;
+}
+
+/* Phase 3: Parent group lookup/create completed */
+static int
+adduser_ensure_parent_cb(void *session, int result, char *group_id)
+{
+    struct adduser_async_ctx *ctx = session;
+    if (!ctx) {
+        if (group_id) free(group_id);
+        return 1;
+    }
+
+    log_module(CS_LOG, LOG_DEBUG, "adduser_async[%s/%s]: Parent lookup result=%d",
+               ctx->channel, ctx->username, result);
+
+    if (result == KC_SUCCESS && group_id) {
+        /* Parent exists - create channel subgroup */
+        ctx->parent_id = group_id;
+    } else if (result == KC_NOT_FOUND) {
+        /* Parent doesn't exist - need to create it first (sync for simplicity) */
+        log_module(CS_LOG, LOG_DEBUG, "adduser_async[%s/%s]: Parent not found, creating sync",
+                   ctx->channel, ctx->username);
+        if (group_id) free(group_id);
+
+        /* Fall back to sync for parent creation (rare case) */
+        int rc = keycloak_ensure_channels_parent(ctx->realm, ctx->client, &ctx->parent_id);
+        if (rc != KC_SUCCESS || !ctx->parent_id) {
+            log_module(CS_LOG, LOG_WARNING, "adduser_async[%s/%s]: Failed to create parent",
+                       ctx->channel, ctx->username);
+            adduser_async_ctx_free(ctx);
+            return 0;
+        }
+    } else {
+        if (group_id) free(group_id);
+        log_module(CS_LOG, LOG_WARNING, "adduser_async[%s/%s]: Parent lookup failed",
+                   ctx->channel, ctx->username);
+        adduser_async_ctx_free(ctx);
+        return 0;
+    }
+
+    /* Now create the channel subgroup */
+    ctx->state = ADDUSER_CREATE_GROUP;
+    if (keycloak_create_subgroup_async(ctx->realm, ctx->client, ctx->parent_id,
+                                        ctx->channel, ctx, adduser_create_group_cb) < 0) {
+        log_module(CS_LOG, LOG_WARNING, "adduser_async[%s/%s]: Failed to start subgroup create",
+                   ctx->channel, ctx->username);
+        adduser_async_ctx_free(ctx);
+        return 0;
+    }
+
+    return 0;
+}
+
+/* Phase 4: Channel group creation completed */
+static int
+adduser_create_group_cb(void *session, int result, char *group_id)
+{
+    struct adduser_async_ctx *ctx = session;
+    if (!ctx) {
+        if (group_id) free(group_id);
+        return 1;
+    }
+
+    log_module(CS_LOG, LOG_DEBUG, "adduser_async[%s/%s]: Create group result=%d",
+               ctx->channel, ctx->username, result);
+
+    if (result == KC_SUCCESS && group_id) {
+        ctx->group_id = group_id;
+    } else if (result == KC_USER_EXISTS) {
+        /* Group already exists - need to look it up */
+        if (group_id) {
+            ctx->group_id = group_id;
+        } else {
+            /* Look up by path to get ID */
+            char group_path[256];
+            snprintf(group_path, sizeof(group_path), "/irc-channels/%s", ctx->channel);
+            if (keycloak_get_group_by_path_async(ctx->realm, ctx->client, group_path,
+                                                  ctx, adduser_lookup_group_cb) < 0) {
+                log_module(CS_LOG, LOG_WARNING, "adduser_async[%s/%s]: Failed to lookup existing group",
+                           ctx->channel, ctx->username);
+                adduser_async_ctx_free(ctx);
+                return 0;
+            }
+            return 0;  /* Will continue in lookup callback */
+        }
+    } else {
+        if (group_id) free(group_id);
+        log_module(CS_LOG, LOG_WARNING, "adduser_async[%s/%s]: Failed to create group",
+                   ctx->channel, ctx->username);
+        adduser_async_ctx_free(ctx);
+        return 0;
+    }
+
+    /* Set access level attribute */
+    ctx->state = ADDUSER_SET_LEVEL;
+    char level_str[16];
+    snprintf(level_str, sizeof(level_str), "%u", ctx->access);
+
+    if (keycloak_set_group_attribute_async(ctx->realm, ctx->client, ctx->group_id,
+                                            chanserv_conf.keycloak_access_level_attr,
+                                            level_str, ctx, adduser_set_level_cb) < 0) {
+        log_module(CS_LOG, LOG_WARNING, "adduser_async[%s/%s]: Failed to start set level",
+                   ctx->channel, ctx->username);
+        adduser_async_ctx_free(ctx);
+        return 0;
+    }
+
+    return 0;
+}
+
+/* Phase 5: Set level completed */
+static int
+adduser_set_level_cb(void *session, int result)
+{
+    struct adduser_async_ctx *ctx = session;
+    if (!ctx) return 1;
+
+    log_module(CS_LOG, LOG_DEBUG, "adduser_async[%s/%s]: Set level result=%d",
+               ctx->channel, ctx->username, result);
+
+    /* Even if set level failed, try to add user */
+    if (result != KC_SUCCESS) {
+        log_module(CS_LOG, LOG_WARNING, "adduser_async[%s/%s]: Set level failed, continuing",
+                   ctx->channel, ctx->username);
+    }
+
+    /* Final step: Add user to group */
+    ctx->state = ADDUSER_ADD_USER;
+    if (keycloak_add_user_to_group_async(ctx->realm, ctx->client, ctx->user_id,
+                                          ctx->group_id, ctx, adduser_final_cb) < 0) {
+        log_module(CS_LOG, LOG_WARNING, "adduser_async[%s/%s]: Failed to start add user",
+                   ctx->channel, ctx->username);
+        adduser_async_ctx_free(ctx);
+        return 0;
+    }
+
+    return 0;
+}
+
+/* Final callback: Add/remove completed */
+static int
+adduser_final_cb(void *session, int result)
+{
+    struct adduser_async_ctx *ctx = session;
+    if (!ctx) return 1;
+
+    log_module(CS_LOG, LOG_DEBUG, "adduser_async[%s/%s]: Final result=%d (access=%d)",
+               ctx->channel, ctx->username, result, ctx->access);
+
+    if (result == KC_SUCCESS) {
+#ifdef WITH_LMDB
+        /* Update LMDB cache on success */
+        if (x3_lmdb_is_available()) {
+            if (ctx->access > 0) {
+                x3_lmdb_chanaccess_set(ctx->channel, ctx->username, ctx->access);
+            } else {
+                x3_lmdb_chanaccess_delete(ctx->channel, ctx->username);
+            }
+            log_module(CS_LOG, LOG_DEBUG, "adduser_async[%s/%s]: Updated LMDB cache",
+                       ctx->channel, ctx->username);
+        }
+#endif
+    } else {
+        log_module(CS_LOG, LOG_WARNING, "adduser_async[%s/%s]: Final operation failed",
+                   ctx->channel, ctx->username);
+    }
+
+    ctx->state = ADDUSER_DONE;
+    adduser_async_ctx_free(ctx);
+    return 0;
+}
+
+/*
+ * Start async ADDUSER operation (Phase 4)
+ * Returns 0 on success (async started), -1 on error
+ */
+static int
+chanserv_push_keycloak_access_async(const char *channel, const char *username,
+                                     unsigned short access)
+{
+    struct adduser_async_ctx *ctx;
+
+    if (!nickserv_conf.keycloak_enable || !chanserv_conf.keycloak_access_sync ||
+        !chanserv_conf.keycloak_bidirectional)
+        return 0;  /* Silently succeed if not enabled */
+
+    if (!channel || !username)
+        return -1;
+
+    /* Check if we have a valid token */
+    if (!kc_client_config.access_token) {
+        log_module(CS_LOG, LOG_DEBUG, "adduser_async: No token available");
+        return -1;
+    }
+
+    /* Allocate context */
+    ctx = calloc(1, sizeof(*ctx));
+    if (!ctx) {
+        log_module(CS_LOG, LOG_ERROR, "adduser_async: Out of memory");
+        return -1;
+    }
+
+    ctx->channel = strdup(channel);
+    ctx->username = strdup(username);
+    ctx->access = access;
+    ctx->realm.base_uri = (char*)nickserv_conf.keycloak_uri;
+    ctx->realm.realm = nickserv_conf.keycloak_realm;
+    ctx->client.client_id = (char*)nickserv_conf.keycloak_client_id;
+    ctx->client.client_secret = (char*)nickserv_conf.keycloak_client_secret;
+    ctx->client.access_token = kc_client_config.access_token;
+    ctx->state = ADDUSER_LOOKUP_USER;
+    ctx->started = now;
+
+    if (!ctx->channel || !ctx->username) {
+        adduser_async_ctx_free(ctx);
+        return -1;
+    }
+
+    /* Start by looking up the user */
+    if (keycloak_get_user_async(ctx->realm, ctx->client, username,
+                                 ctx, adduser_lookup_user_cb) < 0) {
+        log_module(CS_LOG, LOG_WARNING, "adduser_async: Failed to start user lookup for %s",
+                   username);
+        adduser_async_ctx_free(ctx);
+        return -1;
+    }
+
+    log_module(CS_LOG, LOG_DEBUG, "adduser_async: Started for %s/%s level %d",
+               channel, username, access);
+    return 0;
+}
+
+/*
  * Async context for Keycloak group operations with LMDB update
  */
 struct cs_group_async_ctx {
@@ -11424,6 +11830,8 @@ cs_group_async_callback(void *session, int result)
  * Push a user's access level change to Keycloak (bidirectional sync: X3 -> Keycloak)
  * Creates the channel group if it doesn't exist, then adds/updates user membership.
  *
+ * Phase 4: Now uses async state machine when possible.
+ *
  * @param channel    Channel name (with #)
  * @param username   Account name of user
  * @param access     New access level (0 to remove)
@@ -11452,7 +11860,15 @@ chanserv_push_keycloak_access(const char *channel, const char *username, unsigne
     if (!channel || !username)
         return KC_ERROR;
 
-    log_module(CS_LOG, LOG_DEBUG, "chanserv_push_keycloak_access: %s -> %s level %d",
+    /* Phase 4: Try async path first */
+    if (chanserv_push_keycloak_access_async(channel, username, access) == 0) {
+        log_module(CS_LOG, LOG_DEBUG, "chanserv_push_keycloak_access: Using async path for %s/%s",
+                   channel, username);
+        return KC_SUCCESS;  /* Async started - will complete in background */
+    }
+
+    /* Async failed to start - fall back to sync path */
+    log_module(CS_LOG, LOG_DEBUG, "chanserv_push_keycloak_access: %s -> %s level %d (sync fallback)",
                username, channel, access);
 
     /* Setup Keycloak connection */
