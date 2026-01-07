@@ -283,6 +283,10 @@ static int kc_token_refresh_callback(void *session, int result, struct access_to
 static void kc_notify_token_waiters(int result, struct access_token *token);
 int kc_ensure_token_async(kc_token_waiter_cb callback, void *context);
 
+/* Forward declarations for async AUTH command (Phase 2) */
+struct auth_async_ctx;
+static int auth_async_callback(void *ctx_ptr, int result);
+
 /* Forward declarations for Keycloak wrapper functions */
 static int kc_ensure_token(void);
 static int kc_check_auth(const char *handle, const char *password);
@@ -2891,6 +2895,34 @@ static NICKSERV_FUNC(cmd_auth)
 
 #ifdef WITH_KEYCLOAK
     if (nickserv_conf.keycloak_enable) {
+        /* Try async auth first (Phase 2) - only for registered users with numerics */
+        if (user->numeric[0] != '\0') {
+            struct auth_async_ctx *auth_ctx = calloc(1, sizeof(*auth_ctx));
+            if (auth_ctx) {
+                safestrncpy(auth_ctx->handle, handle, sizeof(auth_ctx->handle));
+                safestrncpy(auth_ctx->nick, user->nick, sizeof(auth_ctx->nick));
+                safestrncpy(auth_ctx->numeric, user->numeric, sizeof(auth_ctx->numeric));
+                auth_ctx->user = user;
+                auth_ctx->cmd = cmd;
+                auth_ctx->pw_arg = pw_arg;
+                auth_ctx->started = now;
+
+                if (kc_check_auth_async(kc_realm_config, kc_client_config,
+                                        handle, passwd, auth_ctx,
+                                        auth_async_callback) == 0) {
+                    /* Async started - mask password in logs and return pending */
+                    argv[pw_arg] = "****";
+                    log_module(NS_LOG, LOG_DEBUG, "AUTH async: Started for %s", handle);
+                    return 1;
+                }
+
+                /* Async failed to start - fall through to sync */
+                log_module(NS_LOG, LOG_WARNING, "AUTH async: Failed to start, falling back to sync for %s", handle);
+                free(auth_ctx);
+            }
+        }
+
+        /* Synchronous fallback */
         kc_result = kc_check_auth(handle, passwd);
         /* Get the users email address and update it */
         if (kc_result == KC_SUCCESS) {
@@ -6326,6 +6358,216 @@ kc_check_auth(const char *handle, const char *password)
     }
 
     return rc == KC_FORBIDDEN ? KC_FORBIDDEN : KC_ERROR;
+}
+
+/* Forward declaration for use in auth_async_callback */
+static int kc_get_user_info(const char *handle, char **email_out);
+
+/*
+ * Phase 2: Async AUTH command support
+ * Context structure to resume cmd_auth after async Keycloak authentication
+ */
+struct auth_async_ctx {
+    char handle[NICKSERV_HANDLE_LEN + 1];  /* Account handle */
+    char nick[NICKLEN + 1];                 /* User's nick (for replies) */
+    char numeric[COMBO_NUMERIC_LEN + 1];   /* User numeric for validation */
+    struct userNode *user;                  /* User pointer (validated before use) */
+    struct svccmd *cmd;                     /* Command context */
+    int pw_arg;                             /* Password argument index */
+    time_t started;                         /* When request started */
+};
+
+/* Validate user is still connected by checking numeric matches */
+static struct userNode *
+auth_async_validate_user(struct auth_async_ctx *ctx)
+{
+    struct userNode *user;
+
+    if (!ctx) return NULL;
+
+    /* Look up user by numeric */
+    user = GetUserN(ctx->numeric);
+    if (!user) {
+        log_module(NS_LOG, LOG_DEBUG, "AUTH async: User %s disconnected (numeric %s not found)",
+                   ctx->nick, ctx->numeric);
+        return NULL;
+    }
+
+    /* Verify it's the same user pointer (numeric lookup should return same user) */
+    if (user != ctx->user) {
+        log_module(NS_LOG, LOG_DEBUG, "AUTH async: User pointer mismatch for %s (numeric %s)",
+                   ctx->nick, ctx->numeric);
+        return NULL;
+    }
+
+    /* User is still connected and hasn't been replaced */
+    return user;
+}
+
+/* Async AUTH callback - invoked when Keycloak auth completes */
+static int
+auth_async_callback(void *ctx_ptr, int result)
+{
+    struct auth_async_ctx *ctx = (struct auth_async_ctx *)ctx_ptr;
+    struct userNode *user;
+    struct handle_info *hi;
+    char *kc_email = NULL;
+    int maxlogins, used;
+    struct userNode *other;
+
+    if (!ctx) {
+        log_module(NS_LOG, LOG_ERROR, "AUTH async callback: NULL context");
+        return 1;
+    }
+
+    /* Validate user is still connected */
+    user = auth_async_validate_user(ctx);
+    if (!user) {
+        log_module(NS_LOG, LOG_DEBUG, "AUTH async callback: User no longer valid");
+        free(ctx);
+        return 1;
+    }
+
+    log_module(NS_LOG, LOG_DEBUG, "AUTH async callback: handle=%s result=%d",
+               ctx->handle, result);
+
+    /* Look up handle info */
+    hi = dict_find(nickserv_handle_dict, ctx->handle, NULL);
+
+    /* Process auth result */
+    if (result == KC_SUCCESS) {
+        /* Get user email for potential updates */
+        if (kc_get_user_info(ctx->handle, &kc_email) != KC_SUCCESS) {
+            if (nickserv_conf.email_required) {
+                send_message(user, nickserv, "NSMSG_KEYCLOAK_FAIL_EMAIL", kc_strerror(KC_ERROR));
+                free(ctx);
+                return 0;
+            }
+        }
+
+        /* Handle autocreate if account doesn't exist */
+        if (!hi && nickserv_conf.keycloak_autocreate) {
+            char *mask;
+            hi = nickserv_register(user, user, ctx->handle, "*", 0);
+            if (!hi) {
+                send_message(user, nickserv, "NSMSG_UNABLE_TO_ADD");
+                if (kc_email) free(kc_email);
+                free(ctx);
+                return 0;
+            }
+            /* Add default hostmask */
+            if (nickserv_conf.default_hostmask)
+                mask = "*@*";
+            else
+                mask = generate_hostmask(user, GENMASK_OMITNICK|GENMASK_NO_HIDING|GENMASK_ANY_IDENT);
+            if (mask) {
+                char *mask_canonicalized = canonicalize_hostmask(strdup(mask));
+                string_list_append(hi->masks, mask_canonicalized);
+            }
+            if (kc_email) {
+                nickserv_set_email_addr(hi, kc_email);
+            }
+            if (nickserv_conf.sync_log)
+                SyncLog("REGISTER %s %s %s %s", hi->handle, hi->passwd, kc_email ? kc_email : "@", user->info);
+        }
+
+        if (kc_email) free(kc_email);
+    } else if (result == KC_FORBIDDEN) {
+        /* Invalid credentials */
+        if (!hi) {
+            send_message(user, nickserv, "NSMSG_HANDLE_NOT_FOUND");
+            free(ctx);
+            return 0;
+        }
+        /* Fall through to password check below which will fail */
+    } else {
+        /* Keycloak error */
+        send_message(user, nickserv, "NSMSG_KEYCLOAK_FAIL", kc_strerror(result));
+        free(ctx);
+        return 0;
+    }
+
+    /* Now continue with standard cmd_auth flow */
+    if (!hi) {
+        send_message(user, nickserv, "NSMSG_HANDLE_NOT_FOUND");
+        free(ctx);
+        return 0;
+    }
+
+    /* Hostmask validation */
+    if (!valid_user_for(user, hi)) {
+        if (hi->email_addr && nickserv_conf.email_enabled)
+            send_message_type(4, user, nickserv,
+                              handle_find_message(hi, "NSMSG_USE_AUTHCOOKIE"),
+                              hi->handle);
+        else
+            send_message_type(4, user, nickserv,
+                              handle_find_message(hi, "NSMSG_HOSTMASK_INVALID"),
+                              hi->handle);
+        free(ctx);
+        return 0;
+    }
+
+    /* Check password result (KC_SUCCESS means we're authenticated via Keycloak) */
+    if (result != KC_SUCCESS) {
+        unsigned int n;
+        send_message_type(4, user, nickserv,
+                          handle_find_message(hi, "NSMSG_PASSWORD_INVALID"));
+        for (n = 0; n < failpw_func_used; n++)
+            failpw_func_list[n](user, hi, failpw_func_list_extra[n]);
+        if (nickserv_conf.autogag_enabled) {
+            if (!user->auth_policer.params) {
+                user->auth_policer.last_req = now;
+                user->auth_policer.params = nickserv_conf.auth_policer_params;
+            }
+            if (!policer_conforms(&user->auth_policer, now, 1.0)) {
+                char *hostmask;
+                hostmask = generate_hostmask(user, GENMASK_STRICT_HOST|GENMASK_BYIP|GENMASK_NO_HIDING);
+                log_module(NS_LOG, LOG_INFO, "%s auto-gagged for repeated password guessing.", hostmask);
+                gag_create(hostmask, nickserv->nick, "Repeated password guessing.", now + nickserv_conf.autogag_duration);
+                free(hostmask);
+            }
+        }
+        free(ctx);
+        return 0;
+    }
+
+    /* Check if suspended */
+    if (HANDLE_FLAGGED(hi, SUSPENDED)) {
+        send_message_type(4, user, nickserv,
+                          handle_find_message(hi, "NSMSG_HANDLE_SUSPENDED"));
+        free(ctx);
+        return 0;
+    }
+
+    /* Check for pending activation */
+    if (hi->cookie && hi->cookie->type == ACTIVATION) {
+        send_message_type(4, user, nickserv,
+                          handle_find_message(hi, "NSMSG_USE_COOKIE_REGISTER"));
+        free(ctx);
+        return 0;
+    }
+
+    /* Check max logins */
+    maxlogins = hi->maxlogins ? hi->maxlogins : nickserv_conf.default_maxlogins;
+    for (used = 0, other = hi->users; other; other = other->next_authed) {
+        if (++used >= maxlogins) {
+            send_message_type(4, user, nickserv,
+                              handle_find_message(hi, "NSMSG_MAX_LOGINS"),
+                              maxlogins);
+            free(ctx);
+            return 0;
+        }
+    }
+
+    /* Success! Set user as authenticated */
+    set_user_handle_info(user, hi, 1);
+    if (nickserv_conf.sync_log)
+        SyncLog("ACCOUNTACC %s", hi->handle);
+    send_message_type(4, user, nickserv, handle_find_message(hi, "NSMSG_AUTH_SUCCESS"));
+
+    free(ctx);
+    return 0;
 }
 
 /* Get user info (email) from Keycloak */
