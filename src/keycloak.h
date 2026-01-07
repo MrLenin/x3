@@ -589,6 +589,23 @@ typedef int (*kc_introspect_callback)(void *session, int result, struct kc_token
 typedef int (*kc_client_token_callback)(void *session, int result, struct access_token *access_token);
 
 /**
+ * Async get user callback type (Phase 3)
+ * @param session  Opaque session pointer
+ * @param result   KC_SUCCESS, KC_NOT_FOUND, or KC_ERROR
+ * @param user     User data (only valid if result==KC_SUCCESS, caller must free with keycloak_user_free_fields)
+ * @return 0 if session may continue processing, 1 if session is terminal
+ */
+typedef int (*kc_get_user_callback)(void *session, int result, struct kc_user *user);
+
+/**
+ * Async update user callback type (Phase 3)
+ * @param session  Opaque session pointer
+ * @param result   KC_SUCCESS, KC_NOT_FOUND, or KC_ERROR
+ * @return 0 if session may continue processing, 1 if session is terminal
+ */
+typedef int (*kc_update_user_callback)(void *session, int result);
+
+/**
  * Start async authentication check against Keycloak
  * This function returns immediately and invokes the callback when complete.
  * Uses curl_multi integrated with X3's ioset event loop.
@@ -817,6 +834,39 @@ typedef int (*kc_group_members_callback)(void *session, int result,
 int keycloak_get_group_members_async(struct kc_realm realm, struct kc_client client,
                                       const char *group_id, void *session,
                                       kc_group_members_callback callback);
+
+/**
+ * Get a single user by username asynchronously. (Phase 3)
+ * This function returns immediately and invokes the callback when complete.
+ *
+ * @param realm       Keycloak realm configuration
+ * @param client      Client with admin access token
+ * @param username    Username to search for
+ * @param session     Opaque session pointer (passed to callback)
+ * @param callback    Function to call when lookup completes
+ * @return 0 on success (request started), -1 on error
+ */
+int keycloak_get_user_async(struct kc_realm realm, struct kc_client client,
+                             const char *username, void *session,
+                             kc_get_user_callback callback);
+
+/**
+ * Update a user representation asynchronously. (Phase 3)
+ * This function returns immediately and invokes the callback when complete.
+ *
+ * @param realm       Keycloak realm configuration
+ * @param client      Client with admin access token
+ * @param user_id     Keycloak user UUID
+ * @param update      Fields to update (NULL fields are skipped)
+ * @param session     Opaque session pointer (passed to callback)
+ * @param callback    Function to call when update completes
+ * @return 0 on success (request started), -1 on error
+ */
+int keycloak_update_user_representation_async(struct kc_realm realm, struct kc_client client,
+                                               const char *user_id,
+                                               const struct kc_user_update *update,
+                                               void *session,
+                                               kc_update_user_callback callback);
 
 #endif /* WITH_KEYCLOAK */
 

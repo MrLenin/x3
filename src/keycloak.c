@@ -1304,7 +1304,9 @@ enum kc_async_type {
     KC_ASYNC_CREATE_USER,   /* User creation */
     KC_ASYNC_GROUP_INFO,    /* Get group info (phase 1 of group members) */
     KC_ASYNC_GROUP_MEMBERS, /* Get group members (phase 2 or standalone) */
-    KC_ASYNC_CLIENT_TOKEN   /* Client credentials token acquisition */
+    KC_ASYNC_CLIENT_TOKEN,  /* Client credentials token acquisition */
+    KC_ASYNC_GET_USER,      /* Get user by username (Phase 3) */
+    KC_ASYNC_UPDATE_USER    /* Update user representation (Phase 3) */
 };
 
 /* Async request tracking */
@@ -1326,6 +1328,8 @@ struct kc_async_request {
         kc_group_info_callback group_info;    /* Group info callback */
         kc_group_members_callback group_members; /* Group members callback */
         kc_client_token_callback client_token;   /* Client token callback */
+        kc_get_user_callback get_user;           /* Get user callback (Phase 3) */
+        kc_update_user_callback update_user;     /* Update user callback (Phase 3) */
     } cb;
     /* WebPush-specific: copy of binary POST data for async request */
     void *post_data_copy;
@@ -1841,6 +1845,69 @@ kc_curl_check_completed(void)
                     /* Note: token ownership transferred to callback */
                 } else if (token) {
                     keycloak_free_access_token(token);
+                }
+                break;
+            }
+            case KC_ASYNC_GET_USER: {
+                int result = KC_ERROR;
+                struct kc_user user = {0};
+
+                if (http_code == 200 && req->response.response) {
+                    /* Parse JSON array response (same format as keycloak_get_users) */
+                    json_error_t error;
+                    json_t *root = json_loads(req->response.response, 0, &error);
+                    if (root && json_is_array(root)) {
+                        size_t count = json_array_size(root);
+                        if (count == 0) {
+                            result = KC_NOT_FOUND;
+                            log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async get_user: Not found", req_id);
+                        } else if (count == 1) {
+                            json_t *user_obj = json_array_get(root, 0);
+                            if (json_read_kc_user(user_obj, &user) == KC_SUCCESS) {
+                                result = KC_SUCCESS;
+                                /* Cache user ID for future lookups */
+                                if (user.username && user.id) {
+                                    kc_userid_cache_put(user.username, user.id);
+                                }
+                                log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async get_user: Found user %s", req_id, user.username);
+                            }
+                        } else {
+                            log_module(KC_LOG, LOG_WARNING, "[%s] kc_async get_user: Multiple users found (%zu)", req_id, count);
+                            result = KC_ERROR;
+                        }
+                        json_decref(root);
+                    } else {
+                        log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async get_user: Invalid JSON", req_id);
+                        if (root) json_decref(root);
+                    }
+                } else if (http_code == 404) {
+                    result = KC_NOT_FOUND;
+                    log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async get_user: Not found (HTTP 404)", req_id);
+                } else {
+                    log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async get_user: Error (HTTP %ld)", req_id, http_code);
+                }
+                if (req->cb.get_user) {
+                    req->cb.get_user(req->session, result, result == KC_SUCCESS ? &user : NULL);
+                }
+                /* Free user fields if callback didn't take ownership or there was an error */
+                if (result != KC_SUCCESS) {
+                    keycloak_user_free_fields(&user);
+                }
+                break;
+            }
+            case KC_ASYNC_UPDATE_USER: {
+                int result = KC_ERROR;
+                if (http_code == 204 || http_code == 200) {
+                    result = KC_SUCCESS;
+                    log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async update_user: Success (HTTP %ld)", req_id, http_code);
+                } else if (http_code == 404) {
+                    result = KC_NOT_FOUND;
+                    log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async update_user: Not found (HTTP 404)", req_id);
+                } else {
+                    log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async update_user: Error (HTTP %ld)", req_id, http_code);
+                }
+                if (req->cb.update_user) {
+                    req->cb.update_user(req->session, result);
                 }
                 break;
             }
@@ -5745,6 +5812,172 @@ error:
     if (req) {
         if (req->uri) free(req->uri);
         if (req->response.response) free(req->response.response);
+        free(req);
+    }
+    return -1;
+}
+
+/*
+ * Phase 3: Async get user by username
+ * Returns 0 on success (request started), -1 on error
+ */
+int
+keycloak_get_user_async(struct kc_realm realm, struct kc_client client,
+                         const char *username, void *session,
+                         kc_get_user_callback callback)
+{
+    struct kc_async_request *req = NULL;
+    char *escaped_user = NULL;
+
+    /* Validate inputs */
+    if (!realm.base_uri || !realm.realm || !client.access_token ||
+        !username || !callback) {
+        log_module(KC_LOG, LOG_DEBUG, "get_user_async: Invalid arguments");
+        return -1;
+    }
+
+    /* Check user ID cache first */
+    const char *cached_id = kc_userid_cache_get(username);
+    if (cached_id) {
+        /* Cache hit - create minimal user struct and call callback directly */
+        struct kc_user user = {0};
+        user.id = strdup(cached_id);
+        if (user.id) {
+            user.username = strdup(username);
+            log_module(KC_LOG, LOG_DEBUG, "get_user_async: Cache hit for %s -> %s", username, cached_id);
+            callback(session, KC_SUCCESS, &user);
+            return 0;
+        }
+    }
+
+    /* Allocate request structure */
+    req = calloc(1, sizeof(*req));
+    if (!req) {
+        log_module(KC_LOG, LOG_ERROR, "get_user_async: Out of memory");
+        return -1;
+    }
+    req->session = session;
+    req->type = KC_ASYNC_GET_USER;
+    req->cb.get_user = callback;
+
+    /* URL-encode username */
+    escaped_user = curl_easy_escape(NULL, username, 0);
+    if (!escaped_user) {
+        log_module(KC_LOG, LOG_DEBUG, "get_user_async: Failed to escape username");
+        goto error;
+    }
+
+    /* Build URI: /admin/realms/{realm}/users?username={user}&exact=true */
+    req->uri = kc_build_user_by_username_endpoint(realm, escaped_user, 1);
+    curl_free(escaped_user);
+    if (!req->uri) {
+        log_module(KC_LOG, LOG_ERROR, "get_user_async: Failed to build URI");
+        goto error;
+    }
+
+    /* Use unified async API */
+    struct curl_opts opts = CURL_OPTS_INIT;
+    opts.uri = req->uri;
+    opts.method = HTTP_GET;
+    opts.xoauth2_bearer = client.access_token->access_token;
+
+    if (curl_perform_async(req, opts) < 0) {
+        log_module(KC_LOG, LOG_ERROR, "get_user_async: curl_perform_async failed");
+        goto error;
+    }
+
+    log_module(KC_LOG, LOG_DEBUG, "get_user_async: Started async lookup for %s", username);
+    return 0;
+
+error:
+    if (req) {
+        if (req->uri) free(req->uri);
+        free(req);
+    }
+    return -1;
+}
+
+/*
+ * Phase 3: Async update user representation
+ * Returns 0 on success (request started), -1 on error
+ */
+int
+keycloak_update_user_representation_async(struct kc_realm realm, struct kc_client client,
+                                           const char *user_id,
+                                           const struct kc_user_update *update,
+                                           void *session,
+                                           kc_update_user_callback callback)
+{
+    struct kc_async_request *req = NULL;
+    char *json_body = NULL;
+
+    /* Validate inputs */
+    if (!realm.base_uri || !realm.realm || !client.access_token ||
+        !user_id || !update || !callback) {
+        log_module(KC_LOG, LOG_DEBUG, "update_user_async: Invalid arguments");
+        return -1;
+    }
+
+    /* Check if there's anything to update */
+    if (!update->email && !update->cred_data) {
+        log_module(KC_LOG, LOG_DEBUG, "update_user_async: Nothing to update");
+        /* Call callback with success immediately */
+        callback(session, KC_SUCCESS);
+        return 0;
+    }
+
+    /* Credentials require both cred_data and secret_data */
+    if (update->cred_data && !update->secret_data) {
+        log_module(KC_LOG, LOG_DEBUG, "update_user_async: cred_data requires secret_data");
+        return -1;
+    }
+
+    /* Allocate request structure */
+    req = calloc(1, sizeof(*req));
+    if (!req) {
+        log_module(KC_LOG, LOG_ERROR, "update_user_async: Out of memory");
+        return -1;
+    }
+    req->session = session;
+    req->type = KC_ASYNC_UPDATE_USER;
+    req->cb.update_user = callback;
+
+    /* Build URI */
+    req->uri = kc_build_user_endpoint(realm, user_id);
+    if (!req->uri) {
+        log_module(KC_LOG, LOG_ERROR, "update_user_async: Failed to build URI");
+        goto error;
+    }
+
+    /* Build JSON body using existing helper */
+    json_body = json_build_user_with_hash(NULL, update->email,
+                                          update->cred_data, update->secret_data);
+    if (!json_body) {
+        log_module(KC_LOG, LOG_ERROR, "update_user_async: Failed to build JSON body");
+        goto error;
+    }
+    req->post_fields = json_body;
+
+    /* Use unified async API - PUT request */
+    struct curl_opts opts = CURL_OPTS_INIT;
+    opts.uri = req->uri;
+    opts.method = HTTP_PUT;
+    opts.xoauth2_bearer = client.access_token->access_token;
+    opts.post_fields = json_body;
+    opts.content_type = "application/json";
+
+    if (curl_perform_async(req, opts) < 0) {
+        log_module(KC_LOG, LOG_ERROR, "update_user_async: curl_perform_async failed");
+        goto error;
+    }
+
+    log_module(KC_LOG, LOG_DEBUG, "update_user_async: Started async update for user %s", user_id);
+    return 0;
+
+error:
+    if (req) {
+        if (req->uri) free(req->uri);
+        if (req->post_fields) free(req->post_fields);
         free(req);
     }
     return -1;

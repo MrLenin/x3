@@ -3416,6 +3416,32 @@ static NICKSERV_FUNC(cmd_cookie)
 #ifdef WITH_KEYCLOAK
         /* Set password hash in Keycloak (user was created at registration without password). */
         if (nickserv_conf.keycloak_enable) {
+            /* Phase 3: Try async path for users with numerics (registered users) */
+            if (user->numeric[0] != '\0') {
+                struct cookie_async_ctx *cookie_ctx = calloc(1, sizeof(*cookie_ctx));
+                if (cookie_ctx) {
+                    safestrncpy(cookie_ctx->handle, hi->handle, sizeof(cookie_ctx->handle));
+                    safestrncpy(cookie_ctx->nick, user->nick, sizeof(cookie_ctx->nick));
+                    safestrncpy(cookie_ctx->numeric, user->numeric, sizeof(cookie_ctx->numeric));
+                    cookie_ctx->user = user;
+                    cookie_ctx->hi = hi;
+                    cookie_ctx->password_hash = strdup(hi->cookie->data);
+                    cookie_ctx->plaintext_password = strdup(password);
+                    cookie_ctx->state = COOKIE_STATE_LOOKUP;
+                    cookie_ctx->started = now;
+
+                    /* Start async user lookup (Phase 1) */
+                    if (keycloak_get_user_async(kc_realm_config, kc_client_config,
+                                                hi->handle, cookie_ctx,
+                                                cookie_async_lookup_callback) == 0) {
+                        log_module(NS_LOG, LOG_DEBUG, "COOKIE async: Started for %s", hi->handle);
+                        return 1;  /* Async started - response will come via callback */
+                    }
+                    log_module(NS_LOG, LOG_WARNING, "COOKIE async: Failed to start, falling back to sync for %s", hi->handle);
+                    cookie_async_ctx_free(cookie_ctx);
+                }
+            }
+            /* Synchronous fallback (pre-registration users or async failed) */
             int rc = kc_do_modify(hi->handle, hi->cookie->data, NULL);
             if (rc != KC_SUCCESS) {
                 reply("NSMSG_KEYCLOAK_FAIL", kc_strerror(rc));
@@ -3432,6 +3458,7 @@ static NICKSERV_FUNC(cmd_cookie)
 #endif
 
         set_user_handle_info(user, hi, 1);
+        nickserv_eat_cookie(hi->cookie);  /* Eat the cookie after activation */
         reply("NSMSG_HANDLE_ACTIVATED");
         if (nickserv_conf.sync_log)
           SyncLog("ACCOUNTACC %s", hi->handle);
@@ -6567,6 +6594,217 @@ auth_async_callback(void *ctx_ptr, int result)
     send_message_type(4, user, nickserv, handle_find_message(hi, "NSMSG_AUTH_SUCCESS"));
 
     free(ctx);
+    return 0;
+}
+
+/*
+ * Phase 3: Async COOKIE command support
+ * Two-phase state machine for account activation:
+ *   1. COOKIE_STATE_LOOKUP - Get user ID from Keycloak
+ *   2. COOKIE_STATE_UPDATE - Update password hash in Keycloak
+ */
+enum cookie_async_state {
+    COOKIE_STATE_LOOKUP,
+    COOKIE_STATE_UPDATE,
+    COOKIE_STATE_DONE
+};
+
+struct cookie_async_ctx {
+    char handle[NICKSERV_HANDLE_LEN + 1];   /* Account handle */
+    char nick[NICKLEN + 1];                  /* User's nick (for replies) */
+    char numeric[COMBO_NUMERIC_LEN + 1];    /* User numeric for validation */
+    struct userNode *user;                   /* User pointer (validated before use) */
+    struct handle_info *hi;                  /* Handle info (validated before use) */
+    char *user_id;                           /* Keycloak user ID (from lookup phase) */
+    char *password_hash;                     /* Password hash to set */
+    char *plaintext_password;                /* Plaintext password for SCRAM creation */
+    enum cookie_async_state state;           /* Current state */
+    time_t started;                          /* When request started */
+};
+
+/* Forward declarations for cookie async callbacks */
+static int cookie_async_lookup_callback(void *session, int result, struct kc_user *user);
+static int cookie_async_update_callback(void *session, int result);
+
+/* Validate user is still connected by checking numeric matches */
+static struct userNode *
+cookie_async_validate_user(struct cookie_async_ctx *ctx)
+{
+    struct userNode *user;
+
+    if (!ctx) return NULL;
+
+    /* Look up user by numeric */
+    user = GetUserN(ctx->numeric);
+    if (!user) {
+        log_module(NS_LOG, LOG_DEBUG, "COOKIE async: User %s disconnected (numeric %s not found)",
+                   ctx->nick, ctx->numeric);
+        return NULL;
+    }
+
+    /* Verify it's the same user pointer */
+    if (user != ctx->user) {
+        log_module(NS_LOG, LOG_DEBUG, "COOKIE async: User pointer mismatch for %s (numeric %s)",
+                   ctx->nick, ctx->numeric);
+        return NULL;
+    }
+
+    return user;
+}
+
+/* Free cookie async context */
+static void
+cookie_async_ctx_free(struct cookie_async_ctx *ctx)
+{
+    if (!ctx) return;
+    if (ctx->user_id) free(ctx->user_id);
+    if (ctx->password_hash) free(ctx->password_hash);
+    if (ctx->plaintext_password) {
+        memset(ctx->plaintext_password, 0, strlen(ctx->plaintext_password));
+        free(ctx->plaintext_password);
+    }
+    free(ctx);
+}
+
+/* Phase 1 callback: Keycloak user lookup completed */
+static int
+cookie_async_lookup_callback(void *session, int result, struct kc_user *kc_user)
+{
+    struct cookie_async_ctx *ctx = (struct cookie_async_ctx *)session;
+    struct userNode *user;
+    char cred_data[256];
+    char secret_data[512];
+
+    if (!ctx) {
+        log_module(NS_LOG, LOG_ERROR, "COOKIE async lookup callback: NULL context");
+        return 1;
+    }
+
+    /* Validate user is still connected */
+    user = cookie_async_validate_user(ctx);
+    if (!user) {
+        log_module(NS_LOG, LOG_DEBUG, "COOKIE async lookup: User no longer valid");
+        cookie_async_ctx_free(ctx);
+        return 1;
+    }
+
+    log_module(NS_LOG, LOG_DEBUG, "COOKIE async lookup callback: handle=%s result=%d",
+               ctx->handle, result);
+
+    if (result != KC_SUCCESS) {
+        if (result == KC_NOT_FOUND) {
+            send_message(user, nickserv, "NSMSG_KEYCLOAK_FAIL", "User not found in Keycloak");
+        } else {
+            send_message(user, nickserv, "NSMSG_KEYCLOAK_FAIL", kc_strerror(result));
+        }
+        cookie_async_ctx_free(ctx);
+        return 0;
+    }
+
+    /* Store user ID for phase 2 */
+    if (!kc_user || !kc_user->id) {
+        send_message(user, nickserv, "NSMSG_KEYCLOAK_FAIL", "User ID not returned");
+        cookie_async_ctx_free(ctx);
+        return 0;
+    }
+    ctx->user_id = strdup(kc_user->id);
+
+    /* Free the user struct fields (we only needed the ID) */
+    keycloak_user_free_fields(kc_user);
+
+    /* Convert password hash to Keycloak format */
+    if (pw_export_keycloak(ctx->password_hash, cred_data, sizeof(cred_data),
+                           secret_data, sizeof(secret_data)) != 0) {
+        log_module(NS_LOG, LOG_WARNING,
+                   "COOKIE async: Hash format not exportable for %s",
+                   ctx->handle);
+        send_message(user, nickserv, "NSMSG_KEYCLOAK_FAIL", "Password format not supported");
+        cookie_async_ctx_free(ctx);
+        return 0;
+    }
+
+    /* Build update struct and start phase 2 */
+    struct kc_user_update update = {0};
+    update.cred_data = cred_data;
+    update.secret_data = secret_data;
+
+    ctx->state = COOKIE_STATE_UPDATE;
+
+    if (keycloak_update_user_representation_async(kc_realm_config, kc_client_config,
+                                                   ctx->user_id, &update,
+                                                   ctx, cookie_async_update_callback) != 0) {
+        log_module(NS_LOG, LOG_WARNING, "COOKIE async: Failed to start update for %s", ctx->handle);
+        send_message(user, nickserv, "NSMSG_KEYCLOAK_FAIL", "Failed to start password update");
+        cookie_async_ctx_free(ctx);
+        return 0;
+    }
+
+    log_module(NS_LOG, LOG_DEBUG, "COOKIE async: Started phase 2 (update) for %s", ctx->handle);
+    return 0;
+}
+
+/* Phase 2 callback: Keycloak user update completed */
+static int
+cookie_async_update_callback(void *session, int result)
+{
+    struct cookie_async_ctx *ctx = (struct cookie_async_ctx *)session;
+    struct userNode *user;
+    struct handle_info *hi;
+
+    if (!ctx) {
+        log_module(NS_LOG, LOG_ERROR, "COOKIE async update callback: NULL context");
+        return 1;
+    }
+
+    /* Validate user is still connected */
+    user = cookie_async_validate_user(ctx);
+    if (!user) {
+        log_module(NS_LOG, LOG_DEBUG, "COOKIE async update: User no longer valid");
+        cookie_async_ctx_free(ctx);
+        return 1;
+    }
+
+    log_module(NS_LOG, LOG_DEBUG, "COOKIE async update callback: handle=%s result=%d",
+               ctx->handle, result);
+
+    if (result != KC_SUCCESS) {
+        send_message(user, nickserv, "NSMSG_KEYCLOAK_FAIL", kc_strerror(result));
+        cookie_async_ctx_free(ctx);
+        return 0;
+    }
+
+    /* Verify handle still exists and has cookie */
+    hi = dict_find(nickserv_handle_dict, ctx->handle, NULL);
+    if (!hi || !hi->cookie || hi->cookie->type != ACTIVATION) {
+        log_module(NS_LOG, LOG_DEBUG, "COOKIE async update: Handle state changed for %s", ctx->handle);
+        /* Don't send message - account may have been activated another way */
+        cookie_async_ctx_free(ctx);
+        return 0;
+    }
+
+    /* Complete activation - same as sync path */
+    /* Restore the password hash from cookie */
+    safestrncpy(hi->passwd, hi->cookie->data, sizeof(hi->passwd));
+
+#if defined(WITH_LMDB) && defined(WITH_SSL)
+    /* Create SCRAM credentials if we have plaintext password */
+    if (ctx->plaintext_password) {
+        x3_lmdb_scram_acct_create_all(hi->handle, ctx->plaintext_password);
+    }
+#endif
+
+    set_user_handle_info(user, hi, 1);
+
+    /* Eat the cookie */
+    nickserv_eat_cookie(hi->cookie);
+
+    send_message(user, nickserv, "NSMSG_HANDLE_ACTIVATED");
+    if (nickserv_conf.sync_log)
+        SyncLog("ACCOUNTACC %s", hi->handle);
+
+    log_module(NS_LOG, LOG_DEBUG, "COOKIE async: Activation completed for %s", ctx->handle);
+
+    cookie_async_ctx_free(ctx);
     return 0;
 }
 
