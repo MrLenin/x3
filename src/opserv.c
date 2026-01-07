@@ -455,6 +455,30 @@ static const struct message_entry msgtab[] = {
     { "OSMSG_LMDB_STATS_PURGE", "  Last purge: %s (%lu entries purged)" },
     { "OSMSG_LMDB_STATS_NONE", "  No snapshot/purge history." },
 
+    { "OSMSG_KCSYNC_UNAVAILABLE", "Keycloak sync is not available." },
+    { "OSMSG_KCSYNC_RUNNING", "Keycloak sync in progress: batch %d/%d" },
+    { "OSMSG_KCSYNC_PROGRESS", "  Progress: %d/%d channels (%d entries)" },
+    { "OSMSG_KCSYNC_DETAILS", "  Done: %d  Failed: %d  Skipped: %d" },
+    { "OSMSG_KCSYNC_ELAPSED", "  Elapsed: %ld seconds" },
+    { "OSMSG_KCSYNC_IDLE", "No Keycloak sync currently running." },
+    { "OSMSG_KCSYNC_LAST", "  Last sync: %ld seconds ago (took %lu seconds)" },
+    { "OSMSG_KCSYNC_STATS_HDR", "Keycloak Sync Statistics:" },
+    { "OSMSG_KCSYNC_STATS_TOTAL", "  Total sync operations: %lu" },
+    { "OSMSG_KCSYNC_STATS_SUCCESS", "  Successful channel syncs: %lu" },
+    { "OSMSG_KCSYNC_STATS_FAILED", "  Failed channel syncs: %lu" },
+    { "OSMSG_KCSYNC_STATS_UNCHANGED", "  Unchanged (hash match): %lu" },
+    { "OSMSG_KCSYNC_STATS_ENTRIES", "  Total entries synced: %lu" },
+    { "OSMSG_KCSYNC_STATS_RATE", "  Success rate: %.1f%%" },
+    { "OSMSG_KCSYNC_CHANNEL_QUEUED", "Queued sync for $b%s$b." },
+    { "OSMSG_KCSYNC_CHANNEL_FAILED", "Failed to queue sync for $b%s$b." },
+    { "OSMSG_KCSYNC_ALL_STARTED", "Started full Keycloak sync of all registered channels." },
+    { "OSMSG_KCSYNC_NOT_ENABLED", "Keycloak sync is not enabled." },
+    { "OSMSG_KCSYNC_ALREADY_RUNNING", "A Keycloak sync is already running." },
+    { "OSMSG_KCSYNC_ABORTED", "Keycloak sync has been aborted." },
+    { "OSMSG_KCSYNC_NOT_RUNNING", "No Keycloak sync is currently running." },
+    { "OSMSG_KCSYNC_RESET_OK", "Reset sync state for $b%s$b." },
+    { "OSMSG_KCSYNC_RESET_FAILED", "Failed to reset sync state for $b%s$b." },
+
     { NULL, NULL }
 };
 
@@ -1174,6 +1198,125 @@ static MODCMD_FUNC(cmd_reopen)
     reply("OSMSG_REOPEN_COMPLETE");
     return 1;
 }
+
+#ifdef WITH_KEYCLOAK
+static MODCMD_FUNC(cmd_kcsync)
+{
+    const char *subcmd = (argc > 1) ? argv[1] : "STATUS";
+
+    if (!strcasecmp(subcmd, "STATUS")) {
+        struct kc_sync_status status;
+
+        if (chanserv_kcsync_get_status(&status) < 0) {
+            reply("OSMSG_KCSYNC_UNAVAILABLE");
+            return 0;
+        }
+
+        if (status.in_progress) {
+            int batches = (status.queue_size + 14) / 15;  /* Assuming batch_size 15 */
+            int current_batch = (status.current_index + 14) / 15;
+            time_t elapsed = now - status.start_time;
+
+            reply("OSMSG_KCSYNC_RUNNING", current_batch, batches);
+            reply("OSMSG_KCSYNC_PROGRESS", status.channels_done + status.channels_failed + status.channels_skipped,
+                  status.queue_size, status.total_entries);
+            reply("OSMSG_KCSYNC_DETAILS", status.channels_done, status.channels_failed, status.channels_skipped);
+            reply("OSMSG_KCSYNC_ELAPSED", (long)elapsed);
+        } else {
+            reply("OSMSG_KCSYNC_IDLE");
+
+            /* Show last sync info from stats */
+            struct kc_sync_statistics stats;
+            if (chanserv_kcsync_get_stats(&stats) == 0 && stats.last_sync_time > 0) {
+                time_t ago = now - stats.last_sync_time;
+                reply("OSMSG_KCSYNC_LAST", (long)ago, (unsigned long)stats.last_sync_duration);
+            }
+        }
+        return 1;
+
+    } else if (!strcasecmp(subcmd, "STATS")) {
+        struct kc_sync_statistics stats;
+
+        if (chanserv_kcsync_get_stats(&stats) < 0) {
+            reply("OSMSG_KCSYNC_UNAVAILABLE");
+            return 0;
+        }
+
+        reply("OSMSG_KCSYNC_STATS_HDR");
+        reply("OSMSG_KCSYNC_STATS_TOTAL", stats.total_syncs);
+        reply("OSMSG_KCSYNC_STATS_SUCCESS", stats.successful_syncs);
+        reply("OSMSG_KCSYNC_STATS_FAILED", stats.failed_syncs);
+        reply("OSMSG_KCSYNC_STATS_UNCHANGED", stats.unchanged_syncs);
+        reply("OSMSG_KCSYNC_STATS_ENTRIES", stats.total_entries);
+
+        if (stats.total_syncs > 0) {
+            double success_rate = (stats.successful_syncs * 100.0) / (stats.successful_syncs + stats.failed_syncs);
+            reply("OSMSG_KCSYNC_STATS_RATE", success_rate);
+        }
+
+        return 1;
+
+    } else if (!strcasecmp(subcmd, "CHANNEL")) {
+        if (argc < 3) {
+            reply("OSMSG_SYNTAX_ERROR", "KCSYNC CHANNEL #channel");
+            return 0;
+        }
+        const char *channel = argv[2];
+
+        int rc = chanserv_queue_keycloak_sync(channel, KC_SYNC_PRIORITY_IMMEDIATE);
+        if (rc == 0) {
+            reply("OSMSG_KCSYNC_CHANNEL_QUEUED", channel);
+        } else {
+            reply("OSMSG_KCSYNC_CHANNEL_FAILED", channel);
+            return 0;
+        }
+        return 1;
+
+    } else if (!strcasecmp(subcmd, "ALL")) {
+        int rc = chanserv_kcsync_trigger_all();
+        if (rc == 0) {
+            reply("OSMSG_KCSYNC_ALL_STARTED");
+        } else if (rc == -1) {
+            reply("OSMSG_KCSYNC_NOT_ENABLED");
+            return 0;
+        } else if (rc == -2) {
+            reply("OSMSG_KCSYNC_ALREADY_RUNNING");
+            return 0;
+        }
+        return 1;
+
+    } else if (!strcasecmp(subcmd, "ABORT")) {
+        int rc = chanserv_kcsync_abort();
+        if (rc == 0) {
+            reply("OSMSG_KCSYNC_ABORTED");
+        } else {
+            reply("OSMSG_KCSYNC_NOT_RUNNING");
+            return 0;
+        }
+        return 1;
+
+    } else if (!strcasecmp(subcmd, "RESET")) {
+        if (argc < 3) {
+            reply("OSMSG_SYNTAX_ERROR", "KCSYNC RESET #channel");
+            return 0;
+        }
+        const char *channel = argv[2];
+
+        int rc = chanserv_kcsync_reset_channel(channel);
+        if (rc == 0) {
+            reply("OSMSG_KCSYNC_RESET_OK", channel);
+        } else {
+            reply("OSMSG_KCSYNC_RESET_FAILED", channel);
+            return 0;
+        }
+        return 1;
+
+    } else {
+        reply("OSMSG_BAD_SUBCOMMAND", subcmd, "KCSYNC");
+        return 0;
+    }
+}
+#endif /* WITH_KEYCLOAK */
 
 static MODCMD_FUNC(cmd_reconnect)
 {
@@ -7585,6 +7728,15 @@ init_opserv(const char *nick)
     opserv_define_func("SVSPART", cmd_svspart, 999, 0, 3);
     opserv_define_func("JUMP", cmd_jump, 900, 0, 2);
     opserv_define_func("JUPE", cmd_jupe, 900, 0, 4);
+#ifdef WITH_KEYCLOAK
+    opserv_define_func("KCSYNC", cmd_kcsync, 400, 0, 0);
+    opserv_define_func("KCSYNC STATUS", NULL, 400, 0, 0);
+    opserv_define_func("KCSYNC STATS", NULL, 400, 0, 0);
+    opserv_define_func("KCSYNC CHANNEL", NULL, 400, 0, 0);
+    opserv_define_func("KCSYNC ALL", NULL, 600, 0, 0);
+    opserv_define_func("KCSYNC ABORT", NULL, 600, 0, 0);
+    opserv_define_func("KCSYNC RESET", NULL, 600, 0, 0);
+#endif
     opserv_define_func("KICK", cmd_kick, 100, 2, 2);
     opserv_define_func("FORCEKICK", cmd_forcekick, 800, 2, 2);
     opserv_define_func("KICKALL", cmd_kickall, 400, 2, 0);

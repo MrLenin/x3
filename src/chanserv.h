@@ -248,6 +248,34 @@ void chanserv_sync_x3_metadata(struct chanData *cData, int sync_immutable);
 
 int chanserv_queue_keycloak_sync(const char *channel, int priority);
 char *kc_group_path_to_channel(const char *group_path);
+
+/* Keycloak sync status for OpServ commands */
+struct kc_sync_status {
+    int in_progress;           /* Is a sync currently running? */
+    int queue_size;            /* Total channels to sync */
+    int current_index;         /* Current position in queue */
+    int channels_done;         /* Channels completed */
+    int channels_failed;       /* Channels that failed */
+    int channels_skipped;      /* Channels skipped (unchanged/backoff) */
+    int total_entries;         /* Total entries synced */
+    time_t start_time;         /* When sync started */
+};
+
+struct kc_sync_statistics {
+    unsigned long total_syncs;      /* Total sync operations */
+    unsigned long successful_syncs; /* Successful channel syncs */
+    unsigned long failed_syncs;     /* Failed channel syncs */
+    unsigned long unchanged_syncs;  /* Syncs skipped due to hash match */
+    unsigned long total_entries;    /* Total entries synced */
+    time_t last_sync_time;          /* When last full sync completed */
+    unsigned long last_sync_duration; /* Duration of last sync */
+};
+
+int chanserv_kcsync_get_status(struct kc_sync_status *status);
+int chanserv_kcsync_get_stats(struct kc_sync_statistics *stats);
+int chanserv_kcsync_abort(void);
+int chanserv_kcsync_trigger_all(void);
+int chanserv_kcsync_reset_channel(const char *channel);
 #endif /* WITH_KEYCLOAK */
 
 #endif

@@ -11655,6 +11655,96 @@ chanserv_sync_keycloak_access(UNUSED_ARG(void *data))
     chanserv_sync_keycloak_batch(NULL);
 }
 
+/**
+ * Get current Keycloak sync status for OpServ KCSYNC STATUS command
+ */
+int
+chanserv_kcsync_get_status(struct kc_sync_status *status)
+{
+    if (!status)
+        return -1;
+
+    status->in_progress = kc_sync.in_progress;
+    status->queue_size = kc_sync.queue_size;
+    status->current_index = kc_sync.current_index;
+    status->channels_done = kc_sync.channels_done;
+    status->channels_failed = kc_sync.channels_failed;
+    status->channels_skipped = kc_sync.channels_skipped;
+    status->total_entries = kc_sync.total_entries;
+    status->start_time = kc_sync.start_time;
+    return 0;
+}
+
+/**
+ * Get Keycloak sync statistics for OpServ KCSYNC STATS command
+ */
+int
+chanserv_kcsync_get_stats(struct kc_sync_statistics *stats)
+{
+    if (!stats)
+        return -1;
+
+    stats->total_syncs = kc_stats.total_syncs;
+    stats->successful_syncs = kc_stats.successful_syncs;
+    stats->failed_syncs = kc_stats.failed_syncs;
+    stats->unchanged_syncs = kc_stats.unchanged_syncs;
+    stats->total_entries = kc_stats.total_entries;
+    stats->last_sync_time = kc_stats.last_sync_time;
+    stats->last_sync_duration = kc_stats.last_sync_duration;
+    return 0;
+}
+
+/**
+ * Abort current Keycloak sync operation
+ */
+int
+chanserv_kcsync_abort(void)
+{
+    if (!kc_sync.in_progress) {
+        return -1;  /* Nothing to abort */
+    }
+
+    log_module(CS_LOG, LOG_INFO, "Keycloak sync aborted by operator");
+    kc_sync_cleanup();
+    return 0;
+}
+
+/**
+ * Trigger a full sync of all channels
+ */
+int
+chanserv_kcsync_trigger_all(void)
+{
+    if (!nickserv_conf.keycloak_enable || !chanserv_conf.keycloak_access_sync) {
+        return -1;  /* Keycloak sync not enabled */
+    }
+
+    if (kc_sync.in_progress) {
+        return -2;  /* Sync already in progress */
+    }
+
+    /* Trigger immediate sync */
+    chanserv_sync_keycloak_access(NULL);
+    return 0;
+}
+
+/**
+ * Reset sync metadata for a channel (clear failure counters and hash)
+ */
+int
+chanserv_kcsync_reset_channel(const char *channel)
+{
+    if (!channel)
+        return -1;
+
+    int rc = x3_lmdb_chansync_delete(channel);
+    if (rc == LMDB_SUCCESS || rc == LMDB_NOT_FOUND) {
+        log_module(CS_LOG, LOG_INFO, "Keycloak sync metadata reset for %s", channel);
+        return 0;
+    }
+    return -1;
+}
+
 #endif /* WITH_KEYCLOAK */
 
 #if defined(GCC_VARMACROS)
