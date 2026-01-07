@@ -3966,7 +3966,6 @@ static int
 nickserv_listsslfp(struct svccmd *cmd, struct userNode *user, struct handle_info *hi)
 {
     unsigned int i;
-    char buff[256];
 
     reply("NSMSG_LISTSSLFP_HEADER", hi->handle);
 
@@ -6260,23 +6259,6 @@ kc_strerror(int rc)
     }
 }
 
-/*
- * Wrapper to update SASL mechanisms when Keycloak availability changes.
- * Uses the token manager's availability tracking.
- */
-static void
-ns_keycloak_set_available(int available)
-{
-    static int last_known = 1;
-    keycloak_set_available(available);
-    if (last_known != available) {
-        last_known = available;
-        log_module(NS_LOG, LOG_INFO, "Keycloak availability changed: %s",
-                   available ? "available" : "unavailable");
-        nickserv_update_sasl_mechanisms();
-    }
-}
-
 /* Check authentication via Keycloak password grant */
 static int
 kc_check_auth(const char *handle, const char *password)
@@ -8173,17 +8155,6 @@ kc_delfromgroup(const char *handle, const char *group_name)
 
     log_module(NS_LOG, LOG_DEBUG, "kc_delfromgroup[%s]: Started async remove from group '%s'",
                handle, group_name);
-}
-
-/* Fire-and-forget callback for async attribute updates (just logs result) */
-static int
-ns_attr_async_callback(void *session, int result)
-{
-    (void)session;
-    if (result != KC_SUCCESS) {
-        log_module(NS_LOG, LOG_DEBUG, "ns_attr_async: Attribute update failed (result=%d)", result);
-    }
-    return 1;  /* Terminal - fire-and-forget operation complete */
 }
 
 /* Context for async metadata set operations */
@@ -10687,36 +10658,6 @@ reg_get_session(const char *uid)
     return session;
 }
 
-/**
- * Delete stale registration sessions (called periodically)
- */
-static void
-reg_delete_stale(UNUSED_ARG(void *data))
-{
-    struct RegSession *sess, *next;
-    time_t cutoff = now - REG_STALE_TIMEOUT;
-    int deleted = 0, remaining = 0;
-
-    for (sess = reg_sessions; sess; sess = next) {
-        next = sess->next;
-        if (sess->created < cutoff) {
-            if (sess->state == REG_STATE_KC_CREATING) {
-                /* Async in progress - mark as cancelled, callback will clean up */
-                sess->state = REG_STATE_CANCELLED;
-                remaining++;
-            } else {
-                reg_delete_session(sess);
-                deleted++;
-            }
-        } else {
-            remaining++;
-        }
-    }
-
-    if (deleted || remaining)
-        log_module(NS_LOG, LOG_DEBUG, "REG: Stale check - deleted %d, active %d", deleted, remaining);
-}
-
 /* Forward declaration for async completion */
 static void reg_complete_registration(struct RegSession *session);
 
@@ -12272,19 +12213,17 @@ sasl_packet(struct SASLSession *session)
 
         if (session->state == SASL_STATE_MECH_SELECTED) {
             /* Expecting client-first: n,,n=username,r=nonce */
-            char *gs2_header, *client_first_bare;
+            char *client_first_bare;
             char *n_field, *r_field;
             char *username, *client_nonce;
             const char *token_id;
             struct scram_credential cred;
             unsigned char server_nonce_bytes[16];
-            char server_nonce_b64[32];
-            char salt_b64[32];
 
             log_module(NS_LOG, LOG_DEBUG, "SASL %s: Processing client-first: %s", mech_name, raw);
 
             /* Parse GS2 header and client-first-bare */
-            gs2_header = raw;
+            /* GS2 header must be "n,," for no channel binding */
             if (raw[0] != 'n' || raw[1] != ',' || raw[2] != ',') {
                 log_module(NS_LOG, LOG_DEBUG, "SASL %s: Invalid GS2 header", mech_name);
                 irc_sasl(session->source, session->uid, "D", "F");

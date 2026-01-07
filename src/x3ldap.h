@@ -22,7 +22,7 @@
 #define _x3ldap_h
 
 #include "nickserv.h"
-int ldap_do_init();
+int ldap_do_init(void);
 
 unsigned int ldap_check_auth(const char *account, const char *pass);
 int ldap_do_add(const char *account, const char *password, const char *email);
@@ -35,6 +35,6 @@ int ldap_delfromgroup(char *account, const char *group);
 int ldap_add2group(char *account, const char *group);
 int ldap_user_exists(const char *account);
 
-void ldap_close();
+void ldap_close(void);
 
 #endif /* _x3ldap_h */

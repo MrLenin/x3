@@ -10650,11 +10650,11 @@ chanserv_sync_x3_metadata(struct chanData *cData, int sync_immutable)
 
 #ifdef WITH_KEYCLOAK
 
-/* Access level to group suffix mapping */
+/* Access level to group suffix mapping - reserved for future use */
 static const struct {
     unsigned short level;
     const char *suffix;
-} kc_access_levels[] = {
+} kc_access_levels[] __attribute__((unused)) = {
     { UL_OWNER, "owner" },
     { UL_COOWNER, "coowner" },
     { UL_MANAGER, "manager" },
@@ -11646,8 +11646,8 @@ struct cs_group_async_ctx {
     int is_add;  /* 1 = add to group, 0 = remove from group */
 };
 
-/* Callback for async group add/remove operations */
-static int
+/* Callback for async group add/remove operations - reserved for future use */
+static int __attribute__((unused))
 cs_group_async_callback(void *session, int result)
 {
     struct cs_group_async_ctx *ctx = session;
