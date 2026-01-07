@@ -999,6 +999,7 @@ static void chanserv_sync_keycloak_access(void *data);
 static int kc_async_group_info_cb(void *session, int result, struct kc_group_info *info);
 static int kc_async_group_members_cb(void *session, int result, struct kc_group_member *members);
 static void kc_async_sync_next_channel(void);
+static void kc_async_sync_next_channel_delayed(void *data);
 static void kc_async_sync_channel_done(int synced);
 static int chanserv_sync_keycloak_channel_async(const char *channel);
 static void kc_sync_complete(void);
@@ -11009,7 +11010,23 @@ kc_async_sync_channel_done(int synced)
     kc_async_ctx = NULL;
 
     /* Trigger next channel or complete */
-    kc_async_sync_next_channel();
+    if (chanserv_conf.keycloak_sync_distributed &&
+        chanserv_conf.keycloak_sync_frequency > 0 &&
+        kc_sync.queue_size > 1 &&
+        kc_sync.current_index < kc_sync.queue_size) {
+        /*
+         * Distributed mode: spread syncs across the sync window.
+         * Calculate delay per channel so all channels are synced
+         * before the next full sync cycle would start.
+         */
+        time_t interval = chanserv_conf.keycloak_sync_frequency / kc_sync.queue_size;
+        if (interval < 1) interval = 1;  /* At least 1 second between channels */
+        timeq_add(now + interval, kc_async_sync_next_channel_delayed, NULL);
+        log_module(CS_LOG, LOG_DEBUG, "Distributed sync: next channel in %ld seconds", (long)interval);
+    } else {
+        /* Non-distributed: process next immediately */
+        kc_async_sync_next_channel();
+    }
 }
 
 /* Callback for async group members lookup */
@@ -11285,6 +11302,13 @@ kc_async_sync_next_channel(void)
         kc_async_sync_next_channel();
     }
     /* If rc == 0, async is in progress - callbacks will handle completion */
+}
+
+/* Timeq callback wrapper for delayed next-channel processing (distributed mode) */
+static void
+kc_async_sync_next_channel_delayed(UNUSED_ARG(void *data))
+{
+    kc_async_sync_next_channel();
 }
 
 /*
@@ -12052,13 +12076,22 @@ chanserv_sync_keycloak_access(UNUSED_ARG(void *data))
         return;
     }
 
-    log_module(CS_LOG, LOG_INFO,
-               "Starting Keycloak channel access sync: %d channels (%s%s, prefix: %s, batch_size: %u)",
-               queue_size,
-               chanserv_conf.keycloak_hierarchical_groups ? "hierarchical" : "flat",
-               chanserv_conf.keycloak_use_group_attributes ? "+attribute" : "",
-               chanserv_conf.keycloak_group_prefix,
-               chanserv_conf.keycloak_sync_batch_size);
+    if (chanserv_conf.keycloak_sync_distributed &&
+        chanserv_conf.keycloak_sync_frequency > 0 &&
+        queue_size > 1) {
+        time_t interval = chanserv_conf.keycloak_sync_frequency / queue_size;
+        if (interval < 1) interval = 1;
+        log_module(CS_LOG, LOG_INFO,
+                   "Starting Keycloak channel access sync: %d channels (distributed, %lds/channel)",
+                   queue_size, (long)interval);
+    } else {
+        log_module(CS_LOG, LOG_INFO,
+                   "Starting Keycloak channel access sync: %d channels (%s%s, prefix: %s)",
+                   queue_size,
+                   chanserv_conf.keycloak_hierarchical_groups ? "hierarchical" : "flat",
+                   chanserv_conf.keycloak_use_group_attributes ? "+attribute" : "",
+                   chanserv_conf.keycloak_group_prefix);
+    }
 
     /* Start first batch immediately */
     chanserv_sync_keycloak_batch(NULL);
@@ -12114,6 +12147,16 @@ chanserv_kcsync_abort(void)
     }
 
     log_module(CS_LOG, LOG_INFO, "Keycloak sync aborted by operator");
+
+    /* Cancel any pending distributed sync timer */
+    timeq_del(0, kc_async_sync_next_channel_delayed, NULL, TIMEQ_IGNORE_WHEN);
+
+    /* Free async context if in progress */
+    if (kc_async_ctx) {
+        kc_async_ctx_free(kc_async_ctx);
+        kc_async_ctx = NULL;
+    }
+
     kc_sync_cleanup();
 
     /* Still process any pending webhook syncs */

@@ -9,6 +9,7 @@
 #define X3_LMDB_H
 
 #include "config.h"
+#include <stdint.h>
 
 /* Error codes - always defined so code compiles without LMDB */
 enum lmdb_error {
@@ -269,6 +270,14 @@ int x3_lmdb_channel_get_ex(const char *channel, const char *key,
  * @return Number of entries deleted, LMDB_ERROR on failure
  */
 int x3_lmdb_metadata_purge_expired(void);
+
+/**
+ * Delete all metadata entries for a given account
+ * Used for immediate cache invalidation when user attributes change in Keycloak.
+ * @param account Account name to purge metadata for
+ * @return Number of entries deleted, LMDB_ERROR on failure
+ */
+int x3_lmdb_metadata_delete_by_user(const char *account);
 
 /* ========== Channel Access (Keycloak Group Sync) ========== */
 
@@ -1074,6 +1083,7 @@ void init_x3_lmdb(void);
 #define x3_lmdb_channel_set_ex(c, k, v, e) (-1)
 #define x3_lmdb_channel_get_ex(c, k, v, e) (-2)
 #define x3_lmdb_metadata_purge_expired() (0)
+#define x3_lmdb_metadata_delete_by_user(a) (0)
 #define x3_lmdb_chanaccess_get(c, a, o) (-2)
 #define x3_lmdb_chanaccess_get_ex(c, a, o, t) (-2)
 #define x3_lmdb_chanaccess_set(c, a, l) (-1)

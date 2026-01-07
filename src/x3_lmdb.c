@@ -1128,6 +1128,63 @@ int x3_lmdb_metadata_purge_expired(void)
     return count;
 }
 
+int x3_lmdb_metadata_delete_by_user(const char *account)
+{
+    MDB_txn *txn;
+    MDB_cursor *cursor;
+    MDB_val mkey, mdata;
+    int count = 0;
+    int propagated = 0;
+    int rc;
+    size_t account_len;
+
+    if (!x3_lmdb_is_available() || !account) {
+        return LMDB_ERROR;
+    }
+
+    account_len = strlen(account);
+
+    rc = mdb_txn_begin(lmdb_env, NULL, 0, &txn);
+    if (rc != 0) {
+        return LMDB_ERROR;
+    }
+
+    rc = mdb_cursor_open(txn, dbi_accounts, &cursor);
+    if (rc == 0) {
+        rc = mdb_cursor_get(cursor, &mkey, &mdata, MDB_FIRST);
+        while (rc == 0) {
+            /*
+             * Key format is "account\0key" - check if this entry belongs to
+             * the specified account by comparing the account portion.
+             */
+            if (mkey.mv_size > account_len + 1 &&
+                memcmp(mkey.mv_data, account, account_len) == 0 &&
+                ((char *)mkey.mv_data)[account_len] == '\0') {
+                /* This entry belongs to the target account - delete it */
+                propagate_metadata_deletion(mkey.mv_data, mkey.mv_size);
+                propagated++;
+                mdb_cursor_del(cursor, 0);
+                count++;
+            }
+            rc = mdb_cursor_get(cursor, &mkey, &mdata, MDB_NEXT);
+        }
+        mdb_cursor_close(cursor);
+    }
+
+    rc = mdb_txn_commit(txn);
+    if (rc != 0) {
+        return LMDB_ERROR;
+    }
+
+    if (count > 0) {
+        log_module(MAIN_LOG, LOG_INFO,
+                   "x3_lmdb: Deleted %d metadata entries for account %s (%d propagated to IRCd)",
+                   count, account, propagated);
+    }
+
+    return count;
+}
+
 /* ========== Utility Functions ========== */
 
 void x3_lmdb_free_entries(struct lmdb_metadata_entry *entries)

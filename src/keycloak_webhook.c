@@ -512,10 +512,13 @@ handle_keycloak_event(const char *body, size_t body_len)
                             /* Check for x3_metadata changes */
                             if (json_object_get(attrs, "x3_metadata")) {
                                 log_module(webhook_log, LOG_INFO,
-                                           "Metadata changed for %s via Keycloak", username);
-                                /* Invalidate LMDB metadata cache for this user.
-                                 * Format: meta:<username>.<key> - we need to purge all keys.
-                                 * For now, rely on TTL expiration; add prefix-delete later. */
+                                           "Metadata changed for %s via Keycloak - invalidating cache", username);
+                                /* Immediately purge all metadata entries for this user from LMDB */
+                                int deleted = x3_lmdb_metadata_delete_by_user(username);
+                                if (deleted > 0) {
+                                    log_module(webhook_log, LOG_DEBUG,
+                                               "Deleted %d metadata entries for %s", deleted, username);
+                                }
                                 stats.metadata_invalidations++;
                                 stats.cache_invalidations++;
                                 invalidated = 1;
@@ -612,7 +615,7 @@ handle_keycloak_event(const char *body, size_t body_len)
                                                "Pre-warming fingerprint cache for %s: %.32s...",
                                                username, fingerprint);
                                     /* Pre-warm the fingerprint cache with the account name */
-                                    x3_lmdb_fingerprint_set(fingerprint, username, "testnet", 0);
+                                    x3_lmdb_fingerprint_set(fingerprint, username, now, 0);
                                     stats.fingerprint_additions++;
                                     stats.cache_invalidations++;
                                 }
