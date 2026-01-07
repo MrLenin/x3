@@ -10,6 +10,7 @@
 
 #include "config.h"
 #include <stdint.h>
+#include <time.h>
 
 /* Error codes - always defined so code compiles without LMDB */
 enum lmdb_error {
