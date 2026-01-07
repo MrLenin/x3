@@ -757,6 +757,29 @@ static struct kc_sync_stats {
     unsigned long last_sync_duration; /* Duration of last sync in seconds */
 } kc_stats = {0};
 
+/* Async sync state machine states */
+enum kc_async_sync_state {
+    KC_ASYNC_STATE_IDLE,
+    KC_ASYNC_STATE_GET_GROUP_INFO,
+    KC_ASYNC_STATE_GET_MEMBERS,
+    KC_ASYNC_STATE_DONE
+};
+
+/* Context for a single channel's async sync operation */
+struct kc_async_sync_ctx {
+    char channel[CHANNELLEN+1];     /* Channel name */
+    char *group_id;                 /* Keycloak group ID (allocated) */
+    unsigned short access_level;    /* Access level from group attribute */
+    struct kc_realm realm;          /* Keycloak realm (copied) */
+    struct kc_client client;        /* Keycloak client (access_token ref) */
+    enum kc_async_sync_state state; /* Current state */
+    int member_count;               /* Members synced */
+    int result;                     /* Final result code */
+};
+
+/* Global async context - only one channel sync at a time */
+static struct kc_async_sync_ctx *kc_async_ctx = NULL;
+
 /**
  * FNV-1a hash for membership lists
  * Computes a hash from sorted (username, access_level) pairs
@@ -972,6 +995,13 @@ static struct userData *add_channel_user(struct chanData *channel, struct handle
 static int chanserv_push_keycloak_access(const char *channel, const char *username, unsigned short access);
 static int chanserv_delete_keycloak_channel(const char *channel);
 static void chanserv_sync_keycloak_access(void *data);
+/* Forward declarations for async sync callbacks */
+static int kc_async_group_info_cb(void *session, int result, struct kc_group_info *info);
+static int kc_async_group_members_cb(void *session, int result, struct kc_group_member *members);
+static void kc_async_sync_next_channel(void);
+static void kc_async_sync_channel_done(int synced);
+static int chanserv_sync_keycloak_channel_async(const char *channel);
+static void kc_sync_complete(void);
 #endif
 
 void sputsock(const char *text, ...) PRINTF_LIKE(1, 2);
@@ -10922,6 +10952,342 @@ chanserv_sync_keycloak_channel(const char *channel)
 }
 
 /*
+ * ============================================================================
+ * ASYNC CHANNEL SYNC IMPLEMENTATION
+ * ============================================================================
+ *
+ * State machine for non-blocking channel sync from Keycloak.
+ * Uses two async API calls chained via callbacks:
+ *   1. keycloak_get_group_info_async() -> kc_async_group_info_cb()
+ *   2. keycloak_get_group_members_async() -> kc_async_group_members_cb()
+ * Then processes results and triggers next channel.
+ */
+
+/* Free async sync context */
+static void
+kc_async_ctx_free(struct kc_async_sync_ctx *ctx)
+{
+    if (!ctx) return;
+    if (ctx->group_id) free(ctx->group_id);
+    if (ctx->client.access_token)
+        keycloak_free_access_token(ctx->client.access_token);
+    free(ctx);
+}
+
+/* Called when a channel's async sync completes (success or failure) */
+static void
+kc_async_sync_channel_done(int synced)
+{
+    if (!kc_async_ctx) return;
+
+    const char *chan_name = kc_async_ctx->channel;
+
+    if (synced > 0) {
+        /* Channel had changes */
+        kc_sync.total_entries += synced;
+        kc_sync.channels_done++;
+        log_module(CS_LOG, LOG_DEBUG, "Async sync of %s: %d entries", chan_name, synced);
+    } else if (synced == 0) {
+        /* No changes needed (hash matched or empty) */
+        kc_sync.channels_skipped++;
+        kc_sync.channels_done++;
+    } else {
+        /* Sync failed */
+        kc_sync.channels_failed++;
+        x3_lmdb_chansync_record_failure(chan_name);
+        if (kc_sync.failure_count < KC_MAX_FAILURES_TRACKED) {
+            safestrncpy(kc_sync.failures[kc_sync.failure_count].channel,
+                        chan_name, CHANNELLEN+1);
+            kc_sync.failures[kc_sync.failure_count].error_code = synced;
+            kc_sync.failure_count++;
+        }
+        log_module(CS_LOG, LOG_DEBUG, "Async sync of %s failed", chan_name);
+    }
+
+    /* Free current context */
+    kc_async_ctx_free(kc_async_ctx);
+    kc_async_ctx = NULL;
+
+    /* Trigger next channel or complete */
+    kc_async_sync_next_channel();
+}
+
+/* Callback for async group members lookup */
+static int
+kc_async_group_members_cb(void *session, int result, struct kc_group_member *members)
+{
+    struct kc_async_sync_ctx *ctx = session;
+    struct kc_group_member *member;
+    struct lmdb_chansync_meta sync_meta;
+    uint64_t new_hash;
+    int member_count = 0;
+    int count = 0;
+    int rc;
+
+    if (!ctx || ctx != kc_async_ctx) {
+        /* Stale callback - context was freed */
+        if (members) keycloak_free_group_members(members);
+        return 1;
+    }
+
+    ctx->state = KC_ASYNC_STATE_DONE;
+
+    if (result < 0) {
+        log_module(CS_LOG, LOG_DEBUG, "kc_async_group_members_cb: Failed (result=%d)", result);
+        if (members) keycloak_free_group_members(members);
+        kc_async_sync_channel_done(-1);
+        return 1;
+    }
+
+    if (!members) {
+        /* No members in group */
+        x3_lmdb_chansync_record_success(ctx->channel, 0, 0);
+        kc_async_sync_channel_done(0);
+        return 1;
+    }
+
+    /* Set access level on all members from group info */
+    for (member = members; member; member = member->next) {
+        member->access_level = ctx->access_level;
+        member_count++;
+    }
+
+    /* Compute hash for incremental sync detection */
+    new_hash = kc_membership_hash_init();
+    for (member = members; member; member = member->next) {
+        new_hash = kc_membership_hash_add(new_hash, member->username, member->access_level);
+    }
+
+    /* Check if hash matches - skip if unchanged */
+    rc = x3_lmdb_chansync_get(ctx->channel, &sync_meta);
+    if (rc == LMDB_SUCCESS && sync_meta.membership_hash == new_hash) {
+        keycloak_free_group_members(members);
+        kc_stats.unchanged_syncs++;
+        sync_meta.last_sync = now;
+        x3_lmdb_chansync_set(ctx->channel, &sync_meta);
+        kc_async_sync_channel_done(0);
+        return 1;
+    }
+
+    /* Store each member in LMDB */
+    for (member = members; member; member = member->next) {
+        unsigned short existing_access;
+        int had_existing;
+
+        if (member->access_level == 0) continue;
+
+        had_existing = (x3_lmdb_chanaccess_get(ctx->channel, member->username, &existing_access) == LMDB_SUCCESS);
+
+        rc = x3_lmdb_chanaccess_set(ctx->channel, member->username, member->access_level);
+        if (rc == LMDB_SUCCESS) {
+            count++;
+            if (had_existing && existing_access != member->access_level) {
+                log_module(CS_LOG, LOG_INFO, "Keycloak async sync override: %s/%s was %d, now %d",
+                           ctx->channel, member->username, existing_access, member->access_level);
+            }
+        }
+    }
+
+    keycloak_free_group_members(members);
+    x3_lmdb_chansync_record_success(ctx->channel, new_hash, count);
+    kc_async_sync_channel_done(count);
+    return 1;
+}
+
+/* Callback for async group info lookup */
+static int
+kc_async_group_info_cb(void *session, int result, struct kc_group_info *info)
+{
+    struct kc_async_sync_ctx *ctx = session;
+    int rc;
+
+    if (!ctx || ctx != kc_async_ctx) {
+        /* Stale callback - context was freed */
+        if (info) keycloak_free_group_info(info);
+        return 1;
+    }
+
+    if (result != KC_SUCCESS || !info) {
+        log_module(CS_LOG, LOG_DEBUG, "kc_async_group_info_cb: Failed (result=%d)", result);
+        if (info) keycloak_free_group_info(info);
+        kc_async_sync_channel_done(-1);
+        return 1;
+    }
+
+    /* Store access level from group attributes */
+    ctx->access_level = info->access_level;
+    keycloak_free_group_info(info);
+
+    if (ctx->access_level == 0) {
+        /* No access level attribute - treat as empty */
+        x3_lmdb_chansync_record_success(ctx->channel, 0, 0);
+        kc_async_sync_channel_done(0);
+        return 1;
+    }
+
+    /* Start phase 2: get group members */
+    ctx->state = KC_ASYNC_STATE_GET_MEMBERS;
+    rc = keycloak_get_group_members_async(ctx->realm, ctx->client,
+                                           ctx->group_id, ctx,
+                                           kc_async_group_members_cb);
+    if (rc < 0) {
+        log_module(CS_LOG, LOG_DEBUG, "kc_async_group_info_cb: Failed to start members request");
+        kc_async_sync_channel_done(-1);
+        return 1;
+    }
+
+    return 1;
+}
+
+/**
+ * Start async sync of a single channel from Keycloak
+ * Uses attribute mode only (async legacy mode not implemented)
+ * @param channel Channel name (with #)
+ * @return 0 on success (async started), -1 on error
+ */
+static int
+chanserv_sync_keycloak_channel_async(const char *channel)
+{
+    struct kc_async_sync_ctx *ctx = NULL;
+    char group_name[256];
+    int rc;
+
+    if (!nickserv_conf.keycloak_enable || !chanserv_conf.keycloak_access_sync)
+        return -1;
+
+    if (!x3_lmdb_is_available())
+        return -1;
+
+    /* Only support attribute mode for async - legacy mode has too many API calls */
+    if (!chanserv_conf.keycloak_use_group_attributes) {
+        /* Fall back to sync for legacy mode */
+        int synced = chanserv_sync_keycloak_channel(channel);
+        kc_async_sync_channel_done(synced);
+        return 0;
+    }
+
+    /* Allocate context */
+    ctx = calloc(1, sizeof(*ctx));
+    if (!ctx) {
+        log_module(CS_LOG, LOG_ERROR, "chanserv_sync_keycloak_channel_async: Out of memory");
+        return -1;
+    }
+    safestrncpy(ctx->channel, channel, CHANNELLEN+1);
+    ctx->state = KC_ASYNC_STATE_IDLE;
+
+    /* Setup Keycloak connection */
+    ctx->realm.base_uri = (char*)nickserv_conf.keycloak_uri;
+    ctx->realm.realm = nickserv_conf.keycloak_realm;
+    ctx->client.client_id = (char*)nickserv_conf.keycloak_client_id;
+    ctx->client.client_secret = (char*)nickserv_conf.keycloak_client_secret;
+    ctx->client.access_token = NULL;
+
+    /* Get client token (sync - typically cached and fast) */
+    rc = keycloak_get_client_token(ctx->realm, ctx->client, &ctx->client.access_token);
+    if (rc != KC_SUCCESS) {
+        log_module(CS_LOG, LOG_DEBUG, "chanserv_sync_keycloak_channel_async: Failed to get token");
+        kc_async_ctx_free(ctx);
+        return -1;
+    }
+
+    /* Get group ID (sync - typically cached) */
+    if (chanserv_conf.keycloak_hierarchical_groups) {
+        snprintf(group_name, sizeof(group_name), "/%s/%s",
+                 chanserv_conf.keycloak_group_prefix, channel);
+        rc = keycloak_get_group_by_path(ctx->realm, ctx->client, group_name, &ctx->group_id);
+    } else {
+        snprintf(group_name, sizeof(group_name), "%s%s",
+                 chanserv_conf.keycloak_group_prefix, channel);
+        rc = keycloak_get_group_by_name(ctx->realm, ctx->client, group_name, &ctx->group_id);
+    }
+
+    if (rc == KC_NOT_FOUND) {
+        /* No group for this channel - that's OK */
+        kc_async_ctx_free(ctx);
+        kc_async_sync_channel_done(0);
+        return 0;
+    }
+    if (rc != KC_SUCCESS || !ctx->group_id) {
+        kc_async_ctx_free(ctx);
+        return -1;
+    }
+
+    /* Check backoff */
+    if (x3_lmdb_chansync_in_backoff(channel)) {
+        log_module(CS_LOG, LOG_DEBUG, "chanserv_sync_keycloak_channel_async: %s in backoff", channel);
+        kc_async_ctx_free(ctx);
+        kc_async_sync_channel_done(0);  /* Treat as skip */
+        return 0;
+    }
+
+    /* Store as global context */
+    kc_async_ctx = ctx;
+    ctx->state = KC_ASYNC_STATE_GET_GROUP_INFO;
+
+    /* Start phase 1: get group info (for access level) */
+    rc = keycloak_get_group_info_async(ctx->realm, ctx->client,
+                                        ctx->group_id, ctx,
+                                        kc_async_group_info_cb);
+    if (rc < 0) {
+        log_module(CS_LOG, LOG_ERROR, "chanserv_sync_keycloak_channel_async: Failed to start async request");
+        kc_async_ctx = NULL;
+        kc_async_ctx_free(ctx);
+        return -1;
+    }
+
+    log_module(CS_LOG, LOG_DEBUG, "chanserv_sync_keycloak_channel_async: Started async sync for %s", channel);
+    return 0;
+}
+
+/* Process next channel in async batch or complete */
+static void
+kc_async_sync_next_channel(void)
+{
+    /* Log progress */
+    int total_processed = kc_sync.channels_done + kc_sync.channels_failed + kc_sync.channels_skipped;
+    if (total_processed > 0 && (total_processed % 10 == 0 || total_processed == kc_sync.queue_size)) {
+        log_module(CS_LOG, LOG_DEBUG,
+                   "Keycloak async sync progress: %d/%d channels (%d entries, %d failed)",
+                   total_processed, kc_sync.queue_size,
+                   kc_sync.total_entries, kc_sync.channels_failed);
+    }
+
+    /* Check if we're done */
+    if (kc_sync.current_index >= kc_sync.queue_size) {
+        kc_sync_complete();
+        return;
+    }
+
+    /* Get next channel */
+    struct chanData *cData = kc_sync.queue[kc_sync.current_index++];
+    if (!cData || !cData->channel || !cData->channel->name[0]) {
+        /* Invalid entry - skip and try next */
+        kc_async_sync_next_channel();
+        return;
+    }
+
+    const char *chan_name = cData->channel->name;
+
+    /* Check backoff before starting async */
+    if (x3_lmdb_chansync_in_backoff(chan_name)) {
+        log_module(CS_LOG, LOG_DEBUG, "Keycloak async sync: skipping %s (in backoff)", chan_name);
+        kc_sync.channels_skipped++;
+        kc_async_sync_next_channel();
+        return;
+    }
+
+    /* Start async sync for this channel */
+    int rc = chanserv_sync_keycloak_channel_async(chan_name);
+    if (rc < 0) {
+        /* Failed to start - treat as failure and move on */
+        kc_sync.channels_failed++;
+        x3_lmdb_chansync_record_failure(chan_name);
+        kc_async_sync_next_channel();
+    }
+    /* If rc == 0, async is in progress - callbacks will handle completion */
+}
+
+/*
  * Async context for Keycloak group operations with LMDB update
  */
 struct cs_group_async_ctx {
@@ -11382,75 +11748,18 @@ static void chanserv_sync_keycloak_batch(void *data);
 static void
 chanserv_sync_keycloak_batch(UNUSED_ARG(void *data))
 {
-    unsigned int batch_size = chanserv_conf.keycloak_sync_batch_size;
-    unsigned int processed = 0;
-
     if (!kc_sync.in_progress) {
         log_module(CS_LOG, LOG_WARNING, "Keycloak batch called but sync not in progress");
         return;
     }
 
-    /* Process up to batch_size channels */
-    while (kc_sync.current_index < kc_sync.queue_size && processed < batch_size) {
-        struct chanData *cData = kc_sync.queue[kc_sync.current_index];
-        kc_sync.current_index++;
-
-        if (!cData || !cData->channel || !cData->channel->name[0]) {
-            kc_sync.channels_skipped++;
-            continue;
-        }
-
-        const char *chan_name = cData->channel->name;
-
-        /* Check if channel is in backoff due to previous failures */
-        int in_backoff = x3_lmdb_chansync_in_backoff(chan_name);
-        if (in_backoff > 0) {
-            log_module(CS_LOG, LOG_DEBUG, "Keycloak sync: skipping %s (in backoff)", chan_name);
-            kc_sync.channels_skipped++;
-            continue;
-        }
-
-        int synced = chanserv_sync_keycloak_channel(chan_name);
-        if (synced > 0) {
-            /* Channel had changes - sync function already recorded success with hash */
-            kc_sync.total_entries += synced;
-            kc_sync.channels_done++;
-        } else if (synced == 0) {
-            /* No changes needed (hash matched or empty) - sync function already updated metadata */
-            kc_sync.channels_skipped++;
-            kc_sync.channels_done++;
-        } else {
-            /* Sync failed - record failure and apply backoff */
-            kc_sync.channels_failed++;
-            x3_lmdb_chansync_record_failure(chan_name);
-            if (kc_sync.failure_count < KC_MAX_FAILURES_TRACKED) {
-                safestrncpy(kc_sync.failures[kc_sync.failure_count].channel,
-                            chan_name, CHANNELLEN+1);
-                kc_sync.failures[kc_sync.failure_count].error_code = synced;
-                kc_sync.failure_count++;
-            }
-        }
-
-        processed++;
-    }
-
-    /* Log progress every batch */
-    int total_processed = kc_sync.channels_done + kc_sync.channels_failed + kc_sync.channels_skipped;
-    log_module(CS_LOG, LOG_DEBUG,
-               "Keycloak sync progress: %d/%d channels (%d entries, %d failed)",
-               total_processed, kc_sync.queue_size,
-               kc_sync.total_entries, kc_sync.channels_failed);
-
-    /* Check if we're done */
-    if (kc_sync.current_index >= kc_sync.queue_size) {
-        kc_sync_complete();
-    } else {
-        /* Schedule next batch */
-        unsigned long delay_ms = chanserv_conf.keycloak_sync_batch_delay;
-        /* Convert ms to seconds, minimum 1 second for timeq */
-        time_t delay_sec = (delay_ms >= 1000) ? (delay_ms / 1000) : 1;
-        timeq_add(now + delay_sec, chanserv_sync_keycloak_batch, NULL);
-    }
+    /*
+     * ASYNC MODE: Start async processing chain
+     * Each channel sync is non-blocking - callbacks trigger the next channel.
+     * This replaces the synchronous batch loop with a callback-driven flow.
+     */
+    log_module(CS_LOG, LOG_INFO, "Starting async Keycloak sync for %d channels", kc_sync.queue_size);
+    kc_async_sync_next_channel();
 }
 
 /**

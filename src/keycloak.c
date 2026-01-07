@@ -1301,7 +1301,9 @@ enum kc_async_type {
     KC_ASYNC_GROUP_ADD,     /* Add user to group */
     KC_ASYNC_GROUP_REMOVE,  /* Remove user from group */
     KC_ASYNC_WEBPUSH,       /* WebPush notification delivery */
-    KC_ASYNC_CREATE_USER    /* User creation */
+    KC_ASYNC_CREATE_USER,   /* User creation */
+    KC_ASYNC_GROUP_INFO,    /* Get group info (phase 1 of group members) */
+    KC_ASYNC_GROUP_MEMBERS  /* Get group members (phase 2 or standalone) */
 };
 
 /* Async request tracking */
@@ -1320,6 +1322,8 @@ struct kc_async_request {
         kc_fingerprint_callback fingerprint;  /* Fingerprint callback */
         kc_introspect_callback introspect;    /* Introspect callback */
         void (*webpush)(void *session, int result, long http_code);  /* WebPush callback */
+        kc_group_info_callback group_info;    /* Group info callback */
+        kc_group_members_callback group_members; /* Group members callback */
     } cb;
     /* WebPush-specific: copy of binary POST data for async request */
     void *post_data_copy;
@@ -1701,6 +1705,118 @@ kc_curl_check_completed(void)
                 }
                 if (req->cb.generic) {
                     req->cb.generic(req->session, result);
+                }
+                break;
+            }
+            case KC_ASYNC_GROUP_INFO: {
+                int result = KC_ERROR;
+                struct kc_group_info *info = NULL;
+
+                if (http_code == 404) {
+                    result = KC_NOT_FOUND;
+                    log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async group_info: Not found (HTTP 404)", req_id);
+                } else if (http_code == 200 && req->response.response) {
+                    json_error_t error;
+                    json_t *root = json_loads(req->response.response, 0, &error);
+                    if (root && json_is_object(root)) {
+                        info = calloc(1, sizeof(*info));
+                        if (info) {
+                            json_t *jid = json_object_get(root, "id");
+                            json_t *jname = json_object_get(root, "name");
+                            json_t *jpath = json_object_get(root, "path");
+                            json_t *jattrs = json_object_get(root, "attributes");
+
+                            if (jid && json_is_string(jid))
+                                info->id = strdup(json_string_value(jid));
+                            if (jname && json_is_string(jname))
+                                info->name = strdup(json_string_value(jname));
+                            if (jpath && json_is_string(jpath))
+                                info->path = strdup(json_string_value(jpath));
+
+                            /* Parse x3_access_level attribute */
+                            if (jattrs && json_is_object(jattrs)) {
+                                json_t *level_arr = json_object_get(jattrs, "x3_access_level");
+                                if (level_arr && json_is_array(level_arr) && json_array_size(level_arr) > 0) {
+                                    json_t *level_val = json_array_get(level_arr, 0);
+                                    if (level_val && json_is_string(level_val)) {
+                                        info->access_level = (unsigned short)atoi(json_string_value(level_val));
+                                    }
+                                }
+                            }
+                            result = KC_SUCCESS;
+                            log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async group_info: Success (level=%d)",
+                                       req_id, info->access_level);
+                        }
+                        json_decref(root);
+                    } else {
+                        log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async group_info: JSON parse error", req_id);
+                    }
+                } else {
+                    log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async group_info: Error (HTTP %ld)", req_id, http_code);
+                }
+                if (req->cb.group_info) {
+                    req->cb.group_info(req->session, result, info);
+                }
+                break;
+            }
+            case KC_ASYNC_GROUP_MEMBERS: {
+                int result = KC_ERROR;
+                struct kc_group_member *members = NULL;
+                int member_count = 0;
+
+                if (http_code == 404) {
+                    result = KC_NOT_FOUND;
+                    log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async group_members: Not found (HTTP 404)", req_id);
+                } else if (http_code == 200 && req->response.response) {
+                    json_error_t error;
+                    json_t *root = json_loads(req->response.response, 0, &error);
+                    if (root && json_is_array(root)) {
+                        struct kc_group_member *tail = NULL;
+                        size_t array_size = json_array_size(root);
+
+                        for (size_t i = 0; i < array_size; i++) {
+                            json_t *user_obj = json_array_get(root, i);
+                            json_t *jid = json_object_get(user_obj, "id");
+                            json_t *jusername = json_object_get(user_obj, "username");
+
+                            if (jid && json_is_string(jid) &&
+                                jusername && json_is_string(jusername)) {
+                                struct kc_group_member *member = calloc(1, sizeof(*member));
+                                if (member) {
+                                    member->user_id = strdup(json_string_value(jid));
+                                    member->username = strdup(json_string_value(jusername));
+                                    member->next = NULL;
+
+                                    if (!member->user_id || !member->username) {
+                                        if (member->user_id) free(member->user_id);
+                                        if (member->username) free(member->username);
+                                        free(member);
+                                        continue;
+                                    }
+
+                                    if (!members) {
+                                        members = member;
+                                        tail = member;
+                                    } else {
+                                        tail->next = member;
+                                        tail = member;
+                                    }
+                                    member_count++;
+                                }
+                            }
+                        }
+                        result = member_count;
+                        log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async group_members: Found %d members",
+                                   req_id, member_count);
+                        json_decref(root);
+                    } else {
+                        log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async group_members: JSON parse error", req_id);
+                    }
+                } else {
+                    log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async group_members: Error (HTTP %ld)", req_id, http_code);
+                }
+                if (req->cb.group_members) {
+                    req->cb.group_members(req->session, result, members);
                 }
                 break;
             }
@@ -5499,6 +5615,122 @@ cleanup:
     }
 
     return result;
+}
+
+/*
+ * Start async group info lookup against Keycloak
+ * Returns 0 on success (request started), -1 on error
+ */
+int
+keycloak_get_group_info_async(struct kc_realm realm, struct kc_client client,
+                               const char *group_id, void *session,
+                               kc_group_info_callback callback)
+{
+    struct kc_async_request *req = NULL;
+
+    /* Validate inputs */
+    if (!realm.base_uri || !realm.realm || !client.access_token ||
+        !group_id || !callback) {
+        log_module(KC_LOG, LOG_DEBUG, "group_info_async: Invalid arguments");
+        return -1;
+    }
+
+    /* Allocate request structure */
+    req = calloc(1, sizeof(*req));
+    if (!req) {
+        log_module(KC_LOG, LOG_ERROR, "group_info_async: Out of memory");
+        return -1;
+    }
+    req->session = session;
+    req->type = KC_ASYNC_GROUP_INFO;
+    req->cb.group_info = callback;
+
+    /* Build URI using endpoint builder */
+    req->uri = kc_build_group_endpoint(realm, group_id);
+    if (!req->uri) {
+        log_module(KC_LOG, LOG_ERROR, "group_info_async: Failed to build URI");
+        goto error;
+    }
+
+    /* Use unified async API */
+    struct curl_opts opts = CURL_OPTS_INIT;
+    opts.uri = req->uri;
+    opts.method = HTTP_GET;
+    opts.xoauth2_bearer = client.access_token->access_token;
+
+    if (curl_perform_async(req, opts) < 0) {
+        log_module(KC_LOG, LOG_ERROR, "group_info_async: curl_perform_async failed");
+        goto error;
+    }
+
+    log_module(KC_LOG, LOG_DEBUG, "group_info_async: Started async lookup for group %s", group_id);
+    return 0;
+
+error:
+    if (req) {
+        if (req->uri) free(req->uri);
+        if (req->response.response) free(req->response.response);
+        free(req);
+    }
+    return -1;
+}
+
+/*
+ * Start async group members lookup against Keycloak
+ * Returns 0 on success (request started), -1 on error
+ */
+int
+keycloak_get_group_members_async(struct kc_realm realm, struct kc_client client,
+                                  const char *group_id, void *session,
+                                  kc_group_members_callback callback)
+{
+    struct kc_async_request *req = NULL;
+
+    /* Validate inputs */
+    if (!realm.base_uri || !realm.realm || !client.access_token ||
+        !group_id || !callback) {
+        log_module(KC_LOG, LOG_DEBUG, "group_members_async: Invalid arguments");
+        return -1;
+    }
+
+    /* Allocate request structure */
+    req = calloc(1, sizeof(*req));
+    if (!req) {
+        log_module(KC_LOG, LOG_ERROR, "group_members_async: Out of memory");
+        return -1;
+    }
+    req->session = session;
+    req->type = KC_ASYNC_GROUP_MEMBERS;
+    req->cb.group_members = callback;
+
+    /* Build URI using endpoint builder */
+    req->uri = kc_build_group_members_endpoint(realm, group_id);
+    if (!req->uri) {
+        log_module(KC_LOG, LOG_ERROR, "group_members_async: Failed to build URI");
+        goto error;
+    }
+
+    /* Use unified async API */
+    struct curl_opts opts = CURL_OPTS_INIT;
+    opts.uri = req->uri;
+    opts.method = HTTP_GET;
+    opts.xoauth2_bearer = client.access_token->access_token;
+
+    if (curl_perform_async(req, opts) < 0) {
+        log_module(KC_LOG, LOG_ERROR, "group_members_async: curl_perform_async failed");
+        goto error;
+    }
+
+    log_module(KC_LOG, LOG_DEBUG, "group_members_async: Started async lookup for group %s", group_id);
+    return 0;
+
+error:
+    if (req) {
+        if (req->uri) free(req->uri);
+        if (req->response.response) free(req->response.response);
+        free(req);
+    }
+    return -1;
 }
 
 #endif /* WITH_KEYCLOAK */

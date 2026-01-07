@@ -757,6 +757,56 @@ int keycloak_create_user_async(struct kc_realm realm, struct kc_client client,
                                const char *password, void *session,
                                kc_create_user_callback callback);
 
+/**
+ * Callback type for async group info lookup.
+ * @param session       Opaque session pointer
+ * @param result        KC_SUCCESS, KC_NOT_FOUND, or KC_ERROR
+ * @param info          Group info (only valid if result==KC_SUCCESS, caller must free)
+ * @return 0 if session may continue processing, 1 if session is terminal
+ */
+typedef int (*kc_group_info_callback)(void *session, int result,
+                                       struct kc_group_info *info);
+
+/**
+ * Get group info asynchronously.
+ * This function returns immediately and invokes the callback when complete.
+ *
+ * @param realm       Keycloak realm configuration
+ * @param client      Client with admin access token
+ * @param group_id    Keycloak group ID (UUID)
+ * @param session     Opaque session pointer (passed to callback)
+ * @param callback    Function to call when lookup completes
+ * @return 0 on success (request started), -1 on error
+ */
+int keycloak_get_group_info_async(struct kc_realm realm, struct kc_client client,
+                                   const char *group_id, void *session,
+                                   kc_group_info_callback callback);
+
+/**
+ * Callback type for async group members lookup.
+ * @param session       Opaque session pointer
+ * @param result        Number of members (>=0), KC_NOT_FOUND, or KC_ERROR
+ * @param members       Linked list of members (only valid if result>=0, caller must free)
+ * @return 0 if session may continue processing, 1 if session is terminal
+ */
+typedef int (*kc_group_members_callback)(void *session, int result,
+                                          struct kc_group_member *members);
+
+/**
+ * Get group members asynchronously.
+ * This function returns immediately and invokes the callback when complete.
+ *
+ * @param realm       Keycloak realm configuration
+ * @param client      Client with admin access token
+ * @param group_id    Keycloak group ID (UUID)
+ * @param session     Opaque session pointer (passed to callback)
+ * @param callback    Function to call when lookup completes
+ * @return 0 on success (request started), -1 on error
+ */
+int keycloak_get_group_members_async(struct kc_realm realm, struct kc_client client,
+                                      const char *group_id, void *session,
+                                      kc_group_members_callback callback);
+
 #endif /* WITH_KEYCLOAK */
 
 #endif /* KEYCLOAK_H */
