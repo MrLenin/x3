@@ -14,11 +14,15 @@
 // Error codes
 enum kc_error {
     KC_SUCCESS = 0,
-    KC_ERROR = -1,
-    KC_USER_EXISTS = -2,
-    KC_FORBIDDEN = -3,
-    KC_NOT_FOUND = -4,
-    KC_COLLISION = -5   // Multiple users matched (e.g., fingerprint collision)
+    KC_ERROR = -1,           // Generic/unknown error
+    KC_USER_EXISTS = -2,     // User already exists
+    KC_FORBIDDEN = -3,       // Invalid credentials / access denied
+    KC_NOT_FOUND = -4,       // User not found
+    KC_COLLISION = -5,       // Multiple users matched (e.g., fingerprint collision)
+    KC_TIMEOUT = -6,         // Connection timeout
+    KC_UNAVAILABLE = -7,     // Server unavailable
+    KC_TOKEN_ERROR = -8,     // Token refresh/acquisition failed
+    KC_INVALID_RESPONSE = -9 // Server returned unexpected response
 };
 
 // Data structures

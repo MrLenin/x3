@@ -2789,8 +2789,8 @@ static int json_read_kc_users(const char* json_users_array,
 
 static char* json_build_user_representation(const char *username, const char *email, const char *passwd)
 {
-    // Input validation
-    if (!username || !email || !passwd) {
+    // Input validation - username required, email optional (use ""), passwd optional (NULL = no credentials)
+    if (!username) {
         log_module(KC_LOG, LOG_DEBUG, "json_build_user_representation: Invalid arguments");
         return NULL;
     }
@@ -2798,19 +2798,23 @@ static char* json_build_user_representation(const char *username, const char *em
     char* result = NULL;
 
     json_t* user_obj = json_object();
-    json_t* creds = json_array();
-    json_t* cred = json_object();
 
     // Build JSON using Jansson API
     json_object_set_new(user_obj, "username", json_string(username));
-    json_object_set_new(user_obj, "email", json_string(email));
+    json_object_set_new(user_obj, "email", json_string(email ? email : ""));
     json_object_set_new(user_obj, "enabled", json_true());
 
-    json_object_set_new(cred, "type", json_string("password"));
-    json_object_set_new(cred, "value", json_string(passwd));
-    json_object_set_new(cred, "temporary", json_false());
-    json_array_append_new(creds, cred);
-    json_object_set_new(user_obj, "credentials", creds);
+    // Only add credentials if password provided
+    if (passwd && *passwd) {
+        json_t* creds = json_array();
+        json_t* cred = json_object();
+
+        json_object_set_new(cred, "type", json_string("password"));
+        json_object_set_new(cred, "value", json_string(passwd));
+        json_object_set_new(cred, "temporary", json_false());
+        json_array_append_new(creds, cred);
+        json_object_set_new(user_obj, "credentials", creds);
+    }
 
     result = json_dumps(user_obj, JSON_COMPACT);
 
@@ -3083,7 +3087,8 @@ cleanup:
 
 int keycloak_create_user(struct kc_realm realm, struct kc_client client, const char* username, const char* email, const char* passwd)
 {
-    if (!realm.base_uri || !realm.realm || !client.access_token || !username || !email || !passwd) {
+    /* Only require realm config, token, and username. Email and passwd can be NULL. */
+    if (!realm.base_uri || !realm.realm || !client.access_token || !username) {
         log_module(KC_LOG, LOG_DEBUG, "keycloak_create_user: Invalid arguments");
         return KC_ERROR;
     }
@@ -3210,14 +3215,20 @@ int keycloak_get_user(struct kc_realm realm, struct kc_client client,
     }
 
     struct kc_user* kc_users = NULL;
+    int result = keycloak_get_users(realm, client, user, NULL, true, &kc_users);
 
-    if (keycloak_get_users(realm, client, user, NULL, true, &kc_users) == 1) {
+    if (result >= 1) {
+        /* User found */
         *kc_user_out = kc_users[0];
         free(kc_users);
         return KC_SUCCESS;
+    } else if (result == KC_SUCCESS) {
+        /* Empty array - user not found */
+        return KC_NOT_FOUND;
     }
 
-    return KC_ERROR;
+    /* Error (KC_ERROR, KC_FORBIDDEN, etc.) */
+    return result;
 }
 
 void keycloak_free_users(struct kc_user* users, size_t count)

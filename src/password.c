@@ -763,8 +763,3 @@ const char *pw_cryptpass(const char *pass, char *buffer)
     return NULL;
 }
 
-int pw_checkpass(const char *pass, const char *crypted)
-{
-    int result = pw_verify(pass, crypted);
-    return (result == 1) ? 1 : 0;
-}

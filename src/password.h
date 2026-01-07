@@ -153,14 +153,4 @@ int pw_export_ldap(const char *hash, char *ldap_hash, size_t ldap_hash_len);
  */
 const char *pw_cryptpass(const char *pass, char *buffer);
 
-/*
- * Verify password (compatibility wrapper for checkpass).
- * Uses pw_verify() internally.
- *
- * @param pass    The plaintext password
- * @param crypted The stored hash
- * @return 1 if match, 0 if not
- */
-int pw_checkpass(const char *pass, const char *crypted);
-
 #endif /* PASSWORD_H */

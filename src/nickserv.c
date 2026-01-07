@@ -271,8 +271,7 @@ static int kc_ensure_token(void);
 static int kc_check_auth(const char *handle, const char *password);
 static int kc_get_user_info(const char *handle, char **email_out);
 static int kc_do_add(const char *handle, const char *password, const char *email);
-static int kc_do_add_with_hash(const char *handle, const char *hash, const char *email);
-static int kc_do_modify(const char *handle, const char *password, const char *email);
+static int kc_do_modify(const char *handle, const char *hash, const char *email);
 static int kc_delete_account(const char *handle);
 static int kc_do_oslevel(const char *handle, int level, int oldlevel);
 static int kc_add2group(const char *handle, const char *group);
@@ -282,6 +281,7 @@ static void kc_sync_fingerprints(struct handle_info *hi);
 static int kc_check_email_verified(const char *handle, int *verified_out);
 static int kc_try_auto_activate(struct handle_info *hi);
 static struct handle_info *loc_auth_oauth(const char *bearer_token, const char *username_hint, const char *hostmask);
+static const char *kc_strerror(int rc);
 #endif
 
 /*
@@ -324,6 +324,11 @@ static const struct message_entry msgtab[] = {
     { "NSMSG_LDAP_FAIL_ADD", "There was a problem in adding account %s to ldap: %s." },
     { "NSMSG_LDAP_FAIL_SEND_EMAIL", "There was a problem in storing your email address in the account server (ldap): %s. Please try again later." },
     { "NSMSG_LDAP_FAIL_GET_EMAIL", "There was a problem in retrieving your email address from the account server (ldap): %s. Please try again later." },
+    { "NSMSG_KEYCLOAK_FAIL", "There was a problem contacting the identity server (Keycloak): %s. Please try again later." },
+    { "NSMSG_KEYCLOAK_FAIL_ADD", "There was a problem creating your account in the identity server: %s." },
+    { "NSMSG_KEYCLOAK_FAIL_AUTH", "Authentication with the identity server failed: %s." },
+    { "NSMSG_KEYCLOAK_FAIL_EMAIL", "There was a problem updating your email in the identity server: %s." },
+    { "NSMSG_KEYCLOAK_UNAVAILABLE", "The identity server is currently unavailable. Please try again later." },
     { "NSMSG_PARTIAL_REGISTER", "Account has been registered to you; nick was already registered to someone else." },
     { "NSMSG_OREGISTER_VICTIM", "%s has registered a new account for you (named %s)." },
     { "NSMSG_OREGISTER_H_SUCCESS", "Account has been registered." },
@@ -763,12 +768,12 @@ nickserv_unregister_handle(struct handle_info *hi, struct userNode *notify, stru
 #ifdef WITH_KEYCLOAK
     if (nickserv_conf.keycloak_enable) {
         int rc;
-        if ((rc = kc_delete_account(hi->handle)) != KC_SUCCESS) {
+        if ((rc = kc_delete_account(hi->handle)) != KC_SUCCESS && rc != KC_NOT_FOUND) {
+            /* Only show error and fail for actual errors, not "user not found" */
             if (notify) {
-                send_message(notify, bot, "NSMSG_LDAP_FAIL", "keycloak error");
+                send_message(notify, bot, "NSMSG_KEYCLOAK_FAIL", kc_strerror(rc));
             }
-            if (rc != KC_NOT_FOUND)
-                return false; /* if theres noone there to delete, its kinda ok, right ?:) */
+            return false;
         }
     }
 #endif
@@ -1387,8 +1392,20 @@ nickserv_register(struct userNode *user, struct userNode *settee, const char *ha
         }
     }
 #endif
-    /* Note: Keycloak user creation is deferred to cookie activation (ACTIVATION case)
-     * to match the non-Keycloak flow where password isn't set until activation. */
+#ifdef WITH_KEYCLOAK
+    /* Create Keycloak user at registration time (mirrors LDAP pattern):
+     * - If no_auth or no password: create WITHOUT password (set at activation)
+     * - Otherwise: create WITH hashed password (crypted)
+     * - Email is set later via kc_do_modify() */
+    if (nickserv_conf.keycloak_enable) {
+        int rc = kc_do_add(handle, (no_auth || !passwd ? NULL : crypted), NULL);
+        if (rc != KC_SUCCESS && rc != KC_USER_EXISTS) {
+            if (user)
+                send_message(user, nickserv, "NSMSG_KEYCLOAK_FAIL", kc_strerror(rc));
+            /* Don't fail registration - local account still works */
+        }
+    }
+#endif
     hi = register_handle(handle, crypted, 0);
     hi->masks = alloc_string_list(1);
     hi->sslfps = alloc_string_list(1);
@@ -1648,8 +1665,8 @@ static NICKSERV_FUNC(cmd_register)
     }
 
 
-    if ((argc >= 4) && nickserv_conf.email_enabled) {
-        struct handle_info_list *hil;
+    /* Capture email address if provided */
+    if (argc >= 4) {
         const char *str;
 
         /* Remember email address. */
@@ -1667,22 +1684,27 @@ static NICKSERV_FUNC(cmd_register)
             return 0;
         }
 
-        /* If we do email verify, make sure we don't spam the address. */
-        if ((hil = dict_find(nickserv_email_dict, email_addr, NULL))) {
-            unsigned int nn;
-            for (nn=0; nn<hil->used; nn++) {
-                if (hil->list[nn]->cookie) {
-                    reply("NSMSG_EMAIL_UNACTIVATED");
+        /* If email verification is enabled, do additional checks */
+        if (nickserv_conf.email_enabled) {
+            struct handle_info_list *hil;
+            /* If we do email verify, make sure we don't spam the address. */
+            if ((hil = dict_find(nickserv_email_dict, email_addr, NULL))) {
+                unsigned int nn;
+                for (nn=0; nn<hil->used; nn++) {
+                    if (hil->list[nn]->cookie) {
+                        reply("NSMSG_EMAIL_UNACTIVATED");
+                        return 0;
+                    }
+                }
+                if (hil->used >= nickserv_conf.handles_per_email) {
+                    reply("NSMSG_EMAIL_OVERUSED");
                     return 0;
                 }
             }
-            if (hil->used >= nickserv_conf.handles_per_email) {
-                reply("NSMSG_EMAIL_OVERUSED");
-                return 0;
-            }
+            no_auth = 1;  /* Require email verification */
+        } else {
+            no_auth = 0;  /* Skip email verification */
         }
-
-        no_auth = 1;
     } else {
         email_addr = 0;
         no_auth = 0;
@@ -2860,16 +2882,17 @@ static NICKSERV_FUNC(cmd_auth)
         kc_result = kc_check_auth(handle, passwd);
         /* Get the users email address and update it */
         if (kc_result == KC_SUCCESS) {
-            if (kc_get_user_info(handle, &kc_email) != KC_SUCCESS) {
+            int rc = kc_get_user_info(handle, &kc_email);
+            if (rc != KC_SUCCESS) {
                 if (nickserv_conf.email_required) {
-                    reply("NSMSG_LDAP_FAIL_GET_EMAIL", "keycloak error");
+                    reply("NSMSG_KEYCLOAK_FAIL_EMAIL", kc_strerror(rc));
                     return 0;
                 }
             }
         }
         else if (kc_result != KC_FORBIDDEN) {
             /* KC_FORBIDDEN = invalid credentials, anything else is an error */
-            reply("NSMSG_LDAP_FAIL", "keycloak error");
+            reply("NSMSG_KEYCLOAK_FAIL", kc_strerror(kc_result));
             return 0;
         }
     }
@@ -3331,7 +3354,7 @@ static NICKSERV_FUNC(cmd_cookie)
         }
 
         /* Verify the password matches what was registered (cookie->data has the hash) */
-        if (!hi->cookie->data || !checkpass(password, hi->cookie->data)) {
+        if (!hi->cookie->data || pw_verify(password, hi->cookie->data) != 1) {
             reply("NSMSG_PASSWORD_MISMATCH");
             return 0;
         }
@@ -3347,11 +3370,11 @@ static NICKSERV_FUNC(cmd_cookie)
         }
 #endif
 #ifdef WITH_KEYCLOAK
-        /* Create Keycloak user with password hash at activation time. */
+        /* Set password hash in Keycloak (user was created at registration without password). */
         if (nickserv_conf.keycloak_enable) {
-            int rc = kc_do_add_with_hash(hi->handle, hi->cookie->data, hi->email_addr);
-            if (rc != KC_SUCCESS && rc != KC_USER_EXISTS) {
-                reply("NSMSG_LDAP_FAIL", "keycloak error");
+            int rc = kc_do_modify(hi->handle, hi->cookie->data, NULL);
+            if (rc != KC_SUCCESS) {
+                reply("NSMSG_KEYCLOAK_FAIL", kc_strerror(rc));
                 return 0;
             }
         }
@@ -3531,7 +3554,7 @@ static NICKSERV_FUNC(cmd_pass)
             if (kc_result == KC_FORBIDDEN)
                 reply("NSMSG_PASSWORD_INVALID");
             else
-                reply("NSMSG_LDAP_FAIL", "keycloak error");
+                reply("NSMSG_KEYCLOAK_FAIL_AUTH", kc_strerror(kc_result));
             return 0;
         }
     } else
@@ -3554,8 +3577,8 @@ static NICKSERV_FUNC(cmd_pass)
 #ifdef WITH_KEYCLOAK
     if (nickserv_conf.keycloak_enable) {
         int rc;
-        if ((rc = kc_do_modify(hi->handle, new_pass, NULL)) != KC_SUCCESS) {
-            reply("NSMSG_LDAP_FAIL", "keycloak error");
+        if ((rc = kc_do_modify(hi->handle, crypted, NULL)) != KC_SUCCESS) {
+            reply("NSMSG_KEYCLOAK_FAIL", kc_strerror(rc));
             return 0;
         }
     }
@@ -4341,7 +4364,7 @@ static OPTION_FUNC(opt_email)
                 int rc;
                 if ((rc = kc_do_modify(hi->handle, NULL, argv[1])) != KC_SUCCESS) {
                     if (!(noreply))
-                        reply("NSMSG_LDAP_FAIL", "keycloak error");
+                        reply("NSMSG_KEYCLOAK_FAIL_EMAIL", kc_strerror(rc));
                     return 0;
                 }
             }
@@ -4495,14 +4518,14 @@ oper_try_set_access(struct userNode *user, struct userNode *bot, struct handle_i
         else
             rc = kc_delfromgroup(target->handle, nickserv_conf.keycloak_oper_group);
         if (rc != KC_SUCCESS && rc != KC_USER_EXISTS && rc != KC_NOT_FOUND) {
-            send_message(user, bot, "NSMSG_LDAP_FAIL", "keycloak error");
+            send_message(user, bot, "NSMSG_KEYCLOAK_FAIL", kc_strerror(rc));
             return 0;
         }
     }
     if (nickserv_conf.keycloak_enable && nickserv_conf.keycloak_attr_oslevel && *nickserv_conf.keycloak_attr_oslevel) {
         int rc;
         if ((rc = kc_do_oslevel(target->handle, new_level, target->opserv_level)) != KC_SUCCESS) {
-            send_message(user, bot, "NSMSG_LDAP_FAIL", "keycloak error");
+            send_message(user, bot, "NSMSG_KEYCLOAK_FAIL", kc_strerror(rc));
             return 0;
         }
     }
@@ -6087,6 +6110,25 @@ reclaim_action_from_string(const char *str) {
 }
 
 #ifdef WITH_KEYCLOAK
+/* Convert Keycloak error code to human-readable string */
+static const char *
+kc_strerror(int rc)
+{
+    switch (rc) {
+    case KC_SUCCESS:          return "success";
+    case KC_ERROR:            return "server communication error";
+    case KC_USER_EXISTS:      return "user already exists";
+    case KC_FORBIDDEN:        return "invalid credentials";
+    case KC_NOT_FOUND:        return "user not found";
+    case KC_COLLISION:        return "credential collision";
+    case KC_TIMEOUT:          return "connection timeout";
+    case KC_UNAVAILABLE:      return "server unavailable";
+    case KC_TOKEN_ERROR:      return "token error";
+    case KC_INVALID_RESPONSE: return "invalid server response";
+    default:                  return "unknown error";
+    }
+}
+
 /* Update Keycloak availability and broadcast mechanism change if needed */
 static void
 kc_set_available(int available)
@@ -6169,21 +6211,9 @@ kc_get_user_info(const char *handle, char **email_out)
     return rc;
 }
 
-/* Create user in Keycloak */
+/* Create user in Keycloak with hashed password (like LDAP) */
 static int
-kc_do_add(const char *handle, const char *password, const char *email)
-{
-    if (kc_ensure_token() != KC_SUCCESS) {
-        return KC_ERROR;
-    }
-
-    return keycloak_create_user(kc_realm_config, kc_client_config,
-                                handle, email ? email : "", password);
-}
-
-/* Create user in Keycloak with pre-hashed PBKDF2 password (credential import) */
-static int
-kc_do_add_with_hash(const char *handle, const char *hash, const char *email)
+kc_do_add(const char *handle, const char *hash, const char *email)
 {
     char cred_data[256];
     char secret_data[512];
@@ -6192,16 +6222,21 @@ kc_do_add_with_hash(const char *handle, const char *hash, const char *email)
         return KC_ERROR;
     }
 
-    /* Convert X3 hash to Keycloak credential import format */
+    /* If no hash provided, create user without password */
+    if (!hash) {
+        return keycloak_create_user(kc_realm_config, kc_client_config,
+                                    handle, email ? email : "", NULL);
+    }
+
+    /* Convert X3 hash to Keycloak credential format */
     if (pw_export_keycloak(hash, cred_data, sizeof(cred_data),
                            secret_data, sizeof(secret_data)) != 0) {
-        /* Hash format not exportable (e.g., MD5 or bcrypt) */
+        /* Hash format not exportable (e.g., MD5) - create without password */
         log_module(NS_LOG, LOG_WARNING,
-                   "kc_do_add_with_hash: Hash format not exportable for %s, falling back to no password",
+                   "kc_do_add: Hash format not exportable for %s, creating without password",
                    handle);
-        /* Create user without password - they'll need to reset it */
         return keycloak_create_user(kc_realm_config, kc_client_config,
-                                    handle, email ? email : "", "");
+                                    handle, email ? email : "", NULL);
     }
 
     return keycloak_create_user_with_hash(kc_realm_config, kc_client_config,
@@ -6209,11 +6244,19 @@ kc_do_add_with_hash(const char *handle, const char *hash, const char *email)
                                           cred_data, secret_data);
 }
 
-/* Modify user password and/or email in Keycloak */
+/* Modify user password hash and/or email in Keycloak */
 static int
-kc_do_modify(const char *handle, const char *password, const char *email)
+kc_do_modify(const char *handle, const char *hash, const char *email)
 {
+    char cred_data[256];
+    char secret_data[512];
+
+    log_module(NS_LOG, LOG_DEBUG,
+               "kc_do_modify: called for %s, hash=%s, email=%s",
+               handle, hash ? "yes" : "no", email ? email : "null");
+
     if (kc_ensure_token() != KC_SUCCESS) {
+        log_module(NS_LOG, LOG_DEBUG, "kc_do_modify: token failed");
         return KC_ERROR;
     }
 
@@ -6221,14 +6264,40 @@ kc_do_modify(const char *handle, const char *password, const char *email)
     struct kc_user user;
     int rc = keycloak_get_user(kc_realm_config, kc_client_config, handle, &user);
     if (rc != KC_SUCCESS) {
+        log_module(NS_LOG, LOG_DEBUG,
+                   "kc_do_modify: keycloak_get_user failed for %s: %d",
+                   handle, rc);
         return rc;
     }
 
     char *user_id = strdup(user.id);
     keycloak_user_free_fields(&user);
 
-    rc = keycloak_update_user(kc_realm_config, kc_client_config,
-                              user_id, password, email);
+    /* Update password hash if provided */
+    if (hash) {
+        if (pw_export_keycloak(hash, cred_data, sizeof(cred_data),
+                               secret_data, sizeof(secret_data)) != 0) {
+            /* Hash format not exportable (e.g., MD5) - log warning but continue */
+            log_module(NS_LOG, LOG_WARNING,
+                       "kc_do_modify: Hash format not exportable for %s",
+                       handle);
+            /* Don't fail - just skip password update */
+        } else {
+            rc = keycloak_update_user_credentials(kc_realm_config, kc_client_config,
+                                                   user_id, cred_data, secret_data);
+            if (rc != KC_SUCCESS) {
+                free(user_id);
+                return rc;
+            }
+        }
+    }
+
+    /* Update email if provided */
+    if (email) {
+        rc = keycloak_update_user(kc_realm_config, kc_client_config,
+                                  user_id, NULL, email);
+    }
+
     free(user_id);
     return rc;
 }
