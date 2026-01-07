@@ -11126,6 +11126,95 @@ sasl_async_auth_callback(void *ctx_ptr, int result)
     return 1;  /* Terminal - SASL authentication complete (success or failure) */
 }
 
+/* Forward declaration for async fingerprint callback */
+static int sasl_async_fingerprint_callback(void *ctx_ptr, int result, char *username);
+
+/*
+ * Token callback for SASL EXTERNAL - chains to async fingerprint lookup
+ */
+static void
+sasl_external_token_callback(void *context, int result, struct access_token *token)
+{
+    struct sasl_async_ctx *ctx = context;
+    struct SASLSession *session;
+    struct handle_info *hi;
+    char buffer[256];
+
+    (void)token;  /* Token managed by keycloak module */
+
+    if (!ctx) {
+        log_module(NS_LOG, LOG_ERROR, "sasl_external_token_callback: NULL context");
+        return;
+    }
+
+    /* Validate session still exists */
+    session = sasl_async_ctx_validate(ctx);
+    if (!session) {
+        log_module(NS_LOG, LOG_DEBUG, "sasl_external_token_callback: Session invalid for uid=%s", ctx->uid);
+        free(ctx);
+        return;
+    }
+
+    if (result != KC_SUCCESS) {
+        log_module(NS_LOG, LOG_DEBUG, "sasl_external_token_callback: Token refresh failed for uid=%s: %d",
+                   session->uid, result);
+        /* Fall back to sync path */
+        session->state = SASL_STATE_INIT;
+        hi = loc_auth_external(session->sslclifp, session->authzid, session->hostmask);
+        if (!hi) {
+            log_module(NS_LOG, LOG_DEBUG, "SASL EXTERNAL: No matching account (sync fallback)");
+#ifdef WITH_LMDB
+            if (session->sslclifp)
+                cache_fpfail(session->sslclifp);
+#endif
+            irc_sasl(session->source, session->uid, "D", "F");
+        } else {
+#ifdef WITH_KEYCLOAK
+            kc_try_auto_activate(hi);
+#endif
+            snprintf(buffer, sizeof(buffer), "%s "FMT_TIME_T, hi->handle, hi->registered);
+            irc_sasl(session->source, session->uid, "L", buffer);
+            irc_sasl(session->source, session->uid, "D", "S");
+        }
+        free(ctx);
+        sasl_delete_session(session);
+        return;
+    }
+
+    /* Token ready - start async fingerprint lookup */
+    log_module(NS_LOG, LOG_DEBUG, "sasl_external_token_callback: Token ready, starting fingerprint lookup for uid=%s",
+               session->uid);
+
+    if (keycloak_find_user_by_fingerprint_async(keycloak_get_realm(), keycloak_get_authed_client(),
+                                                 session->sslclifp, ctx,
+                                                 sasl_async_fingerprint_callback) == 0) {
+        /* Request started - callback will handle cleanup of ctx */
+        return;
+    }
+
+    /* Async failed - fall back to sync */
+    log_module(NS_LOG, LOG_WARNING, "sasl_external_token_callback: Async fingerprint lookup failed, using sync");
+    session->state = SASL_STATE_INIT;
+    hi = loc_auth_external(session->sslclifp, session->authzid, session->hostmask);
+    if (!hi) {
+        log_module(NS_LOG, LOG_DEBUG, "SASL EXTERNAL: No matching account (sync fallback)");
+#ifdef WITH_LMDB
+        if (session->sslclifp)
+            cache_fpfail(session->sslclifp);
+#endif
+        irc_sasl(session->source, session->uid, "D", "F");
+    } else {
+#ifdef WITH_KEYCLOAK
+        kc_try_auto_activate(hi);
+#endif
+        snprintf(buffer, sizeof(buffer), "%s "FMT_TIME_T, hi->handle, hi->registered);
+        irc_sasl(session->source, session->uid, "L", buffer);
+        irc_sasl(session->source, session->uid, "D", "S");
+    }
+    free(ctx);
+    sasl_delete_session(session);
+}
+
 /*
  * Async fingerprint lookup callback - invoked when Keycloak fingerprint search completes
  */
@@ -11433,25 +11522,25 @@ sasl_packet(struct SASLSession *session)
 #endif
 
 #ifdef WITH_KEYCLOAK
-        if (nickserv_conf.keycloak_enable && keycloak_ensure_token() == KC_SUCCESS) {
-            /* Use async Keycloak fingerprint lookup */
-            log_module(NS_LOG, LOG_DEBUG, "SASL EXTERNAL: Starting async fingerprint lookup");
+        if (nickserv_conf.keycloak_enable) {
+            /* Use fully async path: token → fingerprint lookup */
+            log_module(NS_LOG, LOG_DEBUG, "SASL EXTERNAL: Starting async token + fingerprint lookup");
 
             /* Store authzid for callback */
             if (authzid && *authzid)
                 session->authzid = strdup(authzid);
             session->state = SASL_STATE_AUTHENTICATING;
 
-            if (keycloak_find_user_by_fingerprint_async(keycloak_get_realm(), keycloak_get_authed_client(),
-                                                         session->sslclifp, sasl_async_ctx_new(session),
-                                                         sasl_async_fingerprint_callback) == 0) {
-                /* Request started - callback will handle cleanup */
+            /* Start async token acquisition → fingerprint lookup chain */
+            if (keycloak_ensure_token_async(sasl_external_token_callback,
+                                            sasl_async_ctx_new(session)) == 0) {
+                /* Request started - callback chain will handle cleanup */
                 free(raw);
                 return 1;
             }
 
             /* Async failed - fall back to sync */
-            log_module(NS_LOG, LOG_WARNING, "SASL EXTERNAL: Async lookup failed, using sync");
+            log_module(NS_LOG, LOG_WARNING, "SASL EXTERNAL: Async start failed, using sync");
             session->state = SASL_STATE_INIT;
             if (session->authzid) {
                 free(session->authzid);
@@ -11459,7 +11548,7 @@ sasl_packet(struct SASLSession *session)
             }
             hi = loc_auth_external(session->sslclifp, authzid, session->hostmask);
         } else {
-            /* Keycloak not available - use sync path */
+            /* Keycloak disabled - use sync path */
             hi = loc_auth_external(session->sslclifp, authzid, session->hostmask);
         }
 #else
