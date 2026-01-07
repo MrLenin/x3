@@ -15,6 +15,7 @@
 #include "common.h"
 #include "x3_lmdb.h"
 #include "nickserv.h"
+#include "chanserv.h"  /* For chanserv_queue_keycloak_sync, kc_group_path_to_channel */
 
 #include <string.h>
 #include <stdlib.h>
@@ -573,6 +574,65 @@ handle_keycloak_event(const char *body, size_t body_len)
                 x3_lmdb_session_revoke_all(username);
                 stats.session_revocations++;
                 stats.cache_invalidations++;
+            }
+        }
+    } else if (strcmp(resource_type, "GROUP_MEMBERSHIP") == 0) {
+        /* Group membership change - sync affected channel */
+        const char *group_path = NULL;
+
+        /* Try to get group path from representation */
+        if (representation) {
+            json_t *rep_json = json_loads(representation, 0, NULL);
+            if (rep_json) {
+                json_t *gpath = json_object_get(rep_json, "path");
+                if (gpath && json_is_string(gpath)) {
+                    group_path = json_string_value(gpath);
+                }
+
+                if (group_path) {
+                    /* Convert group path to channel name */
+                    char *channel = kc_group_path_to_channel(group_path);
+                    if (channel) {
+                        log_module(webhook_log, LOG_INFO,
+                                   "Group membership %s for channel %s (via webhook)",
+                                   operation_type, channel);
+
+                        /* Queue immediate sync for this channel */
+                        int rc = chanserv_queue_keycloak_sync(channel, KC_SYNC_PRIORITY_IMMEDIATE);
+                        if (rc == 0) {
+                            stats.group_syncs++;
+                            stats.cache_invalidations++;
+                        }
+                        free(channel);
+                    }
+                }
+                json_decref(rep_json);
+            }
+        }
+    } else if (strcmp(resource_type, "GROUP") == 0) {
+        /* Group settings changed - might affect access level configuration */
+        if (strcmp(operation_type, "UPDATE") == 0 && representation) {
+            json_t *rep_json = json_loads(representation, 0, NULL);
+            if (rep_json) {
+                json_t *gpath = json_object_get(rep_json, "path");
+                if (gpath && json_is_string(gpath)) {
+                    const char *group_path = json_string_value(gpath);
+
+                    /* Convert group path to channel name */
+                    char *channel = kc_group_path_to_channel(group_path);
+                    if (channel) {
+                        log_module(webhook_log, LOG_INFO,
+                                   "Group attributes changed for %s - queueing re-sync", channel);
+
+                        /* Queue high-priority sync (not immediate, give time for batch changes) */
+                        int rc = chanserv_queue_keycloak_sync(channel, KC_SYNC_PRIORITY_HIGH);
+                        if (rc == 0) {
+                            stats.group_syncs++;
+                        }
+                        free(channel);
+                    }
+                }
+                json_decref(rep_json);
             }
         }
     }

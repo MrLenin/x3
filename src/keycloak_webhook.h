@@ -40,7 +40,9 @@ typedef enum {
     KC_EVENT_LOGOUT_ALL_SESSIONS,  /* User logged out all sessions */
     KC_EVENT_DELETE_USER,          /* User account deleted */
     KC_EVENT_UPDATE_USER,          /* User details updated */
-    KC_EVENT_REVOKE_GRANT          /* OAuth grant revoked */
+    KC_EVENT_REVOKE_GRANT,         /* OAuth grant revoked */
+    KC_EVENT_GROUP_MEMBERSHIP,     /* User added/removed from group */
+    KC_EVENT_GROUP_UPDATE          /* Group attributes updated */
 } kc_webhook_event_type;
 
 /* Webhook statistics */
@@ -51,6 +53,7 @@ struct kc_webhook_stats {
     unsigned long cache_invalidations;
     unsigned long fingerprint_deletions;
     unsigned long session_revocations;
+    unsigned long group_syncs;        /* Channel syncs triggered by group events */
     time_t last_event_time;
 };
 
