@@ -1004,6 +1004,21 @@ int keycloak_delete_group_async(struct kc_realm realm, struct kc_client client,
                                  const char *group_id, void *session,
                                  kc_async_callback callback);
 
+/**
+ * Delete a user asynchronously. (Phase 5.10)
+ * Removes the user from Keycloak.
+ *
+ * @param realm       Keycloak realm configuration
+ * @param client      Client with admin access token
+ * @param user_id     User UUID to delete
+ * @param session     Opaque session pointer (passed to callback)
+ * @param callback    Function to call when deletion completes
+ * @return 0 on success (request started), -1 on error
+ */
+int keycloak_delete_user_async(struct kc_realm realm, struct kc_client client,
+                                const char *user_id, void *session,
+                                kc_async_callback callback);
+
 /*
  * =============================================================================
  * Token Manager API (Phase 5 Integration)

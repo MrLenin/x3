@@ -1313,7 +1313,8 @@ enum kc_async_type {
     KC_ASYNC_CREATE_SUBGROUP,/* Create subgroup (Phase 4) */
     KC_ASYNC_SET_GROUP_ATTR, /* Set group attribute (Phase 4) */
     KC_ASYNC_GET_GROUP_NAME, /* Get group by name (Phase 5 sync cleanup) */
-    KC_ASYNC_DELETE_GROUP    /* Delete group (Phase 5 sync cleanup) */
+    KC_ASYNC_DELETE_GROUP,   /* Delete group (Phase 5 sync cleanup) */
+    KC_ASYNC_DELETE_USER     /* Delete user (Phase 5.10) */
 };
 
 /* Async request tracking */
@@ -1341,6 +1342,7 @@ struct kc_async_request {
         kc_create_subgroup_callback create_subgroup; /* Create subgroup callback (Phase 4) */
         kc_get_group_path_callback get_group_name; /* Get group by name callback (reuses same signature) */
         kc_async_callback delete_group; /* Delete group callback (simple result) */
+        kc_async_callback delete_user;  /* Delete user callback (simple result) */
     } cb;
     /* WebPush-specific: copy of binary POST data for async request */
     void *post_data_copy;
@@ -2062,6 +2064,22 @@ kc_curl_check_completed(void)
                 }
                 if (req->cb.delete_group) {
                     req->cb.delete_group(req->session, result);
+                }
+                break;
+            }
+            case KC_ASYNC_DELETE_USER: {
+                int result = KC_ERROR;
+                if (http_code == 204 || http_code == 200) {
+                    result = KC_SUCCESS;
+                    log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async delete_user: Success (HTTP %ld)", req_id, http_code);
+                } else if (http_code == 404) {
+                    result = KC_NOT_FOUND;
+                    log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async delete_user: Not found (HTTP 404)", req_id);
+                } else {
+                    log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async delete_user: Error (HTTP %ld)", req_id, http_code);
+                }
+                if (req->cb.delete_user) {
+                    req->cb.delete_user(req->session, result);
                 }
                 break;
             }
@@ -6501,6 +6519,63 @@ keycloak_delete_group_async(struct kc_realm realm, struct kc_client client,
     }
 
     log_module(KC_LOG, LOG_DEBUG, "delete_group_async: Started async delete for group %s", group_id);
+    return 0;
+
+error:
+    if (req) {
+        if (req->uri) free(req->uri);
+        free(req);
+    }
+    return -1;
+}
+
+/*
+ * Phase 5.10: Async delete user
+ * Returns 0 on success (request started), -1 on error
+ */
+int
+keycloak_delete_user_async(struct kc_realm realm, struct kc_client client,
+                            const char *user_id, void *session,
+                            kc_async_callback callback)
+{
+    struct kc_async_request *req = NULL;
+
+    /* Validate inputs */
+    if (!realm.base_uri || !realm.realm || !client.access_token ||
+        !user_id || !callback) {
+        log_module(KC_LOG, LOG_DEBUG, "delete_user_async: Invalid arguments");
+        return -1;
+    }
+
+    /* Allocate request structure */
+    req = calloc(1, sizeof(*req));
+    if (!req) {
+        log_module(KC_LOG, LOG_ERROR, "delete_user_async: Out of memory");
+        return -1;
+    }
+    req->session = session;
+    req->type = KC_ASYNC_DELETE_USER;
+    req->cb.delete_user = callback;
+
+    /* Build URI: DELETE /admin/realms/{realm}/users/{user_id} */
+    req->uri = kc_build_user_endpoint(realm, user_id);
+    if (!req->uri) {
+        log_module(KC_LOG, LOG_ERROR, "delete_user_async: Failed to build URI");
+        goto error;
+    }
+
+    /* Use unified async API */
+    struct curl_opts opts = CURL_OPTS_INIT;
+    opts.uri = req->uri;
+    opts.method = HTTP_DELETE;
+    opts.xoauth2_bearer = client.access_token->access_token;
+
+    if (curl_perform_async(req, opts) < 0) {
+        log_module(KC_LOG, LOG_ERROR, "delete_user_async: curl_perform_async failed");
+        goto error;
+    }
+
+    log_module(KC_LOG, LOG_DEBUG, "delete_user_async: Started async delete for user %s", user_id);
     return 0;
 
 error:

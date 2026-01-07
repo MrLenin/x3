@@ -300,10 +300,10 @@ static int kc_check_auth(const char *handle, const char *password);
 static int kc_get_user_info(const char *handle, char **email_out);
 static void kc_do_add(const char *handle, const char *hash, const char *email);
 static void kc_do_modify(const char *handle, const char *hash, const char *email);
-static int kc_delete_account(const char *handle);
-static int kc_do_oslevel(const char *handle, int level, int oldlevel);
-static int kc_add2group(const char *handle, const char *group);
-static int kc_delfromgroup(const char *handle, const char *group);
+static void kc_delete_account(const char *handle);
+static void kc_do_oslevel(const char *handle, int level, int oldlevel);
+static void kc_add2group(const char *handle, const char *group);
+static void kc_delfromgroup(const char *handle, const char *group);
 static void kc_sync_email_verified(const char *handle, int verified);
 static void kc_sync_fingerprints(struct handle_info *hi);
 static int kc_check_email_verified(const char *handle, int *verified_out);
@@ -795,14 +795,8 @@ nickserv_unregister_handle(struct handle_info *hi, struct userNode *notify, stru
 #endif
 #ifdef WITH_KEYCLOAK
     if (nickserv_conf.keycloak_enable) {
-        int rc;
-        if ((rc = kc_delete_account(hi->handle)) != KC_SUCCESS && rc != KC_NOT_FOUND) {
-            /* Only show error and fail for actual errors, not "user not found" */
-            if (notify) {
-                send_message(notify, bot, "NSMSG_KEYCLOAK_FAIL", kc_strerror(rc));
-            }
-            return false;
-        }
+        /* Fire-and-forget: async delete proceeds in background */
+        kc_delete_account(hi->handle);
     }
 #endif
     for (n=0; n<unreg_func_used; n++)
@@ -4613,22 +4607,15 @@ oper_try_set_access(struct userNode *user, struct userNode *bot, struct handle_i
 #endif
 #ifdef WITH_KEYCLOAK
     if (nickserv_conf.keycloak_enable && nickserv_conf.keycloak_oper_group && *nickserv_conf.keycloak_oper_group) {
-        int rc;
+        /* Fire-and-forget: async group membership update proceeds in background */
         if (new_level >= nickserv_conf.keycloak_oper_group_level)
-            rc = kc_add2group(target->handle, nickserv_conf.keycloak_oper_group);
+            kc_add2group(target->handle, nickserv_conf.keycloak_oper_group);
         else
-            rc = kc_delfromgroup(target->handle, nickserv_conf.keycloak_oper_group);
-        if (rc != KC_SUCCESS && rc != KC_USER_EXISTS && rc != KC_NOT_FOUND) {
-            send_message(user, bot, "NSMSG_KEYCLOAK_FAIL", kc_strerror(rc));
-            return 0;
-        }
+            kc_delfromgroup(target->handle, nickserv_conf.keycloak_oper_group);
     }
     if (nickserv_conf.keycloak_enable && nickserv_conf.keycloak_attr_oslevel && *nickserv_conf.keycloak_attr_oslevel) {
-        int rc;
-        if ((rc = kc_do_oslevel(target->handle, new_level, target->opserv_level)) != KC_SUCCESS) {
-            send_message(user, bot, "NSMSG_KEYCLOAK_FAIL", kc_strerror(rc));
-            return 0;
-        }
+        /* Fire-and-forget: async oslevel update proceeds in background */
+        kc_do_oslevel(target->handle, new_level, target->opserv_level);
     }
 #endif
     if (target->opserv_level == new_level)
@@ -7078,61 +7065,278 @@ kc_do_modify(const char *handle, const char *hash, const char *email)
                handle);
 }
 
-/* Delete user from Keycloak */
+/* Context for async delete account */
+struct kc_delete_account_ctx {
+    char handle[NICKSERV_HANDLE_LEN + 1];
+};
+
+/* Final callback for delete account (fire-and-forget) */
 static int
-kc_delete_account(const char *handle)
+kc_delete_account_done_cb(void *session, int result)
 {
-    if (keycloak_ensure_token() != KC_SUCCESS) {
-        return KC_ERROR;
+    struct kc_delete_account_ctx *ctx = session;
+    if (result == KC_SUCCESS) {
+        log_module(NS_LOG, LOG_DEBUG, "kc_delete_account_done_cb[%s]: Delete succeeded",
+                   ctx ? ctx->handle : "?");
+    } else if (result == KC_NOT_FOUND) {
+        log_module(NS_LOG, LOG_DEBUG, "kc_delete_account_done_cb[%s]: User not found (already deleted?)",
+                   ctx ? ctx->handle : "?");
+    } else {
+        log_module(NS_LOG, LOG_WARNING, "kc_delete_account_done_cb[%s]: Delete failed: %d",
+                   ctx ? ctx->handle : "?", result);
     }
-
-    /* First get user ID (may be cached from recent create) */
-    struct kc_user user;
-    int rc = keycloak_get_user(keycloak_get_realm(), keycloak_get_authed_client(), handle, &user);
-    if (rc != KC_SUCCESS) {
-        return rc;
+    /* Invalidate cache regardless of result */
+    if (ctx) {
+        keycloak_invalidate_user_cache(ctx->handle);
+        free(ctx);
     }
-
-    char *user_id = strdup(user.id);
-    keycloak_user_free_fields(&user);
-
-    rc = keycloak_delete_user(keycloak_get_realm(), keycloak_get_authed_client(), user_id);
-    free(user_id);
-
-    /* Invalidate cache entry regardless of delete result */
-    keycloak_invalidate_user_cache(handle);
-
-    return rc;
+    return 1;  /* Terminal - fire-and-forget operation complete */
 }
 
-/* Set opserv level attribute and manage group membership */
+/* User lookup callback for delete account */
 static int
-kc_do_oslevel(const char *handle, int level, int oldlevel)
+kc_delete_account_user_cb(void *session, int result, struct kc_user *user)
 {
-    (void)oldlevel; /* reserved for future use */
-    if (keycloak_ensure_token() != KC_SUCCESS) {
-        return KC_ERROR;
+    struct kc_delete_account_ctx *ctx = session;
+    int rc;
+
+    if (!ctx) {
+        log_module(NS_LOG, LOG_ERROR, "kc_delete_account_user_cb: NULL context");
+        if (user) keycloak_user_free_fields(user);
+        return 1;
     }
 
-    /* Get user ID */
-    struct kc_user user;
-    int rc = keycloak_get_user(keycloak_get_realm(), keycloak_get_authed_client(), handle, &user);
-    if (rc != KC_SUCCESS) {
-        return rc;
+    if (result != KC_SUCCESS || !user || !user->id) {
+        log_module(NS_LOG, LOG_DEBUG, "kc_delete_account_user_cb[%s]: User not found in Keycloak",
+                   ctx->handle);
+        if (user) keycloak_user_free_fields(user);
+        keycloak_invalidate_user_cache(ctx->handle);
+        free(ctx);
+        return 1;
     }
 
-    char *user_id = strdup(user.id);
-    keycloak_user_free_fields(&user);
+    /* Start async delete */
+    rc = keycloak_delete_user_async(keycloak_get_realm(), keycloak_get_authed_client(),
+                                    user->id, ctx, kc_delete_account_done_cb);
+    keycloak_user_free_fields(user);
+
+    if (rc < 0) {
+        log_module(NS_LOG, LOG_WARNING, "kc_delete_account_user_cb[%s]: Failed to start async delete: %d",
+                   ctx->handle, rc);
+        keycloak_invalidate_user_cache(ctx->handle);
+        free(ctx);
+        return 1;
+    }
+
+    log_module(NS_LOG, LOG_DEBUG, "kc_delete_account_user_cb[%s]: Started async delete",
+               ctx->handle);
+    return 1;  /* Terminal - async continues via next callback */
+}
+
+/* Token callback for delete account */
+static void
+kc_delete_account_token_cb(void *context, int result, struct access_token *token)
+{
+    struct kc_delete_account_ctx *ctx = context;
+    int rc;
+
+    (void)token;  /* Token managed by keycloak module */
+
+    if (!ctx) {
+        log_module(NS_LOG, LOG_ERROR, "kc_delete_account_token_cb: NULL context");
+        return;
+    }
+
+    if (result != KC_SUCCESS) {
+        log_module(NS_LOG, LOG_DEBUG, "kc_delete_account_token_cb[%s]: Token refresh failed: %d",
+                   ctx->handle, result);
+        free(ctx);
+        return;
+    }
+
+    /* Start async user lookup */
+    rc = keycloak_get_user_async(keycloak_get_realm(), keycloak_get_authed_client(),
+                                 ctx->handle, ctx, kc_delete_account_user_cb);
+    if (rc < 0) {
+        log_module(NS_LOG, LOG_WARNING, "kc_delete_account_token_cb[%s]: Failed to start user lookup: %d",
+                   ctx->handle, rc);
+        free(ctx);
+        return;
+    }
+
+    log_module(NS_LOG, LOG_DEBUG, "kc_delete_account_token_cb[%s]: Started async user lookup",
+               ctx->handle);
+}
+
+/**
+ * Delete user from Keycloak (fire-and-forget, fully async).
+ * This initiates an async delete sequence: token → user lookup → delete.
+ * The deletion proceeds in the background; caller does not wait for result.
+ */
+static void
+kc_delete_account(const char *handle)
+{
+    struct kc_delete_account_ctx *ctx;
+    int rc;
+
+    if (!handle) {
+        log_module(NS_LOG, LOG_WARNING, "kc_delete_account: NULL handle");
+        return;
+    }
+
+    ctx = calloc(1, sizeof(*ctx));
+    if (!ctx) {
+        log_module(NS_LOG, LOG_ERROR, "kc_delete_account[%s]: Out of memory", handle);
+        return;
+    }
+    safestrncpy(ctx->handle, handle, sizeof(ctx->handle));
+
+    /* Start async token acquisition → user lookup → delete chain */
+    rc = keycloak_ensure_token_async(kc_delete_account_token_cb, ctx);
+    if (rc < 0) {
+        log_module(NS_LOG, LOG_WARNING, "kc_delete_account[%s]: Failed to start async token refresh: %d",
+                   handle, rc);
+        free(ctx);
+        return;
+    }
+
+    log_module(NS_LOG, LOG_DEBUG, "kc_delete_account[%s]: Started async delete sequence", handle);
+}
+
+/* Context for async oslevel update */
+struct kc_oslevel_ctx {
+    char handle[NICKSERV_HANDLE_LEN + 1];
+    int level;
+};
+
+/* Final callback for oslevel update (fire-and-forget) */
+static int
+kc_oslevel_done_cb(void *session, int result)
+{
+    struct kc_oslevel_ctx *ctx = session;
+    if (result == KC_SUCCESS) {
+        log_module(NS_LOG, LOG_DEBUG, "kc_oslevel_done_cb[%s]: oslevel=%d sync succeeded",
+                   ctx ? ctx->handle : "?", ctx ? ctx->level : -1);
+    } else {
+        log_module(NS_LOG, LOG_WARNING, "kc_oslevel_done_cb[%s]: oslevel=%d sync failed: %d",
+                   ctx ? ctx->handle : "?", ctx ? ctx->level : -1, result);
+    }
+    free(ctx);
+    return 1;  /* Terminal - fire-and-forget operation complete */
+}
+
+/* User lookup callback for oslevel update */
+static int
+kc_oslevel_user_cb(void *session, int result, struct kc_user *user)
+{
+    struct kc_oslevel_ctx *ctx = session;
+    char level_str[16];
+    int rc;
+
+    if (!ctx) {
+        log_module(NS_LOG, LOG_ERROR, "kc_oslevel_user_cb: NULL context");
+        if (user) keycloak_user_free_fields(user);
+        return 1;
+    }
+
+    if (result != KC_SUCCESS || !user || !user->id) {
+        log_module(NS_LOG, LOG_DEBUG, "kc_oslevel_user_cb[%s]: User not found in Keycloak",
+                   ctx->handle);
+        if (user) keycloak_user_free_fields(user);
+        free(ctx);
+        return 1;
+    }
 
     /* Set the opserv_level attribute */
-    char level_str[16];
-    snprintf(level_str, sizeof(level_str), "%d", level);
-    rc = keycloak_set_user_attribute(keycloak_get_realm(), keycloak_get_authed_client(),
-                                     user_id, nickserv_conf.keycloak_attr_oslevel,
-                                     level_str);
+    snprintf(level_str, sizeof(level_str), "%d", ctx->level);
+    rc = keycloak_set_user_attribute_async(keycloak_get_realm(), keycloak_get_authed_client(),
+                                           user->id, nickserv_conf.keycloak_attr_oslevel,
+                                           level_str, ctx, kc_oslevel_done_cb);
+    keycloak_user_free_fields(user);
 
-    free(user_id);
-    return rc;
+    if (rc < 0) {
+        log_module(NS_LOG, LOG_WARNING, "kc_oslevel_user_cb[%s]: Failed to start async set: %d",
+                   ctx->handle, rc);
+        free(ctx);
+        return 1;
+    }
+
+    log_module(NS_LOG, LOG_DEBUG, "kc_oslevel_user_cb[%s]: Started async oslevel set",
+               ctx->handle);
+    return 1;  /* Terminal - async continues via next callback */
+}
+
+/* Token callback for oslevel update */
+static void
+kc_oslevel_token_cb(void *context, int result, struct access_token *token)
+{
+    struct kc_oslevel_ctx *ctx = context;
+    int rc;
+
+    (void)token;  /* Token managed by keycloak module */
+
+    if (!ctx) {
+        log_module(NS_LOG, LOG_ERROR, "kc_oslevel_token_cb: NULL context");
+        return;
+    }
+
+    if (result != KC_SUCCESS) {
+        log_module(NS_LOG, LOG_DEBUG, "kc_oslevel_token_cb[%s]: Token refresh failed: %d",
+                   ctx->handle, result);
+        free(ctx);
+        return;
+    }
+
+    /* Start async user lookup */
+    rc = keycloak_get_user_async(keycloak_get_realm(), keycloak_get_authed_client(),
+                                 ctx->handle, ctx, kc_oslevel_user_cb);
+    if (rc < 0) {
+        log_module(NS_LOG, LOG_WARNING, "kc_oslevel_token_cb[%s]: Failed to start user lookup: %d",
+                   ctx->handle, rc);
+        free(ctx);
+        return;
+    }
+
+    log_module(NS_LOG, LOG_DEBUG, "kc_oslevel_token_cb[%s]: Started async user lookup",
+               ctx->handle);
+}
+
+/**
+ * Set opserv level attribute in Keycloak (fire-and-forget, fully async).
+ * This initiates an async sequence: token → user lookup → set attribute.
+ * The update proceeds in the background; caller does not wait for result.
+ */
+static void
+kc_do_oslevel(const char *handle, int level, int oldlevel)
+{
+    struct kc_oslevel_ctx *ctx;
+    int rc;
+
+    (void)oldlevel;  /* reserved for future use */
+
+    if (!handle) {
+        log_module(NS_LOG, LOG_WARNING, "kc_do_oslevel: NULL handle");
+        return;
+    }
+
+    ctx = calloc(1, sizeof(*ctx));
+    if (!ctx) {
+        log_module(NS_LOG, LOG_ERROR, "kc_do_oslevel[%s]: Out of memory", handle);
+        return;
+    }
+    safestrncpy(ctx->handle, handle, sizeof(ctx->handle));
+    ctx->level = level;
+
+    /* Start async token acquisition → user lookup → set attribute chain */
+    rc = keycloak_ensure_token_async(kc_oslevel_token_cb, ctx);
+    if (rc < 0) {
+        log_module(NS_LOG, LOG_WARNING, "kc_do_oslevel[%s]: Failed to start async token refresh: %d",
+                   handle, rc);
+        free(ctx);
+        return;
+    }
+
+    log_module(NS_LOG, LOG_DEBUG, "kc_do_oslevel[%s]: Started async oslevel=%d sync", handle, level);
 }
 
 /* Context for async email verification sync */
@@ -7529,70 +7733,250 @@ kc_try_auto_activate(struct handle_info *hi)
     return 1;
 }
 
-/* Add user to Keycloak group */
-static int
-kc_add2group(const char *handle, const char *group_name)
+/* Context for async group membership operations */
+struct kc_group_ctx {
+    char handle[NICKSERV_HANDLE_LEN + 1];
+    char *group_name;
+    char *user_id;
+    int is_add;  /* 1 = add to group, 0 = remove from group */
+};
+
+static void
+kc_group_ctx_free(struct kc_group_ctx *ctx)
 {
-    if (keycloak_ensure_token() != KC_SUCCESS) {
-        return KC_ERROR;
+    if (ctx) {
+        if (ctx->group_name) free(ctx->group_name);
+        if (ctx->user_id) free(ctx->user_id);
+        free(ctx);
     }
-
-    /* Get user ID */
-    struct kc_user user;
-    int rc = keycloak_get_user(keycloak_get_realm(), keycloak_get_authed_client(), handle, &user);
-    if (rc != KC_SUCCESS) {
-        return rc;
-    }
-    char *user_id = strdup(user.id);
-    keycloak_user_free_fields(&user);
-
-    /* Get group ID */
-    char *group_id = NULL;
-    rc = keycloak_get_group_by_name(keycloak_get_realm(), keycloak_get_authed_client(),
-                                    group_name, &group_id);
-    if (rc != KC_SUCCESS) {
-        free(user_id);
-        return rc;
-    }
-
-    rc = keycloak_add_user_to_group(keycloak_get_realm(), keycloak_get_authed_client(),
-                                    user_id, group_id);
-    free(user_id);
-    free(group_id);
-    return rc;
 }
 
-/* Remove user from Keycloak group */
+/* Final callback for group membership operations (fire-and-forget) */
 static int
+kc_group_done_cb(void *session, int result)
+{
+    struct kc_group_ctx *ctx = session;
+    const char *op = ctx && ctx->is_add ? "add" : "remove";
+    if (result == KC_SUCCESS) {
+        log_module(NS_LOG, LOG_DEBUG, "kc_group_done_cb[%s]: %s to/from group succeeded",
+                   ctx ? ctx->handle : "?", op);
+    } else if (result == KC_NOT_FOUND || result == KC_USER_EXISTS) {
+        log_module(NS_LOG, LOG_DEBUG, "kc_group_done_cb[%s]: %s not needed: %d",
+                   ctx ? ctx->handle : "?", op, result);
+    } else {
+        log_module(NS_LOG, LOG_WARNING, "kc_group_done_cb[%s]: %s failed: %d",
+                   ctx ? ctx->handle : "?", op, result);
+    }
+    kc_group_ctx_free(ctx);
+    return 1;  /* Terminal - fire-and-forget operation complete */
+}
+
+/* Group lookup callback - chain to add/remove user */
+static int
+kc_group_lookup_cb(void *session, int result, char *group_id)
+{
+    struct kc_group_ctx *ctx = session;
+    int rc;
+
+    if (!ctx) {
+        log_module(NS_LOG, LOG_ERROR, "kc_group_lookup_cb: NULL context");
+        if (group_id) free(group_id);
+        return 1;
+    }
+
+    if (result != KC_SUCCESS || !group_id) {
+        log_module(NS_LOG, LOG_DEBUG, "kc_group_lookup_cb[%s]: Group '%s' not found",
+                   ctx->handle, ctx->group_name ? ctx->group_name : "?");
+        if (group_id) free(group_id);
+        kc_group_ctx_free(ctx);
+        return 1;
+    }
+
+    /* Start async add/remove operation */
+    if (ctx->is_add) {
+        rc = keycloak_add_user_to_group_async(keycloak_get_realm(), keycloak_get_authed_client(),
+                                              ctx->user_id, group_id,
+                                              ctx, kc_group_done_cb);
+    } else {
+        rc = keycloak_remove_user_from_group_async(keycloak_get_realm(), keycloak_get_authed_client(),
+                                                   ctx->user_id, group_id,
+                                                   ctx, kc_group_done_cb);
+    }
+    free(group_id);
+
+    if (rc < 0) {
+        log_module(NS_LOG, LOG_WARNING, "kc_group_lookup_cb[%s]: Failed to start async %s: %d",
+                   ctx->handle, ctx->is_add ? "add" : "remove", rc);
+        kc_group_ctx_free(ctx);
+        return 1;
+    }
+
+    log_module(NS_LOG, LOG_DEBUG, "kc_group_lookup_cb[%s]: Started async group %s",
+               ctx->handle, ctx->is_add ? "add" : "remove");
+    return 1;  /* Terminal - async continues via next callback */
+}
+
+/* User lookup callback - chain to group lookup */
+static int
+kc_group_user_cb(void *session, int result, struct kc_user *user)
+{
+    struct kc_group_ctx *ctx = session;
+    int rc;
+
+    if (!ctx) {
+        log_module(NS_LOG, LOG_ERROR, "kc_group_user_cb: NULL context");
+        if (user) keycloak_user_free_fields(user);
+        return 1;
+    }
+
+    if (result != KC_SUCCESS || !user || !user->id) {
+        log_module(NS_LOG, LOG_DEBUG, "kc_group_user_cb[%s]: User not found in Keycloak",
+                   ctx->handle);
+        if (user) keycloak_user_free_fields(user);
+        kc_group_ctx_free(ctx);
+        return 1;
+    }
+
+    /* Save user_id for next callback */
+    ctx->user_id = strdup(user->id);
+    keycloak_user_free_fields(user);
+
+    if (!ctx->user_id) {
+        log_module(NS_LOG, LOG_ERROR, "kc_group_user_cb[%s]: Out of memory", ctx->handle);
+        kc_group_ctx_free(ctx);
+        return 1;
+    }
+
+    /* Start async group lookup */
+    rc = keycloak_get_group_by_name_async(keycloak_get_realm(), keycloak_get_authed_client(),
+                                          ctx->group_name, ctx, kc_group_lookup_cb);
+    if (rc < 0) {
+        log_module(NS_LOG, LOG_WARNING, "kc_group_user_cb[%s]: Failed to start group lookup: %d",
+                   ctx->handle, rc);
+        kc_group_ctx_free(ctx);
+        return 1;
+    }
+
+    log_module(NS_LOG, LOG_DEBUG, "kc_group_user_cb[%s]: Started async group lookup",
+               ctx->handle);
+    return 1;  /* Terminal - async continues via next callback */
+}
+
+/* Token callback for group operations */
+static void
+kc_group_token_cb(void *context, int result, struct access_token *token)
+{
+    struct kc_group_ctx *ctx = context;
+    int rc;
+
+    (void)token;  /* Token managed by keycloak module */
+
+    if (!ctx) {
+        log_module(NS_LOG, LOG_ERROR, "kc_group_token_cb: NULL context");
+        return;
+    }
+
+    if (result != KC_SUCCESS) {
+        log_module(NS_LOG, LOG_DEBUG, "kc_group_token_cb[%s]: Token refresh failed: %d",
+                   ctx->handle, result);
+        kc_group_ctx_free(ctx);
+        return;
+    }
+
+    /* Start async user lookup */
+    rc = keycloak_get_user_async(keycloak_get_realm(), keycloak_get_authed_client(),
+                                 ctx->handle, ctx, kc_group_user_cb);
+    if (rc < 0) {
+        log_module(NS_LOG, LOG_WARNING, "kc_group_token_cb[%s]: Failed to start user lookup: %d",
+                   ctx->handle, rc);
+        kc_group_ctx_free(ctx);
+        return;
+    }
+
+    log_module(NS_LOG, LOG_DEBUG, "kc_group_token_cb[%s]: Started async user lookup",
+               ctx->handle);
+}
+
+/**
+ * Add user to Keycloak group (fire-and-forget, fully async).
+ */
+static void
+kc_add2group(const char *handle, const char *group_name)
+{
+    struct kc_group_ctx *ctx;
+    int rc;
+
+    if (!handle || !group_name) {
+        log_module(NS_LOG, LOG_WARNING, "kc_add2group: NULL handle or group_name");
+        return;
+    }
+
+    ctx = calloc(1, sizeof(*ctx));
+    if (!ctx) {
+        log_module(NS_LOG, LOG_ERROR, "kc_add2group[%s]: Out of memory", handle);
+        return;
+    }
+    safestrncpy(ctx->handle, handle, sizeof(ctx->handle));
+    ctx->group_name = strdup(group_name);
+    ctx->is_add = 1;
+
+    if (!ctx->group_name) {
+        log_module(NS_LOG, LOG_ERROR, "kc_add2group[%s]: Out of memory for group_name", handle);
+        free(ctx);
+        return;
+    }
+
+    /* Start async token acquisition → user lookup → group lookup → add chain */
+    rc = keycloak_ensure_token_async(kc_group_token_cb, ctx);
+    if (rc < 0) {
+        log_module(NS_LOG, LOG_WARNING, "kc_add2group[%s]: Failed to start async: %d", handle, rc);
+        kc_group_ctx_free(ctx);
+        return;
+    }
+
+    log_module(NS_LOG, LOG_DEBUG, "kc_add2group[%s]: Started async add to group '%s'",
+               handle, group_name);
+}
+
+/**
+ * Remove user from Keycloak group (fire-and-forget, fully async).
+ */
+static void
 kc_delfromgroup(const char *handle, const char *group_name)
 {
-    if (keycloak_ensure_token() != KC_SUCCESS) {
-        return KC_ERROR;
+    struct kc_group_ctx *ctx;
+    int rc;
+
+    if (!handle || !group_name) {
+        log_module(NS_LOG, LOG_WARNING, "kc_delfromgroup: NULL handle or group_name");
+        return;
     }
 
-    /* Get user ID */
-    struct kc_user user;
-    int rc = keycloak_get_user(keycloak_get_realm(), keycloak_get_authed_client(), handle, &user);
-    if (rc != KC_SUCCESS) {
-        return rc;
+    ctx = calloc(1, sizeof(*ctx));
+    if (!ctx) {
+        log_module(NS_LOG, LOG_ERROR, "kc_delfromgroup[%s]: Out of memory", handle);
+        return;
     }
-    char *user_id = strdup(user.id);
-    keycloak_user_free_fields(&user);
+    safestrncpy(ctx->handle, handle, sizeof(ctx->handle));
+    ctx->group_name = strdup(group_name);
+    ctx->is_add = 0;
 
-    /* Get group ID */
-    char *group_id = NULL;
-    rc = keycloak_get_group_by_name(keycloak_get_realm(), keycloak_get_authed_client(),
-                                    group_name, &group_id);
-    if (rc != KC_SUCCESS) {
-        free(user_id);
-        return rc;
+    if (!ctx->group_name) {
+        log_module(NS_LOG, LOG_ERROR, "kc_delfromgroup[%s]: Out of memory for group_name", handle);
+        free(ctx);
+        return;
     }
 
-    rc = keycloak_remove_user_from_group(keycloak_get_realm(), keycloak_get_authed_client(),
-                                         user_id, group_id);
-    free(user_id);
-    free(group_id);
-    return rc;
+    /* Start async token acquisition → user lookup → group lookup → remove chain */
+    rc = keycloak_ensure_token_async(kc_group_token_cb, ctx);
+    if (rc < 0) {
+        log_module(NS_LOG, LOG_WARNING, "kc_delfromgroup[%s]: Failed to start async: %d", handle, rc);
+        kc_group_ctx_free(ctx);
+        return;
+    }
+
+    log_module(NS_LOG, LOG_DEBUG, "kc_delfromgroup[%s]: Started async remove from group '%s'",
+               handle, group_name);
 }
 
 /* Fire-and-forget callback for async attribute updates (just logs result) */
@@ -7604,6 +7988,113 @@ ns_attr_async_callback(void *session, int result)
         log_module(NS_LOG, LOG_DEBUG, "ns_attr_async: Attribute update failed (result=%d)", result);
     }
     return 1;  /* Terminal - fire-and-forget operation complete */
+}
+
+/* Context for async metadata set operations */
+struct kc_metadata_ctx {
+    char handle[NICKSERV_HANDLE_LEN + 1];
+    char *attr_name;
+    char *attr_value;
+};
+
+static void
+kc_metadata_ctx_free(struct kc_metadata_ctx *ctx)
+{
+    if (ctx) {
+        if (ctx->attr_name) free(ctx->attr_name);
+        if (ctx->attr_value) free(ctx->attr_value);
+        free(ctx);
+    }
+}
+
+/* Final callback for metadata set (fire-and-forget) */
+static int
+kc_metadata_done_cb(void *session, int result)
+{
+    struct kc_metadata_ctx *ctx = session;
+    if (result == KC_SUCCESS) {
+        log_module(NS_LOG, LOG_DEBUG, "kc_metadata_done_cb[%s]: %s set succeeded",
+                   ctx ? ctx->handle : "?", ctx ? ctx->attr_name : "?");
+    } else {
+        log_module(NS_LOG, LOG_DEBUG, "kc_metadata_done_cb[%s]: %s set failed: %d",
+                   ctx ? ctx->handle : "?", ctx ? ctx->attr_name : "?", result);
+    }
+    kc_metadata_ctx_free(ctx);
+    return 1;  /* Terminal - fire-and-forget operation complete */
+}
+
+/* User lookup callback for metadata set */
+static int
+kc_metadata_user_cb(void *session, int result, struct kc_user *user)
+{
+    struct kc_metadata_ctx *ctx = session;
+    int rc;
+
+    if (!ctx) {
+        log_module(NS_LOG, LOG_ERROR, "kc_metadata_user_cb: NULL context");
+        if (user) keycloak_user_free_fields(user);
+        return 1;
+    }
+
+    if (result != KC_SUCCESS || !user || !user->id) {
+        log_module(NS_LOG, LOG_DEBUG, "kc_metadata_user_cb[%s]: User not found in Keycloak",
+                   ctx->handle);
+        if (user) keycloak_user_free_fields(user);
+        kc_metadata_ctx_free(ctx);
+        return 1;
+    }
+
+    /* Start async attribute set */
+    rc = keycloak_set_user_attribute_async(keycloak_get_realm(), keycloak_get_authed_client(),
+                                           user->id, ctx->attr_name, ctx->attr_value,
+                                           ctx, kc_metadata_done_cb);
+    keycloak_user_free_fields(user);
+
+    if (rc < 0) {
+        log_module(NS_LOG, LOG_DEBUG, "kc_metadata_user_cb[%s]: Failed to start async set: %d",
+                   ctx->handle, rc);
+        kc_metadata_ctx_free(ctx);
+        return 1;
+    }
+
+    log_module(NS_LOG, LOG_DEBUG, "kc_metadata_user_cb[%s]: Started async attribute set",
+               ctx->handle);
+    return 1;  /* Terminal - async continues via next callback */
+}
+
+/* Token callback for metadata set */
+static void
+kc_metadata_token_cb(void *context, int result, struct access_token *token)
+{
+    struct kc_metadata_ctx *ctx = context;
+    int rc;
+
+    (void)token;  /* Token managed by keycloak module */
+
+    if (!ctx) {
+        log_module(NS_LOG, LOG_ERROR, "kc_metadata_token_cb: NULL context");
+        return;
+    }
+
+    if (result != KC_SUCCESS) {
+        log_module(NS_LOG, LOG_DEBUG, "kc_metadata_token_cb[%s]: Token refresh failed: %d",
+                   ctx->handle, result);
+        kc_metadata_ctx_free(ctx);
+        return;
+    }
+
+    /* Start async user lookup */
+    rc = keycloak_get_user_async(keycloak_get_realm(), keycloak_get_authed_client(),
+                                 ctx->handle, ctx, kc_metadata_user_cb);
+    if (rc < 0) {
+        log_module(NS_LOG, LOG_DEBUG, "kc_metadata_token_cb[%s]: Failed to start user lookup: %d",
+                   ctx->handle, rc);
+        kc_metadata_ctx_free(ctx);
+        return;
+    }
+
+    log_module(NS_LOG, LOG_DEBUG, "kc_metadata_token_cb[%s]: Started async user lookup",
+               ctx->handle);
 }
 
 /**
@@ -8233,48 +8724,32 @@ nickserv_set_user_metadata(struct handle_info *hi, const char *key, const char *
 #endif
 
 #ifdef WITH_KEYCLOAK
-    /* Step 2: Write to Keycloak backend (async fire-and-forget) */
+    /* Step 2: Write to Keycloak backend (fully async fire-and-forget) */
     if (nickserv_conf.keycloak_enable) {
-        char attr_name[128];
-        struct kc_user user;
-        int rc;
-
-        if (keycloak_ensure_token() != KC_SUCCESS) {
-            log_module(NS_LOG, LOG_WARNING, "nickserv_set_user_metadata: Failed to get admin token");
-            /* Continue - we may have LMDB cache */
-        } else {
-            /* Get user ID from Keycloak */
-            rc = keycloak_get_user(keycloak_get_realm(), keycloak_get_authed_client(), hi->handle, &user);
-            if (rc != KC_SUCCESS) {
-                log_module(NS_LOG, LOG_WARNING, "nickserv_set_user_metadata: User %s not found in Keycloak", hi->handle);
-                /* Continue - we may have LMDB cache */
-            } else {
-                char *user_id = strdup(user.id);
-                keycloak_user_free_fields(&user);
-
-                /* Prefix metadata keys with "metadata." to avoid conflicts */
-                snprintf(attr_name, sizeof(attr_name), "metadata.%s", key);
-
-                /* Fire-and-forget async update - LMDB is authoritative, this is just sync */
-                const char *attr_value = (value && *value) ? stored_value : "";
-                if (keycloak_set_user_attribute_async(keycloak_get_realm(), keycloak_get_authed_client(),
-                                                       user_id, attr_name, attr_value,
-                                                       NULL, ns_attr_async_callback) == 0) {
-                    /* Async started - consider it optimistically successful */
-                    keycloak_ok = 1;
-                    log_module(NS_LOG, LOG_DEBUG, "nickserv_set_user_metadata: Keycloak async set %s.%s = %s (vis=%d)",
-                               hi->handle, key, value ? value : "(deleted)", visibility);
-                } else {
-                    /* Async failed to start - fall back to sync */
-                    log_module(NS_LOG, LOG_DEBUG, "nickserv_set_user_metadata: Async failed, using sync");
-                    rc = keycloak_set_user_attribute(keycloak_get_realm(), keycloak_get_authed_client(),
-                                                     user_id, attr_name, attr_value);
-                    if (rc == KC_SUCCESS) {
+        /* Use fully async path - token → user lookup → set attribute */
+        struct kc_metadata_ctx *kc_ctx = calloc(1, sizeof(*kc_ctx));
+        if (kc_ctx) {
+            safestrncpy(kc_ctx->handle, hi->handle, sizeof(kc_ctx->handle));
+            kc_ctx->attr_name = malloc(128);
+            if (kc_ctx->attr_name) {
+                snprintf(kc_ctx->attr_name, 128, "metadata.%s", key);
+                kc_ctx->attr_value = strdup((value && *value) ? stored_value : "");
+                if (kc_ctx->attr_value) {
+                    if (keycloak_ensure_token_async(kc_metadata_token_cb, kc_ctx) == 0) {
+                        /* Async started - consider optimistically successful for keycloak_ok */
                         keycloak_ok = 1;
+                        log_module(NS_LOG, LOG_DEBUG, "nickserv_set_user_metadata: Started async Keycloak set %s.%s",
+                                   hi->handle, key);
+                    } else {
+                        log_module(NS_LOG, LOG_DEBUG, "nickserv_set_user_metadata: Failed to start async token");
+                        kc_metadata_ctx_free(kc_ctx);
                     }
+                } else {
+                    free(kc_ctx->attr_name);
+                    free(kc_ctx);
                 }
-
-                free(user_id);
+            } else {
+                free(kc_ctx);
             }
         }
     }
