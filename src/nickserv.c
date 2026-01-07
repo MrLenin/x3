@@ -306,8 +306,7 @@ static void kc_add2group(const char *handle, const char *group);
 static void kc_delfromgroup(const char *handle, const char *group);
 static void kc_sync_email_verified(const char *handle, int verified);
 static void kc_sync_fingerprints(struct handle_info *hi);
-static int kc_check_email_verified(const char *handle, int *verified_out);
-static int kc_try_auto_activate(struct handle_info *hi);
+static void kc_try_auto_activate(struct handle_info *hi);
 static struct handle_info *loc_auth_oauth(const char *bearer_token, const char *username_hint, const char *hostmask);
 static const char *kc_strerror(int rc);
 #endif
@@ -7643,36 +7642,121 @@ kc_sync_fingerprints(struct handle_info *hi)
                hi->handle);
 }
 
-/**
- * Check if Keycloak says user is email verified.
- * Used during SASL auth to trust Keycloak's verification state.
- *
- * @param handle        Account name
- * @param verified_out  Output: 1 if verified, 0 otherwise
- * @return KC_SUCCESS on success, error code otherwise
+/* Context for async auto-activate check */
+struct kc_auto_activate_ctx {
+    char handle[NICKSERV_HANDLE_LEN + 1];
+    char cookie_data[PASSLEN + 1];  /* Copy of password hash from cookie */
+};
+
+/*
+ * Async user lookup callback for auto-activate.
+ * Checks emailVerified and completes activation if true.
  */
 static int
-kc_check_email_verified(const char *handle, int *verified_out)
+kc_auto_activate_user_cb(void *session, int result, struct kc_user *user)
 {
-    *verified_out = 0;
+    struct kc_auto_activate_ctx *ctx = session;
+    struct handle_info *hi;
 
-    if (!nickserv_conf.keycloak_enable) {
-        return KC_ERROR;
+    if (result != KC_SUCCESS || !user) {
+        log_module(NS_LOG, LOG_DEBUG, "kc_auto_activate_user_cb: User lookup failed for %s (rc=%d)",
+                   ctx->handle, result);
+        free(ctx);
+        return 1;
     }
 
-    if (keycloak_ensure_token() != KC_SUCCESS) {
-        return KC_ERROR;
+    /* Check emailVerified */
+    if (!user->emailVerified) {
+        log_module(NS_LOG, LOG_DEBUG, "kc_auto_activate_user_cb: %s not verified in Keycloak",
+                   ctx->handle);
+        free(ctx);
+        return 1;
     }
 
-    struct kc_user user;
-    int rc = keycloak_get_user(keycloak_get_realm(), keycloak_get_authed_client(), handle, &user);
-    if (rc == KC_SUCCESS) {
-        *verified_out = user.emailVerified ? 1 : 0;
-        keycloak_user_free_fields(&user);
-        return KC_SUCCESS;
+    /* Verified! Look up handle and complete activation */
+    hi = get_handle_info(ctx->handle);
+    if (!hi) {
+        log_module(NS_LOG, LOG_DEBUG, "kc_auto_activate_user_cb: Handle %s no longer exists",
+                   ctx->handle);
+        free(ctx);
+        return 1;
     }
 
-    return rc;
+    /* Verify cookie still pending (may have been activated by other means) */
+    if (!hi->cookie || hi->cookie->type != ACTIVATION) {
+        log_module(NS_LOG, LOG_DEBUG, "kc_auto_activate_user_cb: No pending activation for %s",
+                   ctx->handle);
+        free(ctx);
+        return 1;
+    }
+
+    log_module(NS_LOG, LOG_INFO, "kc_auto_activate_user_cb: Auto-activating %s based on Keycloak emailVerified",
+               ctx->handle);
+
+    /* Apply password from context (copied from cookie at start) */
+    if (ctx->cookie_data[0]) {
+        safestrncpy(hi->passwd, ctx->cookie_data, sizeof(hi->passwd));
+    }
+
+    /* Eat the cookie */
+    nickserv_eat_cookie(hi->cookie);
+
+    if (nickserv_conf.sync_log) {
+        SyncLog("ACCOUNTACC %s", ctx->handle);
+    }
+
+    free(ctx);
+    return 1;
+}
+
+/*
+ * Async token callback for auto-activate.
+ * Starts user lookup to check emailVerified.
+ */
+static void
+kc_auto_activate_token_cb(void *context, int result, struct access_token *token)
+{
+    struct kc_auto_activate_ctx *ctx = context;
+    struct handle_info *hi;
+    int rc;
+
+    (void)token;  /* Token is cached globally, we just needed it refreshed */
+
+    if (result != KC_SUCCESS) {
+        log_module(NS_LOG, LOG_DEBUG, "kc_auto_activate_token_cb: Token failed for %s (rc=%d)",
+                   ctx->handle, result);
+        free(ctx);
+        return;
+    }
+
+    /* Verify handle still exists */
+    hi = get_handle_info(ctx->handle);
+    if (!hi) {
+        log_module(NS_LOG, LOG_DEBUG, "kc_auto_activate_token_cb: Handle %s no longer exists",
+                   ctx->handle);
+        free(ctx);
+        return;
+    }
+
+    /* Verify cookie still pending */
+    if (!hi->cookie || hi->cookie->type != ACTIVATION) {
+        log_module(NS_LOG, LOG_DEBUG, "kc_auto_activate_token_cb: No pending activation for %s",
+                   ctx->handle);
+        free(ctx);
+        return;
+    }
+
+    /* Start async user lookup */
+    rc = keycloak_get_user_async(keycloak_get_realm(), keycloak_get_authed_client(),
+                                  ctx->handle, ctx, kc_auto_activate_user_cb);
+    if (rc != 0) {
+        log_module(NS_LOG, LOG_DEBUG, "kc_auto_activate_token_cb: Failed to start user lookup for %s",
+                   ctx->handle);
+        free(ctx);
+        return;
+    }
+
+    /* ctx now owned by async request */
 }
 
 /**
@@ -7681,56 +7765,55 @@ kc_check_email_verified(const char *handle, int *verified_out)
  * If Keycloak says the user is email verified, we trust that and complete
  * the activation (eating the cookie).
  *
+ * This is a fire-and-forget async operation. The SASL auth has already
+ * succeeded; this just handles the email verification shortcut.
+ *
  * @param hi  Handle info to potentially auto-activate
- * @return 1 if auto-activated, 0 otherwise
  */
-static int
+static void
 kc_try_auto_activate(struct handle_info *hi)
 {
-    int verified = 0;
+    struct kc_auto_activate_ctx *ctx;
+    int rc;
 
     /* Must have Keycloak enabled */
     if (!nickserv_conf.keycloak_enable) {
-        return 0;
+        return;
     }
 
     /* Must have pending ACTIVATION cookie */
     if (!hi->cookie || hi->cookie->type != ACTIVATION) {
-        return 0;
+        return;
     }
 
     /* Policy must allow trusting Keycloak verification (0 = trust KC) */
     if (nickserv_conf.keycloak_email_policy != 0) {
-        return 0;
+        return;
     }
 
-    /* Check Keycloak emailVerified */
-    if (kc_check_email_verified(hi->handle, &verified) != KC_SUCCESS) {
-        log_module(NS_LOG, LOG_DEBUG, "kc_try_auto_activate: Failed to check emailVerified for %s", hi->handle);
-        return 0;
+    /* Allocate context */
+    ctx = calloc(1, sizeof(*ctx));
+    if (!ctx) {
+        log_module(NS_LOG, LOG_ERROR, "kc_try_auto_activate: Out of memory");
+        return;
     }
 
-    if (!verified) {
-        log_module(NS_LOG, LOG_DEBUG, "kc_try_auto_activate: Keycloak says %s not verified", hi->handle);
-        return 0;
-    }
-
-    /* Keycloak says verified - auto-complete activation */
-    log_module(NS_LOG, LOG_INFO, "kc_try_auto_activate: Auto-activating %s based on Keycloak emailVerified", hi->handle);
-
-    /* Apply the password hash from the cookie */
+    safestrncpy(ctx->handle, hi->handle, sizeof(ctx->handle));
     if (hi->cookie->data) {
-        safestrncpy(hi->passwd, hi->cookie->data, sizeof(hi->passwd));
+        safestrncpy(ctx->cookie_data, hi->cookie->data, sizeof(ctx->cookie_data));
     }
 
-    /* Eat the cookie */
-    nickserv_eat_cookie(hi->cookie);
-
-    if (nickserv_conf.sync_log) {
-        SyncLog("ACCOUNTACC %s", hi->handle);
+    /* Start async token acquisition */
+    rc = keycloak_ensure_token_async(kc_auto_activate_token_cb, ctx);
+    if (rc != 0) {
+        log_module(NS_LOG, LOG_DEBUG, "kc_try_auto_activate: Failed to start token acquisition for %s",
+                   hi->handle);
+        free(ctx);
+        return;
     }
 
-    return 1;
+    log_module(NS_LOG, LOG_DEBUG, "kc_try_auto_activate: Started async emailVerified check for %s",
+               hi->handle);
 }
 
 /* Context for async group membership operations */
