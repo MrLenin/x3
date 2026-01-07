@@ -298,8 +298,8 @@ static void cookie_async_ctx_free(struct cookie_async_ctx *ctx);
 /* Forward declarations for Keycloak wrapper functions */
 static int kc_check_auth(const char *handle, const char *password);
 static int kc_get_user_info(const char *handle, char **email_out);
-static int kc_do_add(const char *handle, const char *password, const char *email);
-static int kc_do_modify(const char *handle, const char *hash, const char *email);
+static void kc_do_add(const char *handle, const char *hash, const char *email);
+static void kc_do_modify(const char *handle, const char *hash, const char *email);
 static int kc_delete_account(const char *handle);
 static int kc_do_oslevel(const char *handle, int level, int oldlevel);
 static int kc_add2group(const char *handle, const char *group);
@@ -1424,15 +1424,9 @@ nickserv_register(struct userNode *user, struct userNode *settee, const char *ha
     /* Create Keycloak user at registration time (mirrors LDAP pattern):
      * - If no_auth or no password: create WITHOUT password (set at activation)
      * - Otherwise: create WITH hashed password (crypted)
-     * - Email is set later via kc_do_modify() */
-    if (nickserv_conf.keycloak_enable) {
-        int rc = kc_do_add(handle, (no_auth || !passwd ? NULL : crypted), NULL);
-        if (rc != KC_SUCCESS && rc != KC_USER_EXISTS) {
-            if (user)
-                send_message(user, nickserv, "NSMSG_KEYCLOAK_FAIL", kc_strerror(rc));
-            /* Don't fail registration - local account still works */
-        }
-    }
+     * - Email is set later via kc_do_modify()
+     * Fire-and-forget async - errors logged but don't block registration */
+    kc_do_add(handle, (no_auth || !passwd ? NULL : crypted), NULL);
 #endif
     hi = register_handle(handle, crypted, 0);
     hi->masks = alloc_string_list(1);
@@ -1779,9 +1773,8 @@ static NICKSERV_FUNC(cmd_register)
         nickserv_set_email_addr(hi, email_addr);
 #endif
 #ifdef WITH_KEYCLOAK
-        if (nickserv_conf.keycloak_enable) {
-            kc_do_modify(hi->handle, NULL, email_addr);
-        }
+        /* Fire-and-forget async email sync to Keycloak */
+        kc_do_modify(hi->handle, NULL, email_addr);
 #endif
     }
 
@@ -1897,9 +1890,8 @@ static NICKSERV_FUNC(cmd_oregister)
         nickserv_set_email_addr(hi, email);
 #endif
 #ifdef WITH_KEYCLOAK
-        if (nickserv_conf.keycloak_enable) {
-            kc_do_modify(hi->handle, NULL, email);
-        }
+        /* Fire-and-forget async email sync to Keycloak */
+        kc_do_modify(hi->handle, NULL, email);
 #endif
     }
     if (mask) {
@@ -3450,12 +3442,8 @@ static NICKSERV_FUNC(cmd_cookie)
                     cookie_async_ctx_free(cookie_ctx);
                 }
             }
-            /* Synchronous fallback (pre-registration users or async failed) */
-            int rc = kc_do_modify(hi->handle, hi->cookie->data, NULL);
-            if (rc != KC_SUCCESS) {
-                reply("NSMSG_KEYCLOAK_FAIL", kc_strerror(rc));
-                return 0;
-            }
+            /* Fallback: fire-and-forget async (pre-registration users or async failed) */
+            kc_do_modify(hi->handle, hi->cookie->data, NULL);
         }
 #endif
         /* Restore the password hash from cookie */
@@ -3519,12 +3507,8 @@ static NICKSERV_FUNC(cmd_cookie)
                     cookie_async_ctx_free(cookie_ctx);
                 }
             }
-            /* Synchronous fallback */
-            int rc = kc_do_modify(hi->handle, hi->cookie->data, NULL);
-            if (rc != KC_SUCCESS) {
-                reply("NSMSG_KEYCLOAK_FAIL", kc_strerror(rc));
-                return 0;
-            }
+            /* Fallback: fire-and-forget async */
+            kc_do_modify(hi->handle, hi->cookie->data, NULL);
         }
 #endif
         set_user_handle_info(user, hi, 1);
@@ -3703,13 +3687,8 @@ static NICKSERV_FUNC(cmd_pass)
     }
 #endif
 #ifdef WITH_KEYCLOAK
-    if (nickserv_conf.keycloak_enable) {
-        int rc;
-        if ((rc = kc_do_modify(hi->handle, crypted, NULL)) != KC_SUCCESS) {
-            reply("NSMSG_KEYCLOAK_FAIL", kc_strerror(rc));
-            return 0;
-        }
-    }
+    /* Fire-and-forget async password sync to Keycloak */
+    kc_do_modify(hi->handle, crypted, NULL);
 #endif
     //cryptpass(new_pass, hi->passwd);
     strcpy(hi->passwd, crypted);
@@ -4488,14 +4467,8 @@ static OPTION_FUNC(opt_email)
             }
 #endif
 #ifdef WITH_KEYCLOAK
-            if (nickserv_conf.keycloak_enable) {
-                int rc;
-                if ((rc = kc_do_modify(hi->handle, NULL, argv[1])) != KC_SUCCESS) {
-                    if (!(noreply))
-                        reply("NSMSG_KEYCLOAK_FAIL_EMAIL", kc_strerror(rc));
-                    return 0;
-                }
-            }
+            /* Fire-and-forget async email sync to Keycloak */
+            kc_do_modify(hi->handle, NULL, argv[1]);
 #endif
             nickserv_set_email_addr(hi, argv[1]);
             if (hi->cookie)
@@ -6765,94 +6738,344 @@ kc_get_user_info(const char *handle, char **email_out)
     return rc;
 }
 
-/* Create user in Keycloak with hashed password (like LDAP) */
-static int
-kc_do_add(const char *handle, const char *hash, const char *email)
-{
-    char cred_data[256];
-    char secret_data[512];
+/* Context for async user add */
+struct kc_add_ctx {
+    char handle[NICKSERV_HANDLE_LEN + 1];
+    char *email;           /* Allocated, may be NULL */
+    char *cred_data;       /* Allocated, may be NULL */
+    char *secret_data;     /* Allocated, may be NULL */
+};
 
-    if (keycloak_ensure_token() != KC_SUCCESS) {
-        return KC_ERROR;
+static void kc_add_ctx_free(struct kc_add_ctx *ctx) {
+    if (ctx) {
+        if (ctx->email) free(ctx->email);
+        if (ctx->cred_data) {
+            memset(ctx->cred_data, 0, strlen(ctx->cred_data));
+            free(ctx->cred_data);
+        }
+        if (ctx->secret_data) {
+            memset(ctx->secret_data, 0, strlen(ctx->secret_data));
+            free(ctx->secret_data);
+        }
+        free(ctx);
     }
-
-    /* If no hash provided, create user without password */
-    if (!hash) {
-        return keycloak_create_user(keycloak_get_realm(), keycloak_get_authed_client(),
-                                    handle, email ? email : "", NULL);
-    }
-
-    /* Convert X3 hash to Keycloak credential format */
-    if (pw_export_keycloak(hash, cred_data, sizeof(cred_data),
-                           secret_data, sizeof(secret_data)) != 0) {
-        /* Hash format not exportable (e.g., MD5) - create without password */
-        log_module(NS_LOG, LOG_WARNING,
-                   "kc_do_add: Hash format not exportable for %s, creating without password",
-                   handle);
-        return keycloak_create_user(keycloak_get_realm(), keycloak_get_authed_client(),
-                                    handle, email ? email : "", NULL);
-    }
-
-    return keycloak_create_user_with_hash(keycloak_get_realm(), keycloak_get_authed_client(),
-                                          handle, email ? email : "",
-                                          cred_data, secret_data);
 }
 
-/* Modify user password hash and/or email in Keycloak */
+/* Final callback for user creation (fire-and-forget) */
 static int
-kc_do_modify(const char *handle, const char *hash, const char *email)
+kc_add_done_cb(void *session, int result)
 {
+    struct kc_add_ctx *ctx = session;
+    if (result == KC_SUCCESS) {
+        log_module(NS_LOG, LOG_DEBUG, "kc_add_done_cb[%s]: Keycloak user created",
+                   ctx ? ctx->handle : "?");
+    } else if (result == KC_USER_EXISTS) {
+        log_module(NS_LOG, LOG_DEBUG, "kc_add_done_cb[%s]: Keycloak user already exists",
+                   ctx ? ctx->handle : "?");
+    } else {
+        log_module(NS_LOG, LOG_WARNING, "kc_add_done_cb[%s]: Keycloak user creation failed: %d",
+                   ctx ? ctx->handle : "?", result);
+    }
+    kc_add_ctx_free(ctx);
+    return 1;  /* Terminal - fire-and-forget */
+}
+
+/* Token callback for user add */
+static void
+kc_add_token_cb(void *context, int result, struct access_token *token)
+{
+    struct kc_add_ctx *ctx = context;
+    int rc;
+
+    (void)token;  /* Token managed by keycloak module */
+
+    if (!ctx) {
+        log_module(NS_LOG, LOG_ERROR, "kc_add_token_cb: NULL context");
+        return;
+    }
+
+    if (result != KC_SUCCESS) {
+        log_module(NS_LOG, LOG_DEBUG, "kc_add_token_cb[%s]: Token refresh failed: %d",
+                   ctx->handle, result);
+        kc_add_ctx_free(ctx);
+        return;
+    }
+
+    /* Start async user creation */
+    if (ctx->cred_data && ctx->secret_data) {
+        /* Create with pre-hashed password */
+        rc = keycloak_create_user_with_hash_async(keycloak_get_realm(), keycloak_get_authed_client(),
+                                                   ctx->handle, ctx->email ? ctx->email : "",
+                                                   ctx->cred_data, ctx->secret_data,
+                                                   ctx, kc_add_done_cb);
+    } else {
+        /* Create without password */
+        rc = keycloak_create_user_async(keycloak_get_realm(), keycloak_get_authed_client(),
+                                        ctx->handle, ctx->email ? ctx->email : "",
+                                        NULL, ctx, kc_add_done_cb);
+    }
+
+    if (rc < 0) {
+        log_module(NS_LOG, LOG_WARNING, "kc_add_token_cb[%s]: Failed to start async create: %d",
+                   ctx->handle, rc);
+        kc_add_ctx_free(ctx);
+        return;
+    }
+
+    log_module(NS_LOG, LOG_DEBUG, "kc_add_token_cb[%s]: Started async user creation",
+               ctx->handle);
+}
+
+/**
+ * Create user in Keycloak with hashed password (fire-and-forget, fully async).
+ * Like LDAP pattern - mirrors local account creation to Keycloak.
+ *
+ * @param handle  Account name
+ * @param hash    X3 password hash (NULL = create without password)
+ * @param email   Email address (can be NULL)
+ */
+static void
+kc_do_add(const char *handle, const char *hash, const char *email)
+{
+    struct kc_add_ctx *ctx;
     char cred_data[256];
     char secret_data[512];
+    int rc;
+
+    if (!nickserv_conf.keycloak_enable) {
+        return;
+    }
+
+    /* Allocate context */
+    ctx = calloc(1, sizeof(*ctx));
+    if (!ctx) {
+        log_module(NS_LOG, LOG_ERROR, "kc_do_add: Out of memory");
+        return;
+    }
+    safestrncpy(ctx->handle, handle, sizeof(ctx->handle));
+
+    if (email) {
+        ctx->email = strdup(email);
+    }
+
+    /* Convert hash to Keycloak format if provided */
+    if (hash) {
+        if (pw_export_keycloak(hash, cred_data, sizeof(cred_data),
+                               secret_data, sizeof(secret_data)) == 0) {
+            ctx->cred_data = strdup(cred_data);
+            ctx->secret_data = strdup(secret_data);
+            /* Clear stack buffers */
+            memset(cred_data, 0, sizeof(cred_data));
+            memset(secret_data, 0, sizeof(secret_data));
+        } else {
+            log_module(NS_LOG, LOG_WARNING,
+                       "kc_do_add[%s]: Hash format not exportable, creating without password",
+                       handle);
+        }
+    }
+
+    /* Start async token acquisition */
+    rc = keycloak_ensure_token_async(kc_add_token_cb, ctx);
+    if (rc < 0) {
+        log_module(NS_LOG, LOG_DEBUG, "kc_do_add[%s]: Failed to start token acquisition: %d",
+                   handle, rc);
+        kc_add_ctx_free(ctx);
+        return;
+    }
+
+    log_module(NS_LOG, LOG_DEBUG, "kc_do_add[%s]: Started async token acquisition",
+               handle);
+}
+
+/* Context for async user modify */
+struct kc_modify_ctx {
+    char handle[NICKSERV_HANDLE_LEN + 1];
+    char *email;           /* Allocated, may be NULL */
+    char *cred_data;       /* Allocated, may be NULL */
+    char *secret_data;     /* Allocated, may be NULL */
+    char *user_id;         /* Keycloak user UUID, allocated */
+};
+
+static void kc_modify_ctx_free(struct kc_modify_ctx *ctx) {
+    if (ctx) {
+        if (ctx->email) free(ctx->email);
+        if (ctx->cred_data) {
+            memset(ctx->cred_data, 0, strlen(ctx->cred_data));
+            free(ctx->cred_data);
+        }
+        if (ctx->secret_data) {
+            memset(ctx->secret_data, 0, strlen(ctx->secret_data));
+            free(ctx->secret_data);
+        }
+        if (ctx->user_id) free(ctx->user_id);
+        free(ctx);
+    }
+}
+
+/* Final callback for user modify (fire-and-forget) */
+static int
+kc_modify_done_cb(void *session, int result)
+{
+    struct kc_modify_ctx *ctx = session;
+    if (result == KC_SUCCESS) {
+        log_module(NS_LOG, LOG_DEBUG, "kc_modify_done_cb[%s]: Keycloak user updated",
+                   ctx ? ctx->handle : "?");
+    } else {
+        log_module(NS_LOG, LOG_WARNING, "kc_modify_done_cb[%s]: Keycloak user update failed: %d",
+                   ctx ? ctx->handle : "?", result);
+    }
+    kc_modify_ctx_free(ctx);
+    return 1;  /* Terminal - fire-and-forget */
+}
+
+/* User lookup callback for modify */
+static int
+kc_modify_user_cb(void *session, int result, struct kc_user *user)
+{
+    struct kc_modify_ctx *ctx = session;
     struct kc_user_update update = {0};
+    int rc;
+
+    if (!ctx) {
+        log_module(NS_LOG, LOG_ERROR, "kc_modify_user_cb: NULL context");
+        if (user) keycloak_user_free_fields(user);
+        return 1;
+    }
+
+    if (result != KC_SUCCESS || !user || !user->id) {
+        log_module(NS_LOG, LOG_DEBUG, "kc_modify_user_cb[%s]: User not found in Keycloak",
+                   ctx->handle);
+        if (user) keycloak_user_free_fields(user);
+        kc_modify_ctx_free(ctx);
+        return 1;
+    }
+
+    /* Store user_id */
+    ctx->user_id = strdup(user->id);
+    keycloak_user_free_fields(user);
+
+    /* Build update struct */
+    if (ctx->cred_data && ctx->secret_data) {
+        update.cred_data = ctx->cred_data;
+        update.secret_data = ctx->secret_data;
+    }
+    if (ctx->email) {
+        update.email = ctx->email;
+    }
+
+    /* Start async update */
+    rc = keycloak_update_user_representation_async(keycloak_get_realm(), keycloak_get_authed_client(),
+                                                    ctx->user_id, &update,
+                                                    ctx, kc_modify_done_cb);
+    if (rc < 0) {
+        log_module(NS_LOG, LOG_WARNING, "kc_modify_user_cb[%s]: Failed to start async update: %d",
+                   ctx->handle, rc);
+        kc_modify_ctx_free(ctx);
+        return 1;
+    }
+
+    log_module(NS_LOG, LOG_DEBUG, "kc_modify_user_cb[%s]: Started async user update",
+               ctx->handle);
+    return 1;  /* Terminal - async continues via next callback */
+}
+
+/* Token callback for user modify */
+static void
+kc_modify_token_cb(void *context, int result, struct access_token *token)
+{
+    struct kc_modify_ctx *ctx = context;
+    int rc;
+
+    (void)token;  /* Token managed by keycloak module */
+
+    if (!ctx) {
+        log_module(NS_LOG, LOG_ERROR, "kc_modify_token_cb: NULL context");
+        return;
+    }
+
+    if (result != KC_SUCCESS) {
+        log_module(NS_LOG, LOG_DEBUG, "kc_modify_token_cb[%s]: Token refresh failed: %d",
+                   ctx->handle, result);
+        kc_modify_ctx_free(ctx);
+        return;
+    }
+
+    /* Start async user lookup */
+    rc = keycloak_get_user_async(keycloak_get_realm(), keycloak_get_authed_client(),
+                                 ctx->handle, ctx, kc_modify_user_cb);
+    if (rc < 0) {
+        log_module(NS_LOG, LOG_WARNING, "kc_modify_token_cb[%s]: Failed to start user lookup: %d",
+                   ctx->handle, rc);
+        kc_modify_ctx_free(ctx);
+        return;
+    }
+
+    log_module(NS_LOG, LOG_DEBUG, "kc_modify_token_cb[%s]: Started async user lookup",
+               ctx->handle);
+}
+
+/**
+ * Modify user password hash and/or email in Keycloak (fire-and-forget, fully async).
+ *
+ * @param handle  Account name
+ * @param hash    X3 password hash (NULL = no password change)
+ * @param email   Email address (NULL = no email change)
+ */
+static void
+kc_do_modify(const char *handle, const char *hash, const char *email)
+{
+    struct kc_modify_ctx *ctx;
+    char cred_data[256];
+    char secret_data[512];
+    int rc;
+
+    if (!nickserv_conf.keycloak_enable) {
+        return;
+    }
 
     log_module(NS_LOG, LOG_DEBUG,
                "kc_do_modify: called for %s, hash=%s, email=%s",
                handle, hash ? "yes" : "no", email ? email : "null");
 
-    if (keycloak_ensure_token() != KC_SUCCESS) {
-        log_module(NS_LOG, LOG_DEBUG, "kc_do_modify: token failed");
-        return KC_ERROR;
+    /* Allocate context */
+    ctx = calloc(1, sizeof(*ctx));
+    if (!ctx) {
+        log_module(NS_LOG, LOG_ERROR, "kc_do_modify: Out of memory");
+        return;
+    }
+    safestrncpy(ctx->handle, handle, sizeof(ctx->handle));
+
+    if (email) {
+        ctx->email = strdup(email);
     }
 
-    /* First get user ID */
-    struct kc_user user;
-    int rc = keycloak_get_user(keycloak_get_realm(), keycloak_get_authed_client(), handle, &user);
-    if (rc != KC_SUCCESS) {
-        log_module(NS_LOG, LOG_DEBUG,
-                   "kc_do_modify: keycloak_get_user failed for %s: %d",
-                   handle, rc);
-        return rc;
-    }
-
-    char *user_id = strdup(user.id);
-    keycloak_user_free_fields(&user);
-
-    /* Build update struct with requested changes */
+    /* Convert hash to Keycloak format if provided */
     if (hash) {
         if (pw_export_keycloak(hash, cred_data, sizeof(cred_data),
-                               secret_data, sizeof(secret_data)) != 0) {
-            /* Hash format not exportable (e.g., MD5) - log warning but continue */
-            log_module(NS_LOG, LOG_WARNING,
-                       "kc_do_modify: Hash format not exportable for %s",
-                       handle);
-            /* Don't fail - just skip password update */
+                               secret_data, sizeof(secret_data)) == 0) {
+            ctx->cred_data = strdup(cred_data);
+            ctx->secret_data = strdup(secret_data);
+            /* Clear stack buffers */
+            memset(cred_data, 0, sizeof(cred_data));
+            memset(secret_data, 0, sizeof(secret_data));
         } else {
-            update.cred_data = cred_data;
-            update.secret_data = secret_data;
+            log_module(NS_LOG, LOG_WARNING,
+                       "kc_do_modify[%s]: Hash format not exportable, skipping password update",
+                       handle);
         }
     }
 
-    if (email) {
-        update.email = email;
+    /* Start async token acquisition */
+    rc = keycloak_ensure_token_async(kc_modify_token_cb, ctx);
+    if (rc < 0) {
+        log_module(NS_LOG, LOG_DEBUG, "kc_do_modify[%s]: Failed to start token acquisition: %d",
+                   handle, rc);
+        kc_modify_ctx_free(ctx);
+        return;
     }
 
-    /* Single API call to update all fields */
-    rc = keycloak_update_user_representation(keycloak_get_realm(), keycloak_get_authed_client(),
-                                             user_id, &update);
-
-    free(user_id);
-    return rc;
+    log_module(NS_LOG, LOG_DEBUG, "kc_do_modify[%s]: Started async token acquisition",
+               handle);
 }
 
 /* Delete user from Keycloak */
@@ -6912,21 +7135,104 @@ kc_do_oslevel(const char *handle, int level, int oldlevel)
     return rc;
 }
 
-/* Fire-and-forget callback for email verification sync */
+/* Context for async email verification sync */
+struct kc_email_verified_ctx {
+    char handle[NICKSERV_HANDLE_LEN + 1];
+    int verified;
+};
+
+/* Final callback for email verification sync (fire-and-forget) */
 static int
-kc_email_verified_callback(void *session, int result)
+kc_email_verified_done_cb(void *session, int result)
 {
-    (void)session;
+    struct kc_email_verified_ctx *ctx = session;
     if (result == KC_SUCCESS) {
-        log_module(NS_LOG, LOG_DEBUG, "Keycloak emailVerified sync succeeded");
+        log_module(NS_LOG, LOG_DEBUG, "kc_email_verified_done_cb[%s]: emailVerified sync succeeded",
+                   ctx ? ctx->handle : "?");
     } else {
-        log_module(NS_LOG, LOG_DEBUG, "Keycloak emailVerified sync failed: %d", result);
+        log_module(NS_LOG, LOG_DEBUG, "kc_email_verified_done_cb[%s]: emailVerified sync failed: %d",
+                   ctx ? ctx->handle : "?", result);
     }
+    free(ctx);
     return 1;  /* Terminal - fire-and-forget operation complete */
 }
 
+/* User lookup callback for email verification sync */
+static int
+kc_email_verified_user_cb(void *session, int result, struct kc_user *user)
+{
+    struct kc_email_verified_ctx *ctx = session;
+    int rc;
+
+    if (!ctx) {
+        log_module(NS_LOG, LOG_ERROR, "kc_email_verified_user_cb: NULL context");
+        if (user) keycloak_user_free_fields(user);
+        return 1;
+    }
+
+    if (result != KC_SUCCESS || !user || !user->id) {
+        log_module(NS_LOG, LOG_DEBUG, "kc_email_verified_user_cb[%s]: User not found in Keycloak",
+                   ctx->handle);
+        if (user) keycloak_user_free_fields(user);
+        free(ctx);
+        return 1;
+    }
+
+    /* Start async email verified update */
+    rc = keycloak_set_email_verified_async(keycloak_get_realm(), keycloak_get_authed_client(),
+                                           user->id, ctx->verified,
+                                           ctx, kc_email_verified_done_cb);
+    keycloak_user_free_fields(user);
+
+    if (rc < 0) {
+        log_module(NS_LOG, LOG_WARNING, "kc_email_verified_user_cb[%s]: Failed to start async set: %d",
+                   ctx->handle, rc);
+        free(ctx);
+        return 1;
+    }
+
+    log_module(NS_LOG, LOG_DEBUG, "kc_email_verified_user_cb[%s]: Started async emailVerified set",
+               ctx->handle);
+    return 1;  /* Terminal - async continues via next callback */
+}
+
+/* Token callback for email verification sync */
+static void
+kc_email_verified_token_cb(void *context, int result, struct access_token *token)
+{
+    struct kc_email_verified_ctx *ctx = context;
+    int rc;
+
+    (void)token;  /* Token managed by keycloak module */
+
+    if (!ctx) {
+        log_module(NS_LOG, LOG_ERROR, "kc_email_verified_token_cb: NULL context");
+        return;
+    }
+
+    if (result != KC_SUCCESS) {
+        log_module(NS_LOG, LOG_DEBUG, "kc_email_verified_token_cb[%s]: Token refresh failed: %d",
+                   ctx->handle, result);
+        free(ctx);
+        return;
+    }
+
+    /* Start async user lookup */
+    rc = keycloak_get_user_async(keycloak_get_realm(), keycloak_get_authed_client(),
+                                 ctx->handle, ctx, kc_email_verified_user_cb);
+    if (rc < 0) {
+        log_module(NS_LOG, LOG_WARNING, "kc_email_verified_token_cb[%s]: Failed to start user lookup: %d",
+                   ctx->handle, rc);
+        free(ctx);
+        return;
+    }
+
+    log_module(NS_LOG, LOG_DEBUG, "kc_email_verified_token_cb[%s]: Started async user lookup",
+               ctx->handle);
+}
+
 /**
- * Sync email verification state to Keycloak (fire-and-forget).
+ * Sync email verification state to Keycloak (fire-and-forget, fully async).
  * Used after successful X3 cookie verification to update Keycloak's emailVerified.
  *
  * @param handle  Account name
@@ -6935,75 +7241,102 @@ kc_email_verified_callback(void *session, int result)
 static void
 kc_sync_email_verified(const char *handle, int verified)
 {
+    struct kc_email_verified_ctx *ctx;
+    int rc;
+
     if (!nickserv_conf.keycloak_enable) {
         return;
     }
 
-    if (keycloak_ensure_token() != KC_SUCCESS) {
-        log_module(NS_LOG, LOG_DEBUG, "kc_sync_email_verified: Failed to get admin token");
+    /* Allocate context for async chain */
+    ctx = malloc(sizeof(*ctx));
+    if (!ctx) {
+        log_module(NS_LOG, LOG_ERROR, "kc_sync_email_verified: Out of memory");
         return;
     }
+    safestrncpy(ctx->handle, handle, sizeof(ctx->handle));
+    ctx->verified = verified;
 
-    /* Get user ID from Keycloak */
-    struct kc_user user;
-    int rc = keycloak_get_user(keycloak_get_realm(), keycloak_get_authed_client(), handle, &user);
-    if (rc != KC_SUCCESS) {
-        log_module(NS_LOG, LOG_DEBUG, "kc_sync_email_verified: User %s not found in Keycloak", handle);
-        return;
-    }
-
-    char *user_id = strdup(user.id);
-    keycloak_user_free_fields(&user);
-
-    /* Fire-and-forget async sync */
-    rc = keycloak_set_email_verified_async(keycloak_get_realm(), keycloak_get_authed_client(),
-                                            user_id, verified,
-                                            NULL, kc_email_verified_callback);
+    /* Start async token acquisition */
+    rc = keycloak_ensure_token_async(kc_email_verified_token_cb, ctx);
     if (rc < 0) {
-        log_module(NS_LOG, LOG_WARNING, "kc_sync_email_verified: Failed to start async sync for %s", handle);
+        log_module(NS_LOG, LOG_DEBUG, "kc_sync_email_verified[%s]: Failed to start token acquisition: %d",
+                   handle, rc);
+        free(ctx);
+        return;
     }
 
-    free(user_id);
+    log_module(NS_LOG, LOG_DEBUG, "kc_sync_email_verified[%s]: Started async token acquisition",
+               handle);
 }
 
-/**
- * Sync all fingerprints for an account to Keycloak.
- * Updates the x509_fingerprints attribute with all fingerprints from hi->sslfps.
- * Fire-and-forget operation - errors are logged but not returned.
- *
- * @param hi  Handle info for the account
- */
-static void
-kc_sync_fingerprints(struct handle_info *hi)
+/* Context for async fingerprints sync */
+struct kc_fingerprints_ctx {
+    char handle[NICKSERV_HANDLE_LEN + 1];
+    char *user_id;  /* Keycloak user UUID, allocated */
+};
+
+static void kc_fingerprints_ctx_free(struct kc_fingerprints_ctx *ctx) {
+    if (ctx) {
+        if (ctx->user_id) free(ctx->user_id);
+        free(ctx);
+    }
+}
+
+/* Final callback for fingerprints sync (fire-and-forget) */
+static int
+kc_fingerprints_done_cb(void *session, int result)
 {
-    if (!nickserv_conf.keycloak_enable || !hi) {
-        return;
+    struct kc_fingerprints_ctx *ctx = session;
+    if (result == KC_SUCCESS) {
+        log_module(NS_LOG, LOG_DEBUG, "kc_fingerprints_done_cb[%s]: fingerprints sync succeeded",
+                   ctx ? ctx->handle : "?");
+    } else {
+        log_module(NS_LOG, LOG_DEBUG, "kc_fingerprints_done_cb[%s]: fingerprints sync failed: %d",
+                   ctx ? ctx->handle : "?", result);
+    }
+    kc_fingerprints_ctx_free(ctx);
+    return 1;  /* Terminal - fire-and-forget operation complete */
+}
+
+/* User lookup callback for fingerprints sync */
+static int
+kc_fingerprints_user_cb(void *session, int result, struct kc_user *user)
+{
+    struct kc_fingerprints_ctx *ctx = session;
+    struct handle_info *hi;
+    const char **fingerprints = NULL;
+    size_t fp_count = 0;
+    int rc;
+
+    if (!ctx) {
+        log_module(NS_LOG, LOG_ERROR, "kc_fingerprints_user_cb: NULL context");
+        if (user) keycloak_user_free_fields(user);
+        return 1;
     }
 
-    if (keycloak_ensure_token() != KC_SUCCESS) {
-        log_module(NS_LOG, LOG_DEBUG, "kc_sync_fingerprints: Failed to get admin token");
-        return;
+    if (result != KC_SUCCESS || !user || !user->id) {
+        log_module(NS_LOG, LOG_DEBUG, "kc_fingerprints_user_cb[%s]: User not found in Keycloak",
+                   ctx->handle);
+        if (user) keycloak_user_free_fields(user);
+        kc_fingerprints_ctx_free(ctx);
+        return 1;
     }
 
-    /* Get user ID from Keycloak */
-    struct kc_user user;
-    int rc = keycloak_get_user(keycloak_get_realm(), keycloak_get_authed_client(), hi->handle, &user);
-    if (rc != KC_SUCCESS) {
-        log_module(NS_LOG, LOG_DEBUG, "kc_sync_fingerprints: User %s not found in Keycloak", hi->handle);
-        return;
-    }
+    /* Store user_id for logging */
+    ctx->user_id = strdup(user->id);
 
-    char *user_id = strdup(user.id);
-    keycloak_user_free_fields(&user);
-
-    if (!user_id) {
-        return;
+    /* Look up current handle_info to get latest fingerprints */
+    hi = get_handle_info(ctx->handle);
+    if (!hi) {
+        log_module(NS_LOG, LOG_DEBUG, "kc_fingerprints_user_cb[%s]: Handle no longer exists",
+                   ctx->handle);
+        keycloak_user_free_fields(user);
+        kc_fingerprints_ctx_free(ctx);
+        return 1;
     }
 
     /* Build array of fingerprints */
-    const char **fingerprints = NULL;
-    size_t fp_count = 0;
-
     if (hi->sslfps && hi->sslfps->used > 0) {
         fingerprints = malloc(sizeof(char*) * hi->sslfps->used);
         if (fingerprints) {
@@ -7014,21 +7347,96 @@ kc_sync_fingerprints(struct handle_info *hi)
         }
     }
 
-    /* Sync to Keycloak */
-    rc = keycloak_set_user_attribute_array(keycloak_get_realm(), keycloak_get_authed_client(),
-                                           user_id, "x509_fingerprints",
-                                           fingerprints, fp_count);
+    /* Start async attribute array update */
+    rc = keycloak_set_user_attribute_array_async(keycloak_get_realm(), keycloak_get_authed_client(),
+                                                  user->id, "x509_fingerprints",
+                                                  fingerprints, fp_count,
+                                                  ctx, kc_fingerprints_done_cb);
+    keycloak_user_free_fields(user);
+    free(fingerprints);
 
-    if (rc == KC_SUCCESS) {
-        log_module(NS_LOG, LOG_DEBUG, "kc_sync_fingerprints: Synced %zu fingerprints for %s",
-                   fp_count, hi->handle);
-    } else {
-        log_module(NS_LOG, LOG_WARNING, "kc_sync_fingerprints: Failed to sync fingerprints for %s: %d",
-                   hi->handle, rc);
+    if (rc < 0) {
+        log_module(NS_LOG, LOG_WARNING, "kc_fingerprints_user_cb[%s]: Failed to start async set: %d",
+                   ctx->handle, rc);
+        kc_fingerprints_ctx_free(ctx);
+        return 1;
     }
 
-    free(fingerprints);
-    free(user_id);
+    log_module(NS_LOG, LOG_DEBUG, "kc_fingerprints_user_cb[%s]: Started async fingerprints set (%zu fingerprints)",
+               ctx->handle, fp_count);
+    return 1;  /* Terminal - async continues via next callback */
+}
+
+/* Token callback for fingerprints sync */
+static void
+kc_fingerprints_token_cb(void *context, int result, struct access_token *token)
+{
+    struct kc_fingerprints_ctx *ctx = context;
+    int rc;
+
+    (void)token;  /* Token managed by keycloak module */
+
+    if (!ctx) {
+        log_module(NS_LOG, LOG_ERROR, "kc_fingerprints_token_cb: NULL context");
+        return;
+    }
+
+    if (result != KC_SUCCESS) {
+        log_module(NS_LOG, LOG_DEBUG, "kc_fingerprints_token_cb[%s]: Token refresh failed: %d",
+                   ctx->handle, result);
+        kc_fingerprints_ctx_free(ctx);
+        return;
+    }
+
+    /* Start async user lookup */
+    rc = keycloak_get_user_async(keycloak_get_realm(), keycloak_get_authed_client(),
+                                 ctx->handle, ctx, kc_fingerprints_user_cb);
+    if (rc < 0) {
+        log_module(NS_LOG, LOG_WARNING, "kc_fingerprints_token_cb[%s]: Failed to start user lookup: %d",
+                   ctx->handle, rc);
+        kc_fingerprints_ctx_free(ctx);
+        return;
+    }
+
+    log_module(NS_LOG, LOG_DEBUG, "kc_fingerprints_token_cb[%s]: Started async user lookup",
+               ctx->handle);
+}
+
+/**
+ * Sync all fingerprints for an account to Keycloak (fire-and-forget, fully async).
+ * Updates the x509_fingerprints attribute with all fingerprints from hi->sslfps.
+ *
+ * @param hi  Handle info for the account
+ */
+static void
+kc_sync_fingerprints(struct handle_info *hi)
+{
+    struct kc_fingerprints_ctx *ctx;
+    int rc;
+
+    if (!nickserv_conf.keycloak_enable || !hi) {
+        return;
+    }
+
+    /* Allocate context for async chain */
+    ctx = calloc(1, sizeof(*ctx));
+    if (!ctx) {
+        log_module(NS_LOG, LOG_ERROR, "kc_sync_fingerprints: Out of memory");
+        return;
+    }
+    safestrncpy(ctx->handle, hi->handle, sizeof(ctx->handle));
+
+    /* Start async token acquisition */
+    rc = keycloak_ensure_token_async(kc_fingerprints_token_cb, ctx);
+    if (rc < 0) {
+        log_module(NS_LOG, LOG_DEBUG, "kc_sync_fingerprints[%s]: Failed to start token acquisition: %d",
+                   hi->handle, rc);
+        kc_fingerprints_ctx_free(ctx);
+        return;
+    }
+
+    log_module(NS_LOG, LOG_DEBUG, "kc_sync_fingerprints[%s]: Started async token acquisition",
+               hi->handle);
 }
 
 /**
@@ -11668,13 +12076,8 @@ nickserv_ircv3_register(struct userNode *user, const char *handle,
     }
 #endif
 #ifdef WITH_KEYCLOAK
-    if (nickserv_conf.keycloak_enable) {
-        int rc = kc_do_add(actual_handle, password, use_email ? email : NULL);
-        if (rc != KC_SUCCESS && rc != KC_USER_EXISTS) {
-            snprintf(result_msg, 256, "Keycloak error");
-            return NSREG_INTERNAL_ERROR;
-        }
-    }
+    /* Fire-and-forget async Keycloak user creation - errors logged but don't block registration */
+    kc_do_add(actual_handle, crypted, use_email ? email : NULL);
 #endif
 
     /* Create the account - with email verification if email was provided and email is enabled */

@@ -2605,6 +2605,101 @@ error:
 }
 
 /**
+ * Set a multi-valued user attribute asynchronously.
+ * Used for attributes like x509_fingerprints that have multiple values.
+ */
+int
+keycloak_set_user_attribute_array_async(struct kc_realm realm, struct kc_client client,
+                                         const char *user_id, const char *attr_name,
+                                         const char **values, size_t value_count,
+                                         void *session, kc_async_callback callback)
+{
+    struct kc_async_request *req = NULL;
+    char *json_body = NULL;
+
+    /* Validate inputs */
+    if (!realm.base_uri || !realm.realm || !client.access_token ||
+        !user_id || !attr_name || !callback) {
+        log_module(KC_LOG, LOG_DEBUG, "set_attr_array_async: Invalid arguments");
+        return -1;
+    }
+
+    /* Allocate request structure */
+    req = calloc(1, sizeof(*req));
+    if (!req) {
+        log_module(KC_LOG, LOG_ERROR, "set_attr_array_async: Out of memory");
+        return -1;
+    }
+    req->session = session;
+    req->type = KC_ASYNC_SET_ATTR;
+    req->cb.generic = callback;
+
+    /* Build URI */
+    req->uri = kc_build_user_endpoint(realm, user_id);
+    if (!req->uri) {
+        log_module(KC_LOG, LOG_ERROR, "set_attr_array_async: Failed to build URI");
+        goto error;
+    }
+
+    /* Build JSON body - { "attributes": { "attr_name": ["val1", "val2", ...] } } */
+    json_t *attrs = json_object();
+    json_t *attr_array = json_array();
+
+    for (size_t i = 0; i < value_count; i++) {
+        if (values && values[i]) {
+            json_array_append_new(attr_array, json_string(values[i]));
+        }
+    }
+    json_object_set_new(attrs, attr_name, attr_array);
+
+    json_t *user_obj = json_object();
+    json_object_set_new(user_obj, "attributes", attrs);
+    json_body = json_dumps(user_obj, JSON_COMPACT);
+    json_decref(user_obj);
+
+    if (!json_body) {
+        log_module(KC_LOG, LOG_ERROR, "set_attr_array_async: Failed to build JSON");
+        goto error;
+    }
+
+    /* Store post fields in request for cleanup */
+    req->post_fields = json_body;
+    json_body = NULL;  /* Transferred ownership */
+
+    /* Use unified async API */
+    struct curl_opts opts = CURL_OPTS_INIT;
+    opts.uri = req->uri;
+    opts.method = HTTP_PUT;
+    opts.post_fields = req->post_fields;
+    opts.xoauth2_bearer = client.access_token->access_token;
+    opts.header_list[0] = "Content-Type: application/json";
+    opts.header_count = 1;
+
+    if (curl_perform_async(req, opts) < 0) {
+        log_module(KC_LOG, LOG_ERROR, "set_attr_array_async: curl_perform_async failed");
+        goto error;
+    }
+
+    log_module(KC_LOG, LOG_DEBUG, "set_attr_array_async: Started attribute array update for %s.%s (%zu values)",
+               user_id, attr_name, value_count);
+    return 0;
+
+error:
+    if (json_body) free(json_body);
+    if (req) {
+        if (req->easy) curl_easy_cleanup(req->easy);
+        if (req->uri) free(req->uri);
+        if (req->post_fields) {
+            memset(req->post_fields, 0, strlen(req->post_fields));
+            free(req->post_fields);
+        }
+        if (req->response.response) free(req->response.response);
+        free(req);
+    }
+    return -1;
+}
+
+/**
  * Set emailVerified flag on a Keycloak user asynchronously.
  * Used to sync X3's cookie-based email verification to Keycloak.
  */
@@ -2917,8 +3012,8 @@ keycloak_create_user_async(struct kc_realm realm, struct kc_client client,
     struct kc_async_request *req = NULL;
     char *user_repr = NULL;
 
-    /* Validate inputs */
-    if (!realm.base_uri || !realm.realm || !client.access_token || !username || !password || !callback) {
+    /* Validate inputs - password can be NULL (user created without credentials) */
+    if (!realm.base_uri || !realm.realm || !client.access_token || !username || !callback) {
         log_module(KC_LOG, LOG_DEBUG, "create_user_async: Invalid arguments");
         return -1;
     }
@@ -2979,6 +3074,104 @@ keycloak_create_user_async(struct kc_realm realm, struct kc_client client,
     }
 
     log_module(KC_LOG, LOG_DEBUG, "create_user_async: Started user creation for %s", username);
+    return 0;
+
+error:
+    if (req) {
+        if (req->easy) curl_easy_cleanup(req->easy);
+        if (req->uri) free(req->uri);
+        if (req->post_fields) {
+            memset(req->post_fields, 0, strlen(req->post_fields));
+            free(req->post_fields);
+        }
+        if (req->create_username) free(req->create_username);
+        if (req->response.response) free(req->response.response);
+        free(req);
+    }
+    if (user_repr) {
+        memset(user_repr, 0, strlen(user_repr));
+        free(user_repr);
+    }
+    return -1;
+}
+
+/**
+ * Create a user in Keycloak with a pre-hashed password asynchronously.
+ * Uses the async curl_multi infrastructure for non-blocking HTTP.
+ */
+int
+keycloak_create_user_with_hash_async(struct kc_realm realm, struct kc_client client,
+                                      const char *username, const char *email,
+                                      const char *cred_data, const char *secret_data,
+                                      void *session, kc_create_user_callback callback)
+{
+    struct kc_async_request *req = NULL;
+    char *user_repr = NULL;
+
+    /* Validate inputs */
+    if (!realm.base_uri || !realm.realm || !client.access_token ||
+        !username || !cred_data || !secret_data || !callback) {
+        log_module(KC_LOG, LOG_DEBUG, "create_user_with_hash_async: Invalid arguments");
+        return -1;
+    }
+
+    /* Allocate request structure */
+    req = calloc(1, sizeof(*req));
+    if (!req) {
+        log_module(KC_LOG, LOG_ERROR, "create_user_with_hash_async: Out of memory");
+        return -1;
+    }
+    req->session = session;
+    req->type = KC_ASYNC_CREATE_USER;
+    req->cb.generic = callback;
+
+    /* Store username for user ID caching */
+    req->create_username = strdup(username);
+    if (!req->create_username) {
+        log_module(KC_LOG, LOG_ERROR, "create_user_with_hash_async: Failed to copy username");
+        free(req);
+        return -1;
+    }
+
+    /* Build users endpoint URI */
+    req->uri = kc_build_users_endpoint(realm);
+    if (!req->uri) {
+        log_module(KC_LOG, LOG_ERROR, "create_user_with_hash_async: Failed to build URI");
+        goto error;
+    }
+
+    /* Build user JSON representation with pre-hashed password */
+    user_repr = json_build_user_with_hash(username, email ? email : "", cred_data, secret_data);
+    if (!user_repr) {
+        log_module(KC_LOG, LOG_ERROR, "create_user_with_hash_async: Failed to build user JSON");
+        goto error;
+    }
+
+    /* Copy POST data */
+    req->post_fields = user_repr;
+    user_repr = NULL;  /* Transfer ownership to req */
+
+    /* Initialize location header buffer for user ID capture */
+    req->location_header[0] = '\0';
+
+    /* Build curl options with header callback for Location capture */
+    struct curl_opts opts = CURL_OPTS_INIT;
+    opts.uri = req->uri;
+    opts.method = HTTP_POST;
+    opts.xoauth2_bearer = client.access_token->access_token;
+    opts.post_fields = req->post_fields;
+    opts.header_list[0] = "Content-Type: application/json";
+    opts.header_count = 1;
+    opts.header_callback = kc_header_callback;
+    opts.header_userdata = req;
+
+    if (curl_perform_async(req, opts) < 0) {
+        log_module(KC_LOG, LOG_ERROR, "create_user_with_hash_async: curl_perform_async failed");
+        goto error;
+    }
+
+    log_module(KC_LOG, LOG_DEBUG, "create_user_with_hash_async: Started user creation for %s",
+               username);
     return 0;
 
 error:
