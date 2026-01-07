@@ -259,36 +259,43 @@ static int expire_nicks_timer_set = 0;
 static int metadata_purge_timer_set = 0;
 
 #ifdef WITH_KEYCLOAK
-/* Keycloak client state - cached token for admin operations */
-static struct kc_realm kc_realm_config;
-static struct kc_client kc_client_config;
-static struct access_token *kc_admin_token = NULL;
-static time_t kc_token_expires = 0;
-static int keycloak_available = 1;  /* Track Keycloak availability */
-
-/* Token waiter queue for async token refresh (Phase 5) */
-typedef void (*kc_token_waiter_cb)(void *ctx, int result, struct access_token *token);
-
-struct kc_token_waiter {
-    kc_token_waiter_cb callback;     /* Callback when token ready */
-    void *context;                    /* Opaque context for callback */
-    struct kc_token_waiter *next;    /* Queue linkage */
+/* Structure for async AUTH command (Phase 2) */
+struct auth_async_ctx {
+    char handle[NICKSERV_HANDLE_LEN + 1];  /* Account handle */
+    char nick[NICKLEN + 1];                 /* User's nick (for replies) */
+    char numeric[COMBO_NUMERIC_LEN + 1];   /* User numeric for validation */
+    struct userNode *user;                  /* User pointer (validated before use) */
+    struct svccmd *cmd;                     /* Command context */
+    int pw_arg;                             /* Password argument index */
+    time_t started;                         /* When request started */
 };
-
-static struct kc_token_waiter *kc_token_waiters = NULL;  /* Waiter queue head */
-static int kc_token_refresh_pending = 0;  /* 1 if refresh in progress */
-
-/* Forward declarations for async token functions */
-static int kc_token_refresh_callback(void *session, int result, struct access_token *token);
-static void kc_notify_token_waiters(int result, struct access_token *token);
-int kc_ensure_token_async(kc_token_waiter_cb callback, void *context);
-
-/* Forward declarations for async AUTH command (Phase 2) */
-struct auth_async_ctx;
 static int auth_async_callback(void *ctx_ptr, int result);
 
+/* Structure for async COOKIE command (Phase 4/5) */
+enum cookie_async_state {
+    COOKIE_STATE_TOKEN_WAIT,  /* Waiting for token refresh (Phase 5 integration) */
+    COOKIE_STATE_LOOKUP,
+    COOKIE_STATE_UPDATE,
+    COOKIE_STATE_DONE
+};
+
+struct cookie_async_ctx {
+    char handle[NICKSERV_HANDLE_LEN + 1];   /* Account handle */
+    char nick[NICKLEN + 1];                  /* User's nick (for replies) */
+    char numeric[COMBO_NUMERIC_LEN + 1];    /* User numeric for validation */
+    struct userNode *user;                   /* User pointer (validated before use) */
+    struct handle_info *hi;                  /* Handle info (validated before use) */
+    char *user_id;                           /* Keycloak user ID (from lookup phase) */
+    char *password_hash;                     /* Password hash to set */
+    char *plaintext_password;                /* Plaintext password for SCRAM creation */
+    enum cookie_async_state state;           /* Current state */
+    enum cookie_type cookie_type;            /* ACTIVATION or PASSWORD_CHANGE */
+    time_t started;                          /* When request started */
+};
+static void cookie_async_token_callback(void *ctx, int result, struct access_token *token);
+static void cookie_async_ctx_free(struct cookie_async_ctx *ctx);
+
 /* Forward declarations for Keycloak wrapper functions */
-static int kc_ensure_token(void);
 static int kc_check_auth(const char *handle, const char *password);
 static int kc_get_user_info(const char *handle, char **email_out);
 static int kc_do_add(const char *handle, const char *password, const char *email);
@@ -2693,7 +2700,7 @@ const char *nickserv_get_sasl_mechanisms(void)
 
 #ifdef WITH_KEYCLOAK
     /* Add OAUTHBEARER if Keycloak is enabled AND available */
-    if (nickserv_conf.keycloak_enable && keycloak_available)
+    if (nickserv_conf.keycloak_enable && keycloak_is_available())
         strcat(mechs, ",OAUTHBEARER");
 #endif
 
@@ -2907,7 +2914,7 @@ static NICKSERV_FUNC(cmd_auth)
                 auth_ctx->pw_arg = pw_arg;
                 auth_ctx->started = now;
 
-                if (kc_check_auth_async(kc_realm_config, kc_client_config,
+                if (kc_check_auth_async(keycloak_get_realm(), keycloak_get_authed_client(),
                                         handle, passwd, auth_ctx,
                                         auth_async_callback) == 0) {
                     /* Async started - mask password in logs and return pending */
@@ -3416,10 +3423,11 @@ static NICKSERV_FUNC(cmd_cookie)
 #ifdef WITH_KEYCLOAK
         /* Set password hash in Keycloak (user was created at registration without password). */
         if (nickserv_conf.keycloak_enable) {
-            /* Phase 3: Try async path for users with numerics (registered users) */
+            /* Phase 3+5: Try async path for users with numerics (registered users) */
             if (user->numeric[0] != '\0') {
                 struct cookie_async_ctx *cookie_ctx = calloc(1, sizeof(*cookie_ctx));
                 if (cookie_ctx) {
+                    int token_rc;
                     safestrncpy(cookie_ctx->handle, hi->handle, sizeof(cookie_ctx->handle));
                     safestrncpy(cookie_ctx->nick, user->nick, sizeof(cookie_ctx->nick));
                     safestrncpy(cookie_ctx->numeric, user->numeric, sizeof(cookie_ctx->numeric));
@@ -3427,18 +3435,18 @@ static NICKSERV_FUNC(cmd_cookie)
                     cookie_ctx->hi = hi;
                     cookie_ctx->password_hash = strdup(hi->cookie->data);
                     cookie_ctx->plaintext_password = strdup(password);
-                    cookie_ctx->state = COOKIE_STATE_LOOKUP;
+                    cookie_ctx->state = COOKIE_STATE_TOKEN_WAIT;
                     cookie_ctx->cookie_type = ACTIVATION;
                     cookie_ctx->started = now;
 
-                    /* Start async user lookup (Phase 1) */
-                    if (keycloak_get_user_async(kc_realm_config, kc_client_config,
-                                                hi->handle, cookie_ctx,
-                                                cookie_async_lookup_callback) == 0) {
-                        log_module(NS_LOG, LOG_DEBUG, "COOKIE async: Started for %s", hi->handle);
+                    /* Phase 5 integration: Ensure token is valid before proceeding */
+                    token_rc = keycloak_ensure_token_async(cookie_async_token_callback, cookie_ctx);
+                    if (token_rc >= 0) {
+                        log_module(NS_LOG, LOG_DEBUG, "COOKIE async: Started (token %s) for %s",
+                                   token_rc == 1 ? "valid" : "refreshing", hi->handle);
                         return 1;  /* Async started - response will come via callback */
                     }
-                    log_module(NS_LOG, LOG_WARNING, "COOKIE async: Failed to start, falling back to sync for %s", hi->handle);
+                    log_module(NS_LOG, LOG_WARNING, "COOKIE async: Token check failed, falling back to sync for %s", hi->handle);
                     cookie_async_ctx_free(cookie_ctx);
                 }
             }
@@ -3484,10 +3492,11 @@ static NICKSERV_FUNC(cmd_cookie)
 #ifdef WITH_KEYCLOAK
         /* Sync password hash to Keycloak */
         if (nickserv_conf.keycloak_enable) {
-            /* Try async path for users with numerics */
+            /* Phase 5 integration: Try async path with token-first for users with numerics */
             if (user->numeric[0] != '\0') {
                 struct cookie_async_ctx *cookie_ctx = calloc(1, sizeof(*cookie_ctx));
                 if (cookie_ctx) {
+                    int token_rc;
                     safestrncpy(cookie_ctx->handle, hi->handle, sizeof(cookie_ctx->handle));
                     safestrncpy(cookie_ctx->nick, user->nick, sizeof(cookie_ctx->nick));
                     safestrncpy(cookie_ctx->numeric, user->numeric, sizeof(cookie_ctx->numeric));
@@ -3495,18 +3504,18 @@ static NICKSERV_FUNC(cmd_cookie)
                     cookie_ctx->hi = hi;
                     cookie_ctx->password_hash = strdup(hi->cookie->data);
                     cookie_ctx->plaintext_password = pw_for_scram ? strdup(pw_for_scram) : NULL;
-                    cookie_ctx->state = COOKIE_STATE_LOOKUP;
+                    cookie_ctx->state = COOKIE_STATE_TOKEN_WAIT;
                     cookie_ctx->cookie_type = PASSWORD_CHANGE;
                     cookie_ctx->started = now;
 
-                    /* Start async user lookup */
-                    if (keycloak_get_user_async(kc_realm_config, kc_client_config,
-                                                hi->handle, cookie_ctx,
-                                                cookie_async_lookup_callback) == 0) {
-                        log_module(NS_LOG, LOG_DEBUG, "COOKIE async: Started PASSWORD_CHANGE for %s", hi->handle);
+                    /* Phase 5 integration: Ensure token is valid before proceeding */
+                    token_rc = keycloak_ensure_token_async(cookie_async_token_callback, cookie_ctx);
+                    if (token_rc >= 0) {
+                        log_module(NS_LOG, LOG_DEBUG, "COOKIE async: Started PASSWORD_CHANGE (token %s) for %s",
+                                   token_rc == 1 ? "valid" : "refreshing", hi->handle);
                         return 1;  /* Async started - response will come via callback */
                     }
-                    log_module(NS_LOG, LOG_WARNING, "COOKIE async: Failed to start, falling back to sync for %s", hi->handle);
+                    log_module(NS_LOG, LOG_WARNING, "COOKIE async: Token check failed, falling back to sync for %s", hi->handle);
                     cookie_async_ctx_free(cookie_ctx);
                 }
             }
@@ -6248,174 +6257,21 @@ kc_strerror(int rc)
     }
 }
 
-/* Update Keycloak availability and broadcast mechanism change if needed */
+/*
+ * Wrapper to update SASL mechanisms when Keycloak availability changes.
+ * Uses the token manager's availability tracking.
+ */
 static void
-kc_set_available(int available)
+ns_keycloak_set_available(int available)
 {
-    if (keycloak_available != available) {
-        keycloak_available = available;
+    static int last_known = 1;
+    keycloak_set_available(available);
+    if (last_known != available) {
+        last_known = available;
         log_module(NS_LOG, LOG_INFO, "Keycloak availability changed: %s",
                    available ? "available" : "unavailable");
         nickserv_update_sasl_mechanisms();
     }
-}
-
-/* Ensure we have a valid admin token, refresh if expired */
-static int
-kc_ensure_token(void)
-{
-    time_t now_time = time(NULL);
-
-    /* Check if token is still valid (with 60s margin) */
-    if (kc_admin_token && kc_token_expires > (now_time + 60)) {
-        kc_client_config.access_token = kc_admin_token;
-        return KC_SUCCESS;
-    }
-
-    /* Free old token if exists */
-    if (kc_admin_token) {
-        keycloak_free_access_token(kc_admin_token);
-        kc_admin_token = NULL;
-        kc_client_config.access_token = NULL;
-    }
-
-    /* Get new token */
-    int rc = keycloak_get_client_token(kc_realm_config, kc_client_config, &kc_admin_token);
-    if (rc != KC_SUCCESS) {
-        kc_set_available(0);
-        return rc;
-    }
-
-    kc_set_available(1);
-    kc_client_config.access_token = kc_admin_token;
-    kc_token_expires = now_time + kc_admin_token->expires_in;
-    return KC_SUCCESS;
-}
-
-/*
- * Notify all waiters that token refresh completed.
- * Clears the waiter queue and calls each callback.
- */
-static void
-kc_notify_token_waiters(int result, struct access_token *token)
-{
-    struct kc_token_waiter *waiter, *next;
-
-    /* Clear refresh pending flag */
-    kc_token_refresh_pending = 0;
-
-    /* Process all waiters */
-    waiter = kc_token_waiters;
-    kc_token_waiters = NULL;
-
-    while (waiter) {
-        next = waiter->next;
-        if (waiter->callback) {
-            waiter->callback(waiter->context, result, token);
-        }
-        free(waiter);
-        waiter = next;
-    }
-}
-
-/*
- * Callback from keycloak_get_client_token_async() when refresh completes.
- */
-static int
-kc_token_refresh_callback(void *session, int result, struct access_token *token)
-{
-    (void)session;  /* Unused */
-
-    if (result == KC_SUCCESS && token) {
-        /* Update cached token */
-        if (kc_admin_token) {
-            keycloak_free_access_token(kc_admin_token);
-        }
-        kc_admin_token = token;
-        kc_client_config.access_token = kc_admin_token;
-        kc_token_expires = time(NULL) + token->expires_in;
-        kc_set_available(1);
-        log_module(NS_LOG, LOG_DEBUG, "Async token refresh successful (expires in %ld sec)",
-                   token->expires_in);
-    } else {
-        kc_set_available(0);
-        log_module(NS_LOG, LOG_WARNING, "Async token refresh failed: %s",
-                   kc_strerror(result));
-    }
-
-    /* Notify all waiters */
-    kc_notify_token_waiters(result, result == KC_SUCCESS ? kc_admin_token : NULL);
-    return 0;  /* Session continues (not terminal) */
-}
-
-/*
- * Async version of kc_ensure_token().
- * If token is valid, calls callback immediately.
- * If refresh needed and not in progress, starts refresh and queues callback.
- * If refresh already in progress, just queues callback.
- *
- * Returns:
- *   1 - Token valid, callback called immediately with KC_SUCCESS
- *   0 - Refresh started/pending, callback will be called when done
- *  -1 - Error (invalid args, out of memory, or refresh start failed)
- */
-int
-kc_ensure_token_async(kc_token_waiter_cb callback, void *context)
-{
-    time_t now_time = time(NULL);
-    struct kc_token_waiter *waiter;
-
-    if (!callback) {
-        log_module(NS_LOG, LOG_ERROR, "kc_ensure_token_async: no callback");
-        return -1;
-    }
-
-    /* Check if token is still valid (with 60s margin) */
-    if (kc_admin_token && kc_token_expires > (now_time + 60)) {
-        kc_client_config.access_token = kc_admin_token;
-        /* Token valid - invoke callback immediately */
-        callback(context, KC_SUCCESS, kc_admin_token);
-        return 1;
-    }
-
-    /* Token needs refresh - add to waiter queue */
-    waiter = calloc(1, sizeof(*waiter));
-    if (!waiter) {
-        log_module(NS_LOG, LOG_ERROR, "kc_ensure_token_async: out of memory");
-        return -1;
-    }
-    waiter->callback = callback;
-    waiter->context = context;
-    waiter->next = kc_token_waiters;
-    kc_token_waiters = waiter;
-
-    /* If refresh not already in progress, start it */
-    if (!kc_token_refresh_pending) {
-        kc_token_refresh_pending = 1;
-
-        /* Free old token before refresh */
-        if (kc_admin_token) {
-            keycloak_free_access_token(kc_admin_token);
-            kc_admin_token = NULL;
-            kc_client_config.access_token = NULL;
-        }
-
-        if (keycloak_get_client_token_async(kc_realm_config, kc_client_config,
-                                             NULL, kc_token_refresh_callback) < 0) {
-            log_module(NS_LOG, LOG_ERROR, "kc_ensure_token_async: failed to start refresh");
-            /* Remove the waiter we just added and fail */
-            kc_token_waiters = waiter->next;
-            free(waiter);
-            kc_token_refresh_pending = 0;
-            return -1;
-        }
-
-        log_module(NS_LOG, LOG_DEBUG, "kc_ensure_token_async: started async refresh");
-    } else {
-        log_module(NS_LOG, LOG_DEBUG, "kc_ensure_token_async: refresh pending, queued waiter");
-    }
-
-    return 0;
 }
 
 /* Check authentication via Keycloak password grant */
@@ -6425,7 +6281,7 @@ kc_check_auth(const char *handle, const char *password)
     struct access_token *user_token = NULL;
     int rc;
 
-    rc = keycloak_get_user_token(kc_realm_config, kc_client_config,
+    rc = keycloak_get_user_token(keycloak_get_realm(), keycloak_get_authed_client(),
                                   handle, password, &user_token);
     if (rc == KC_SUCCESS && user_token) {
         keycloak_free_access_token(user_token);
@@ -6437,20 +6293,6 @@ kc_check_auth(const char *handle, const char *password)
 
 /* Forward declaration for use in auth_async_callback */
 static int kc_get_user_info(const char *handle, char **email_out);
-
-/*
- * Phase 2: Async AUTH command support
- * Context structure to resume cmd_auth after async Keycloak authentication
- */
-struct auth_async_ctx {
-    char handle[NICKSERV_HANDLE_LEN + 1];  /* Account handle */
-    char nick[NICKLEN + 1];                 /* User's nick (for replies) */
-    char numeric[COMBO_NUMERIC_LEN + 1];   /* User numeric for validation */
-    struct userNode *user;                  /* User pointer (validated before use) */
-    struct svccmd *cmd;                     /* Command context */
-    int pw_arg;                             /* Password argument index */
-    time_t started;                         /* When request started */
-};
 
 /* Validate user is still connected by checking numeric matches */
 static struct userNode *
@@ -6645,33 +6487,7 @@ auth_async_callback(void *ctx_ptr, int result)
     return 0;
 }
 
-/*
- * Phase 3: Async COOKIE command support
- * Two-phase state machine for account activation:
- *   1. COOKIE_STATE_LOOKUP - Get user ID from Keycloak
- *   2. COOKIE_STATE_UPDATE - Update password hash in Keycloak
- */
-enum cookie_async_state {
-    COOKIE_STATE_LOOKUP,
-    COOKIE_STATE_UPDATE,
-    COOKIE_STATE_DONE
-};
-
-struct cookie_async_ctx {
-    char handle[NICKSERV_HANDLE_LEN + 1];   /* Account handle */
-    char nick[NICKLEN + 1];                  /* User's nick (for replies) */
-    char numeric[COMBO_NUMERIC_LEN + 1];    /* User numeric for validation */
-    struct userNode *user;                   /* User pointer (validated before use) */
-    struct handle_info *hi;                  /* Handle info (validated before use) */
-    char *user_id;                           /* Keycloak user ID (from lookup phase) */
-    char *password_hash;                     /* Password hash to set */
-    char *plaintext_password;                /* Plaintext password for SCRAM creation */
-    enum cookie_async_state state;           /* Current state */
-    enum cookie_type cookie_type;            /* ACTIVATION or PASSWORD_CHANGE */
-    time_t started;                          /* When request started */
-};
-
-/* Forward declarations for cookie async callbacks */
+/* Forward declarations for cookie async callbacks (token callback declared earlier) */
 static int cookie_async_lookup_callback(void *session, int result, struct kc_user *user);
 static int cookie_async_update_callback(void *session, int result);
 
@@ -6713,6 +6529,51 @@ cookie_async_ctx_free(struct cookie_async_ctx *ctx)
         free(ctx->plaintext_password);
     }
     free(ctx);
+}
+
+/* Phase 0 callback: Token ready, now start user lookup */
+static void
+cookie_async_token_callback(void *context, int result, struct access_token *token)
+{
+    struct cookie_async_ctx *ctx = (struct cookie_async_ctx *)context;
+    struct userNode *user;
+
+    (void)token;  /* Token is managed by keycloak module */
+
+    if (!ctx) {
+        log_module(NS_LOG, LOG_ERROR, "COOKIE async token callback: NULL context");
+        return;
+    }
+
+    /* Validate user is still connected */
+    user = cookie_async_validate_user(ctx);
+    if (!user) {
+        log_module(NS_LOG, LOG_DEBUG, "COOKIE async token: User no longer valid");
+        cookie_async_ctx_free(ctx);
+        return;
+    }
+
+    if (result != KC_SUCCESS) {
+        log_module(NS_LOG, LOG_WARNING, "COOKIE async: Token refresh failed: %s", kc_strerror(result));
+        send_message(user, nickserv, "NSMSG_KEYCLOAK_FAIL", "Token refresh failed");
+        cookie_async_ctx_free(ctx);
+        return;
+    }
+
+    /* Token is ready, transition to lookup state */
+    ctx->state = COOKIE_STATE_LOOKUP;
+
+    /* Start async user lookup using token manager's cached config */
+    if (keycloak_get_user_async(keycloak_get_realm(), keycloak_get_authed_client(),
+                                ctx->handle, ctx,
+                                cookie_async_lookup_callback) != 0) {
+        log_module(NS_LOG, LOG_WARNING, "COOKIE async: Failed to start user lookup for %s", ctx->handle);
+        send_message(user, nickserv, "NSMSG_KEYCLOAK_FAIL", "Failed to start user lookup");
+        cookie_async_ctx_free(ctx);
+        return;
+    }
+
+    log_module(NS_LOG, LOG_DEBUG, "COOKIE async: Token ready, started user lookup for %s", ctx->handle);
 }
 
 /* Phase 1 callback: Keycloak user lookup completed */
@@ -6779,7 +6640,7 @@ cookie_async_lookup_callback(void *session, int result, struct kc_user *kc_user)
 
     ctx->state = COOKIE_STATE_UPDATE;
 
-    if (keycloak_update_user_representation_async(kc_realm_config, kc_client_config,
+    if (keycloak_update_user_representation_async(keycloak_get_realm(), keycloak_get_authed_client(),
                                                    ctx->user_id, &update,
                                                    ctx, cookie_async_update_callback) != 0) {
         log_module(NS_LOG, LOG_WARNING, "COOKIE async: Failed to start update for %s", ctx->handle);
@@ -6887,12 +6748,12 @@ cookie_async_update_callback(void *session, int result)
 static int
 kc_get_user_info(const char *handle, char **email_out)
 {
-    if (kc_ensure_token() != KC_SUCCESS) {
+    if (keycloak_ensure_token() != KC_SUCCESS) {
         return KC_ERROR;
     }
 
     struct kc_user user;
-    int rc = keycloak_get_user(kc_realm_config, kc_client_config, handle, &user);
+    int rc = keycloak_get_user(keycloak_get_realm(), keycloak_get_authed_client(), handle, &user);
     if (rc == KC_SUCCESS) {
         if (user.email) {
             *email_out = strdup(user.email);
@@ -6911,13 +6772,13 @@ kc_do_add(const char *handle, const char *hash, const char *email)
     char cred_data[256];
     char secret_data[512];
 
-    if (kc_ensure_token() != KC_SUCCESS) {
+    if (keycloak_ensure_token() != KC_SUCCESS) {
         return KC_ERROR;
     }
 
     /* If no hash provided, create user without password */
     if (!hash) {
-        return keycloak_create_user(kc_realm_config, kc_client_config,
+        return keycloak_create_user(keycloak_get_realm(), keycloak_get_authed_client(),
                                     handle, email ? email : "", NULL);
     }
 
@@ -6928,11 +6789,11 @@ kc_do_add(const char *handle, const char *hash, const char *email)
         log_module(NS_LOG, LOG_WARNING,
                    "kc_do_add: Hash format not exportable for %s, creating without password",
                    handle);
-        return keycloak_create_user(kc_realm_config, kc_client_config,
+        return keycloak_create_user(keycloak_get_realm(), keycloak_get_authed_client(),
                                     handle, email ? email : "", NULL);
     }
 
-    return keycloak_create_user_with_hash(kc_realm_config, kc_client_config,
+    return keycloak_create_user_with_hash(keycloak_get_realm(), keycloak_get_authed_client(),
                                           handle, email ? email : "",
                                           cred_data, secret_data);
 }
@@ -6949,14 +6810,14 @@ kc_do_modify(const char *handle, const char *hash, const char *email)
                "kc_do_modify: called for %s, hash=%s, email=%s",
                handle, hash ? "yes" : "no", email ? email : "null");
 
-    if (kc_ensure_token() != KC_SUCCESS) {
+    if (keycloak_ensure_token() != KC_SUCCESS) {
         log_module(NS_LOG, LOG_DEBUG, "kc_do_modify: token failed");
         return KC_ERROR;
     }
 
     /* First get user ID */
     struct kc_user user;
-    int rc = keycloak_get_user(kc_realm_config, kc_client_config, handle, &user);
+    int rc = keycloak_get_user(keycloak_get_realm(), keycloak_get_authed_client(), handle, &user);
     if (rc != KC_SUCCESS) {
         log_module(NS_LOG, LOG_DEBUG,
                    "kc_do_modify: keycloak_get_user failed for %s: %d",
@@ -6987,7 +6848,7 @@ kc_do_modify(const char *handle, const char *hash, const char *email)
     }
 
     /* Single API call to update all fields */
-    rc = keycloak_update_user_representation(kc_realm_config, kc_client_config,
+    rc = keycloak_update_user_representation(keycloak_get_realm(), keycloak_get_authed_client(),
                                              user_id, &update);
 
     free(user_id);
@@ -6998,13 +6859,13 @@ kc_do_modify(const char *handle, const char *hash, const char *email)
 static int
 kc_delete_account(const char *handle)
 {
-    if (kc_ensure_token() != KC_SUCCESS) {
+    if (keycloak_ensure_token() != KC_SUCCESS) {
         return KC_ERROR;
     }
 
     /* First get user ID (may be cached from recent create) */
     struct kc_user user;
-    int rc = keycloak_get_user(kc_realm_config, kc_client_config, handle, &user);
+    int rc = keycloak_get_user(keycloak_get_realm(), keycloak_get_authed_client(), handle, &user);
     if (rc != KC_SUCCESS) {
         return rc;
     }
@@ -7012,7 +6873,7 @@ kc_delete_account(const char *handle)
     char *user_id = strdup(user.id);
     keycloak_user_free_fields(&user);
 
-    rc = keycloak_delete_user(kc_realm_config, kc_client_config, user_id);
+    rc = keycloak_delete_user(keycloak_get_realm(), keycloak_get_authed_client(), user_id);
     free(user_id);
 
     /* Invalidate cache entry regardless of delete result */
@@ -7026,13 +6887,13 @@ static int
 kc_do_oslevel(const char *handle, int level, int oldlevel)
 {
     (void)oldlevel; /* reserved for future use */
-    if (kc_ensure_token() != KC_SUCCESS) {
+    if (keycloak_ensure_token() != KC_SUCCESS) {
         return KC_ERROR;
     }
 
     /* Get user ID */
     struct kc_user user;
-    int rc = keycloak_get_user(kc_realm_config, kc_client_config, handle, &user);
+    int rc = keycloak_get_user(keycloak_get_realm(), keycloak_get_authed_client(), handle, &user);
     if (rc != KC_SUCCESS) {
         return rc;
     }
@@ -7043,7 +6904,7 @@ kc_do_oslevel(const char *handle, int level, int oldlevel)
     /* Set the opserv_level attribute */
     char level_str[16];
     snprintf(level_str, sizeof(level_str), "%d", level);
-    rc = keycloak_set_user_attribute(kc_realm_config, kc_client_config,
+    rc = keycloak_set_user_attribute(keycloak_get_realm(), keycloak_get_authed_client(),
                                      user_id, nickserv_conf.keycloak_attr_oslevel,
                                      level_str);
 
@@ -7078,14 +6939,14 @@ kc_sync_email_verified(const char *handle, int verified)
         return;
     }
 
-    if (kc_ensure_token() != KC_SUCCESS) {
+    if (keycloak_ensure_token() != KC_SUCCESS) {
         log_module(NS_LOG, LOG_DEBUG, "kc_sync_email_verified: Failed to get admin token");
         return;
     }
 
     /* Get user ID from Keycloak */
     struct kc_user user;
-    int rc = keycloak_get_user(kc_realm_config, kc_client_config, handle, &user);
+    int rc = keycloak_get_user(keycloak_get_realm(), keycloak_get_authed_client(), handle, &user);
     if (rc != KC_SUCCESS) {
         log_module(NS_LOG, LOG_DEBUG, "kc_sync_email_verified: User %s not found in Keycloak", handle);
         return;
@@ -7095,7 +6956,7 @@ kc_sync_email_verified(const char *handle, int verified)
     keycloak_user_free_fields(&user);
 
     /* Fire-and-forget async sync */
-    rc = keycloak_set_email_verified_async(kc_realm_config, kc_client_config,
+    rc = keycloak_set_email_verified_async(keycloak_get_realm(), keycloak_get_authed_client(),
                                             user_id, verified,
                                             NULL, kc_email_verified_callback);
     if (rc < 0) {
@@ -7119,14 +6980,14 @@ kc_sync_fingerprints(struct handle_info *hi)
         return;
     }
 
-    if (kc_ensure_token() != KC_SUCCESS) {
+    if (keycloak_ensure_token() != KC_SUCCESS) {
         log_module(NS_LOG, LOG_DEBUG, "kc_sync_fingerprints: Failed to get admin token");
         return;
     }
 
     /* Get user ID from Keycloak */
     struct kc_user user;
-    int rc = keycloak_get_user(kc_realm_config, kc_client_config, hi->handle, &user);
+    int rc = keycloak_get_user(keycloak_get_realm(), keycloak_get_authed_client(), hi->handle, &user);
     if (rc != KC_SUCCESS) {
         log_module(NS_LOG, LOG_DEBUG, "kc_sync_fingerprints: User %s not found in Keycloak", hi->handle);
         return;
@@ -7154,7 +7015,7 @@ kc_sync_fingerprints(struct handle_info *hi)
     }
 
     /* Sync to Keycloak */
-    rc = keycloak_set_user_attribute_array(kc_realm_config, kc_client_config,
+    rc = keycloak_set_user_attribute_array(keycloak_get_realm(), keycloak_get_authed_client(),
                                            user_id, "x509_fingerprints",
                                            fingerprints, fp_count);
 
@@ -7187,12 +7048,12 @@ kc_check_email_verified(const char *handle, int *verified_out)
         return KC_ERROR;
     }
 
-    if (kc_ensure_token() != KC_SUCCESS) {
+    if (keycloak_ensure_token() != KC_SUCCESS) {
         return KC_ERROR;
     }
 
     struct kc_user user;
-    int rc = keycloak_get_user(kc_realm_config, kc_client_config, handle, &user);
+    int rc = keycloak_get_user(keycloak_get_realm(), keycloak_get_authed_client(), handle, &user);
     if (rc == KC_SUCCESS) {
         *verified_out = user.emailVerified ? 1 : 0;
         keycloak_user_free_fields(&user);
@@ -7264,13 +7125,13 @@ kc_try_auto_activate(struct handle_info *hi)
 static int
 kc_add2group(const char *handle, const char *group_name)
 {
-    if (kc_ensure_token() != KC_SUCCESS) {
+    if (keycloak_ensure_token() != KC_SUCCESS) {
         return KC_ERROR;
     }
 
     /* Get user ID */
     struct kc_user user;
-    int rc = keycloak_get_user(kc_realm_config, kc_client_config, handle, &user);
+    int rc = keycloak_get_user(keycloak_get_realm(), keycloak_get_authed_client(), handle, &user);
     if (rc != KC_SUCCESS) {
         return rc;
     }
@@ -7279,14 +7140,14 @@ kc_add2group(const char *handle, const char *group_name)
 
     /* Get group ID */
     char *group_id = NULL;
-    rc = keycloak_get_group_by_name(kc_realm_config, kc_client_config,
+    rc = keycloak_get_group_by_name(keycloak_get_realm(), keycloak_get_authed_client(),
                                     group_name, &group_id);
     if (rc != KC_SUCCESS) {
         free(user_id);
         return rc;
     }
 
-    rc = keycloak_add_user_to_group(kc_realm_config, kc_client_config,
+    rc = keycloak_add_user_to_group(keycloak_get_realm(), keycloak_get_authed_client(),
                                     user_id, group_id);
     free(user_id);
     free(group_id);
@@ -7297,13 +7158,13 @@ kc_add2group(const char *handle, const char *group_name)
 static int
 kc_delfromgroup(const char *handle, const char *group_name)
 {
-    if (kc_ensure_token() != KC_SUCCESS) {
+    if (keycloak_ensure_token() != KC_SUCCESS) {
         return KC_ERROR;
     }
 
     /* Get user ID */
     struct kc_user user;
-    int rc = keycloak_get_user(kc_realm_config, kc_client_config, handle, &user);
+    int rc = keycloak_get_user(keycloak_get_realm(), keycloak_get_authed_client(), handle, &user);
     if (rc != KC_SUCCESS) {
         return rc;
     }
@@ -7312,14 +7173,14 @@ kc_delfromgroup(const char *handle, const char *group_name)
 
     /* Get group ID */
     char *group_id = NULL;
-    rc = keycloak_get_group_by_name(kc_realm_config, kc_client_config,
+    rc = keycloak_get_group_by_name(keycloak_get_realm(), keycloak_get_authed_client(),
                                     group_name, &group_id);
     if (rc != KC_SUCCESS) {
         free(user_id);
         return rc;
     }
 
-    rc = keycloak_remove_user_from_group(kc_realm_config, kc_client_config,
+    rc = keycloak_remove_user_from_group(keycloak_get_realm(), keycloak_get_authed_client(),
                                          user_id, group_id);
     free(user_id);
     free(group_id);
@@ -7354,13 +7215,13 @@ loc_auth_oauth(const char *bearer_token, const char *username_hint, const char *
         return NULL;
     }
 
-    if (kc_ensure_token() != KC_SUCCESS) {
+    if (keycloak_ensure_token() != KC_SUCCESS) {
         log_module(NS_LOG, LOG_WARNING, "loc_auth_oauth: Failed to get admin token");
         return NULL;
     }
 
     /* Introspect the bearer token */
-    rc = keycloak_introspect_token(kc_realm_config, kc_client_config,
+    rc = keycloak_introspect_token(keycloak_get_realm(), keycloak_get_authed_client(),
                                    bearer_token, &token_info);
 
     if (rc != KC_SUCCESS || !token_info) {
@@ -7585,12 +7446,12 @@ loc_auth_external(const char *fingerprint, const char *authzid, const char *host
 
     /* Step 3: Query Keycloak (HTTP call) */
     if (nickserv_conf.keycloak_enable) {
-        if (kc_ensure_token() != KC_SUCCESS) {
+        if (keycloak_ensure_token() != KC_SUCCESS) {
             log_module(NS_LOG, LOG_WARNING, "loc_auth_external: Failed to get admin token");
             return NULL;
         }
 
-        rc = keycloak_find_user_by_fingerprint(kc_realm_config, kc_client_config,
+        rc = keycloak_find_user_by_fingerprint(keycloak_get_realm(), keycloak_get_authed_client(),
                                                 fingerprint, &kc_username);
 
         if (rc == KC_COLLISION) {
@@ -7970,12 +7831,12 @@ nickserv_set_user_metadata(struct handle_info *hi, const char *key, const char *
         struct kc_user user;
         int rc;
 
-        if (kc_ensure_token() != KC_SUCCESS) {
+        if (keycloak_ensure_token() != KC_SUCCESS) {
             log_module(NS_LOG, LOG_WARNING, "nickserv_set_user_metadata: Failed to get admin token");
             /* Continue - we may have LMDB cache */
         } else {
             /* Get user ID from Keycloak */
-            rc = keycloak_get_user(kc_realm_config, kc_client_config, hi->handle, &user);
+            rc = keycloak_get_user(keycloak_get_realm(), keycloak_get_authed_client(), hi->handle, &user);
             if (rc != KC_SUCCESS) {
                 log_module(NS_LOG, LOG_WARNING, "nickserv_set_user_metadata: User %s not found in Keycloak", hi->handle);
                 /* Continue - we may have LMDB cache */
@@ -7988,7 +7849,7 @@ nickserv_set_user_metadata(struct handle_info *hi, const char *key, const char *
 
                 /* Fire-and-forget async update - LMDB is authoritative, this is just sync */
                 const char *attr_value = (value && *value) ? stored_value : "";
-                if (keycloak_set_user_attribute_async(kc_realm_config, kc_client_config,
+                if (keycloak_set_user_attribute_async(keycloak_get_realm(), keycloak_get_authed_client(),
                                                        user_id, attr_name, attr_value,
                                                        NULL, ns_attr_async_callback) == 0) {
                     /* Async started - consider it optimistically successful */
@@ -7998,7 +7859,7 @@ nickserv_set_user_metadata(struct handle_info *hi, const char *key, const char *
                 } else {
                     /* Async failed to start - fall back to sync */
                     log_module(NS_LOG, LOG_DEBUG, "nickserv_set_user_metadata: Async failed, using sync");
-                    rc = keycloak_set_user_attribute(kc_realm_config, kc_client_config,
+                    rc = keycloak_set_user_attribute(keycloak_get_realm(), keycloak_get_authed_client(),
                                                      user_id, attr_name, attr_value);
                     if (rc == KC_SUCCESS) {
                         keycloak_ok = 1;
@@ -8080,13 +7941,13 @@ nickserv_get_user_metadata(struct handle_info *hi, const char *key, char *value_
         char *attr_value = NULL;
         int rc;
 
-        if (kc_ensure_token() != KC_SUCCESS) {
+        if (keycloak_ensure_token() != KC_SUCCESS) {
             log_module(NS_LOG, LOG_WARNING, "nickserv_get_user_metadata: Failed to get admin token");
             return -1;
         }
 
         /* Get user ID from Keycloak */
-        rc = keycloak_get_user(kc_realm_config, kc_client_config, hi->handle, &user);
+        rc = keycloak_get_user(keycloak_get_realm(), keycloak_get_authed_client(), hi->handle, &user);
         if (rc != KC_SUCCESS) {
             log_module(NS_LOG, LOG_DEBUG, "nickserv_get_user_metadata: User %s not found in Keycloak", hi->handle);
             return 1; /* Not found */
@@ -8098,7 +7959,7 @@ nickserv_get_user_metadata(struct handle_info *hi, const char *key, char *value_
         /* Prefix metadata keys with "metadata." */
         snprintf(attr_name, sizeof(attr_name), "metadata.%s", key);
 
-        rc = keycloak_get_user_attribute(kc_realm_config, kc_client_config,
+        rc = keycloak_get_user_attribute(keycloak_get_realm(), keycloak_get_authed_client(),
                                          user_id, attr_name, &attr_value);
         free(user_id);
 
@@ -8277,13 +8138,13 @@ nickserv_sync_metadata_to_ircd(struct userNode *user)
         struct kc_metadata_entry *entry;
         int rc;
 
-        if (kc_ensure_token() != KC_SUCCESS) {
+        if (keycloak_ensure_token() != KC_SUCCESS) {
             log_module(NS_LOG, LOG_DEBUG, "nickserv_sync_metadata_to_ircd: Failed to get admin token");
             return;
         }
 
         /* Get user ID from Keycloak */
-        rc = keycloak_get_user(kc_realm_config, kc_client_config, user->handle_info->handle, &kc_user);
+        rc = keycloak_get_user(keycloak_get_realm(), keycloak_get_authed_client(), user->handle_info->handle, &kc_user);
         if (rc != KC_SUCCESS) {
             log_module(NS_LOG, LOG_DEBUG, "nickserv_sync_metadata_to_ircd: User %s not found in Keycloak",
                        user->handle_info->handle);
@@ -8294,7 +8155,7 @@ nickserv_sync_metadata_to_ircd(struct userNode *user)
         keycloak_user_free_fields(&kc_user);
 
         /* Fetch all metadata.* attributes */
-        rc = keycloak_list_user_attributes(kc_realm_config, kc_client_config,
+        rc = keycloak_list_user_attributes(keycloak_get_realm(), keycloak_get_authed_client(),
                                            user_id, "metadata.", &entries);
         free(user_id);
 
@@ -8416,13 +8277,13 @@ nickserv_sync_account_metadata_to_ircd(struct handle_info *hi)
         struct kc_metadata_entry *entry;
         int rc;
 
-        if (kc_ensure_token() != KC_SUCCESS) {
+        if (keycloak_ensure_token() != KC_SUCCESS) {
             log_module(NS_LOG, LOG_DEBUG, "nickserv_sync_account_metadata_to_ircd: Failed to get admin token");
             return;
         }
 
         /* Get user ID from Keycloak */
-        rc = keycloak_get_user(kc_realm_config, kc_client_config, hi->handle, &kc_user);
+        rc = keycloak_get_user(keycloak_get_realm(), keycloak_get_authed_client(), hi->handle, &kc_user);
         if (rc != KC_SUCCESS) {
             log_module(NS_LOG, LOG_DEBUG, "nickserv_sync_account_metadata_to_ircd: User %s not found in Keycloak",
                        hi->handle);
@@ -8433,7 +8294,7 @@ nickserv_sync_account_metadata_to_ircd(struct handle_info *hi)
         keycloak_user_free_fields(&kc_user);
 
         /* Fetch all metadata.* attributes */
-        rc = keycloak_list_user_attributes(kc_realm_config, kc_client_config,
+        rc = keycloak_list_user_attributes(keycloak_get_realm(), keycloak_get_authed_client(),
                                            user_id, "metadata.", &entries);
         free(user_id);
 
@@ -8496,13 +8357,13 @@ nickserv_get_webpush_subscriptions(const char *account_name,
         struct kc_user kc_user;
         int rc;
 
-        if (kc_ensure_token() != KC_SUCCESS) {
+        if (keycloak_ensure_token() != KC_SUCCESS) {
             log_module(NS_LOG, LOG_DEBUG, "nickserv_get_webpush_subscriptions: Failed to get admin token");
             return -1;
         }
 
         /* Get user ID from Keycloak */
-        rc = keycloak_get_user(kc_realm_config, kc_client_config, account_name, &kc_user);
+        rc = keycloak_get_user(keycloak_get_realm(), keycloak_get_authed_client(), account_name, &kc_user);
         if (rc != KC_SUCCESS) {
             log_module(NS_LOG, LOG_DEBUG, "nickserv_get_webpush_subscriptions: User %s not found in Keycloak",
                        account_name);
@@ -8513,7 +8374,7 @@ nickserv_get_webpush_subscriptions(const char *account_name,
         keycloak_user_free_fields(&kc_user);
 
         /* Fetch all webpush.* attributes */
-        rc = keycloak_list_user_attributes(kc_realm_config, kc_client_config,
+        rc = keycloak_list_user_attributes(keycloak_get_realm(), keycloak_get_authed_client(),
                                            user_id, "webpush.", entries_out);
         free(user_id);
 
@@ -8904,14 +8765,15 @@ nickserv_conf_read(void)
     str = database_get_data(conf_node, KEY_KEYCLOAK_WEBHOOK_BIND, RECDB_QSTRING);
     nickserv_conf.keycloak_webhook_bind = str ? str : NULL;
 
-    /* Initialize Keycloak client if enabled */
+    /* Initialize Keycloak token manager if enabled */
     if (nickserv_conf.keycloak_enable) {
-        memset(&kc_realm_config, 0, sizeof(kc_realm_config));
-        memset(&kc_client_config, 0, sizeof(kc_client_config));
-        kc_realm_config.base_uri = nickserv_conf.keycloak_uri;
-        kc_realm_config.realm = nickserv_conf.keycloak_realm;
-        kc_client_config.client_id = nickserv_conf.keycloak_client_id;
-        kc_client_config.client_secret = nickserv_conf.keycloak_client_secret;
+        struct kc_realm realm = {0};
+        struct kc_client client = {0};
+        realm.base_uri = (char*)nickserv_conf.keycloak_uri;
+        realm.realm = nickserv_conf.keycloak_realm;
+        client.client_id = (char*)nickserv_conf.keycloak_client_id;
+        client.client_secret = (char*)nickserv_conf.keycloak_client_secret;
+        keycloak_token_manager_init(realm, client);
         log_module(NS_LOG, LOG_INFO, "Keycloak integration enabled for realm %s", nickserv_conf.keycloak_realm);
 
         /* Initialize webhook listener if configured */
@@ -9782,8 +9644,8 @@ nickserv_ircv3_register_p10(const char *uid, const char *handle,
         log_module(NS_LOG, LOG_DEBUG, "REG: Starting async Keycloak user creation for %s", actual_handle);
 
         int rc = keycloak_create_user_async(
-            kc_realm_config,
-            kc_client_config,
+            keycloak_get_realm(),
+            keycloak_get_authed_client(),
             actual_handle,
             use_email ? email : NULL,
             password,  /* Keycloak needs plain password */
@@ -10688,7 +10550,7 @@ sasl_packet(struct SASLSession *session)
 #endif
 
 #ifdef WITH_KEYCLOAK
-        if (nickserv_conf.keycloak_enable && kc_ensure_token() == KC_SUCCESS) {
+        if (nickserv_conf.keycloak_enable && keycloak_ensure_token() == KC_SUCCESS) {
             /* Use async Keycloak fingerprint lookup */
             log_module(NS_LOG, LOG_DEBUG, "SASL EXTERNAL: Starting async fingerprint lookup");
 
@@ -10697,7 +10559,7 @@ sasl_packet(struct SASLSession *session)
                 session->authzid = strdup(authzid);
             session->state = SASL_STATE_AUTHENTICATING;
 
-            if (keycloak_find_user_by_fingerprint_async(kc_realm_config, kc_client_config,
+            if (keycloak_find_user_by_fingerprint_async(keycloak_get_realm(), keycloak_get_authed_client(),
                                                          session->sslclifp, sasl_async_ctx_new(session),
                                                          sasl_async_fingerprint_callback) == 0) {
                 /* Request started - callback will handle cleanup */
@@ -10824,7 +10686,7 @@ sasl_packet(struct SASLSession *session)
         /* Try local JWT validation first (no HTTP round-trip) */
         if (nickserv_conf.keycloak_enable) {
             struct kc_token_info *token_info = NULL;
-            int jwt_result = keycloak_validate_jwt_local(kc_realm_config, token_start, &token_info);
+            int jwt_result = keycloak_validate_jwt_local(keycloak_get_realm(), token_start, &token_info);
 
             if (jwt_result == KC_SUCCESS && token_info) {
                 /* JWT validated locally - complete auth immediately */
@@ -10899,7 +10761,7 @@ sasl_packet(struct SASLSession *session)
                 session->authzid = strdup(authzid);
             session->state = SASL_STATE_AUTHENTICATING;
 
-            if (keycloak_introspect_token_async(kc_realm_config, kc_client_config,
+            if (keycloak_introspect_token_async(keycloak_get_realm(), keycloak_get_authed_client(),
                                                  token_start, sasl_async_ctx_new(session),
                                                  sasl_async_introspect_callback) == 0) {
                 /* Request started - callback will handle cleanup */
@@ -11403,7 +11265,7 @@ sasl_packet(struct SASLSession *session)
             session->state = SASL_STATE_AUTHENTICATING;
 
             /* Start async auth - returns immediately */
-            if (kc_check_auth_async(kc_realm_config, kc_client_config,
+            if (kc_check_auth_async(keycloak_get_realm(), keycloak_get_authed_client(),
                                     authcid, passwd, sasl_async_ctx_new(session),
                                     sasl_async_auth_callback) == 0) {
                 /* Request started - DON'T delete session, callback will handle it */

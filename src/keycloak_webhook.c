@@ -586,6 +586,7 @@ handle_keycloak_event(const char *body, size_t body_len)
     if (strcmp(resource_type, "USER") == 0) {
         /* User events - extract username from authDetails or representation */
         const char *username = NULL;
+        char *username_alloc = NULL;  /* Track if we allocated username */
         json_t *auth = json_object_get(root, "authDetails");
         if (auth) {
             json_t *uname = json_object_get(auth, "username");
@@ -598,8 +599,11 @@ handle_keycloak_event(const char *body, size_t body_len)
             json_t *rep_json = json_loads(representation, 0, NULL);
             if (rep_json) {
                 json_t *uname = json_object_get(rep_json, "username");
-                if (uname && json_is_string(uname))
-                    username = json_string_value(uname);
+                if (uname && json_is_string(uname)) {
+                    /* Must strdup because rep_json will be freed */
+                    username_alloc = strdup(json_string_value(uname));
+                    username = username_alloc;
+                }
                 json_decref(rep_json);
             }
         }
@@ -657,6 +661,7 @@ handle_keycloak_event(const char *body, size_t body_len)
                 }
             }
         }
+        free(username_alloc);  /* Free if we allocated from representation */
     } else if (strcmp(resource_type, "CREDENTIAL") == 0) {
         /* Credential events - password or cert changes */
         if (strcmp(operation_type, "DELETE") == 0) {

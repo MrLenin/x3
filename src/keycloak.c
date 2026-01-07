@@ -204,6 +204,8 @@ static int jwt_parse_claims(const char *payload_b64, struct kc_token_info *info)
 static char* json_build_user_representation(const char *username, const char *email, const char *passwd);
 static char* json_build_user_with_hash(const char *username, const char *email,
                                        const char *cred_data, const char *secret_data);
+static int json_read_kc_access_token(const char* response, struct access_token** token_out);
+static int json_read_kc_user(json_t* user_object, struct kc_user* user_out);
 
 /* Forward declaration for exit handler */
 static void keycloak_exit_handler(void *extra);
@@ -1309,7 +1311,9 @@ enum kc_async_type {
     KC_ASYNC_UPDATE_USER,   /* Update user representation (Phase 3) */
     KC_ASYNC_GET_GROUP_PATH,/* Get group by path (Phase 4) */
     KC_ASYNC_CREATE_SUBGROUP,/* Create subgroup (Phase 4) */
-    KC_ASYNC_SET_GROUP_ATTR /* Set group attribute (Phase 4) */
+    KC_ASYNC_SET_GROUP_ATTR, /* Set group attribute (Phase 4) */
+    KC_ASYNC_GET_GROUP_NAME, /* Get group by name (Phase 5 sync cleanup) */
+    KC_ASYNC_DELETE_GROUP    /* Delete group (Phase 5 sync cleanup) */
 };
 
 /* Async request tracking */
@@ -1335,6 +1339,8 @@ struct kc_async_request {
         kc_update_user_callback update_user;     /* Update user callback (Phase 3) */
         kc_get_group_path_callback get_group_path; /* Get group by path callback (Phase 4) */
         kc_create_subgroup_callback create_subgroup; /* Create subgroup callback (Phase 4) */
+        kc_get_group_path_callback get_group_name; /* Get group by name callback (reuses same signature) */
+        kc_async_callback delete_group; /* Delete group callback (simple result) */
     } cb;
     /* WebPush-specific: copy of binary POST data for async request */
     void *post_data_copy;
@@ -1999,6 +2005,63 @@ kc_curl_check_completed(void)
                 }
                 if (req->cb.generic) {
                     req->cb.generic(req->session, result);
+                }
+                break;
+            }
+            case KC_ASYNC_GET_GROUP_NAME: {
+                /* Parse group search results - returns array of groups */
+                int result = KC_ERROR;
+                char *group_id = NULL;
+
+                if (http_code == 200 && req->response.response) {
+                    json_error_t error;
+                    json_t *root = json_loads(req->response.response, 0, &error);
+                    if (root) {
+                        if (json_is_array(root) && json_array_size(root) > 0) {
+                            json_t *first_group = json_array_get(root, 0);
+                            json_t *id_val = json_object_get(first_group, "id");
+                            if (id_val && json_is_string(id_val)) {
+                                group_id = strdup(json_string_value(id_val));
+                                if (group_id) {
+                                    result = KC_SUCCESS;
+                                    log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async get_group_name: Found group ID %s", req_id, group_id);
+                                }
+                            }
+                        } else {
+                            result = KC_NOT_FOUND;
+                            log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async get_group_name: Group not found", req_id);
+                        }
+                        json_decref(root);
+                    } else {
+                        log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async get_group_name: JSON parse error: %s", req_id, error.text);
+                    }
+                } else if (http_code == 404) {
+                    result = KC_NOT_FOUND;
+                    log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async get_group_name: Not found (HTTP 404)", req_id);
+                } else {
+                    log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async get_group_name: Error (HTTP %ld)", req_id, http_code);
+                }
+                if (req->cb.get_group_name) {
+                    req->cb.get_group_name(req->session, result, group_id);
+                    /* Note: group_id ownership transferred to callback */
+                } else if (group_id) {
+                    free(group_id);
+                }
+                break;
+            }
+            case KC_ASYNC_DELETE_GROUP: {
+                int result = KC_ERROR;
+                if (http_code == 204 || http_code == 200) {
+                    result = KC_SUCCESS;
+                    log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async delete_group: Success (HTTP %ld)", req_id, http_code);
+                } else if (http_code == 404) {
+                    result = KC_NOT_FOUND;
+                    log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async delete_group: Not found (HTTP 404)", req_id);
+                } else {
+                    log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async delete_group: Error (HTTP %ld)", req_id, http_code);
+                }
+                if (req->cb.delete_group) {
+                    req->cb.delete_group(req->session, result);
                 }
                 break;
             }
@@ -6055,7 +6118,8 @@ keycloak_update_user_representation_async(struct kc_realm realm, struct kc_clien
     opts.method = HTTP_PUT;
     opts.xoauth2_bearer = client.access_token->access_token;
     opts.post_fields = json_body;
-    opts.content_type = "application/json";
+    opts.header_list[0] = "Content-Type: application/json";
+    opts.header_count = 1;
 
     if (curl_perform_async(req, opts) < 0) {
         log_module(KC_LOG, LOG_ERROR, "update_user_async: curl_perform_async failed");
@@ -6132,6 +6196,129 @@ error:
 }
 
 /*
+ * Phase 5 sync cleanup: Async get group by name
+ * Returns 0 on success (request started), -1 on error
+ */
+int
+keycloak_get_group_by_name_async(struct kc_realm realm, struct kc_client client,
+                                  const char *group_name, void *session,
+                                  kc_get_group_path_callback callback)
+{
+    struct kc_async_request *req = NULL;
+    char *escaped_name = NULL;
+
+    /* Validate inputs */
+    if (!realm.base_uri || !realm.realm || !client.access_token ||
+        !group_name || !callback) {
+        log_module(KC_LOG, LOG_DEBUG, "get_group_name_async: Invalid arguments");
+        return -1;
+    }
+
+    /* Allocate request structure */
+    req = calloc(1, sizeof(*req));
+    if (!req) {
+        log_module(KC_LOG, LOG_ERROR, "get_group_name_async: Out of memory");
+        return -1;
+    }
+    req->session = session;
+    req->type = KC_ASYNC_GET_GROUP_NAME;
+    req->cb.get_group_name = callback;
+
+    /* URL-escape the group name */
+    escaped_name = curl_easy_escape(NULL, group_name, 0);
+    if (!escaped_name) {
+        log_module(KC_LOG, LOG_ERROR, "get_group_name_async: Failed to escape group name");
+        goto error;
+    }
+
+    /* Build URI using endpoint builder */
+    req->uri = kc_build_group_search_endpoint(realm, escaped_name);
+    curl_free(escaped_name);
+    if (!req->uri) {
+        log_module(KC_LOG, LOG_ERROR, "get_group_name_async: Failed to build URI");
+        goto error;
+    }
+
+    /* Use unified async API */
+    struct curl_opts opts = CURL_OPTS_INIT;
+    opts.uri = req->uri;
+    opts.method = HTTP_GET;
+    opts.xoauth2_bearer = client.access_token->access_token;
+
+    if (curl_perform_async(req, opts) < 0) {
+        log_module(KC_LOG, LOG_ERROR, "get_group_name_async: curl_perform_async failed");
+        goto error;
+    }
+
+    log_module(KC_LOG, LOG_DEBUG, "get_group_name_async: Started async lookup for name %s", group_name);
+    return 0;
+
+error:
+    if (req) {
+        if (req->uri) free(req->uri);
+        free(req);
+    }
+    return -1;
+}
+
+/*
+ * Phase 5 sync cleanup: Async delete group
+ * Returns 0 on success (request started), -1 on error
+ */
+int
+keycloak_delete_group_async(struct kc_realm realm, struct kc_client client,
+                             const char *group_id, void *session,
+                             kc_async_callback callback)
+{
+    struct kc_async_request *req = NULL;
+
+    /* Validate inputs */
+    if (!realm.base_uri || !realm.realm || !client.access_token ||
+        !group_id || !callback) {
+        log_module(KC_LOG, LOG_DEBUG, "delete_group_async: Invalid arguments");
+        return -1;
+    }
+
+    /* Allocate request structure */
+    req = calloc(1, sizeof(*req));
+    if (!req) {
+        log_module(KC_LOG, LOG_ERROR, "delete_group_async: Out of memory");
+        return -1;
+    }
+    req->session = session;
+    req->type = KC_ASYNC_DELETE_GROUP;
+    req->cb.delete_group = callback;
+
+    /* Build URI: DELETE /admin/realms/{realm}/groups/{group_id} */
+    req->uri = kc_build_group_endpoint(realm, group_id);
+    if (!req->uri) {
+        log_module(KC_LOG, LOG_ERROR, "delete_group_async: Failed to build URI");
+        goto error;
+    }
+
+    /* Use unified async API */
+    struct curl_opts opts = CURL_OPTS_INIT;
+    opts.uri = req->uri;
+    opts.method = HTTP_DELETE;
+    opts.xoauth2_bearer = client.access_token->access_token;
+
+    if (curl_perform_async(req, opts) < 0) {
+        log_module(KC_LOG, LOG_ERROR, "delete_group_async: curl_perform_async failed");
+        goto error;
+    }
+
+    log_module(KC_LOG, LOG_DEBUG, "delete_group_async: Started async delete for group %s", group_id);
+    return 0;
+
+error:
+    if (req) {
+        if (req->uri) free(req->uri);
+        free(req);
+    }
+    return -1;
+}
+
+/*
  * Phase 4: Async create subgroup
  * Returns 0 on success (request started), -1 on error
  */
@@ -6184,7 +6371,8 @@ keycloak_create_subgroup_async(struct kc_realm realm, struct kc_client client,
     opts.method = HTTP_POST;
     opts.xoauth2_bearer = client.access_token->access_token;
     opts.post_fields = json_body;
-    opts.content_type = "application/json";
+    opts.header_list[0] = "Content-Type: application/json";
+    opts.header_count = 1;
 
     if (curl_perform_async(req, opts) < 0) {
         log_module(KC_LOG, LOG_ERROR, "create_subgroup_async: curl_perform_async failed");
@@ -6264,7 +6452,8 @@ keycloak_set_group_attribute_async(struct kc_realm realm, struct kc_client clien
     opts.method = HTTP_PUT;
     opts.xoauth2_bearer = client.access_token->access_token;
     opts.post_fields = json_body;
-    opts.content_type = "application/json";
+    opts.header_list[0] = "Content-Type: application/json";
+    opts.header_count = 1;
 
     if (curl_perform_async(req, opts) < 0) {
         log_module(KC_LOG, LOG_ERROR, "set_group_attr_async: curl_perform_async failed");
@@ -6282,6 +6471,284 @@ error:
         free(req);
     }
     return -1;
+}
+
+/*
+ * =============================================================================
+ * Token Manager Implementation (Phase 5 Integration)
+ * =============================================================================
+ * Centralized token management for all Keycloak operations.
+ */
+
+/* Token manager state */
+static struct {
+    int initialized;                       /* 1 if initialized */
+    struct kc_realm realm;                 /* Cached realm config */
+    struct kc_client client;               /* Cached client config */
+    struct access_token *token;            /* Cached admin token */
+    time_t token_expires;                  /* When token expires */
+    int refresh_pending;                   /* 1 if refresh in progress */
+    int available;                         /* Keycloak availability flag */
+} kc_token_mgr = {0};
+
+/* Token waiter queue for async operations */
+struct kc_token_waiter {
+    kc_token_callback callback;
+    void *context;
+    struct kc_token_waiter *next;
+};
+static struct kc_token_waiter *kc_token_waiters = NULL;
+static unsigned int kc_token_waiter_count = 0;
+
+/* Backpressure: max waiters queued during token refresh */
+#define KC_TOKEN_WAITER_LIMIT 100
+
+/* Forward declaration for refresh callback */
+static int kc_token_refresh_cb(void *session, int result, struct access_token *token);
+
+void
+keycloak_token_manager_init(struct kc_realm realm, struct kc_client client)
+{
+    if (kc_token_mgr.initialized) {
+        keycloak_token_manager_shutdown();
+    }
+
+    memset(&kc_token_mgr, 0, sizeof(kc_token_mgr));
+
+    /* Copy realm config - note: strings are borrowed, not owned */
+    kc_token_mgr.realm.base_uri = realm.base_uri;
+    kc_token_mgr.realm.realm = realm.realm;
+
+    /* Copy client config - note: strings are borrowed, not owned */
+    kc_token_mgr.client.client_id = client.client_id;
+    kc_token_mgr.client.client_secret = client.client_secret;
+    kc_token_mgr.client.access_token = NULL;
+
+    kc_token_mgr.available = 1;
+    kc_token_mgr.initialized = 1;
+
+    log_module(KC_LOG, LOG_DEBUG, "Token manager initialized for realm %s", realm.realm);
+}
+
+void
+keycloak_token_manager_shutdown(void)
+{
+    struct kc_token_waiter *waiter, *next;
+
+    if (!kc_token_mgr.initialized)
+        return;
+
+    /* Free cached token */
+    if (kc_token_mgr.token) {
+        keycloak_free_access_token(kc_token_mgr.token);
+        kc_token_mgr.token = NULL;
+    }
+
+    /* Free pending waiters */
+    for (waiter = kc_token_waiters; waiter; waiter = next) {
+        next = waiter->next;
+        /* Notify with error */
+        if (waiter->callback) {
+            waiter->callback(waiter->context, KC_ERROR, NULL);
+        }
+        free(waiter);
+    }
+    kc_token_waiters = NULL;
+    kc_token_waiter_count = 0;
+
+    kc_token_mgr.initialized = 0;
+    log_module(KC_LOG, LOG_DEBUG, "Token manager shutdown");
+}
+
+int
+keycloak_ensure_token(void)
+{
+    time_t now_time = time(NULL);
+
+    if (!kc_token_mgr.initialized) {
+        log_module(KC_LOG, LOG_ERROR, "keycloak_ensure_token: Token manager not initialized");
+        return KC_ERROR;
+    }
+
+    /* Check if token is still valid (with 60s margin) */
+    if (kc_token_mgr.token && kc_token_mgr.token_expires > (now_time + 60)) {
+        kc_token_mgr.client.access_token = kc_token_mgr.token;
+        return KC_SUCCESS;
+    }
+
+    /* Free old token if exists */
+    if (kc_token_mgr.token) {
+        keycloak_free_access_token(kc_token_mgr.token);
+        kc_token_mgr.token = NULL;
+        kc_token_mgr.client.access_token = NULL;
+    }
+
+    /* Get new token synchronously */
+    int rc = keycloak_get_client_token(kc_token_mgr.realm, kc_token_mgr.client,
+                                        &kc_token_mgr.token);
+    if (rc != KC_SUCCESS) {
+        kc_token_mgr.available = 0;
+        return rc;
+    }
+
+    kc_token_mgr.available = 1;
+    kc_token_mgr.client.access_token = kc_token_mgr.token;
+    kc_token_mgr.token_expires = now_time + kc_token_mgr.token->expires_in;
+    return KC_SUCCESS;
+}
+
+/* Notify all waiters that token refresh completed */
+static void
+kc_notify_waiters(int result, struct access_token *token)
+{
+    struct kc_token_waiter *waiter, *next;
+
+    kc_token_mgr.refresh_pending = 0;
+
+    waiter = kc_token_waiters;
+    kc_token_waiters = NULL;
+    kc_token_waiter_count = 0;
+
+    while (waiter) {
+        next = waiter->next;
+        if (waiter->callback) {
+            waiter->callback(waiter->context, result, token);
+        }
+        free(waiter);
+        waiter = next;
+    }
+}
+
+/* Callback from async token refresh */
+static int
+kc_token_refresh_cb(void *session, int result, struct access_token *token)
+{
+    (void)session;
+
+    if (result == KC_SUCCESS && token) {
+        /* Update cached token */
+        if (kc_token_mgr.token) {
+            keycloak_free_access_token(kc_token_mgr.token);
+        }
+        kc_token_mgr.token = token;
+        kc_token_mgr.client.access_token = token;
+        kc_token_mgr.token_expires = time(NULL) + token->expires_in;
+        kc_token_mgr.available = 1;
+        log_module(KC_LOG, LOG_DEBUG, "Async token refresh successful (expires in %ld sec)",
+                   token->expires_in);
+    } else {
+        kc_token_mgr.available = 0;
+        log_module(KC_LOG, LOG_WARNING, "Async token refresh failed: %d", result);
+    }
+
+    /* Notify all waiters */
+    kc_notify_waiters(result, result == KC_SUCCESS ? kc_token_mgr.token : NULL);
+    return 0;
+}
+
+int
+keycloak_ensure_token_async(kc_token_callback callback, void *ctx)
+{
+    time_t now_time = time(NULL);
+    struct kc_token_waiter *waiter;
+
+    if (!kc_token_mgr.initialized) {
+        log_module(KC_LOG, LOG_ERROR, "keycloak_ensure_token_async: Token manager not initialized");
+        return -1;
+    }
+
+    if (!callback) {
+        log_module(KC_LOG, LOG_ERROR, "keycloak_ensure_token_async: No callback");
+        return -1;
+    }
+
+    /* Check if token is still valid (with 60s margin) */
+    if (kc_token_mgr.token && kc_token_mgr.token_expires > (now_time + 60)) {
+        kc_token_mgr.client.access_token = kc_token_mgr.token;
+        /* Token valid - invoke callback immediately */
+        callback(ctx, KC_SUCCESS, kc_token_mgr.token);
+        return 1;
+    }
+
+    /* Backpressure: reject if waiter queue is full */
+    if (kc_token_waiter_count >= KC_TOKEN_WAITER_LIMIT) {
+        log_module(KC_LOG, LOG_WARNING, "keycloak_ensure_token_async: Waiter queue full (%u/%u)",
+                   kc_token_waiter_count, KC_TOKEN_WAITER_LIMIT);
+        return -1;
+    }
+
+    /* Token needs refresh - add to waiter queue */
+    waiter = calloc(1, sizeof(*waiter));
+    if (!waiter) {
+        log_module(KC_LOG, LOG_ERROR, "keycloak_ensure_token_async: Out of memory");
+        return -1;
+    }
+    waiter->callback = callback;
+    waiter->context = ctx;
+    waiter->next = kc_token_waiters;
+    kc_token_waiters = waiter;
+    kc_token_waiter_count++;
+
+    /* If refresh not already in progress, start it */
+    if (!kc_token_mgr.refresh_pending) {
+        kc_token_mgr.refresh_pending = 1;
+
+        /* Free old token before refresh */
+        if (kc_token_mgr.token) {
+            keycloak_free_access_token(kc_token_mgr.token);
+            kc_token_mgr.token = NULL;
+            kc_token_mgr.client.access_token = NULL;
+        }
+
+        if (keycloak_get_client_token_async(kc_token_mgr.realm, kc_token_mgr.client,
+                                             NULL, kc_token_refresh_cb) < 0) {
+            log_module(KC_LOG, LOG_ERROR, "keycloak_ensure_token_async: Failed to start refresh");
+            /* Remove the waiter we just added and fail */
+            kc_token_waiters = waiter->next;
+            kc_token_waiter_count--;
+            free(waiter);
+            kc_token_mgr.refresh_pending = 0;
+            return -1;
+        }
+
+        log_module(KC_LOG, LOG_DEBUG, "keycloak_ensure_token_async: Started async refresh");
+    } else {
+        log_module(KC_LOG, LOG_DEBUG, "keycloak_ensure_token_async: Refresh pending, queued waiter");
+    }
+
+    return 0;
+}
+
+struct access_token *
+keycloak_get_cached_token(void)
+{
+    return kc_token_mgr.token;
+}
+
+struct kc_client
+keycloak_get_authed_client(void)
+{
+    struct kc_client client = kc_token_mgr.client;
+    client.access_token = kc_token_mgr.token;
+    return client;
+}
+
+struct kc_realm
+keycloak_get_realm(void)
+{
+    return kc_token_mgr.realm;
+}
+
+void
+keycloak_set_available(int available)
+{
+    kc_token_mgr.available = available;
+}
+
+int
+keycloak_is_available(void)
+{
+    return kc_token_mgr.available;
 }
 
 #endif /* WITH_KEYCLOAK */

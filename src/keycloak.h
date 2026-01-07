@@ -935,6 +935,129 @@ int keycloak_set_group_attribute_async(struct kc_realm realm, struct kc_client c
                                         const char *attr_value, void *session,
                                         kc_async_callback callback);
 
+/**
+ * Get a group by name asynchronously. (Phase 5 sync cleanup)
+ * Searches for a group by exact name match and returns its UUID.
+ * Uses the same callback signature as keycloak_get_group_by_path_async().
+ *
+ * @param realm       Keycloak realm configuration
+ * @param client      Client with admin access token
+ * @param group_name  Group name to search for
+ * @param session     Opaque session pointer (passed to callback)
+ * @param callback    Function to call when lookup completes
+ * @return 0 on success (request started), -1 on error
+ */
+int keycloak_get_group_by_name_async(struct kc_realm realm, struct kc_client client,
+                                      const char *group_name, void *session,
+                                      kc_get_group_path_callback callback);
+
+/**
+ * Delete a group asynchronously. (Phase 5 sync cleanup)
+ * Removes the group from Keycloak.
+ *
+ * @param realm       Keycloak realm configuration
+ * @param client      Client with admin access token
+ * @param group_id    Group UUID to delete
+ * @param session     Opaque session pointer (passed to callback)
+ * @param callback    Function to call when deletion completes
+ * @return 0 on success (request started), -1 on error
+ */
+int keycloak_delete_group_async(struct kc_realm realm, struct kc_client client,
+                                 const char *group_id, void *session,
+                                 kc_async_callback callback);
+
+/*
+ * =============================================================================
+ * Token Manager API (Phase 5 Integration)
+ * =============================================================================
+ * Centralized token management for all Keycloak operations.
+ * Call keycloak_token_manager_init() once at startup, then use
+ * keycloak_ensure_token*() before operations that need authentication.
+ */
+
+/**
+ * Callback type for async token operations.
+ * @param ctx    Opaque context pointer
+ * @param result KC_SUCCESS on success, error code on failure
+ * @param token  The access token (valid only on success)
+ */
+typedef void (*kc_token_callback)(void *ctx, int result, struct access_token *token);
+
+/**
+ * Initialize the token manager with Keycloak configuration.
+ * Must be called before using any token management functions.
+ *
+ * @param realm  Keycloak realm configuration (copied internally)
+ * @param client Client credentials (client_id, client_secret) - copied internally
+ */
+void keycloak_token_manager_init(struct kc_realm realm, struct kc_client client);
+
+/**
+ * Shutdown the token manager and free resources.
+ * Call during service shutdown.
+ */
+void keycloak_token_manager_shutdown(void);
+
+/**
+ * Ensure a valid admin token is available (synchronous).
+ * Refreshes token if expired or about to expire.
+ *
+ * @return KC_SUCCESS if token is valid, error code otherwise
+ */
+int keycloak_ensure_token(void);
+
+/**
+ * Ensure a valid admin token is available (asynchronous).
+ * If token is valid, callback is invoked immediately with KC_SUCCESS.
+ * If refresh is needed, callback is queued and invoked when refresh completes.
+ *
+ * @param callback Function to call when token is ready
+ * @param ctx      Opaque context passed to callback
+ * @return  1 = token valid, callback called immediately
+ *          0 = refresh started/pending, callback will be called later
+ *         -1 = error (invalid args, OOM, or refresh start failed)
+ */
+int keycloak_ensure_token_async(kc_token_callback callback, void *ctx);
+
+/**
+ * Get the current cached access token.
+ * May be NULL if no token has been acquired yet.
+ * Do not free the returned pointer - it's managed by the token manager.
+ *
+ * @return Current access token or NULL
+ */
+struct access_token *keycloak_get_cached_token(void);
+
+/**
+ * Get a client config struct with the current access token set.
+ * Useful for passing to keycloak_*_async() functions.
+ *
+ * @return Client config with access_token populated
+ */
+struct kc_client keycloak_get_authed_client(void);
+
+/**
+ * Get the configured realm.
+ *
+ * @return Realm configuration
+ */
+struct kc_realm keycloak_get_realm(void);
+
+/**
+ * Set Keycloak availability flag.
+ * Used to track when Keycloak is unreachable.
+ *
+ * @param available 1 if available, 0 if unavailable
+ */
+void keycloak_set_available(int available);
+
+/**
+ * Check if Keycloak is currently available.
+ *
+ * @return 1 if available, 0 if unavailable
+ */
+int keycloak_is_available(void);
+
 #endif /* WITH_KEYCLOAK */
 
 #endif /* KEYCLOAK_H */

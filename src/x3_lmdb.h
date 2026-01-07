@@ -20,6 +20,15 @@ enum lmdb_error {
     LMDB_EXPIRED = -4   /* Entry found but expired (auto-deleted) */
 };
 
+/* Channel sync metadata structure - always defined for use in code */
+struct lmdb_chansync_meta {
+    uint64_t membership_hash;     /* Hash of last known membership (for incremental sync) */
+    time_t last_sync;             /* When this channel was last synced */
+    int consecutive_failures;     /* For exponential backoff */
+    time_t next_allowed_sync;     /* Don't retry before this time */
+    int last_entry_count;         /* Number of entries in last sync */
+};
+
 #ifdef WITH_LMDB
 
 #include <lmdb.h>
@@ -363,14 +372,8 @@ void x3_lmdb_free_chanaccess_entries(struct lmdb_chanaccess_entry *entries);
 /* Key prefix for channel sync metadata */
 #define LMDB_PREFIX_CHANSYNC "kcsyncmeta:"
 
-/* Channel sync metadata structure - persists across restarts */
-struct lmdb_chansync_meta {
-    uint64_t membership_hash;     /* Hash of last known membership (for incremental sync) */
-    time_t last_sync;             /* When this channel was last synced */
-    int consecutive_failures;     /* For exponential backoff */
-    time_t next_allowed_sync;     /* Don't retry before this time */
-    int last_entry_count;         /* Number of entries in last sync */
-};
+/* Note: struct lmdb_chansync_meta is defined at the top of this header,
+ * outside #ifdef WITH_LMDB, so code can use the struct even without LMDB */
 
 /**
  * Get channel sync metadata

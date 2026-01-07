@@ -129,7 +129,7 @@ am_x3_OBJECTS = base64.$(OBJEXT) chanserv.$(OBJEXT) compat.$(OBJEXT) \
 	saxdb.$(OBJEXT) spamserv.$(OBJEXT) shun.$(OBJEXT) \
 	timeq.$(OBJEXT) tools.$(OBJEXT) x3ldap.$(OBJEXT) \
 	x3_ssl.$(OBJEXT) x3_compress.$(OBJEXT) webpush.$(OBJEXT) \
-	version.$(OBJEXT)
+	mempool.$(OBJEXT) threadpool.$(OBJEXT) version.$(OBJEXT)
 x3_OBJECTS = $(am_x3_OBJECTS)
 AM_V_P = $(am__v_P_@AM_V@)
 am__v_P_ = $(am__v_P_@AM_DEFAULT_V@)
@@ -161,7 +161,8 @@ am__depfiles_remade = ./$(DEPDIR)/alloc-slab.Po \
 	./$(DEPDIR)/log.Po ./$(DEPDIR)/mail-common.Po \
 	./$(DEPDIR)/mail-sendmail.Po ./$(DEPDIR)/main-common.Po \
 	./$(DEPDIR)/main.Po ./$(DEPDIR)/math.Po ./$(DEPDIR)/md5.Po \
-	./$(DEPDIR)/mod-blacklist.Po ./$(DEPDIR)/mod-helpserv.Po \
+	./$(DEPDIR)/mempool.Po ./$(DEPDIR)/mod-blacklist.Po \
+	./$(DEPDIR)/mod-helpserv.Po ./$(DEPDIR)/mod-histserv.Po \
 	./$(DEPDIR)/mod-memoserv.Po ./$(DEPDIR)/mod-python.Po \
 	./$(DEPDIR)/mod-qserver.Po ./$(DEPDIR)/mod-snoop.Po \
 	./$(DEPDIR)/mod-sockcheck.Po ./$(DEPDIR)/mod-track.Po \
@@ -172,10 +173,11 @@ am__depfiles_remade = ./$(DEPDIR)/alloc-slab.Po \
 	./$(DEPDIR)/proto-p10.Po ./$(DEPDIR)/recdb.Po \
 	./$(DEPDIR)/sar.Po ./$(DEPDIR)/saxdb.Po ./$(DEPDIR)/shun.Po \
 	./$(DEPDIR)/slab-read.Po ./$(DEPDIR)/spamserv.Po \
-	./$(DEPDIR)/timeq.Po ./$(DEPDIR)/tools.Po \
-	./$(DEPDIR)/version.Po ./$(DEPDIR)/webpush.Po \
-	./$(DEPDIR)/x3_compress.Po ./$(DEPDIR)/x3_lmdb.Po \
-	./$(DEPDIR)/x3_ssl.Po ./$(DEPDIR)/x3ldap.Po
+	./$(DEPDIR)/threadpool.Po ./$(DEPDIR)/timeq.Po \
+	./$(DEPDIR)/tools.Po ./$(DEPDIR)/version.Po \
+	./$(DEPDIR)/webpush.Po ./$(DEPDIR)/x3_compress.Po \
+	./$(DEPDIR)/x3_lmdb.Po ./$(DEPDIR)/x3_ssl.Po \
+	./$(DEPDIR)/x3ldap.Po
 am__mv = mv -f
 COMPILE = $(CC) $(DEFS) $(DEFAULT_INCLUDES) $(INCLUDES) $(AM_CPPFLAGS) \
 	$(CPPFLAGS) $(AM_CFLAGS) $(CFLAGS)
@@ -374,6 +376,7 @@ EXTRA_x3_SOURCES = \
 	mod-snoop.c \
 	mod-track.c \
 	mod-memoserv.c \
+	mod-histserv.c \
 	mod-helpserv.c \
 	mod-sockcheck.c \
 	mod-webtv.c \
@@ -423,6 +426,8 @@ x3_SOURCES = \
 	x3_ssl.c x3_ssl.h \
 	x3_compress.c x3_compress.h \
 	webpush.c webpush.h \
+	mempool.c mempool.h \
+	threadpool.c threadpool.h \
 	version.c version.h
 
 checkdb_SOURCES = checkdb.c common.h compat.c compat.h dict-splay.c dict.h recdb.c recdb.h saxdb.c saxdb.h tools.c conf.h log.h modcmd.h saxdb.h timeq.h
@@ -533,8 +538,10 @@ distclean-compile:
 @AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/main.Po@am__quote@ # am--include-marker
 @AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/math.Po@am__quote@ # am--include-marker
 @AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/md5.Po@am__quote@ # am--include-marker
+@AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/mempool.Po@am__quote@ # am--include-marker
 @AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/mod-blacklist.Po@am__quote@ # am--include-marker
 @AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/mod-helpserv.Po@am__quote@ # am--include-marker
+@AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/mod-histserv.Po@am__quote@ # am--include-marker
 @AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/mod-memoserv.Po@am__quote@ # am--include-marker
 @AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/mod-python.Po@am__quote@ # am--include-marker
 @AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/mod-qserver.Po@am__quote@ # am--include-marker
@@ -556,6 +563,7 @@ distclean-compile:
 @AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/shun.Po@am__quote@ # am--include-marker
 @AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/slab-read.Po@am__quote@ # am--include-marker
 @AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/spamserv.Po@am__quote@ # am--include-marker
+@AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/threadpool.Po@am__quote@ # am--include-marker
 @AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/timeq.Po@am__quote@ # am--include-marker
 @AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/tools.Po@am__quote@ # am--include-marker
 @AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/version.Po@am__quote@ # am--include-marker
@@ -738,8 +746,10 @@ distclean: distclean-am
 	-rm -f ./$(DEPDIR)/main.Po
 	-rm -f ./$(DEPDIR)/math.Po
 	-rm -f ./$(DEPDIR)/md5.Po
+	-rm -f ./$(DEPDIR)/mempool.Po
 	-rm -f ./$(DEPDIR)/mod-blacklist.Po
 	-rm -f ./$(DEPDIR)/mod-helpserv.Po
+	-rm -f ./$(DEPDIR)/mod-histserv.Po
 	-rm -f ./$(DEPDIR)/mod-memoserv.Po
 	-rm -f ./$(DEPDIR)/mod-python.Po
 	-rm -f ./$(DEPDIR)/mod-qserver.Po
@@ -761,6 +771,7 @@ distclean: distclean-am
 	-rm -f ./$(DEPDIR)/shun.Po
 	-rm -f ./$(DEPDIR)/slab-read.Po
 	-rm -f ./$(DEPDIR)/spamserv.Po
+	-rm -f ./$(DEPDIR)/threadpool.Po
 	-rm -f ./$(DEPDIR)/timeq.Po
 	-rm -f ./$(DEPDIR)/tools.Po
 	-rm -f ./$(DEPDIR)/version.Po
@@ -844,8 +855,10 @@ maintainer-clean: maintainer-clean-am
 	-rm -f ./$(DEPDIR)/main.Po
 	-rm -f ./$(DEPDIR)/math.Po
 	-rm -f ./$(DEPDIR)/md5.Po
+	-rm -f ./$(DEPDIR)/mempool.Po
 	-rm -f ./$(DEPDIR)/mod-blacklist.Po
 	-rm -f ./$(DEPDIR)/mod-helpserv.Po
+	-rm -f ./$(DEPDIR)/mod-histserv.Po
 	-rm -f ./$(DEPDIR)/mod-memoserv.Po
 	-rm -f ./$(DEPDIR)/mod-python.Po
 	-rm -f ./$(DEPDIR)/mod-qserver.Po
@@ -867,6 +880,7 @@ maintainer-clean: maintainer-clean-am
 	-rm -f ./$(DEPDIR)/shun.Po
 	-rm -f ./$(DEPDIR)/slab-read.Po
 	-rm -f ./$(DEPDIR)/spamserv.Po
+	-rm -f ./$(DEPDIR)/threadpool.Po
 	-rm -f ./$(DEPDIR)/timeq.Po
 	-rm -f ./$(DEPDIR)/tools.Po
 	-rm -f ./$(DEPDIR)/version.Po
