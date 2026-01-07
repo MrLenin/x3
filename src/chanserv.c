@@ -713,6 +713,13 @@ static struct
 #define KC_MAX_FAILURES_TRACKED 10
 
 /* Sync state structure - persists across batches */
+/* Pending sync entry - for channels queued during batch */
+struct kc_pending_sync {
+    char channel[CHANNELLEN+1];
+    int priority;
+    struct kc_pending_sync *next;
+};
+
 struct kc_sync_state {
     struct chanData **queue;      /* Sorted channel queue */
     int queue_size;               /* Total channels to sync */
@@ -730,6 +737,10 @@ struct kc_sync_state {
         char channel[CHANNELLEN+1];
         int error_code;
     } failures[KC_MAX_FAILURES_TRACKED];
+    /* Pending syncs - channels queued while batch was running */
+    struct kc_pending_sync *pending_head;
+    struct kc_pending_sync *pending_tail;
+    int pending_count;
 };
 
 /* Global sync state */
@@ -957,9 +968,10 @@ unsigned int chanserv_read_version = 0; /* db version control */
 static struct userData *add_channel_user(struct chanData *channel, struct handle_info *handle, unsigned short access_level, time_t seen, const char *info, time_t accessexpiry);
 
 #ifdef WITH_KEYCLOAK
-/* Forward declarations for Keycloak bidirectional sync */
+/* Forward declarations for Keycloak sync functions */
 static int chanserv_push_keycloak_access(const char *channel, const char *username, unsigned short access);
 static int chanserv_delete_keycloak_channel(const char *channel);
+static void chanserv_sync_keycloak_access(void *data);
 #endif
 
 void sputsock(const char *text, ...) PRINTF_LIKE(1, 2);
@@ -11253,7 +11265,7 @@ kc_sync_priority_cmp(const void *a, const void *b)
 }
 
 /**
- * Free sync queue resources
+ * Free sync queue resources (batch queue only, not pending)
  */
 static void
 kc_sync_cleanup(void)
@@ -11266,6 +11278,53 @@ kc_sync_cleanup(void)
     kc_sync.queue_alloc = 0;
     kc_sync.current_index = 0;
     kc_sync.in_progress = 0;
+}
+
+/**
+ * Process pending syncs queued during batch
+ * Called after batch cleanup when no sync is in progress
+ */
+static void
+kc_sync_process_pending(void)
+{
+    struct kc_pending_sync *pending, *next;
+    int processed = 0, success = 0, failed = 0;
+
+    if (!kc_sync.pending_head) {
+        return;
+    }
+
+    log_module(CS_LOG, LOG_INFO, "Processing %d pending webhook syncs",
+               kc_sync.pending_count);
+
+    /* Process each pending sync */
+    for (pending = kc_sync.pending_head; pending; pending = next) {
+        next = pending->next;
+
+        int synced = chanserv_sync_keycloak_channel(pending->channel);
+        processed++;
+
+        if (synced >= 0) {
+            success++;
+            kc_stats.successful_syncs++;
+            kc_stats.total_entries += synced;
+            log_module(CS_LOG, LOG_DEBUG, "Pending sync of %s: %d entries",
+                       pending->channel, synced);
+        } else {
+            failed++;
+            kc_stats.failed_syncs++;
+            log_module(CS_LOG, LOG_WARNING, "Pending sync of %s failed",
+                       pending->channel);
+        }
+
+        free(pending);
+    }
+
+    kc_sync.pending_head = kc_sync.pending_tail = NULL;
+    kc_sync.pending_count = 0;
+
+    log_module(CS_LOG, LOG_INFO, "Pending syncs complete: %d processed, %d success, %d failed",
+               processed, success, failed);
 }
 
 /**
@@ -11303,6 +11362,9 @@ kc_sync_complete(void)
     }
 
     kc_sync_cleanup();
+
+    /* Process any pending webhook syncs that were queued during batch */
+    kc_sync_process_pending();
 
     /* Schedule next sync if configured */
     if (chanserv_conf.keycloak_sync_frequency > 0) {
@@ -11592,14 +11654,52 @@ chanserv_queue_keycloak_sync(const char *channel, int priority)
         return synced >= 0 ? 0 : -1;
     }
 
-    /* TODO: For lower priorities, add to a priority queue
-     * For now, just do immediate sync if possible */
+    /* For HIGH priority during batch, add to pending queue */
+    if (kc_sync.in_progress && priority >= KC_SYNC_PRIORITY_HIGH) {
+        struct kc_pending_sync *pending;
+
+        /* Check if already in pending queue */
+        for (pending = kc_sync.pending_head; pending; pending = pending->next) {
+            if (strcasecmp(pending->channel, channel) == 0) {
+                /* Update priority if higher */
+                if (priority > pending->priority)
+                    pending->priority = priority;
+                log_module(CS_LOG, LOG_DEBUG, "Channel %s already in pending queue (priority %d)", channel, pending->priority);
+                return 0;
+            }
+        }
+
+        /* Add to pending queue */
+        pending = malloc(sizeof(*pending));
+        if (!pending) {
+            log_module(CS_LOG, LOG_ERROR, "Failed to allocate pending sync entry");
+            return -1;
+        }
+        strncpy(pending->channel, channel, CHANNELLEN);
+        pending->channel[CHANNELLEN] = '\0';
+        pending->priority = priority;
+        pending->next = NULL;
+
+        if (kc_sync.pending_tail) {
+            kc_sync.pending_tail->next = pending;
+            kc_sync.pending_tail = pending;
+        } else {
+            kc_sync.pending_head = kc_sync.pending_tail = pending;
+        }
+        kc_sync.pending_count++;
+
+        log_module(CS_LOG, LOG_DEBUG, "Queued %s for post-batch sync (priority %d, %d pending)",
+                   channel, priority, kc_sync.pending_count);
+        return 0;
+    }
+
+    /* For lower priorities without batch running, sync immediately */
     if (!kc_sync.in_progress) {
         int synced = chanserv_sync_keycloak_channel(channel);
         return synced >= 0 ? 0 : -1;
     }
 
-    /* A batch sync is in progress - the channel will be synced as part of it */
+    /* NORMAL/LOW priority during batch - will be covered by ongoing batch */
     log_module(CS_LOG, LOG_DEBUG, "Batch sync in progress, %s will be synced in current cycle", channel);
     return 0;
 }
@@ -11706,6 +11806,10 @@ chanserv_kcsync_abort(void)
 
     log_module(CS_LOG, LOG_INFO, "Keycloak sync aborted by operator");
     kc_sync_cleanup();
+
+    /* Still process any pending webhook syncs */
+    kc_sync_process_pending();
+
     return 0;
 }
 
