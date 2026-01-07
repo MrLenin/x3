@@ -855,7 +855,7 @@ svccmd_send_help_brief(struct userNode *user, struct userNode *bot, struct svccm
     return r;
 }
 
-int is_joiner(struct svccmd *cmd)
+static int is_joiner(struct svccmd *cmd)
 {
     if(cmd->command->name)
     {
@@ -984,7 +984,7 @@ svccmd_invoke(struct userNode *user, struct service *service, struct chanNode *c
     return argc ? svccmd_invoke_argv(user, service, channel, argc, argv, server_qualified) : 0;
 }
 
-void
+static void
 modcmd_privmsg(struct userNode *user, struct userNode *bot, const char *text, int server_qualified) {
     struct service *service;
 
@@ -1046,7 +1046,7 @@ modcmd_privmsg(struct userNode *user, struct userNode *bot, const char *text, in
     svccmd_invoke(user, service, NULL, text, server_qualified, 0);
 }
 
-void
+static void
 modcmd_chanmsg(struct userNode *user, struct chanNode *chan, const char *text, struct userNode *bot, unsigned int is_notice, UNUSED_ARG(void *extra)) {
     struct service *service;
     if (!(service = dict_find(services, bot->nick, NULL)))
@@ -2094,7 +2094,7 @@ static MODCMD_FUNC(cmd_tell) {
     return 1;
 }
 
-void
+static void
 modcmd_nick_change(struct userNode *user, const char *old_nick, UNUSED_ARG(void *extra)) {
     struct service *svc;
     if (!(svc = dict_find(services, old_nick, NULL)))
@@ -2103,7 +2103,7 @@ modcmd_nick_change(struct userNode *user, const char *old_nick, UNUSED_ARG(void 
     dict_insert(services, user->nick, svc);
 }
 
-void
+static void
 modcmd_cleanup(UNUSED_ARG(void* extra)) {
     dict_delete(services);
     dict_delete(modules);
@@ -2589,7 +2589,7 @@ create_default_binds(int rebind) {
 }
 
 static void
-import_aliases_db() {
+import_aliases_db(void) {
     struct dict *db;
     dict_iterator_t it, it2;
     struct record_data *rd, *rd2;

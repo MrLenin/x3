@@ -65,7 +65,7 @@
 
 #include "main-common.c"
 
-void sigaction_writedb(int x)
+static void sigaction_writedb(int x)
 {
 #ifndef HAVE_STRSIGNAL
     log_module(MAIN_LOG, LOG_INFO, "Signal %d -- writing databases.", x);
@@ -75,7 +75,7 @@ void sigaction_writedb(int x)
     do_write_dbs = 1;
 }
 
-void sigaction_exit(int x)
+static void sigaction_exit(int x)
 {
 #ifndef HAVE_STRSIGNAL
     log_module(MAIN_LOG, LOG_INFO, "Signal %d -- exiting.", x);
@@ -86,13 +86,13 @@ void sigaction_exit(int x)
     quit_services = 1;
 }
 
-void sigaction_wait(UNUSED_ARG(int x))
+static void sigaction_wait(UNUSED_ARG(int x))
 {
     int code;
     wait4(-1, &code, WNOHANG, NULL);
 }
 
-void sigaction_rehash(int x)
+static void sigaction_rehash(int x)
 {
 #ifndef HAVE_STRSIGNAL
     log_module(MAIN_LOG, LOG_INFO, "Signal %d -- rehashing.", x);

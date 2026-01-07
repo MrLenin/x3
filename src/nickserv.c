@@ -1533,7 +1533,7 @@ nickserv_bake_cookie(struct handle_cookie *cookie)
 /* Since this gets used in a URL, we want to avoid stuff that confuses
  * email clients such as ] and ?. a-z, 0-9 only.
  */
-void genpass(char *str, int len)
+static void genpass(char *str, int len)
 {
         int i = 0;
         char c = 0;
@@ -2438,7 +2438,7 @@ reg_failpw_func(failpw_func_t func, void *extra)
 /*
  * Return hi for the first handle that has a matching SSL fingerprint.
  */
-struct handle_info *find_handleinfo_by_sslfp(char *sslfp)
+static struct handle_info *find_handleinfo_by_sslfp(char *sslfp)
 {
     dict_iterator_t it;
     struct handle_info *hi;
@@ -4803,7 +4803,7 @@ static OPTION_FUNC(opt_title)
     return 1;
 }
 
-int 
+static int
 check_vhost(char *vhost, struct userNode *user, struct svccmd *cmd) 
 {
     unsigned int y;
@@ -10273,7 +10273,7 @@ new_user_event(struct userNode *user, void *extra) {
     return check_user_nick(user, extra);
 }
 
-void
+static void
 handle_account(struct userNode *user, const char *stamp)
 {
     struct handle_info *hi;
@@ -10343,7 +10343,7 @@ ctime(&hi->registered));
     }
 }
 
-void
+static void
 handle_nick_change(struct userNode *user, const char *old_nick, UNUSED_ARG(void *extra))
 {
     struct handle_info *hi;
@@ -10356,7 +10356,7 @@ handle_nick_change(struct userNode *user, const char *old_nick, UNUSED_ARG(void 
     check_user_nick(user, NULL);
 }
 
-void
+static void
 nickserv_remove_user(struct userNode *user, UNUSED_ARG(struct userNode *killer), UNUSED_ARG(const char *why), UNUSED_ARG(void *extra))
 {
     dict_remove(nickserv_allow_auth_dict, user->nick);
@@ -11199,7 +11199,7 @@ cache_fpfail(const char *fingerprint)
 }
 #endif /* WITH_LMDB */
 
-void
+static void
 sasl_delete_session(struct SASLSession *session)
 {
     if (!session)
@@ -11254,7 +11254,7 @@ sasl_delete_session(struct SASLSession *session)
 /* Flag indicating stale check timer is running (started at init, runs forever) */
 static int sasl_stale_timer_running = 0;
 
-void
+static void
 sasl_delete_stale(UNUSED_ARG(void *data))
 {
     int delcount = 0;
@@ -11293,7 +11293,7 @@ sasl_delete_stale(UNUSED_ARG(void *data))
     timeq_add(now + SASL_STALE_CHECK_INTERVAL, sasl_delete_stale, NULL);
 }
 
-struct SASLSession*
+static struct SASLSession*
 sasl_get_session(const char *uid)
 {
     struct SASLSession *sess;
@@ -11841,7 +11841,7 @@ sasl_async_introspect_callback(void *ctx_ptr, int result, struct kc_token_info *
 #endif /* WITH_KEYCLOAK */
 
 /* Returns 1 if session was deleted, 0 if still valid */
-int
+static int
 sasl_packet(struct SASLSession *session)
 {
     log_module(NS_LOG, LOG_DEBUG, "SASL: Got packet containing: %s", session->buf);
@@ -12723,7 +12723,7 @@ sasl_packet(struct SASLSession *session)
     return 0;  /* Session still valid */
 }
 
-void
+static void
 handle_sasl_input(struct server* source ,const char *uid, const char *subcmd, const char *data, const char *ext, UNUSED_ARG(void *extra))
 {
     struct SASLSession* sess;
@@ -12878,7 +12878,7 @@ nickserv_db_cleanup(UNUSED_ARG(void* extra))
         regfree(&nickserv_conf.valid_nick_regex);
 }
 
-void handle_loc_auth_oper(struct userNode *user, UNUSED_ARG(struct handle_info *old_handle), UNUSED_ARG(void *extra)) {
+static void handle_loc_auth_oper(struct userNode *user, UNUSED_ARG(struct handle_info *old_handle), UNUSED_ARG(void *extra)) {
     char *privv[MAXNUMPARAMS];
     int privc, i;
 

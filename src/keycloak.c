@@ -211,7 +211,7 @@ static int json_read_kc_user(json_t* user_object, struct kc_user* user_out);
 static void keycloak_exit_handler(void *extra);
 
 void
-init_keycloak()
+init_keycloak(void)
 {
     KC_LOG = log_register_type("keycloak", "file:keycloak.log");
 
@@ -241,7 +241,7 @@ keycloak_exit_handler(UNUSED_ARG(void *extra))
 static void kc_async_cleanup(void);
 
 void
-cleanup_keycloak()
+cleanup_keycloak(void)
 {
     /* Cleanup async infrastructure first */
     kc_async_cleanup();
@@ -874,7 +874,7 @@ struct curl_opts {
  * Usage: AUTO_CLEANUP_RESPONSE struct memory chunk = {0};
  *        // chunk.response will be freed automatically when scope ends
  */
-static void memory_struct_cleanup(struct memory *mem) {
+static void __attribute__((unused)) memory_struct_cleanup(struct memory *mem) {
     if (mem && mem->response) {
         free(mem->response);
         mem->response = NULL;
@@ -886,7 +886,7 @@ static void memory_struct_cleanup(struct memory *mem) {
 #define AUTO_CLEANUP_RESPONSE __attribute__((cleanup(memory_struct_cleanup)))
 
 /* For sensitive data that should be zeroed before free */
-static void memory_secure_cleanup(struct memory *mem) {
+static void __attribute__((unused)) memory_secure_cleanup(struct memory *mem) {
     if (mem && mem->response) {
         memset(mem->response, 0, mem->size);
         free(mem->response);
@@ -899,7 +899,7 @@ static void memory_secure_cleanup(struct memory *mem) {
 #define AUTO_CLEANUP_RESPONSE_SECURE __attribute__((cleanup(memory_secure_cleanup)))
 
 /* Auto-cleanup for allocated strings (uri, json_body, etc.) */
-static void string_cleanup(char **str) {
+static void __attribute__((unused)) string_cleanup(char **str) {
     if (str && *str) {
         free(*str);
         *str = NULL;
@@ -909,7 +909,7 @@ static void string_cleanup(char **str) {
 #define AUTO_FREE_STRING __attribute__((cleanup(string_cleanup)))
 
 /* For strings containing sensitive data */
-static void string_secure_cleanup(char **str) {
+static void __attribute__((unused)) string_secure_cleanup(char **str) {
     if (str && *str) {
         memset(*str, 0, strlen(*str));
         free(*str);
@@ -1057,7 +1057,7 @@ kc_build_group_by_path_endpoint(struct kc_realm realm, const char *path)
 }
 
 /* User search endpoint: /admin/realms/{realm}/users?{query} */
-static char *
+static __attribute__((unused)) char *
 kc_build_user_search_endpoint(struct kc_realm realm, const char *query)
 {
     static const char tmpl[] = "%s/admin/realms/%s/users?%s";
@@ -1083,7 +1083,7 @@ kc_build_reset_password_endpoint(struct kc_realm realm, const char *user_id)
 }
 
 /* Credentials endpoint for hash import: /admin/realms/{realm}/users/{user_id}/credentials */
-static char *
+static __attribute__((unused)) char *
 kc_build_credentials_endpoint(struct kc_realm realm, const char *user_id)
 {
     static const char tmpl[] = "%s/admin/realms/%s/users/%s/credentials";

@@ -265,7 +265,7 @@ const char *language_find_message(struct language *lang, const char *msgid) {
     return NULL;
 }
 
-int strlen_vis(char *str)
+static __attribute__((unused)) int strlen_vis(char *str)
 {
     int count;
     for(count=0;*str;str++)
@@ -779,7 +779,7 @@ send_target_message(int msg_type, const char *dest, struct userNode *src, const 
     return res;
 }
 
-int
+static int
 _send_help(struct userNode *dest, struct userNode *src, expand_func_t expand, const char *format, ...)
 {
     int res;

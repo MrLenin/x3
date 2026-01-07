@@ -149,7 +149,7 @@ unreg_sasl_input_func(sasl_input_func_t handler, void *extra)
     sif_used--;
 }
 
-void
+static void
 nuf_free_ehf(struct eh_func *ehf)
 {
     if (ehf->extra != NULL)
@@ -158,7 +158,7 @@ nuf_free_ehf(struct eh_func *ehf)
 
 DEFINE_EH_FUNC_LIST(nuf_list, EH_ADD_TAIL, nuf_free_ehf);
 
-int
+static int
 nuf_wrapper(void *extra, void *callextra)
 {
     struct funcargs *fa = (struct funcargs *)extra;
@@ -502,7 +502,7 @@ reg_new_channel_func(new_channel_func_t handler, void *extra)
     ncf_list_extra[ncf_used++] = extra;
 }
 
-void
+static void
 jf_free_ehf(struct eh_func *ehf)
 {
     if (ehf->extra != NULL)
@@ -511,7 +511,7 @@ jf_free_ehf(struct eh_func *ehf)
 
 DEFINE_EH_FUNC_LIST(jf_list, EH_ADD_TAIL, jf_free_ehf);
 
-int
+static int
 jf_wrapper(void *extra, void *callextra)
 {
     struct funcargs *fa = (struct funcargs *)extra;
@@ -543,7 +543,7 @@ reg_join_func(join_func_t handler, void *extra)
     reg_join_func_pos(handler, extra, EH_ADD_DEFAULT);
 }
 
-void
+static void
 call_join_funcs(struct modeNode *mNode)
 {
     call_hook_func_args(&jf_list, (void *)mNode);

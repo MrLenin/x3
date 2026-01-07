@@ -181,7 +181,7 @@ uplink_insert(const char *key, void *data, UNUSED_ARG(void *extra))
     return 0;
 }
 
-void
+static void
 uplink_compile(void)
 {
     const char *cycles;
@@ -670,7 +670,7 @@ usage(char *exe_name)
 }
 
 static void
-version()
+version(void)
 {
     printf("    --------------------------------------------------\n"
            "    - "PACKAGE_STRING", Built: " __DATE__ ", " __TIME__".\n"
@@ -680,7 +680,7 @@ version()
 }
 
 static void
-license()
+license(void)
 {
     printf("\n"
            "This program is free software; you can redistribute it and/or modify\n"
@@ -698,7 +698,7 @@ license()
            "Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.\n\n");
 }
 
-void main_shutdown(UNUSED_ARG(void *extra))
+static void main_shutdown(UNUSED_ARG(void *extra))
 {
     struct uplinkNode *ul, *ul_next;
 

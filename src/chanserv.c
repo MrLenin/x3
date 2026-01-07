@@ -1073,7 +1073,7 @@ user_level_name_from_level(int level)
 }
 
 
-int
+static int
 parse_level_range(unsigned short *minl, unsigned short *maxl, const char *arg)
 {
     char *sep;
@@ -1279,7 +1279,7 @@ chanserv_ctcp_check(struct userNode *user, struct chanNode *channel, const char 
     eject_user(chanserv, channel, argc, argv, NULL, eflags);
 }
 
-struct note_type *
+static struct note_type *
 chanserv_create_note_type(const char *name)
 {
     struct note_type *ntype = calloc(1, sizeof(*ntype) + strlen(name));
@@ -1763,7 +1763,7 @@ del_adduser_pending(struct adduserPending *ap)
     free(ap);
 }
 
-static void expire_adduser_pending();
+static void expire_adduser_pending(void);
 
 /* find_adduser_pending(channel, user) will find an arbitrary record
  * from user, channel, or user and channel.
@@ -1827,7 +1827,7 @@ process_adduser_pending(struct userNode *user)
 }
 
 static void
-expire_adduser_pending()
+expire_adduser_pending(void)
 {
     struct adduserPending *ap, *ap_next;
     ap = adduser_pendings;
@@ -2706,7 +2706,7 @@ static MODCMD_FUNC(cmd_dnrsearch)
     return 1;
 }
 
-unsigned int
+static unsigned int
 chanserv_get_owned_count(struct handle_info *hi)
 {
     struct userData *cList;
@@ -4078,7 +4078,7 @@ bad_channel_ban(struct chanNode *channel, struct userNode *user, const char *ban
     return 0;
 }
 
-int is_extban(char *b) {
+static int is_extban(char *b) {
     if(*b == '~') {
         return 1;
     }
@@ -4524,7 +4524,7 @@ find_matching_bans(struct banList *bans, struct userNode *actee, const char *mas
     return change;
 }
 
-void expire_bans(UNUSED_ARG(void* data)) /* Real bans, not lamers */
+static void expire_bans(UNUSED_ARG(void* data)) /* Real bans, not lamers */
 {
     unsigned int jj, ii, count;
     struct banNode *bn;
@@ -5414,7 +5414,7 @@ bad_topic(struct chanNode *channel, struct userNode *user, const char *new_topic
  *
  * modifies: new_topic
  */
-void
+static void
 conform_topic(char* topic_mask, char* topic, char *new_topic)
 {
     //char *topic_mask = cData->topic_mask;
@@ -6914,7 +6914,7 @@ static MODCMD_FUNC(chan_opt_topicmask)
     return 1;
 }
 
-int opt_greeting_common(struct userNode *user, struct svccmd *cmd, int argc, char *argv[], char *name, char **data)
+static int opt_greeting_common(struct userNode *user, struct svccmd *cmd, int argc, char *argv[], char *name, char **data)
 {
     if(argc > 1)
     {
@@ -8013,7 +8013,7 @@ chanserv_remove_abuse(void *data)
          DelUser(user, NULL, 1, "");
 }
 
-int lamepart(struct userNode *nick) {
+static int lamepart(struct userNode *nick) {
     struct modeNode *mn;
     unsigned int count, n;
 
@@ -8307,7 +8307,7 @@ static CHANSERV_FUNC(cmd_8ball)
 
 #else /* Use cool 8ball instead */
 
-void eightball(char *outcome, int method, unsigned int seed)
+static void eightball(char *outcome, int method, unsigned int seed)
 {
    int answer = 0;
 
@@ -8705,7 +8705,7 @@ check_bans(struct userNode *user, const char *channel)
     return 0;
 }
 
-int
+static int
 channel_user_is_exempt(struct userNode *user, struct chanNode *channel)
 {
    unsigned int ii;

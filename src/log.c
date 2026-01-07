@@ -1053,7 +1053,7 @@ void SyncLog(char *fmt,...)
 
 }
 
-int parselog(char *LogLine, struct userNode *user, struct chanNode *cptr, char *chan, char *nuh, char *command, char *rest)
+static int parselog(char *LogLine, struct userNode *user, struct chanNode *cptr, char *chan, char *nuh, char *command, char *rest)
 {
    struct svccmd *svccmd;
    struct svccmd *cmd;
