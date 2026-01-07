@@ -491,13 +491,47 @@ handle_keycloak_event(const char *body, size_t body_len)
                            "User deleted via Keycloak: %s", username);
                 keycloak_invalidate_user_caches(username, 1, 1);
             } else if (strcmp(operation_type, "UPDATE") == 0) {
-                /* User updated - may need cache refresh */
-                log_module(webhook_log, LOG_DEBUG,
-                           "User updated via Keycloak: %s", username);
-                /* Only invalidate auth failure cache to allow fresh auth */
-                char keybuf[256];
-                snprintf(keybuf, sizeof(keybuf), "%s%s:", LMDB_PREFIX_AUTHFAIL, username);
-                /* Note: We'd need a prefix-delete function here, for now just log */
+                /* User updated - check for x3-specific attribute changes */
+                int invalidated = 0;
+
+                if (representation) {
+                    json_t *rep_json = json_loads(representation, 0, NULL);
+                    if (rep_json) {
+                        json_t *attrs = json_object_get(rep_json, "attributes");
+                        if (attrs && json_is_object(attrs)) {
+                            /* Check for x3_opserv_level change */
+                            if (json_object_get(attrs, "x3_opserv_level")) {
+                                log_module(webhook_log, LOG_INFO,
+                                           "OpServ level changed for %s via Keycloak", username);
+                                /* Note: OpServ level is checked live from Keycloak,
+                                 * but we log for tracking. Could add a local cache later. */
+                                stats.opserv_invalidations++;
+                                stats.cache_invalidations++;
+                                invalidated = 1;
+                            }
+                            /* Check for x3_metadata changes */
+                            if (json_object_get(attrs, "x3_metadata")) {
+                                log_module(webhook_log, LOG_INFO,
+                                           "Metadata changed for %s via Keycloak", username);
+                                /* Invalidate LMDB metadata cache for this user.
+                                 * Format: meta:<username>.<key> - we need to purge all keys.
+                                 * For now, rely on TTL expiration; add prefix-delete later. */
+                                stats.metadata_invalidations++;
+                                stats.cache_invalidations++;
+                                invalidated = 1;
+                            }
+                        }
+                        json_decref(rep_json);
+                    }
+                }
+
+                if (invalidated) {
+                    log_module(webhook_log, LOG_DEBUG,
+                               "User updated via Keycloak: %s (caches invalidated)", username);
+                } else {
+                    log_module(webhook_log, LOG_DEBUG,
+                               "User updated via Keycloak: %s (no x3 attributes)", username);
+                }
             }
         }
     } else if (strcmp(resource_type, "CREDENTIAL") == 0) {
@@ -533,24 +567,60 @@ handle_keycloak_event(const char *body, size_t body_len)
             }
         } else if (strcmp(operation_type, "UPDATE") == 0 ||
                    strcmp(operation_type, "CREATE") == 0) {
-            /* Password might have changed - extract user and revoke sessions */
-            /* The resourcePath format is: users/<user-id>/credentials/<cred-id> */
-            if (resource_path && strstr(resource_path, "/credentials/")) {
-                /* Extract user ID from path */
-                const char *users_prefix = "users/";
-                if (strncmp(resource_path, users_prefix, strlen(users_prefix)) == 0) {
-                    char user_id[64];
-                    const char *cred_start = strstr(resource_path + strlen(users_prefix), "/");
-                    if (cred_start) {
-                        size_t id_len = cred_start - (resource_path + strlen(users_prefix));
-                        if (id_len < sizeof(user_id)) {
-                            strncpy(user_id, resource_path + strlen(users_prefix), id_len);
-                            user_id[id_len] = '\0';
-                            log_module(webhook_log, LOG_DEBUG,
-                                       "Password change detected for user ID: %s", user_id);
-                            /* Would need to look up username from user_id here */
+            /* Credential created or updated - check type and handle accordingly */
+            if (representation) {
+                json_t *rep_json = json_loads(representation, 0, NULL);
+                if (rep_json) {
+                    json_t *type = json_object_get(rep_json, "type");
+                    const char *cred_type = type && json_is_string(type) ? json_string_value(type) : NULL;
+
+                    /* Try to get username from representation or authDetails */
+                    const char *username = NULL;
+                    json_t *user_uname = json_object_get(rep_json, "username");
+                    if (user_uname && json_is_string(user_uname)) {
+                        username = json_string_value(user_uname);
+                    }
+                    if (!username) {
+                        json_t *auth = json_object_get(root, "authDetails");
+                        if (auth) {
+                            json_t *uname = json_object_get(auth, "username");
+                            if (uname && json_is_string(uname))
+                                username = json_string_value(uname);
                         }
                     }
+
+                    if (cred_type && strcmp(cred_type, "password") == 0 && username) {
+                        /* Password credential changed - invalidate SCRAM caches */
+                        log_module(webhook_log, LOG_INFO,
+                                   "Password changed for %s via Keycloak - invalidating SCRAM caches",
+                                   username);
+                        x3_lmdb_scram_revoke_all(username);
+                        x3_lmdb_scram_acct_delete_all(username);
+                        stats.scram_invalidations++;
+                        stats.cache_invalidations++;
+                    } else if (cred_type && strcmp(cred_type, "x509") == 0 &&
+                               strcmp(operation_type, "CREATE") == 0) {
+                        /* New X.509 certificate - pre-warm fingerprint cache */
+                        json_t *cred_data = json_object_get(rep_json, "credentialData");
+                        if (cred_data && json_is_string(cred_data)) {
+                            json_t *cd = json_loads(json_string_value(cred_data), 0, NULL);
+                            if (cd) {
+                                json_t *fp = json_object_get(cd, "fingerprint");
+                                if (fp && json_is_string(fp) && username) {
+                                    const char *fingerprint = json_string_value(fp);
+                                    log_module(webhook_log, LOG_INFO,
+                                               "Pre-warming fingerprint cache for %s: %.32s...",
+                                               username, fingerprint);
+                                    /* Pre-warm the fingerprint cache with the account name */
+                                    x3_lmdb_fingerprint_set(fingerprint, username, "testnet", 0);
+                                    stats.fingerprint_additions++;
+                                    stats.cache_invalidations++;
+                                }
+                                json_decref(cd);
+                            }
+                        }
+                    }
+                    json_decref(rep_json);
                 }
             }
         }

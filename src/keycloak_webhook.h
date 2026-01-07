@@ -52,8 +52,12 @@ struct kc_webhook_stats {
     unsigned long events_invalid;
     unsigned long cache_invalidations;
     unsigned long fingerprint_deletions;
+    unsigned long fingerprint_additions;  /* Fingerprints pre-cached from webhook */
     unsigned long session_revocations;
-    unsigned long group_syncs;        /* Channel syncs triggered by group events */
+    unsigned long group_syncs;            /* Channel syncs triggered by group events */
+    unsigned long scram_invalidations;    /* SCRAM caches invalidated */
+    unsigned long opserv_invalidations;   /* OpServ level cache invalidations */
+    unsigned long metadata_invalidations; /* Metadata cache invalidations */
     time_t last_event_time;
 };
 
