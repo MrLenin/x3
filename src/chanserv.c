@@ -741,9 +741,52 @@ static struct kc_sync_stats {
     unsigned long successful_syncs; /* Successful channel syncs */
     unsigned long failed_syncs;     /* Failed channel syncs */
     unsigned long total_entries;    /* Total entries synced */
+    unsigned long unchanged_syncs;  /* Syncs skipped due to hash match */
     time_t last_sync_time;          /* When last full sync completed */
     unsigned long last_sync_duration; /* Duration of last sync in seconds */
 } kc_stats = {0};
+
+/**
+ * FNV-1a hash for membership lists
+ * Computes a hash from sorted (username, access_level) pairs
+ * Used for incremental sync - skip if hash unchanged
+ */
+#define FNV_OFFSET_BASIS 0xcbf29ce484222325ULL
+#define FNV_PRIME        0x100000001b3ULL
+
+static uint64_t
+kc_membership_hash_init(void)
+{
+    return FNV_OFFSET_BASIS;
+}
+
+static uint64_t
+kc_membership_hash_add(uint64_t hash, const char *username, unsigned short access)
+{
+    const unsigned char *p;
+
+    /* Hash the username */
+    for (p = (const unsigned char *)username; *p; p++) {
+        hash ^= *p;
+        hash *= FNV_PRIME;
+    }
+
+    /* Hash a separator */
+    hash ^= ':';
+    hash *= FNV_PRIME;
+
+    /* Hash the access level (2 bytes) */
+    hash ^= (access & 0xFF);
+    hash *= FNV_PRIME;
+    hash ^= ((access >> 8) & 0xFF);
+    hash *= FNV_PRIME;
+
+    /* Hash a separator between entries */
+    hash ^= '\n';
+    hash *= FNV_PRIME;
+
+    return hash;
+}
 #endif /* WITH_KEYCLOAK */
 
 struct listData
@@ -10684,6 +10727,9 @@ chanserv_sync_keycloak_group_with_attribute(const char *channel, const char *gro
 {
     struct kc_group_member *members = NULL;
     struct kc_group_member *member;
+    struct lmdb_chansync_meta sync_meta;
+    uint64_t new_hash;
+    int member_count = 0;
     int count = 0;
     int rc;
 
@@ -10693,7 +10739,33 @@ chanserv_sync_keycloak_group_with_attribute(const char *channel, const char *gro
         return -1;
     }
 
-    /* Store each member in LMDB, checking for conflicts */
+    /* First pass: compute hash of membership for incremental sync */
+    new_hash = kc_membership_hash_init();
+    for (member = members; member; member = member->next) {
+        if (member->access_level == 0)
+            continue;  /* Skip members without access level */
+        new_hash = kc_membership_hash_add(new_hash, member->username, member->access_level);
+        member_count++;
+    }
+
+    /* Check if incremental sync is enabled and hash matches stored value */
+    if (chanserv_conf.keycloak_sync_incremental) {
+        rc = x3_lmdb_chansync_get(channel, &sync_meta);
+        if (rc == LMDB_SUCCESS && sync_meta.membership_hash == new_hash) {
+            /* Hash matches - no changes since last sync */
+            log_module(CS_LOG, LOG_DEBUG,
+                       "Keycloak incremental sync: %s unchanged (hash %016llx, %d members)",
+                       channel, (unsigned long long)new_hash, member_count);
+            keycloak_free_group_members(members);
+            kc_stats.unchanged_syncs++;
+            /* Update last_sync time but keep hash and entry count */
+            sync_meta.last_sync = now;
+            x3_lmdb_chansync_set(channel, &sync_meta);
+            return 0;  /* No changes needed */
+        }
+    }
+
+    /* Second pass: store each member in LMDB */
     for (member = members; member; member = member->next) {
         unsigned short existing_access;
         int had_existing;
@@ -10723,6 +10795,10 @@ chanserv_sync_keycloak_group_with_attribute(const char *channel, const char *gro
     }
 
     keycloak_free_group_members(members);
+
+    /* Store the new hash for future incremental sync checks */
+    x3_lmdb_chansync_record_success(channel, new_hash, count);
+
     return count;
 }
 
@@ -10807,20 +10883,30 @@ chanserv_sync_keycloak_channel(const char *channel)
 {
     int total = 0;
     int i, rc;
+    int had_error = 0;
 
-    /* Use attribute-based mode if enabled */
+    /* Use attribute-based mode if enabled (has full incremental sync support) */
     if (chanserv_conf.keycloak_use_group_attributes) {
         return chanserv_sync_keycloak_channel_attribute_mode(channel);
     }
 
-    /* Legacy mode: iterate through predefined access levels */
+    /* Legacy mode: iterate through predefined access levels
+     * Note: Legacy mode doesn't support incremental sync - each level is a separate API call
+     */
     for (i = 0; kc_access_levels[i].suffix; i++) {
         rc = chanserv_sync_keycloak_channel_level(channel, kc_access_levels[i].level);
         if (rc > 0)
             total += rc;
+        else if (rc < 0)
+            had_error = 1;
     }
 
-    return total;
+    /* Record success with entry count as hash (legacy mode doesn't support true incremental) */
+    if (!had_error && total >= 0) {
+        x3_lmdb_chansync_record_success(channel, (uint64_t)total, total);
+    }
+
+    return had_error ? -1 : total;
 }
 
 /*
@@ -11264,16 +11350,13 @@ chanserv_sync_keycloak_batch(UNUSED_ARG(void *data))
 
         int synced = chanserv_sync_keycloak_channel(chan_name);
         if (synced > 0) {
+            /* Channel had changes - sync function already recorded success with hash */
             kc_sync.total_entries += synced;
             kc_sync.channels_done++;
-            /* Record success with entry count as simple hash for now */
-            x3_lmdb_chansync_record_success(chan_name, (uint64_t)synced, synced);
         } else if (synced == 0) {
-            /* No changes needed */
+            /* No changes needed (hash matched or empty) - sync function already updated metadata */
             kc_sync.channels_skipped++;
             kc_sync.channels_done++;
-            /* Still counts as success (channel was checked) */
-            x3_lmdb_chansync_record_success(chan_name, 0, 0);
         } else {
             /* Sync failed - record failure and apply backoff */
             kc_sync.channels_failed++;
