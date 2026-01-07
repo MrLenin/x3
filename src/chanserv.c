@@ -72,6 +72,10 @@ extern struct nickserv_config nickserv_conf;
 #define KEY_KEYCLOAK_ACCESS_LEVEL_ATTR "keycloak_access_level_attr"
 #define KEY_KEYCLOAK_SYNC_FREQUENCY "keycloak_sync_frequency"
 #define KEY_KEYCLOAK_BIDIRECTIONAL  "keycloak_bidirectional_sync"
+#define KEY_KEYCLOAK_SYNC_BATCH_SIZE "keycloak_sync_batch_size"
+#define KEY_KEYCLOAK_SYNC_BATCH_DELAY "keycloak_sync_batch_delay"
+#define KEY_KEYCLOAK_SYNC_PRIORITIZE "keycloak_sync_prioritize"
+#define KEY_KEYCLOAK_SYNC_DISTRIBUTED "keycloak_sync_distributed"
 #define KEY_CHANNEL_METADATA_TTL_ENABLED "channel_metadata_ttl_enabled"
 #define KEY_CHANNEL_METADATA_DEFAULT_TTL "channel_metadata_default_ttl"
 #define KEY_CHANNEL_IMMUTABLE_KEYS  "channel_immutable_keys"
@@ -691,12 +695,54 @@ static struct
     const char          *keycloak_group_prefix;    /* Group name prefix, e.g. "irc-channel-" or "irc-channels" */
     const char          *keycloak_access_level_attr; /* Attribute name for access level (default: x3_access_level) */
     unsigned long       keycloak_sync_frequency;   /* Sync interval in seconds (0 = startup only) */
+    unsigned int        keycloak_sync_batch_size;  /* Channels per batch (default: 15) */
+    unsigned int        keycloak_sync_batch_delay; /* Ms between batches (default: 100) */
+    unsigned int        keycloak_sync_prioritize : 1;  /* Enable priority sorting (default: ON) */
+    unsigned int        keycloak_sync_distributed : 1; /* Enable distributed sync (default: ON) */
 
     /* Channel metadata TTL configuration */
     unsigned int        channel_metadata_ttl_enabled : 1;  /* Enable channel metadata expiry */
     unsigned long       channel_metadata_default_ttl;      /* Default TTL in seconds (2592000 = 30 days) */
     const char          *channel_immutable_keys;           /* Space-separated keys that never expire */
 } chanserv_conf;
+
+#ifdef WITH_KEYCLOAK
+/* Maximum failures to track per sync cycle */
+#define KC_MAX_FAILURES_TRACKED 10
+
+/* Sync state structure - persists across batches */
+struct kc_sync_state {
+    struct chanData **queue;      /* Sorted channel queue */
+    int queue_size;               /* Total channels to sync */
+    int queue_alloc;              /* Allocated size */
+    int current_index;            /* Current position in queue */
+    int total_entries;            /* Running total of entries synced */
+    int channels_done;            /* Channels completed */
+    int channels_failed;          /* Channels that failed */
+    int channels_skipped;         /* Channels skipped (no change) */
+    time_t start_time;            /* When sync started */
+    int in_progress;              /* Is a sync currently running? */
+    /* Failure tracking */
+    int failure_count;
+    struct {
+        char channel[CHANNELLEN+1];
+        int error_code;
+    } failures[KC_MAX_FAILURES_TRACKED];
+};
+
+/* Global sync state */
+static struct kc_sync_state kc_sync = {0};
+
+/* Sync statistics (persistent across runs) */
+static struct kc_sync_stats {
+    unsigned long total_syncs;      /* Total sync operations completed */
+    unsigned long successful_syncs; /* Successful channel syncs */
+    unsigned long failed_syncs;     /* Failed channel syncs */
+    unsigned long total_entries;    /* Total entries synced */
+    time_t last_sync_time;          /* When last full sync completed */
+    unsigned long last_sync_duration; /* Duration of last sync in seconds */
+} kc_stats = {0};
+#endif /* WITH_KEYCLOAK */
 
 struct listData
 {
@@ -9311,12 +9357,32 @@ chanserv_conf_read(void)
     str = database_get_data(conf_node, KEY_KEYCLOAK_BIDIRECTIONAL, RECDB_QSTRING);
     chanserv_conf.keycloak_bidirectional = str ? enabled_string(str) : 0;
 
+    /* Keycloak sync batch configuration */
+    str = database_get_data(conf_node, KEY_KEYCLOAK_SYNC_BATCH_SIZE, RECDB_QSTRING);
+    chanserv_conf.keycloak_sync_batch_size = str ? strtoul(str, NULL, 0) : 15;
+    if (chanserv_conf.keycloak_sync_batch_size < 1)
+        chanserv_conf.keycloak_sync_batch_size = 15;
+
+    str = database_get_data(conf_node, KEY_KEYCLOAK_SYNC_BATCH_DELAY, RECDB_QSTRING);
+    chanserv_conf.keycloak_sync_batch_delay = str ? strtoul(str, NULL, 0) : 100;
+
+    str = database_get_data(conf_node, KEY_KEYCLOAK_SYNC_PRIORITIZE, RECDB_QSTRING);
+    chanserv_conf.keycloak_sync_prioritize = str ? !disabled_string(str) : 1;  /* ON by default */
+
+    str = database_get_data(conf_node, KEY_KEYCLOAK_SYNC_DISTRIBUTED, RECDB_QSTRING);
+    chanserv_conf.keycloak_sync_distributed = str ? !disabled_string(str) : 1;  /* ON by default */
+
     /* Log Keycloak sync configuration */
     log_module(CS_LOG, LOG_INFO, "Keycloak access sync config: access_sync=%d, bidirectional=%d, hierarchical=%d, prefix=%s",
                chanserv_conf.keycloak_access_sync,
                chanserv_conf.keycloak_bidirectional,
                chanserv_conf.keycloak_hierarchical_groups,
                chanserv_conf.keycloak_group_prefix);
+    log_module(CS_LOG, LOG_DEBUG, "Keycloak sync batch config: batch_size=%u, batch_delay=%ums, prioritize=%d, distributed=%d",
+               chanserv_conf.keycloak_sync_batch_size,
+               chanserv_conf.keycloak_sync_batch_delay,
+               chanserv_conf.keycloak_sync_prioritize,
+               chanserv_conf.keycloak_sync_distributed);
 
     /* Channel metadata TTL configuration */
     str = database_get_data(conf_node, KEY_CHANNEL_METADATA_TTL_ENABLED, RECDB_QSTRING);
@@ -11059,17 +11125,275 @@ chanserv_delete_keycloak_channel(const char *channel)
 }
 
 /**
- * Sync all registered channels from Keycloak groups
+ * Priority scoring for channel sync order
+ * Higher scores = synced first
+ */
+static int
+kc_channel_priority(struct chanData *cData)
+{
+    int score = 0;
+
+    if (!cData)
+        return 0;
+
+    /* Channels with active users get highest priority */
+    if (cData->channel && cData->channel->members.used > 0)
+        score += 100;
+
+    /* Recently active channels get medium priority */
+    if (cData->visited > now - 3600)
+        score += 50;
+
+    return score;
+}
+
+/**
+ * Comparison function for qsort - higher priority first
+ */
+static int
+kc_sync_priority_cmp(const void *a, const void *b)
+{
+    struct chanData *ca = *(struct chanData **)a;
+    struct chanData *cb = *(struct chanData **)b;
+    int pa = kc_channel_priority(ca);
+    int pb = kc_channel_priority(cb);
+    return pb - pa;  /* Descending order */
+}
+
+/**
+ * Free sync queue resources
+ */
+static void
+kc_sync_cleanup(void)
+{
+    if (kc_sync.queue) {
+        free(kc_sync.queue);
+        kc_sync.queue = NULL;
+    }
+    kc_sync.queue_size = 0;
+    kc_sync.queue_alloc = 0;
+    kc_sync.current_index = 0;
+    kc_sync.in_progress = 0;
+}
+
+/**
+ * Complete the sync and update statistics
+ */
+static void
+kc_sync_complete(void)
+{
+    time_t duration = now - kc_sync.start_time;
+
+    log_module(CS_LOG, LOG_INFO,
+               "Keycloak access sync complete: %d entries across %d channels "
+               "(%d failed, %d skipped) in %ld seconds",
+               kc_sync.total_entries, kc_sync.channels_done,
+               kc_sync.channels_failed, kc_sync.channels_skipped,
+               (long)duration);
+
+    /* Update persistent statistics */
+    kc_stats.total_syncs++;
+    kc_stats.successful_syncs += kc_sync.channels_done;
+    kc_stats.failed_syncs += kc_sync.channels_failed;
+    kc_stats.total_entries += kc_sync.total_entries;
+    kc_stats.last_sync_time = now;
+    kc_stats.last_sync_duration = duration;
+
+    /* Log any failures */
+    if (kc_sync.failure_count > 0) {
+        log_module(CS_LOG, LOG_WARNING,
+                   "Keycloak sync had %d failures:", kc_sync.failure_count);
+        for (int i = 0; i < kc_sync.failure_count && i < KC_MAX_FAILURES_TRACKED; i++) {
+            log_module(CS_LOG, LOG_WARNING, "  - %s (error %d)",
+                       kc_sync.failures[i].channel,
+                       kc_sync.failures[i].error_code);
+        }
+    }
+
+    kc_sync_cleanup();
+
+    /* Schedule next sync if configured */
+    if (chanserv_conf.keycloak_sync_frequency > 0) {
+        timeq_add(now + chanserv_conf.keycloak_sync_frequency,
+                  chanserv_sync_keycloak_access, NULL);
+    }
+}
+
+/* Forward declaration */
+static void chanserv_sync_keycloak_batch(void *data);
+
+/**
+ * Process a single batch of channels
+ */
+static void
+chanserv_sync_keycloak_batch(UNUSED_ARG(void *data))
+{
+    unsigned int batch_size = chanserv_conf.keycloak_sync_batch_size;
+    unsigned int processed = 0;
+
+    if (!kc_sync.in_progress) {
+        log_module(CS_LOG, LOG_WARNING, "Keycloak batch called but sync not in progress");
+        return;
+    }
+
+    /* Process up to batch_size channels */
+    while (kc_sync.current_index < kc_sync.queue_size && processed < batch_size) {
+        struct chanData *cData = kc_sync.queue[kc_sync.current_index];
+        kc_sync.current_index++;
+
+        if (!cData || !cData->channel || !cData->channel->name[0]) {
+            kc_sync.channels_skipped++;
+            continue;
+        }
+
+        int synced = chanserv_sync_keycloak_channel(cData->channel->name);
+        if (synced > 0) {
+            kc_sync.total_entries += synced;
+            kc_sync.channels_done++;
+        } else if (synced == 0) {
+            /* No changes needed */
+            kc_sync.channels_skipped++;
+            kc_sync.channels_done++;
+        } else {
+            /* Sync failed */
+            kc_sync.channels_failed++;
+            if (kc_sync.failure_count < KC_MAX_FAILURES_TRACKED) {
+                safestrncpy(kc_sync.failures[kc_sync.failure_count].channel,
+                            cData->channel->name, CHANNELLEN+1);
+                kc_sync.failures[kc_sync.failure_count].error_code = synced;
+                kc_sync.failure_count++;
+            }
+        }
+
+        processed++;
+    }
+
+    /* Log progress every batch */
+    int total_processed = kc_sync.channels_done + kc_sync.channels_failed + kc_sync.channels_skipped;
+    log_module(CS_LOG, LOG_DEBUG,
+               "Keycloak sync progress: %d/%d channels (%d entries, %d failed)",
+               total_processed, kc_sync.queue_size,
+               kc_sync.total_entries, kc_sync.channels_failed);
+
+    /* Check if we're done */
+    if (kc_sync.current_index >= kc_sync.queue_size) {
+        kc_sync_complete();
+    } else {
+        /* Schedule next batch */
+        unsigned long delay_ms = chanserv_conf.keycloak_sync_batch_delay;
+        /* Convert ms to seconds, minimum 1 second for timeq */
+        time_t delay_sec = (delay_ms >= 1000) ? (delay_ms / 1000) : 1;
+        timeq_add(now + delay_sec, chanserv_sync_keycloak_batch, NULL);
+    }
+}
+
+/**
+ * Build the sync queue from registered channels
+ */
+static int
+kc_sync_build_queue(void)
+{
+    struct chanData *cData;
+    int count = 0;
+
+    /* Count channels first */
+    for (cData = channelList; cData; cData = cData->next) {
+        if (cData->channel && cData->channel->name[0])
+            count++;
+    }
+
+    if (count == 0)
+        return 0;
+
+    /* Allocate queue */
+    kc_sync.queue = malloc(count * sizeof(struct chanData *));
+    if (!kc_sync.queue) {
+        log_module(CS_LOG, LOG_ERROR, "Failed to allocate Keycloak sync queue");
+        return -1;
+    }
+
+    /* Fill queue */
+    kc_sync.queue_size = 0;
+    kc_sync.queue_alloc = count;
+    for (cData = channelList; cData; cData = cData->next) {
+        if (cData->channel && cData->channel->name[0]) {
+            kc_sync.queue[kc_sync.queue_size++] = cData;
+        }
+    }
+
+    /* Sort by priority if enabled */
+    if (chanserv_conf.keycloak_sync_prioritize && kc_sync.queue_size > 1) {
+        qsort(kc_sync.queue, kc_sync.queue_size, sizeof(struct chanData *),
+              kc_sync_priority_cmp);
+    }
+
+    return kc_sync.queue_size;
+}
+
+/**
+ * Queue a specific channel for immediate Keycloak sync
+ * Used by webhooks to trigger targeted syncs
+ * @param channel Channel name to sync
+ * @param priority Priority level (KC_SYNC_PRIORITY_*)
+ * @return 0 on success, -1 on error
+ */
+int
+chanserv_queue_keycloak_sync(const char *channel, int priority)
+{
+    struct chanNode *cNode;
+    struct chanData *cData;
+
+    if (!channel || !nickserv_conf.keycloak_enable || !chanserv_conf.keycloak_access_sync)
+        return -1;
+
+    /* Find the channel */
+    cNode = GetChannel(channel);
+    if (!cNode) {
+        log_module(CS_LOG, LOG_DEBUG, "chanserv_queue_keycloak_sync: channel %s not found", channel);
+        return -1;
+    }
+
+    cData = cNode->channel_info;
+    if (!cData) {
+        log_module(CS_LOG, LOG_DEBUG, "chanserv_queue_keycloak_sync: channel %s not registered", channel);
+        return -1;
+    }
+
+    log_module(CS_LOG, LOG_INFO, "Queuing immediate Keycloak sync for %s (priority: %d)", channel, priority);
+
+    /* For immediate priority, sync right now if no batch is running */
+    if (priority >= KC_SYNC_PRIORITY_IMMEDIATE && !kc_sync.in_progress) {
+        int synced = chanserv_sync_keycloak_channel(channel);
+        if (synced >= 0) {
+            kc_stats.successful_syncs++;
+            kc_stats.total_entries += synced;
+            log_module(CS_LOG, LOG_DEBUG, "Immediate sync of %s: %d entries", channel, synced);
+        } else {
+            kc_stats.failed_syncs++;
+            log_module(CS_LOG, LOG_WARNING, "Immediate sync of %s failed", channel);
+        }
+        return synced >= 0 ? 0 : -1;
+    }
+
+    /* TODO: For lower priorities, add to a priority queue
+     * For now, just do immediate sync if possible */
+    if (!kc_sync.in_progress) {
+        int synced = chanserv_sync_keycloak_channel(channel);
+        return synced >= 0 ? 0 : -1;
+    }
+
+    /* A batch sync is in progress - the channel will be synced as part of it */
+    log_module(CS_LOG, LOG_DEBUG, "Batch sync in progress, %s will be synced in current cycle", channel);
+    return 0;
+}
+
+/**
+ * Sync all registered channels from Keycloak groups (batched version)
  * This is called on startup and periodically
  */
 static void
 chanserv_sync_keycloak_access(UNUSED_ARG(void *data))
 {
-    struct chanData *cData;
-    int total = 0;
-    int channel_count = 0;
-    time_t start_time = now;
-
     if (!nickserv_conf.keycloak_enable || !chanserv_conf.keycloak_access_sync)
         return;
 
@@ -11078,30 +11402,40 @@ chanserv_sync_keycloak_access(UNUSED_ARG(void *data))
         return;
     }
 
-    log_module(CS_LOG, LOG_INFO, "Starting Keycloak channel access sync (%s%s, prefix: %s)...",
+    /* Check if a sync is already in progress */
+    if (kc_sync.in_progress) {
+        log_module(CS_LOG, LOG_WARNING, "Keycloak access sync already in progress, skipping");
+        return;
+    }
+
+    /* Initialize sync state */
+    memset(&kc_sync, 0, sizeof(kc_sync));
+    kc_sync.start_time = now;
+    kc_sync.in_progress = 1;
+
+    /* Build the sync queue */
+    int queue_size = kc_sync_build_queue();
+    if (queue_size <= 0) {
+        log_module(CS_LOG, LOG_INFO, "Keycloak access sync: no channels to sync");
+        kc_sync.in_progress = 0;
+        /* Schedule next sync anyway */
+        if (chanserv_conf.keycloak_sync_frequency > 0) {
+            timeq_add(now + chanserv_conf.keycloak_sync_frequency,
+                      chanserv_sync_keycloak_access, NULL);
+        }
+        return;
+    }
+
+    log_module(CS_LOG, LOG_INFO,
+               "Starting Keycloak channel access sync: %d channels (%s%s, prefix: %s, batch_size: %u)",
+               queue_size,
                chanserv_conf.keycloak_hierarchical_groups ? "hierarchical" : "flat",
                chanserv_conf.keycloak_use_group_attributes ? "+attribute" : "",
-               chanserv_conf.keycloak_group_prefix);
+               chanserv_conf.keycloak_group_prefix,
+               chanserv_conf.keycloak_sync_batch_size);
 
-    /* Iterate through all registered channels */
-    for (cData = channelList; cData; cData = cData->next) {
-        if (!cData->channel || !cData->channel->name[0])
-            continue;
-
-        int synced = chanserv_sync_keycloak_channel(cData->channel->name);
-        if (synced > 0) {
-            total += synced;
-            channel_count++;
-        }
-    }
-
-    log_module(CS_LOG, LOG_INFO, "Keycloak access sync complete: %d entries across %d channels in %ld seconds",
-               total, channel_count, (long)(now - start_time));
-
-    /* Schedule next sync if configured */
-    if (chanserv_conf.keycloak_sync_frequency > 0) {
-        timeq_add(now + chanserv_conf.keycloak_sync_frequency, chanserv_sync_keycloak_access, NULL);
-    }
+    /* Start first batch immediately */
+    chanserv_sync_keycloak_batch(NULL);
 }
 
 #endif /* WITH_KEYCLOAK */

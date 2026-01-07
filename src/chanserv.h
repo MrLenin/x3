@@ -238,4 +238,15 @@ int chanserv_get_channel_metadata(struct chanData *cData, const char *key, char 
 void chanserv_sync_metadata_to_ircd(struct chanData *cData);
 void chanserv_sync_x3_metadata(struct chanData *cData, int sync_immutable);
 
+/* Keycloak sync functions */
+#ifdef WITH_KEYCLOAK
+/* Keycloak sync priority levels */
+#define KC_SYNC_PRIORITY_LOW      0
+#define KC_SYNC_PRIORITY_NORMAL   1
+#define KC_SYNC_PRIORITY_HIGH     2
+#define KC_SYNC_PRIORITY_IMMEDIATE 3
+
+int chanserv_queue_keycloak_sync(const char *channel, int priority);
+#endif /* WITH_KEYCLOAK */
+
 #endif
