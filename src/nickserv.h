@@ -399,6 +399,15 @@ int nickserv_set_user_metadata(struct handle_info *hi, const char *key, const ch
 int nickserv_get_user_metadata(struct handle_info *hi, const char *key, char *value_out, int *visibility_out);
 
 /**
+ * Async version of nickserv_get_user_metadata for non-blocking MDQ.
+ * Uses LMDB cache first (fast sync check), then async Keycloak on miss.
+ * Response is sent via irc_metadata() from callback - fire-and-forget pattern.
+ * @param hi The handle_info for the account
+ * @param key The metadata key to look up
+ */
+void nickserv_get_user_metadata_async(struct handle_info *hi, const char *key);
+
+/**
  * Send all metadata for a user to the IRCd.
  * Called when a user authenticates to push their stored metadata.
  * @param user The user who just authenticated
@@ -425,6 +434,26 @@ void nickserv_sync_account_metadata_to_ircd(struct handle_info *hi);
  */
 int nickserv_get_webpush_subscriptions(const char *account_name,
                                        struct kc_metadata_entry **entries_out);
+
+/**
+ * Callback type for async webpush subscription lookup.
+ * @param session  Opaque session pointer
+ * @param result   KC_SUCCESS on success, error code on failure
+ * @param entries  Linked list of subscription entries (caller must free with keycloak_free_metadata_entries)
+ */
+typedef void (*webpush_subs_callback)(void *session, int result, struct kc_metadata_entry *entries);
+
+/**
+ * Get webpush subscriptions for an account asynchronously.
+ * Uses the async token manager and attribute listing APIs.
+ * @param account_name The account name to look up
+ * @param session      Opaque session pointer passed to callback
+ * @param callback     Function to call when lookup completes
+ * @return 0 on success (request started), -1 on error
+ */
+int nickserv_get_webpush_subscriptions_async(const char *account_name,
+                                              void *session,
+                                              webpush_subs_callback callback);
 
 /* Presence aggregation support */
 

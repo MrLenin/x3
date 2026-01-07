@@ -624,6 +624,24 @@ typedef int (*kc_get_group_path_callback)(void *session, int result, char *group
 typedef int (*kc_create_subgroup_callback)(void *session, int result, char *group_id);
 
 /**
+ * Async list user attributes callback type (Phase 5.10)
+ * @param session  Opaque session pointer
+ * @param result   KC_SUCCESS, KC_NOT_FOUND, or KC_ERROR
+ * @param entries  Linked list of metadata entries (only valid if result==KC_SUCCESS, caller must free)
+ * @return 0 if session may continue processing, 1 if session is terminal
+ */
+typedef int (*kc_list_attrs_callback)(void *session, int result, struct kc_metadata_entry *entries);
+
+/**
+ * Async get user attribute callback type (Phase 5.10)
+ * @param session  Opaque session pointer
+ * @param result   KC_SUCCESS, KC_NOT_FOUND, or KC_ERROR
+ * @param value    Attribute value (only valid if result==KC_SUCCESS, caller must free)
+ * @return 0 if session may continue processing, 1 if session is terminal
+ */
+typedef int (*kc_get_attr_callback)(void *session, int result, char *value);
+
+/**
  * Start async authentication check against Keycloak
  * This function returns immediately and invokes the callback when complete.
  * Uses curl_multi integrated with X3's ioset event loop.
@@ -1018,6 +1036,38 @@ int keycloak_delete_group_async(struct kc_realm realm, struct kc_client client,
 int keycloak_delete_user_async(struct kc_realm realm, struct kc_client client,
                                 const char *user_id, void *session,
                                 kc_async_callback callback);
+
+/**
+ * List user attributes asynchronously, optionally filtered by prefix. (Phase 5.10)
+ * This function returns immediately and invokes the callback when complete.
+ *
+ * @param realm       Keycloak realm configuration
+ * @param client      Client with admin access token
+ * @param user_id     User UUID to query
+ * @param prefix      Optional prefix filter (NULL for all attributes)
+ * @param session     Opaque session pointer (passed to callback)
+ * @param callback    Function to call when listing completes
+ * @return 0 on success (request started), -1 on error
+ */
+int keycloak_list_user_attributes_async(struct kc_realm realm, struct kc_client client,
+                                         const char *user_id, const char *prefix,
+                                         void *session, kc_list_attrs_callback callback);
+
+/**
+ * Get a single user attribute asynchronously. (Phase 5.10)
+ * This function returns immediately and invokes the callback when complete.
+ *
+ * @param realm       Keycloak realm configuration
+ * @param client      Client with admin access token
+ * @param user_id     User UUID to query
+ * @param attr_name   Attribute name to retrieve
+ * @param session     Opaque session pointer (passed to callback)
+ * @param callback    Function to call when retrieval completes
+ * @return 0 on success (request started), -1 on error
+ */
+int keycloak_get_user_attribute_async(struct kc_realm realm, struct kc_client client,
+                                       const char *user_id, const char *attr_name,
+                                       void *session, kc_get_attr_callback callback);
 
 /*
  * =============================================================================

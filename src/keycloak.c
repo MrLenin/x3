@@ -1314,7 +1314,9 @@ enum kc_async_type {
     KC_ASYNC_SET_GROUP_ATTR, /* Set group attribute (Phase 4) */
     KC_ASYNC_GET_GROUP_NAME, /* Get group by name (Phase 5 sync cleanup) */
     KC_ASYNC_DELETE_GROUP,   /* Delete group (Phase 5 sync cleanup) */
-    KC_ASYNC_DELETE_USER     /* Delete user (Phase 5.10) */
+    KC_ASYNC_DELETE_USER,    /* Delete user (Phase 5.10) */
+    KC_ASYNC_LIST_ATTRS,     /* List user attributes (Phase 5.10) */
+    KC_ASYNC_GET_ATTR        /* Get user attribute (Phase 5.10) */
 };
 
 /* Async request tracking */
@@ -1343,6 +1345,8 @@ struct kc_async_request {
         kc_get_group_path_callback get_group_name; /* Get group by name callback (reuses same signature) */
         kc_async_callback delete_group; /* Delete group callback (simple result) */
         kc_async_callback delete_user;  /* Delete user callback (simple result) */
+        kc_list_attrs_callback list_attrs; /* List attributes callback (Phase 5.10) */
+        kc_get_attr_callback get_attr;     /* Get attribute callback (Phase 5.10) */
     } cb;
     /* WebPush-specific: copy of binary POST data for async request */
     void *post_data_copy;
@@ -1352,6 +1356,9 @@ struct kc_async_request {
     /* User ID cache support (for KC_ASYNC_CREATE_USER) */
     char *create_username;        /* Username being created (for cache population) */
     char location_header[256];    /* Captured Location header from 201 response */
+    /* Attribute operations (Phase 5.10) */
+    char *attr_prefix;            /* For KC_ASYNC_LIST_ATTRS - prefix filter (allocated) */
+    char *attr_name;              /* For KC_ASYNC_GET_ATTR - attribute name (allocated) */
 };
 
 /* Header callback to capture Location header from HTTP 201 response */
@@ -2083,6 +2090,144 @@ kc_curl_check_completed(void)
                 }
                 break;
             }
+            case KC_ASYNC_LIST_ATTRS: {
+                int result = KC_ERROR;
+                struct kc_metadata_entry *entries = NULL;
+
+                if (http_code == 200 && req->response.response) {
+                    json_error_t error;
+                    json_t *root = json_loads(req->response.response, 0, &error);
+                    if (root) {
+                        json_t *attrs = json_object_get(root, "attributes");
+                        if (attrs && json_is_object(attrs)) {
+                            const char *key;
+                            json_t *value;
+                            struct kc_metadata_entry *head = NULL;
+                            struct kc_metadata_entry *tail = NULL;
+                            size_t prefix_len = req->attr_prefix ? strlen(req->attr_prefix) : 0;
+
+                            json_object_foreach(attrs, key, value) {
+                                /* Skip if prefix specified and doesn't match */
+                                if (req->attr_prefix && prefix_len > 0) {
+                                    if (strncmp(key, req->attr_prefix, prefix_len) != 0)
+                                        continue;
+                                }
+
+                                /* Get first value from array */
+                                if (!json_is_array(value) || json_array_size(value) == 0)
+                                    continue;
+
+                                json_t *first_val = json_array_get(value, 0);
+                                if (!first_val || !json_is_string(first_val))
+                                    continue;
+
+                                const char *val_str = json_string_value(first_val);
+                                if (!val_str || !*val_str)
+                                    continue;
+
+                                /* Create entry */
+                                struct kc_metadata_entry *entry = malloc(sizeof(*entry));
+                                if (!entry)
+                                    continue;
+
+                                entry->key = strdup(key);
+                                entry->value = strdup(val_str);
+                                entry->next = NULL;
+
+                                if (!entry->key || !entry->value) {
+                                    if (entry->key) free(entry->key);
+                                    if (entry->value) free(entry->value);
+                                    free(entry);
+                                    continue;
+                                }
+
+                                /* Add to list */
+                                if (!head) {
+                                    head = tail = entry;
+                                } else {
+                                    tail->next = entry;
+                                    tail = entry;
+                                }
+                            }
+
+                            entries = head;
+                            result = KC_SUCCESS;
+                            log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async list_attrs: Success", req_id);
+                        } else {
+                            /* No attributes object is valid - empty list */
+                            result = KC_SUCCESS;
+                            log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async list_attrs: No attributes on user", req_id);
+                        }
+                        json_decref(root);
+                    } else {
+                        log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async list_attrs: Invalid JSON: %s", req_id, error.text);
+                    }
+                } else if (http_code == 404) {
+                    result = KC_NOT_FOUND;
+                    log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async list_attrs: Not found (HTTP 404)", req_id);
+                } else {
+                    log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async list_attrs: Error (HTTP %ld)", req_id, http_code);
+                }
+                if (req->cb.list_attrs) {
+                    req->cb.list_attrs(req->session, result, entries);
+                }
+                /* Note: callback owns entries on success, must free on error */
+                if (result != KC_SUCCESS && entries) {
+                    keycloak_free_metadata_entries(entries);
+                }
+                break;
+            }
+            case KC_ASYNC_GET_ATTR: {
+                int result = KC_ERROR;
+                char *attr_value = NULL;
+
+                if (http_code == 200 && req->response.response) {
+                    json_error_t error;
+                    json_t *root = json_loads(req->response.response, 0, &error);
+                    if (root) {
+                        json_t *attrs = json_object_get(root, "attributes");
+                        if (attrs && json_is_object(attrs) && req->attr_name) {
+                            json_t *attr_arr = json_object_get(attrs, req->attr_name);
+                            if (attr_arr && json_is_array(attr_arr) && json_array_size(attr_arr) > 0) {
+                                json_t *first_val = json_array_get(attr_arr, 0);
+                                if (first_val && json_is_string(first_val)) {
+                                    const char *val_str = json_string_value(first_val);
+                                    if (val_str && *val_str) {
+                                        attr_value = strdup(val_str);
+                                        if (attr_value) {
+                                            result = KC_SUCCESS;
+                                            log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async get_attr: Found %s", req_id, req->attr_name);
+                                        }
+                                    }
+                                }
+                            }
+                            if (result != KC_SUCCESS) {
+                                result = KC_NOT_FOUND;
+                                log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async get_attr: Attribute %s not found", req_id, req->attr_name);
+                            }
+                        } else if (!attrs || !json_is_object(attrs)) {
+                            result = KC_NOT_FOUND;
+                            log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async get_attr: No attributes on user", req_id);
+                        }
+                        json_decref(root);
+                    } else {
+                        log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async get_attr: Invalid JSON: %s", req_id, error.text);
+                    }
+                } else if (http_code == 404) {
+                    result = KC_NOT_FOUND;
+                    log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async get_attr: User not found (HTTP 404)", req_id);
+                } else {
+                    log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async get_attr: Error (HTTP %ld)", req_id, http_code);
+                }
+                if (req->cb.get_attr) {
+                    req->cb.get_attr(req->session, result, attr_value);
+                }
+                /* Note: callback owns attr_value on success, must free on error */
+                if (result != KC_SUCCESS && attr_value) {
+                    free(attr_value);
+                }
+                break;
+            }
             }
 
             /* Cleanup - return handle to pool for reuse */
@@ -2101,6 +2246,8 @@ kc_curl_check_completed(void)
             if (req->header_list) curl_slist_free_all(req->header_list);
             if (req->request_id) free(req->request_id);
             if (req->create_username) free(req->create_username);
+            if (req->attr_prefix) free(req->attr_prefix);
+            if (req->attr_name) free(req->attr_name);
             free(req);
         }
     }
@@ -3103,6 +3250,8 @@ error:
             free(req->post_fields);
         }
         if (req->create_username) free(req->create_username);
+        if (req->attr_prefix) free(req->attr_prefix);
+        if (req->attr_name) free(req->attr_name);
         if (req->response.response) free(req->response.response);
         free(req);
     }
@@ -3201,12 +3350,164 @@ error:
             free(req->post_fields);
         }
         if (req->create_username) free(req->create_username);
+        if (req->attr_prefix) free(req->attr_prefix);
+        if (req->attr_name) free(req->attr_name);
         if (req->response.response) free(req->response.response);
         free(req);
     }
     if (user_repr) {
         memset(user_repr, 0, strlen(user_repr));
         free(user_repr);
+    }
+    return -1;
+}
+
+/**
+ * List user attributes asynchronously, optionally filtered by prefix.
+ * Uses the async curl_multi infrastructure for non-blocking HTTP.
+ *
+ * @param realm     Keycloak realm configuration
+ * @param client    Client with valid access token
+ * @param user_id   Keycloak user ID (UUID)
+ * @param prefix    Optional prefix filter (NULL for all attributes)
+ * @param session   Opaque session pointer passed to callback
+ * @param callback  Callback invoked on completion
+ * @return 0 on success (request started), -1 on error
+ */
+int
+keycloak_list_user_attributes_async(struct kc_realm realm, struct kc_client client,
+                                     const char *user_id, const char *prefix,
+                                     void *session, kc_list_attrs_callback callback)
+{
+    struct kc_async_request *req = NULL;
+
+    /* Validate inputs */
+    if (!realm.base_uri || !realm.realm || !client.access_token ||
+        !user_id || !callback) {
+        log_module(KC_LOG, LOG_DEBUG, "list_user_attrs_async: Invalid arguments");
+        return -1;
+    }
+
+    /* Allocate request structure */
+    req = calloc(1, sizeof(*req));
+    if (!req) {
+        log_module(KC_LOG, LOG_ERROR, "list_user_attrs_async: Out of memory");
+        return -1;
+    }
+    req->session = session;
+    req->type = KC_ASYNC_LIST_ATTRS;
+    req->cb.list_attrs = callback;
+
+    /* Store prefix for completion handler */
+    if (prefix) {
+        req->attr_prefix = strdup(prefix);
+        if (!req->attr_prefix) {
+            log_module(KC_LOG, LOG_ERROR, "list_user_attrs_async: Failed to copy prefix");
+            goto error;
+        }
+    }
+
+    /* Build URI: /admin/realms/{realm}/users/{user_id} */
+    req->uri = kc_build_user_endpoint(realm, user_id);
+    if (!req->uri) {
+        log_module(KC_LOG, LOG_ERROR, "list_user_attrs_async: Failed to build URI");
+        goto error;
+    }
+
+    /* Use unified async API */
+    struct curl_opts opts = CURL_OPTS_INIT;
+    opts.uri = req->uri;
+    opts.method = HTTP_GET;
+    opts.xoauth2_bearer = client.access_token->access_token;
+
+    if (curl_perform_async(req, opts) < 0) {
+        log_module(KC_LOG, LOG_ERROR, "list_user_attrs_async: curl_perform_async failed");
+        goto error;
+    }
+
+    log_module(KC_LOG, LOG_DEBUG, "list_user_attrs_async: Started for user %s (prefix: %s)",
+               user_id, prefix ? prefix : "(none)");
+    return 0;
+
+error:
+    if (req) {
+        if (req->uri) free(req->uri);
+        if (req->attr_prefix) free(req->attr_prefix);
+        free(req);
+    }
+    return -1;
+}
+
+/**
+ * Get a single user attribute asynchronously.
+ * Uses the async curl_multi infrastructure for non-blocking HTTP.
+ *
+ * @param realm      Keycloak realm configuration
+ * @param client     Client with valid access token
+ * @param user_id    Keycloak user ID (UUID)
+ * @param attr_name  Attribute name to retrieve
+ * @param session    Opaque session pointer passed to callback
+ * @param callback   Callback invoked on completion
+ * @return 0 on success (request started), -1 on error
+ */
+int
+keycloak_get_user_attribute_async(struct kc_realm realm, struct kc_client client,
+                                   const char *user_id, const char *attr_name,
+                                   void *session, kc_get_attr_callback callback)
+{
+    struct kc_async_request *req = NULL;
+
+    /* Validate inputs */
+    if (!realm.base_uri || !realm.realm || !client.access_token ||
+        !user_id || !attr_name || !callback) {
+        log_module(KC_LOG, LOG_DEBUG, "get_user_attr_async: Invalid arguments");
+        return -1;
+    }
+
+    /* Allocate request structure */
+    req = calloc(1, sizeof(*req));
+    if (!req) {
+        log_module(KC_LOG, LOG_ERROR, "get_user_attr_async: Out of memory");
+        return -1;
+    }
+    req->session = session;
+    req->type = KC_ASYNC_GET_ATTR;
+    req->cb.get_attr = callback;
+
+    /* Store attribute name for completion handler */
+    req->attr_name = strdup(attr_name);
+    if (!req->attr_name) {
+        log_module(KC_LOG, LOG_ERROR, "get_user_attr_async: Failed to copy attr_name");
+        goto error;
+    }
+
+    /* Build URI: /admin/realms/{realm}/users/{user_id} */
+    req->uri = kc_build_user_endpoint(realm, user_id);
+    if (!req->uri) {
+        log_module(KC_LOG, LOG_ERROR, "get_user_attr_async: Failed to build URI");
+        goto error;
+    }
+
+    /* Use unified async API */
+    struct curl_opts opts = CURL_OPTS_INIT;
+    opts.uri = req->uri;
+    opts.method = HTTP_GET;
+    opts.xoauth2_bearer = client.access_token->access_token;
+
+    if (curl_perform_async(req, opts) < 0) {
+        log_module(KC_LOG, LOG_ERROR, "get_user_attr_async: curl_perform_async failed");
+        goto error;
+    }
+
+    log_module(KC_LOG, LOG_DEBUG, "get_user_attr_async: Started for user %s, attr %s",
+               user_id, attr_name);
+    return 0;
+
+error:
+    if (req) {
+        if (req->uri) free(req->uri);
+        if (req->attr_name) free(req->attr_name);
+        free(req);
     }
     return -1;
 }

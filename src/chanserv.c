@@ -1017,6 +1017,7 @@ static void kc_async_sync_next_channel(void);
 static void kc_async_sync_next_channel_delayed(void *data);
 static void kc_async_sync_channel_done(int synced);
 static int chanserv_sync_keycloak_channel_async(const char *channel);
+static int chanserv_sync_keycloak_channel_async_standalone(const char *channel);
 static void kc_sync_complete(void);
 #endif
 

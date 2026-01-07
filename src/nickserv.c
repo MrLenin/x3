@@ -259,7 +259,12 @@ static int expire_nicks_timer_set = 0;
 static int metadata_purge_timer_set = 0;
 
 #ifdef WITH_KEYCLOAK
-/* Structure for async AUTH command (Phase 2) */
+/* Structure for async AUTH command (Phase 2 + Phase 5.10 email chain) */
+enum auth_async_state {
+    AUTH_STATE_PASSWORD,     /* Waiting for password check */
+    AUTH_STATE_EMAIL_LOOKUP  /* Waiting for email lookup (Phase 5.10) */
+};
+
 struct auth_async_ctx {
     char handle[NICKSERV_HANDLE_LEN + 1];  /* Account handle */
     char nick[NICKLEN + 1];                 /* User's nick (for replies) */
@@ -268,8 +273,12 @@ struct auth_async_ctx {
     struct svccmd *cmd;                     /* Command context */
     int pw_arg;                             /* Password argument index */
     time_t started;                         /* When request started */
+    enum auth_async_state state;            /* Current state (Phase 5.10) */
+    char *kc_email;                         /* Email from async lookup (Phase 5.10) */
 };
 static int auth_async_callback(void *ctx_ptr, int result);
+static int auth_async_email_cb(void *session, int result, struct kc_user *user);
+static void auth_async_complete(struct auth_async_ctx *ctx);
 
 /* Structure for async COOKIE command (Phase 4/5) */
 enum cookie_async_state {
@@ -309,6 +318,41 @@ static void kc_sync_fingerprints(struct handle_info *hi);
 static void kc_try_auto_activate(struct handle_info *hi);
 static struct handle_info *loc_auth_oauth(const char *bearer_token, const char *username_hint, const char *hostmask);
 static const char *kc_strerror(int rc);
+
+/* Webpush subscriptions async context (Phase 5.10) */
+typedef void (*webpush_subs_callback)(void *session, int result, struct kc_metadata_entry *entries);
+
+struct webpush_subs_ctx {
+    char account_name[NICKSERV_HANDLE_LEN + 1];  /* Account name to look up */
+    char *user_id;                                /* Keycloak user ID (from lookup) */
+    void *caller_session;                         /* Caller's session pointer */
+    webpush_subs_callback callback;               /* Caller's callback */
+};
+static void webpush_subs_token_cb(void *ctx, int result, struct access_token *token);
+static int webpush_subs_user_cb(void *session, int result, struct kc_user *user);
+static int webpush_subs_list_cb(void *session, int result, struct kc_metadata_entry *entries);
+
+/* Metadata sync async context (Phase 5.10) - fire-and-forget pattern */
+struct metadata_sync_ctx {
+    char handle[NICKSERV_HANDLE_LEN + 1];  /* Account handle */
+    char nick[NICKLEN + 1];                 /* User's nick (for irc_metadata target) */
+    char *user_id;                          /* Keycloak user ID (from lookup) */
+    int use_nick;                           /* 1=use nick as target, 0=use handle */
+};
+static void metadata_sync_token_cb(void *ctx, int result, struct access_token *token);
+static int metadata_sync_user_cb(void *session, int result, struct kc_user *user);
+static int metadata_sync_list_cb(void *session, int result, struct kc_metadata_entry *entries);
+static void nickserv_sync_metadata_async(const char *handle, const char *nick, int use_nick);
+
+/* Single-key metadata async context (Phase 5.10) - for MDQ single-key queries */
+struct mdq_single_ctx {
+    char handle[NICKSERV_HANDLE_LEN + 1];  /* Account handle (also used as irc_metadata target) */
+    char key[128];                          /* Metadata key */
+    char *user_id;                          /* Keycloak user ID (from lookup) */
+};
+static void mdq_single_token_cb(void *ctx, int result, struct access_token *token);
+static int mdq_single_user_cb(void *session, int result, struct kc_user *user);
+static int mdq_single_attr_cb(void *session, int result, char *value);
 #endif
 
 /*
@@ -6280,94 +6324,65 @@ auth_async_validate_user(struct auth_async_ctx *ctx)
     return user;
 }
 
-/* Async AUTH callback - invoked when Keycloak auth completes */
-static int
-auth_async_callback(void *ctx_ptr, int result)
+/* Free auth async context */
+static void
+auth_async_ctx_free(struct auth_async_ctx *ctx)
 {
-    struct auth_async_ctx *ctx = (struct auth_async_ctx *)ctx_ptr;
+    if (!ctx) return;
+    if (ctx->kc_email) free(ctx->kc_email);
+    free(ctx);
+}
+
+/* Complete AUTH flow after password check and optional email lookup */
+static void
+auth_async_complete(struct auth_async_ctx *ctx)
+{
     struct userNode *user;
     struct handle_info *hi;
-    char *kc_email = NULL;
     int maxlogins, used;
     struct userNode *other;
-
-    if (!ctx) {
-        log_module(NS_LOG, LOG_ERROR, "AUTH async callback: NULL context");
-        return 1;
-    }
 
     /* Validate user is still connected */
     user = auth_async_validate_user(ctx);
     if (!user) {
-        log_module(NS_LOG, LOG_DEBUG, "AUTH async callback: User no longer valid");
-        free(ctx);
-        return 1;
+        log_module(NS_LOG, LOG_DEBUG, "AUTH async complete: User no longer valid");
+        auth_async_ctx_free(ctx);
+        return;
     }
-
-    log_module(NS_LOG, LOG_DEBUG, "AUTH async callback: handle=%s result=%d",
-               ctx->handle, result);
 
     /* Look up handle info */
     hi = dict_find(nickserv_handle_dict, ctx->handle, NULL);
 
-    /* Process auth result */
-    if (result == KC_SUCCESS) {
-        /* Get user email for potential updates */
-        if (kc_get_user_info(ctx->handle, &kc_email) != KC_SUCCESS) {
-            if (nickserv_conf.email_required) {
-                send_message(user, nickserv, "NSMSG_KEYCLOAK_FAIL_EMAIL", kc_strerror(KC_ERROR));
-                free(ctx);
-                return 0;
-            }
-        }
-
-        /* Handle autocreate if account doesn't exist */
-        if (!hi && nickserv_conf.keycloak_autocreate) {
-            char *mask;
-            hi = nickserv_register(user, user, ctx->handle, "*", 0);
-            if (!hi) {
-                send_message(user, nickserv, "NSMSG_UNABLE_TO_ADD");
-                if (kc_email) free(kc_email);
-                free(ctx);
-                return 0;
-            }
-            /* Add default hostmask */
-            if (nickserv_conf.default_hostmask)
-                mask = "*@*";
-            else
-                mask = generate_hostmask(user, GENMASK_OMITNICK|GENMASK_NO_HIDING|GENMASK_ANY_IDENT);
-            if (mask) {
-                char *mask_canonicalized = canonicalize_hostmask(strdup(mask));
-                string_list_append(hi->masks, mask_canonicalized);
-            }
-            if (kc_email) {
-                nickserv_set_email_addr(hi, kc_email);
-            }
-            if (nickserv_conf.sync_log)
-                SyncLog("REGISTER %s %s %s %s", hi->handle, hi->passwd, kc_email ? kc_email : "@", user->info);
-        }
-
-        if (kc_email) free(kc_email);
-    } else if (result == KC_FORBIDDEN) {
-        /* Invalid credentials */
+    /* Handle autocreate if account doesn't exist (only on KC_SUCCESS) */
+    if (!hi && nickserv_conf.keycloak_autocreate && ctx->state == AUTH_STATE_EMAIL_LOOKUP) {
+        char *mask;
+        hi = nickserv_register(user, user, ctx->handle, "*", 0);
         if (!hi) {
-            send_message(user, nickserv, "NSMSG_HANDLE_NOT_FOUND");
-            free(ctx);
-            return 0;
+            send_message(user, nickserv, "NSMSG_UNABLE_TO_ADD");
+            auth_async_ctx_free(ctx);
+            return;
         }
-        /* Fall through to password check below which will fail */
-    } else {
-        /* Keycloak error */
-        send_message(user, nickserv, "NSMSG_KEYCLOAK_FAIL", kc_strerror(result));
-        free(ctx);
-        return 0;
+        /* Add default hostmask */
+        if (nickserv_conf.default_hostmask)
+            mask = "*@*";
+        else
+            mask = generate_hostmask(user, GENMASK_OMITNICK|GENMASK_NO_HIDING|GENMASK_ANY_IDENT);
+        if (mask) {
+            char *mask_canonicalized = canonicalize_hostmask(strdup(mask));
+            string_list_append(hi->masks, mask_canonicalized);
+        }
+        if (ctx->kc_email) {
+            nickserv_set_email_addr(hi, ctx->kc_email);
+        }
+        if (nickserv_conf.sync_log)
+            SyncLog("REGISTER %s %s %s %s", hi->handle, hi->passwd, ctx->kc_email ? ctx->kc_email : "@", user->info);
     }
 
     /* Now continue with standard cmd_auth flow */
     if (!hi) {
         send_message(user, nickserv, "NSMSG_HANDLE_NOT_FOUND");
-        free(ctx);
-        return 0;
+        auth_async_ctx_free(ctx);
+        return;
     }
 
     /* Hostmask validation */
@@ -6380,12 +6395,12 @@ auth_async_callback(void *ctx_ptr, int result)
             send_message_type(4, user, nickserv,
                               handle_find_message(hi, "NSMSG_HOSTMASK_INVALID"),
                               hi->handle);
-        free(ctx);
-        return 0;
+        auth_async_ctx_free(ctx);
+        return;
     }
 
-    /* Check password result (KC_SUCCESS means we're authenticated via Keycloak) */
-    if (result != KC_SUCCESS) {
+    /* Check password result (AUTH_STATE_EMAIL_LOOKUP means we're authenticated via Keycloak) */
+    if (ctx->state != AUTH_STATE_EMAIL_LOOKUP) {
         unsigned int n;
         send_message_type(4, user, nickserv,
                           handle_find_message(hi, "NSMSG_PASSWORD_INVALID"));
@@ -6404,24 +6419,24 @@ auth_async_callback(void *ctx_ptr, int result)
                 free(hostmask);
             }
         }
-        free(ctx);
-        return 0;
+        auth_async_ctx_free(ctx);
+        return;
     }
 
     /* Check if suspended */
     if (HANDLE_FLAGGED(hi, SUSPENDED)) {
         send_message_type(4, user, nickserv,
                           handle_find_message(hi, "NSMSG_HANDLE_SUSPENDED"));
-        free(ctx);
-        return 0;
+        auth_async_ctx_free(ctx);
+        return;
     }
 
     /* Check for pending activation */
     if (hi->cookie && hi->cookie->type == ACTIVATION) {
         send_message_type(4, user, nickserv,
                           handle_find_message(hi, "NSMSG_USE_COOKIE_REGISTER"));
-        free(ctx);
-        return 0;
+        auth_async_ctx_free(ctx);
+        return;
     }
 
     /* Check max logins */
@@ -6431,8 +6446,8 @@ auth_async_callback(void *ctx_ptr, int result)
             send_message_type(4, user, nickserv,
                               handle_find_message(hi, "NSMSG_MAX_LOGINS"),
                               maxlogins);
-            free(ctx);
-            return 0;
+            auth_async_ctx_free(ctx);
+            return;
         }
     }
 
@@ -6442,8 +6457,106 @@ auth_async_callback(void *ctx_ptr, int result)
         SyncLog("ACCOUNTACC %s", hi->handle);
     send_message_type(4, user, nickserv, handle_find_message(hi, "NSMSG_AUTH_SUCCESS"));
 
-    free(ctx);
+    auth_async_ctx_free(ctx);
+}
+
+/* Stage 2: Email lookup callback (Phase 5.10) */
+static int
+auth_async_email_cb(void *session, int result, struct kc_user *user)
+{
+    struct auth_async_ctx *ctx = (struct auth_async_ctx *)session;
+    struct userNode *irc_user;
+
+    if (!ctx) {
+        if (user) keycloak_user_free_fields(user);
+        return 1;
+    }
+
+    /* Validate user is still connected */
+    irc_user = auth_async_validate_user(ctx);
+    if (!irc_user) {
+        log_module(NS_LOG, LOG_DEBUG, "AUTH async email_cb: User no longer valid");
+        if (user) keycloak_user_free_fields(user);
+        auth_async_ctx_free(ctx);
+        return 1;
+    }
+
+    if (result == KC_SUCCESS && user && user->email) {
+        ctx->kc_email = strdup(user->email);
+        log_module(NS_LOG, LOG_DEBUG, "AUTH async email_cb: Got email for %s", ctx->handle);
+    } else {
+        log_module(NS_LOG, LOG_DEBUG, "AUTH async email_cb: No email for %s (result=%d)", ctx->handle, result);
+        if (nickserv_conf.email_required) {
+            send_message(irc_user, nickserv, "NSMSG_KEYCLOAK_FAIL_EMAIL", kc_strerror(KC_ERROR));
+            if (user) keycloak_user_free_fields(user);
+            auth_async_ctx_free(ctx);
+            return 0;
+        }
+    }
+
+    if (user) keycloak_user_free_fields(user);
+
+    /* Continue to completion */
+    auth_async_complete(ctx);
     return 0;
+}
+
+/* Async AUTH callback - invoked when Keycloak auth completes */
+static int
+auth_async_callback(void *ctx_ptr, int result)
+{
+    struct auth_async_ctx *ctx = (struct auth_async_ctx *)ctx_ptr;
+    struct userNode *user;
+    struct handle_info *hi;
+
+    if (!ctx) {
+        log_module(NS_LOG, LOG_ERROR, "AUTH async callback: NULL context");
+        return 1;
+    }
+
+    /* Validate user is still connected */
+    user = auth_async_validate_user(ctx);
+    if (!user) {
+        log_module(NS_LOG, LOG_DEBUG, "AUTH async callback: User no longer valid");
+        auth_async_ctx_free(ctx);
+        return 1;
+    }
+
+    log_module(NS_LOG, LOG_DEBUG, "AUTH async callback: handle=%s result=%d",
+               ctx->handle, result);
+
+    /* Look up handle info */
+    hi = dict_find(nickserv_handle_dict, ctx->handle, NULL);
+
+    /* Process auth result */
+    if (result == KC_SUCCESS) {
+        /* Start async email lookup (Phase 5.10) */
+        ctx->state = AUTH_STATE_EMAIL_LOOKUP;
+
+        if (keycloak_get_user_async(keycloak_get_realm(), keycloak_get_authed_client(),
+                                     ctx->handle, ctx, auth_async_email_cb) < 0) {
+            log_module(NS_LOG, LOG_DEBUG, "AUTH async callback: Failed to start email lookup, continuing without email");
+            /* Continue without email if async fails to start */
+            auth_async_complete(ctx);
+        }
+        return 0;  /* Async in progress */
+    } else if (result == KC_FORBIDDEN) {
+        /* Invalid credentials */
+        if (!hi) {
+            send_message(user, nickserv, "NSMSG_HANDLE_NOT_FOUND");
+            auth_async_ctx_free(ctx);
+            return 0;
+        }
+        /* Fall through to password check in complete which will fail */
+        ctx->state = AUTH_STATE_PASSWORD;
+        auth_async_complete(ctx);
+        return 0;
+    } else {
+        /* Keycloak error */
+        send_message(user, nickserv, "NSMSG_KEYCLOAK_FAIL", kc_strerror(result));
+        auth_async_ctx_free(ctx);
+        return 0;
+    }
 }
 
 /* Forward declarations for cookie async callbacks (token callback declared earlier) */
@@ -7645,7 +7758,7 @@ kc_sync_fingerprints(struct handle_info *hi)
 /* Context for async auto-activate check */
 struct kc_auto_activate_ctx {
     char handle[NICKSERV_HANDLE_LEN + 1];
-    char cookie_data[PASSLEN + 1];  /* Copy of password hash from cookie */
+    char cookie_data[PASSWD_LEN + 1];  /* Copy of password hash from cookie */
 };
 
 /*
@@ -8867,13 +8980,12 @@ nickserv_get_user_metadata(struct handle_info *hi, const char *key, char *value_
         *visibility_out = METADATA_VIS_PUBLIC;
 
     /*
-     * Read-through cache pattern:
-     * 1. Check LMDB cache first (fast, local)
-     * 2. If cache miss, query Keycloak and populate cache
+     * LMDB cache lookup only (non-blocking).
+     * For cache misses, caller should use nickserv_get_user_metadata_async()
+     * which will query Keycloak and send the MD response from callback.
      */
 
 #ifdef WITH_LMDB
-    /* Step 1: Check LMDB cache first */
     if (x3_lmdb_is_available()) {
         char stored_value[2048];
         int rc;
@@ -8893,73 +9005,160 @@ nickserv_get_user_metadata(struct handle_info *hi, const char *key, char *value_
                        hi->handle, key);
             return 0;
         }
-        /* Cache miss - continue to Keycloak */
+        /* Cache miss - caller should use async API */
         log_module(NS_LOG, LOG_DEBUG, "nickserv_get_user_metadata: LMDB cache miss for %s.%s",
                    hi->handle, key);
     }
 #endif
 
-#ifdef WITH_KEYCLOAK
-    /* Step 2: Query Keycloak backend */
-    if (nickserv_conf.keycloak_enable) {
-        char attr_name[128];
-        struct kc_user user;
-        char *attr_value = NULL;
-        int rc;
+    return 1; /* Cache miss or no LMDB - caller should use async */
+}
 
-        if (keycloak_ensure_token() != KC_SUCCESS) {
-            log_module(NS_LOG, LOG_WARNING, "nickserv_get_user_metadata: Failed to get admin token");
-            return -1;
+/**
+ * Async single-key metadata lookup - callback chain stage 1 (token ready).
+ */
+static void
+mdq_single_token_cb(void *ctx_ptr, int result, struct access_token *token)
+{
+    struct mdq_single_ctx *ctx = (struct mdq_single_ctx *)ctx_ptr;
+    (void)token;  /* Token is managed by token manager */
+
+    if (result != KC_SUCCESS) {
+        log_module(NS_LOG, LOG_DEBUG, "mdq_single_async: Token acquisition failed (%d)", result);
+        free(ctx);
+        return;
+    }
+
+    /* Stage 2: Get user ID from Keycloak */
+    if (keycloak_get_user_async(keycloak_get_realm(), keycloak_get_authed_client(),
+                                 ctx->handle, ctx, mdq_single_user_cb) < 0) {
+        log_module(NS_LOG, LOG_DEBUG, "mdq_single_async: Failed to start user lookup for %s", ctx->handle);
+        free(ctx);
+        return;
+    }
+}
+
+/**
+ * Async single-key metadata lookup - callback chain stage 2 (user ID ready).
+ */
+static int
+mdq_single_user_cb(void *session, int result, struct kc_user *user)
+{
+    struct mdq_single_ctx *ctx = (struct mdq_single_ctx *)session;
+    char attr_name[128];
+
+    if (result != KC_SUCCESS || !user || !user->id) {
+        log_module(NS_LOG, LOG_DEBUG, "mdq_single_async: User %s not found (%d)", ctx->handle, result);
+        if (user) keycloak_user_free_fields(user);
+        free(ctx);
+        return 1;
+    }
+
+    /* Store user ID for stage 3 */
+    ctx->user_id = strdup(user->id);
+    keycloak_user_free_fields(user);
+
+    if (!ctx->user_id) {
+        log_module(NS_LOG, LOG_ERROR, "mdq_single_async: Out of memory");
+        free(ctx);
+        return 1;
+    }
+
+    /* Stage 3: Get specific attribute */
+    snprintf(attr_name, sizeof(attr_name), "metadata.%s", ctx->key);
+    if (keycloak_get_user_attribute_async(keycloak_get_realm(), keycloak_get_authed_client(),
+                                           ctx->user_id, attr_name, ctx,
+                                           mdq_single_attr_cb) < 0) {
+        log_module(NS_LOG, LOG_DEBUG, "mdq_single_async: Failed to start attribute lookup for %s.%s",
+                   ctx->handle, ctx->key);
+        free(ctx->user_id);
+        free(ctx);
+        return 1;
+    }
+
+    return 0;  /* Continue processing */
+}
+
+/**
+ * Async single-key metadata lookup - callback chain stage 3 (attribute ready).
+ * Sends MD response to IRCd and populates LMDB cache.
+ */
+static int
+mdq_single_attr_cb(void *session, int result, char *value)
+{
+    struct mdq_single_ctx *ctx = (struct mdq_single_ctx *)session;
+
+    if (result == KC_SUCCESS && value) {
+        const char *display_value = value;
+        int visibility = METADATA_VIS_PUBLIC;
+
+        /* Parse visibility prefix */
+        if (value[0] == 'P' && value[1] == ':') {
+            visibility = METADATA_VIS_PRIVATE;
+            display_value = value + 2;
         }
 
-        /* Get user ID from Keycloak */
-        rc = keycloak_get_user(keycloak_get_realm(), keycloak_get_authed_client(), hi->handle, &user);
-        if (rc != KC_SUCCESS) {
-            log_module(NS_LOG, LOG_DEBUG, "nickserv_get_user_metadata: User %s not found in Keycloak", hi->handle);
-            return 1; /* Not found */
-        }
+        log_module(NS_LOG, LOG_DEBUG, "mdq_single_async: Pushing %s.%s = %s (vis=%d) from Keycloak",
+                   ctx->handle, ctx->key, display_value, visibility);
 
-        char *user_id = strdup(user.id);
-        keycloak_user_free_fields(&user);
-
-        /* Prefix metadata keys with "metadata." */
-        snprintf(attr_name, sizeof(attr_name), "metadata.%s", key);
-
-        rc = keycloak_get_user_attribute(keycloak_get_realm(), keycloak_get_authed_client(),
-                                         user_id, attr_name, &attr_value);
-        free(user_id);
-
-        if (rc == KC_SUCCESS && attr_value) {
-            /* Found in Keycloak - populate cache and return */
-            if (attr_value[0] == 'P' && attr_value[1] == ':') {
-                if (visibility_out)
-                    *visibility_out = METADATA_VIS_PRIVATE;
-                strncpy(value_out, attr_value + 2, 1023);
-            } else {
-                strncpy(value_out, attr_value, 1023);
-            }
-            value_out[1023] = '\0';
+        /* Send MD response to IRCd */
+        irc_metadata(ctx->handle, ctx->key, display_value, visibility);
 
 #ifdef WITH_LMDB
-            /* Populate LMDB cache with Keycloak data */
-            if (x3_lmdb_is_available()) {
-                x3_lmdb_account_set(hi->handle, key, attr_value);
-                log_module(NS_LOG, LOG_DEBUG, "nickserv_get_user_metadata: Populated LMDB cache for %s.%s",
-                           hi->handle, key);
-            }
-#endif
-            free(attr_value);
-            return 0;
-        } else if (rc == KC_NOT_FOUND) {
-            free(attr_value);
-            return 1; /* Not found */
+        /* Populate LMDB cache */
+        if (x3_lmdb_is_available()) {
+            x3_lmdb_account_set(ctx->handle, ctx->key, value);
         }
-        free(attr_value);
-        return -1;
-    }
 #endif
+        free(value);
+    } else {
+        log_module(NS_LOG, LOG_DEBUG, "mdq_single_async: Attribute %s.%s not found (%d)",
+                   ctx->handle, ctx->key, result);
+        if (value) free(value);
+    }
 
-    return 1; /* Not found - no backend */
+    /* Cleanup context */
+    if (ctx->user_id) free(ctx->user_id);
+    free(ctx);
+    return 1;  /* Terminal callback */
+}
+
+/**
+ * Start async single-key metadata lookup (fire-and-forget).
+ * Called when LMDB cache miss occurs for MDQ single-key queries.
+ */
+void
+nickserv_get_user_metadata_async(struct handle_info *hi, const char *key)
+{
+#ifdef WITH_KEYCLOAK
+    if (!nickserv_conf.keycloak_enable)
+        return;
+
+    if (!hi || !key)
+        return;
+
+    struct mdq_single_ctx *ctx = calloc(1, sizeof(*ctx));
+    if (!ctx) {
+        log_module(NS_LOG, LOG_ERROR, "mdq_single_async: Out of memory");
+        return;
+    }
+
+    strncpy(ctx->handle, hi->handle, sizeof(ctx->handle) - 1);
+    strncpy(ctx->key, key, sizeof(ctx->key) - 1);
+
+    /* Start async token acquisition - fire-and-forget */
+    if (keycloak_ensure_token_async(mdq_single_token_cb, ctx) != 0) {
+        log_module(NS_LOG, LOG_DEBUG, "mdq_single_async: Failed to start token acquisition for %s.%s",
+                   hi->handle, key);
+        free(ctx);
+        return;
+    }
+
+    log_module(NS_LOG, LOG_DEBUG, "mdq_single_async: Started async lookup for %s.%s", hi->handle, key);
+#else
+    (void)hi;
+    (void)key;
+#endif
 }
 
 /**
@@ -9096,78 +9295,8 @@ nickserv_sync_metadata_to_ircd(struct userNode *user)
     if (found_entries > 0)
         return;
 
-#ifdef WITH_KEYCLOAK
-    /* Step 2: Query Keycloak backend (cache miss or no LMDB) */
-    if (nickserv_conf.keycloak_enable) {
-        struct kc_user kc_user;
-        struct kc_metadata_entry *entries = NULL;
-        struct kc_metadata_entry *entry;
-        int rc;
-
-        if (keycloak_ensure_token() != KC_SUCCESS) {
-            log_module(NS_LOG, LOG_DEBUG, "nickserv_sync_metadata_to_ircd: Failed to get admin token");
-            return;
-        }
-
-        /* Get user ID from Keycloak */
-        rc = keycloak_get_user(keycloak_get_realm(), keycloak_get_authed_client(), user->handle_info->handle, &kc_user);
-        if (rc != KC_SUCCESS) {
-            log_module(NS_LOG, LOG_DEBUG, "nickserv_sync_metadata_to_ircd: User %s not found in Keycloak",
-                       user->handle_info->handle);
-            return;
-        }
-
-        char *user_id = strdup(kc_user.id);
-        keycloak_user_free_fields(&kc_user);
-
-        /* Fetch all metadata.* attributes */
-        rc = keycloak_list_user_attributes(keycloak_get_realm(), keycloak_get_authed_client(),
-                                           user_id, "metadata.", &entries);
-        free(user_id);
-
-        if (rc != KC_SUCCESS) {
-            log_module(NS_LOG, LOG_DEBUG, "nickserv_sync_metadata_to_ircd: Failed to list attributes for %s",
-                       user->handle_info->handle);
-            return;
-        }
-
-        /* Push each metadata entry to the IRCd and populate LMDB cache */
-        for (entry = entries; entry; entry = entry->next) {
-            /* Strip "metadata." prefix from key */
-            const char *key = entry->key;
-            const char *value = entry->value;
-            const char *original_value = entry->value;
-            int visibility = METADATA_VIS_PUBLIC;
-
-            if (strncmp(key, "metadata.", 9) == 0)
-                key += 9;
-
-            /* Parse visibility prefix from stored value (P:value for private) */
-            if (value && value[0] == 'P' && value[1] == ':') {
-                visibility = METADATA_VIS_PRIVATE;
-                value += 2;
-            }
-
-            log_module(NS_LOG, LOG_DEBUG, "nickserv_sync_metadata_to_ircd: Pushing %s.%s = %s (vis=%d) from Keycloak",
-                       user->nick, key, value, visibility);
-
-            irc_metadata(user->nick, key, value, visibility);
-
-#ifdef WITH_LMDB
-            /* Populate LMDB cache */
-            if (x3_lmdb_is_available()) {
-                x3_lmdb_account_set(user->handle_info->handle, key, original_value);
-            }
-#endif
-        }
-
-        keycloak_free_metadata_entries(entries);
-        return;
-    }
-#endif
-
-    log_module(NS_LOG, LOG_DEBUG, "nickserv_sync_metadata_to_ircd: No backend for %s",
-               user->handle_info->handle);
+    /* Step 2: Query Keycloak backend async (cache miss or no LMDB) - fire-and-forget */
+    nickserv_sync_metadata_async(user->handle_info->handle, user->nick, 1);
 }
 
 void
@@ -9235,78 +9364,168 @@ nickserv_sync_account_metadata_to_ircd(struct handle_info *hi)
     if (found_entries > 0)
         return;
 
-#ifdef WITH_KEYCLOAK
-    /* Step 2: Query Keycloak backend (cache miss or no LMDB) */
-    if (nickserv_conf.keycloak_enable) {
-        struct kc_user kc_user;
-        struct kc_metadata_entry *entries = NULL;
-        struct kc_metadata_entry *entry;
-        int rc;
+    /* Step 2: Query Keycloak backend async (cache miss or no LMDB) - fire-and-forget */
+    nickserv_sync_metadata_async(hi->handle, NULL, 0);
+}
 
-        if (keycloak_ensure_token() != KC_SUCCESS) {
-            log_module(NS_LOG, LOG_DEBUG, "nickserv_sync_account_metadata_to_ircd: Failed to get admin token");
-            return;
-        }
+/**
+ * Async metadata sync - callback chain stage 1 (token ready).
+ */
+static void
+metadata_sync_token_cb(void *ctx_ptr, int result, struct access_token *token)
+{
+    struct metadata_sync_ctx *ctx = (struct metadata_sync_ctx *)ctx_ptr;
+    (void)token;  /* Token is managed by token manager */
 
-        /* Get user ID from Keycloak */
-        rc = keycloak_get_user(keycloak_get_realm(), keycloak_get_authed_client(), hi->handle, &kc_user);
-        if (rc != KC_SUCCESS) {
-            log_module(NS_LOG, LOG_DEBUG, "nickserv_sync_account_metadata_to_ircd: User %s not found in Keycloak",
-                       hi->handle);
-            return;
-        }
-
-        char *user_id = strdup(kc_user.id);
-        keycloak_user_free_fields(&kc_user);
-
-        /* Fetch all metadata.* attributes */
-        rc = keycloak_list_user_attributes(keycloak_get_realm(), keycloak_get_authed_client(),
-                                           user_id, "metadata.", &entries);
-        free(user_id);
-
-        if (rc != KC_SUCCESS) {
-            log_module(NS_LOG, LOG_DEBUG, "nickserv_sync_account_metadata_to_ircd: Failed to list attributes for %s",
-                       hi->handle);
-            return;
-        }
-
-        /* Push each metadata entry to the IRCd and populate LMDB cache */
-        for (entry = entries; entry; entry = entry->next) {
-            /* Strip "metadata." prefix from key */
-            const char *key = entry->key;
-            const char *value = entry->value;
-            const char *original_value = entry->value;
-            int visibility = METADATA_VIS_PUBLIC;
-
-            if (strncmp(key, "metadata.", 9) == 0)
-                key += 9;
-
-            /* Parse visibility prefix from stored value (P:value for private) */
-            if (value && value[0] == 'P' && value[1] == ':') {
-                visibility = METADATA_VIS_PRIVATE;
-                value += 2;
-            }
-
-            log_module(NS_LOG, LOG_DEBUG, "nickserv_sync_account_metadata_to_ircd: Pushing %s.%s = %s (vis=%d) from Keycloak",
-                       hi->handle, key, value, visibility);
-
-            irc_metadata(hi->handle, key, value, visibility);
-
-#ifdef WITH_LMDB
-            /* Populate LMDB cache */
-            if (x3_lmdb_is_available()) {
-                x3_lmdb_account_set(hi->handle, key, original_value);
-            }
-#endif
-        }
-
-        keycloak_free_metadata_entries(entries);
+    if (result != KC_SUCCESS) {
+        log_module(NS_LOG, LOG_DEBUG, "metadata_sync_async: Token acquisition failed (%d)", result);
+        free(ctx);
         return;
     }
-#endif
 
-    log_module(NS_LOG, LOG_DEBUG, "nickserv_sync_account_metadata_to_ircd: No backend for %s",
-               hi->handle);
+    /* Stage 2: Get user ID from Keycloak */
+    if (keycloak_get_user_async(keycloak_get_realm(), keycloak_get_authed_client(),
+                                 ctx->handle, ctx, metadata_sync_user_cb) < 0) {
+        log_module(NS_LOG, LOG_DEBUG, "metadata_sync_async: Failed to start user lookup for %s", ctx->handle);
+        free(ctx);
+        return;
+    }
+}
+
+/**
+ * Async metadata sync - callback chain stage 2 (user ID ready).
+ */
+static int
+metadata_sync_user_cb(void *session, int result, struct kc_user *user)
+{
+    struct metadata_sync_ctx *ctx = (struct metadata_sync_ctx *)session;
+
+    if (result != KC_SUCCESS || !user || !user->id) {
+        log_module(NS_LOG, LOG_DEBUG, "metadata_sync_async: User %s not found (%d)", ctx->handle, result);
+        if (user) keycloak_user_free_fields(user);
+        free(ctx);
+        return 1;
+    }
+
+    /* Store user ID for stage 3 */
+    ctx->user_id = strdup(user->id);
+    keycloak_user_free_fields(user);
+
+    if (!ctx->user_id) {
+        log_module(NS_LOG, LOG_ERROR, "metadata_sync_async: Out of memory");
+        free(ctx);
+        return 1;
+    }
+
+    /* Stage 3: List metadata.* attributes */
+    if (keycloak_list_user_attributes_async(keycloak_get_realm(), keycloak_get_authed_client(),
+                                             ctx->user_id, "metadata.", ctx,
+                                             metadata_sync_list_cb) < 0) {
+        log_module(NS_LOG, LOG_DEBUG, "metadata_sync_async: Failed to start attribute listing for %s", ctx->handle);
+        free(ctx->user_id);
+        free(ctx);
+        return 1;
+    }
+
+    return 0;  /* Continue processing */
+}
+
+/**
+ * Async metadata sync - callback chain stage 3 (attributes ready).
+ * Pushes metadata to IRCd and populates LMDB cache.
+ */
+static int
+metadata_sync_list_cb(void *session, int result, struct kc_metadata_entry *entries)
+{
+    struct metadata_sync_ctx *ctx = (struct metadata_sync_ctx *)session;
+    struct kc_metadata_entry *entry;
+    const char *target;
+
+    if (result != KC_SUCCESS || !entries) {
+        log_module(NS_LOG, LOG_DEBUG, "metadata_sync_async: No attributes for %s (%d)", ctx->handle, result);
+        if (entries) keycloak_free_metadata_entries(entries);
+        if (ctx->user_id) free(ctx->user_id);
+        free(ctx);
+        return 1;
+    }
+
+    /* Determine target (nick or handle) */
+    target = ctx->use_nick ? ctx->nick : ctx->handle;
+
+    /* Push each metadata entry to the IRCd and populate LMDB cache */
+    for (entry = entries; entry; entry = entry->next) {
+        /* Strip "metadata." prefix from key */
+        const char *key = entry->key;
+        const char *value = entry->value;
+        const char *original_value = entry->value;
+        int visibility = METADATA_VIS_PUBLIC;
+
+        if (strncmp(key, "metadata.", 9) == 0)
+            key += 9;
+
+        /* Parse visibility prefix from stored value (P:value for private) */
+        if (value && value[0] == 'P' && value[1] == ':') {
+            visibility = METADATA_VIS_PRIVATE;
+            value += 2;
+        }
+
+        log_module(NS_LOG, LOG_DEBUG, "metadata_sync_async: Pushing %s.%s = %s (vis=%d) from Keycloak",
+                   target, key, value, visibility);
+
+        irc_metadata(target, key, value, visibility);
+
+#ifdef WITH_LMDB
+        /* Populate LMDB cache */
+        if (x3_lmdb_is_available()) {
+            x3_lmdb_account_set(ctx->handle, key, original_value);
+        }
+#endif
+    }
+
+    keycloak_free_metadata_entries(entries);
+
+    /* Cleanup context */
+    if (ctx->user_id) free(ctx->user_id);
+    free(ctx);
+    return 1;  /* Terminal callback */
+}
+
+/**
+ * Start async metadata sync for a user (fire-and-forget).
+ * Called when LMDB cache miss occurs.
+ */
+static void
+nickserv_sync_metadata_async(const char *handle, const char *nick, int use_nick)
+{
+#ifdef WITH_KEYCLOAK
+    if (!nickserv_conf.keycloak_enable)
+        return;
+
+    struct metadata_sync_ctx *ctx = calloc(1, sizeof(*ctx));
+    if (!ctx) {
+        log_module(NS_LOG, LOG_ERROR, "metadata_sync_async: Out of memory");
+        return;
+    }
+
+    strncpy(ctx->handle, handle, sizeof(ctx->handle) - 1);
+    if (nick)
+        strncpy(ctx->nick, nick, sizeof(ctx->nick) - 1);
+    ctx->use_nick = use_nick;
+
+    /* Start async token acquisition - fire-and-forget */
+    if (keycloak_ensure_token_async(metadata_sync_token_cb, ctx) != 0) {
+        log_module(NS_LOG, LOG_DEBUG, "metadata_sync_async: Failed to start token acquisition for %s", handle);
+        free(ctx);
+        return;
+    }
+
+    log_module(NS_LOG, LOG_DEBUG, "metadata_sync_async: Started async sync for %s (target=%s)",
+               handle, use_nick ? nick : handle);
+#else
+    (void)handle;
+    (void)nick;
+    (void)use_nick;
+#endif
 }
 
 int
@@ -9355,6 +9574,157 @@ nickserv_get_webpush_subscriptions(const char *account_name,
 #endif
 
     return -1;
+}
+
+/**
+ * Async webpush subscriptions lookup - callback chain stage 1 (token ready).
+ */
+static void
+webpush_subs_token_cb(void *ctx_ptr, int result, struct access_token *token)
+{
+    struct webpush_subs_ctx *ctx = (struct webpush_subs_ctx *)ctx_ptr;
+    (void)token;  /* Token is managed by token manager */
+
+    if (result != KC_SUCCESS) {
+        log_module(NS_LOG, LOG_DEBUG, "webpush_subs_async: Token acquisition failed (%d)", result);
+        if (ctx->callback) {
+            ctx->callback(ctx->caller_session, result, NULL);
+        }
+        free(ctx);
+        return;
+    }
+
+    /* Stage 2: Get user ID from Keycloak */
+    if (keycloak_get_user_async(keycloak_get_realm(), keycloak_get_authed_client(),
+                                 ctx->account_name, ctx, webpush_subs_user_cb) < 0) {
+        log_module(NS_LOG, LOG_DEBUG, "webpush_subs_async: Failed to start user lookup");
+        if (ctx->callback) {
+            ctx->callback(ctx->caller_session, KC_ERROR, NULL);
+        }
+        free(ctx);
+        return;
+    }
+}
+
+/**
+ * Async webpush subscriptions lookup - callback chain stage 2 (user ID ready).
+ */
+static int
+webpush_subs_user_cb(void *session, int result, struct kc_user *user)
+{
+    struct webpush_subs_ctx *ctx = (struct webpush_subs_ctx *)session;
+
+    if (result != KC_SUCCESS || !user || !user->id) {
+        log_module(NS_LOG, LOG_DEBUG, "webpush_subs_async: User %s not found (%d)",
+                   ctx->account_name, result);
+        if (ctx->callback) {
+            ctx->callback(ctx->caller_session, result == KC_SUCCESS ? KC_NOT_FOUND : result, NULL);
+        }
+        if (user) keycloak_user_free_fields(user);
+        free(ctx);
+        return 1;
+    }
+
+    /* Store user ID for stage 3 */
+    ctx->user_id = strdup(user->id);
+    keycloak_user_free_fields(user);
+
+    if (!ctx->user_id) {
+        log_module(NS_LOG, LOG_ERROR, "webpush_subs_async: Out of memory");
+        if (ctx->callback) {
+            ctx->callback(ctx->caller_session, KC_ERROR, NULL);
+        }
+        free(ctx);
+        return 1;
+    }
+
+    /* Stage 3: List webpush.* attributes */
+    if (keycloak_list_user_attributes_async(keycloak_get_realm(), keycloak_get_authed_client(),
+                                             ctx->user_id, "webpush.", ctx,
+                                             webpush_subs_list_cb) < 0) {
+        log_module(NS_LOG, LOG_DEBUG, "webpush_subs_async: Failed to start attribute listing");
+        if (ctx->callback) {
+            ctx->callback(ctx->caller_session, KC_ERROR, NULL);
+        }
+        free(ctx->user_id);
+        free(ctx);
+        return 1;
+    }
+
+    return 0;  /* Continue processing */
+}
+
+/**
+ * Async webpush subscriptions lookup - callback chain stage 3 (attributes ready).
+ */
+static int
+webpush_subs_list_cb(void *session, int result, struct kc_metadata_entry *entries)
+{
+    struct webpush_subs_ctx *ctx = (struct webpush_subs_ctx *)session;
+
+    /* Pass results to caller */
+    if (ctx->callback) {
+        ctx->callback(ctx->caller_session, result, entries);
+    } else if (entries) {
+        /* No callback - free entries to avoid leak */
+        keycloak_free_metadata_entries(entries);
+    }
+
+    /* Cleanup context */
+    if (ctx->user_id) free(ctx->user_id);
+    free(ctx);
+    return 1;  /* Terminal callback */
+}
+
+/**
+ * Get webpush subscriptions for an account asynchronously.
+ * Uses the async token manager and attribute listing APIs.
+ *
+ * @param account_name  Account name to look up
+ * @param session       Opaque session pointer passed to callback
+ * @param callback      Function to call when lookup completes
+ * @return 0 on success (request started), -1 on error
+ */
+int
+nickserv_get_webpush_subscriptions_async(const char *account_name,
+                                          void *session,
+                                          webpush_subs_callback callback)
+{
+#ifdef WITH_KEYCLOAK
+    if (!nickserv_conf.keycloak_enable) {
+        return -1;
+    }
+
+    if (!account_name || !callback) {
+        log_module(NS_LOG, LOG_DEBUG, "webpush_subs_async: Invalid arguments");
+        return -1;
+    }
+
+    /* Allocate context */
+    struct webpush_subs_ctx *ctx = calloc(1, sizeof(*ctx));
+    if (!ctx) {
+        log_module(NS_LOG, LOG_ERROR, "webpush_subs_async: Out of memory");
+        return -1;
+    }
+
+    strncpy(ctx->account_name, account_name, sizeof(ctx->account_name) - 1);
+    ctx->caller_session = session;
+    ctx->callback = callback;
+
+    /* Stage 1: Acquire token asynchronously */
+    if (keycloak_ensure_token_async(webpush_subs_token_cb, ctx) != 0) {
+        log_module(NS_LOG, LOG_DEBUG, "webpush_subs_async: Failed to start token acquisition");
+        free(ctx);
+        return -1;
+    }
+
+    return 0;
+#else
+    (void)account_name;
+    (void)session;
+    (void)callback;
+    return -1;
+#endif
 }
 
 /* Presence aggregation implementation */

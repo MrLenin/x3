@@ -772,31 +772,37 @@ webpush_notify_callback(void *user_data, int result, long http_code)
     (void)http_code;  /* Already logged in webpush_async_complete */
 }
 
-int
-webpush_notify_user(const char *account_name, const char *message)
+/* Context for async subscription lookup */
+struct webpush_user_notify_ctx {
+    char account_name[128];  /* Account for logging */
+    char *message;           /* Message to send (allocated copy) */
+};
+
+/* Callback for async subscription lookup */
+static void
+webpush_subs_async_callback(void *session, int result, struct kc_metadata_entry *entries)
 {
-    struct kc_metadata_entry *entries = NULL;
+    struct webpush_user_notify_ctx *user_ctx = (struct webpush_user_notify_ctx *)session;
     struct kc_metadata_entry *entry;
     struct webpush_subscription sub;
-    struct webpush_notify_ctx *ctx;
+    struct webpush_notify_ctx *notify_ctx;
     int started = 0;
-    int result;
+    int send_result;
 
-    if (!account_name || !message)
-        return -1;
+    if (!user_ctx)
+        return;
 
-    /* Get all webpush subscriptions for this account */
-    if (nickserv_get_webpush_subscriptions(account_name, &entries) != 0) {
-        log_module(MAIN_LOG, LOG_DEBUG, "WEBPUSH: No subscriptions for %s", account_name);
-        return 0;
+    if (result != 0 /* KC_SUCCESS */ || !entries) {
+        log_module(MAIN_LOG, LOG_DEBUG, "WEBPUSH: No subscriptions for %s (async result=%d)",
+                   user_ctx->account_name, result);
+        if (entries) keycloak_free_metadata_entries(entries);
+        free(user_ctx->message);
+        free(user_ctx);
+        return;
     }
 
-    if (!entries) {
-        log_module(MAIN_LOG, LOG_DEBUG, "WEBPUSH: No subscriptions for %s (empty)", account_name);
-        return 0;
-    }
-
-    log_module(MAIN_LOG, LOG_INFO, "WEBPUSH: Starting async push notifications for %s", account_name);
+    log_module(MAIN_LOG, LOG_INFO, "WEBPUSH: Starting async push notifications for %s",
+               user_ctx->account_name);
 
     /* Iterate over subscriptions and start async send to each */
     for (entry = entries; entry; entry = entry->next) {
@@ -807,29 +813,69 @@ webpush_notify_user(const char *account_name, const char *message)
         }
 
         /* Allocate context for callback */
-        ctx = calloc(1, sizeof(*ctx));
-        if (!ctx) {
+        notify_ctx = calloc(1, sizeof(*notify_ctx));
+        if (!notify_ctx) {
             log_module(MAIN_LOG, LOG_ERROR, "WEBPUSH: Out of memory for callback context");
             continue;
         }
-        strncpy(ctx->account_name, account_name, sizeof(ctx->account_name) - 1);
-        strncpy(ctx->key, entry->key, sizeof(ctx->key) - 1);
+        strncpy(notify_ctx->account_name, user_ctx->account_name, sizeof(notify_ctx->account_name) - 1);
+        strncpy(notify_ctx->key, entry->key, sizeof(notify_ctx->key) - 1);
 
-        result = webpush_send_async(&sub, message, 86400, ctx, webpush_notify_callback);
+        send_result = webpush_send_async(&sub, user_ctx->message, 86400, notify_ctx, webpush_notify_callback);
 
-        if (result == WEBPUSH_OK) {
+        if (send_result == WEBPUSH_OK) {
             started++;
         } else {
             /* Async request failed to start - immediate error */
             log_module(MAIN_LOG, LOG_WARNING, "WEBPUSH: Failed to start async for %s", entry->key);
-            free(ctx);
+            free(notify_ctx);
         }
     }
 
     keycloak_free_metadata_entries(entries);
 
-    log_module(MAIN_LOG, LOG_INFO, "WEBPUSH: Started %d async push notifications for %s", started, account_name);
-    return started;
+    log_module(MAIN_LOG, LOG_INFO, "WEBPUSH: Started %d async push notifications for %s",
+               started, user_ctx->account_name);
+
+    /* Cleanup user context */
+    free(user_ctx->message);
+    free(user_ctx);
+}
+
+int
+webpush_notify_user(const char *account_name, const char *message)
+{
+    struct webpush_user_notify_ctx *ctx;
+
+    if (!account_name || !message)
+        return -1;
+
+    /* Allocate context for async operation */
+    ctx = calloc(1, sizeof(*ctx));
+    if (!ctx) {
+        log_module(MAIN_LOG, LOG_ERROR, "WEBPUSH: Out of memory for user notify context");
+        return -1;
+    }
+
+    strncpy(ctx->account_name, account_name, sizeof(ctx->account_name) - 1);
+    ctx->message = strdup(message);
+    if (!ctx->message) {
+        log_module(MAIN_LOG, LOG_ERROR, "WEBPUSH: Out of memory for message copy");
+        free(ctx);
+        return -1;
+    }
+
+    /* Start async subscription lookup - notifications sent in callback */
+    if (nickserv_get_webpush_subscriptions_async(account_name, ctx, webpush_subs_async_callback) != 0) {
+        log_module(MAIN_LOG, LOG_DEBUG, "WEBPUSH: Failed to start async subscription lookup for %s",
+                   account_name);
+        free(ctx->message);
+        free(ctx);
+        return 0;  /* Not an error - just no subscriptions or Keycloak disabled */
+    }
+
+    log_module(MAIN_LOG, LOG_DEBUG, "WEBPUSH: Started async subscription lookup for %s", account_name);
+    return 0;  /* Async started - actual count returned via callback would need different API */
 }
 
 #else /* !HAVE_WEBPUSH_CRYPTO */

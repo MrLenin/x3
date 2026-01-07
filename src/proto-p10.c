@@ -3075,9 +3075,13 @@ static CMD_FUNC(cmd_metadataquery)
         /* Query all metadata for account - sync all stored metadata to IRCd */
         nickserv_sync_account_metadata_to_ircd(hi);
     } else {
-        /* Single key query */
+        /* Single key query - try LMDB cache first (instant) */
         if (nickserv_get_user_metadata(hi, key, value, &visibility) == 0) {
+            /* Cache hit - send immediately */
             irc_metadata(target, key, value, visibility);
+        } else {
+            /* Cache miss - start async Keycloak lookup, response sent from callback */
+            nickserv_get_user_metadata_async(hi, key);
         }
     }
 
