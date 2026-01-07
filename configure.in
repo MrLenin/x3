@@ -64,6 +64,12 @@ AC_CHECK_LIB(nsl, gethostbyname)
 AC_CHECK_LIB(m, main)
 AC_CHECK_LIB(GeoIP, GeoIP_open)
 
+dnl Check for pthread support (for thread pool)
+AC_CHECK_LIB(pthread, pthread_create, [
+  AC_DEFINE([HAVE_PTHREAD_H], [1], [Define if pthread.h is available])
+  LIBS="$LIBS -lpthread"
+], [])
+
 dnl Checks for header files.
 AC_HEADER_STDC
 

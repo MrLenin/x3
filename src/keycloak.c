@@ -1303,7 +1303,8 @@ enum kc_async_type {
     KC_ASYNC_WEBPUSH,       /* WebPush notification delivery */
     KC_ASYNC_CREATE_USER,   /* User creation */
     KC_ASYNC_GROUP_INFO,    /* Get group info (phase 1 of group members) */
-    KC_ASYNC_GROUP_MEMBERS  /* Get group members (phase 2 or standalone) */
+    KC_ASYNC_GROUP_MEMBERS, /* Get group members (phase 2 or standalone) */
+    KC_ASYNC_CLIENT_TOKEN   /* Client credentials token acquisition */
 };
 
 /* Async request tracking */
@@ -1324,6 +1325,7 @@ struct kc_async_request {
         void (*webpush)(void *session, int result, long http_code);  /* WebPush callback */
         kc_group_info_callback group_info;    /* Group info callback */
         kc_group_members_callback group_members; /* Group members callback */
+        kc_client_token_callback client_token;   /* Client token callback */
     } cb;
     /* WebPush-specific: copy of binary POST data for async request */
     void *post_data_copy;
@@ -1820,6 +1822,28 @@ kc_curl_check_completed(void)
                 }
                 break;
             }
+            case KC_ASYNC_CLIENT_TOKEN: {
+                int result = KC_TOKEN_ERROR;
+                struct access_token *token = NULL;
+
+                if (http_code == 200 && req->response.response) {
+                    if (json_read_kc_access_token(req->response.response, &token) == KC_SUCCESS) {
+                        result = KC_SUCCESS;
+                        log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async client_token: Success (HTTP 200)", req_id);
+                    } else {
+                        log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async client_token: JSON parse error", req_id);
+                    }
+                } else {
+                    log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async client_token: Error (HTTP %ld)", req_id, http_code);
+                }
+                if (req->cb.client_token) {
+                    req->cb.client_token(req->session, result, token);
+                    /* Note: token ownership transferred to callback */
+                } else if (token) {
+                    keycloak_free_access_token(token);
+                }
+                break;
+            }
             }
 
             /* Cleanup - return handle to pool for reuse */
@@ -2040,6 +2064,72 @@ error:
             free(req->post_fields);
         }
         if (req->response.response) free(req->response.response);
+        free(req);
+    }
+    return -1;
+}
+
+/*
+ * Start async client credentials token acquisition from Keycloak
+ * Returns 0 on success (request started), -1 on error
+ */
+int
+keycloak_get_client_token_async(struct kc_realm realm, struct kc_client client,
+                                 void *session, kc_client_token_callback callback)
+{
+    struct kc_async_request *req = NULL;
+    static const char query_params[] = "grant_type=client_credentials";
+
+    /* Validate inputs */
+    if (!realm.base_uri || !realm.realm || !client.client_id ||
+        !client.client_secret || !callback) {
+        log_module(KC_LOG, LOG_DEBUG, "keycloak_get_client_token_async: Invalid arguments");
+        return -1;
+    }
+
+    /* Allocate request structure */
+    req = calloc(1, sizeof(*req));
+    if (!req) {
+        log_module(KC_LOG, LOG_ERROR, "keycloak_get_client_token_async: Out of memory");
+        return -1;
+    }
+    req->session = session;
+    req->type = KC_ASYNC_CLIENT_TOKEN;
+    req->cb.client_token = callback;
+
+    /* Build URI using endpoint builder */
+    req->uri = kc_build_token_endpoint(realm);
+    if (!req->uri) {
+        log_module(KC_LOG, LOG_DEBUG, "keycloak_get_client_token_async: Failed to build URI");
+        goto error;
+    }
+
+    /* Copy POST data */
+    req->post_fields = strdup(query_params);
+    if (!req->post_fields) {
+        goto error;
+    }
+
+    /* Use unified async API */
+    struct curl_opts opts = CURL_OPTS_INIT;
+    opts.uri = req->uri;
+    opts.post_fields = req->post_fields;
+    opts.auth_user = client.client_id;
+    opts.auth_passwd = client.client_secret;
+    opts.method = HTTP_POST;
+
+    if (curl_perform_async(req, opts) < 0) {
+        log_module(KC_LOG, LOG_ERROR, "keycloak_get_client_token_async: curl_perform_async failed");
+        goto error;
+    }
+
+    log_module(KC_LOG, LOG_DEBUG, "keycloak_get_client_token_async: Started async token request");
+    return 0;
+
+error:
+    if (req) {
+        if (req->uri) free(req->uri);
+        if (req->post_fields) free(req->post_fields);
         free(req);
     }
     return -1;
@@ -3740,81 +3830,8 @@ cleanup:
     return result;
 }
 
-int keycloak_update_user_credentials(struct kc_realm realm, struct kc_client client,
-                                     const char* user_id,
-                                     const char* cred_data, const char* secret_data)
-{
-    if (!realm.base_uri || !realm.realm || !client.access_token ||
-        !user_id || !cred_data || !secret_data) {
-        log_module(KC_LOG, LOG_DEBUG, "keycloak_update_user_credentials: Invalid arguments");
-        return KC_ERROR;
-    }
-
-    int result = KC_ERROR;
-    char *uri = kc_build_user_endpoint(realm, user_id);
-    char *json_body = NULL;
-    struct memory chunk = {0};
-
-    if (!uri) {
-        log_module(KC_LOG, LOG_DEBUG, "keycloak_update_user_credentials: Failed to build uri");
-        goto cleanup;
-    }
-
-    /* Build user update with credentials array
-     * Keycloak expects credentialData and secretData as JSON strings within each credential */
-    json_t* cred_obj = json_object();
-    json_object_set_new(cred_obj, "type", json_string("password"));
-    json_object_set_new(cred_obj, "credentialData", json_string(cred_data));
-    json_object_set_new(cred_obj, "secretData", json_string(secret_data));
-
-    json_t* creds_array = json_array();
-    json_array_append_new(creds_array, cred_obj);
-
-    json_t* user_obj = json_object();
-    json_object_set_new(user_obj, "credentials", creds_array);
-
-    json_body = json_dumps(user_obj, JSON_COMPACT);
-    json_decref(user_obj);
-
-    if (!json_body) {
-        log_module(KC_LOG, LOG_DEBUG, "keycloak_update_user_credentials: Failed to build JSON");
-        goto cleanup;
-    }
-
-    struct curl_opts opts = CURL_OPTS_INIT;
-    opts.uri = uri;
-    opts.method = HTTP_PUT;  /* PUT to /users/{id} with credentials array */
-    opts.post_fields = json_body;
-    opts.xoauth2_bearer = client.access_token->access_token;
-    opts.header_list[0] = "Content-Type: application/json";
-    opts.header_count = 1;
-
-    long http_code = curl_perform(opts, &chunk);
-
-    if (http_code == 204) {
-        log_module(KC_LOG, LOG_DEBUG, "keycloak_update_user_credentials: Credentials updated (HTTP 204)");
-        result = KC_SUCCESS;
-    } else if (http_code == 404) {
-        log_module(KC_LOG, LOG_DEBUG, "keycloak_update_user_credentials: User not found (HTTP 404)");
-        result = KC_NOT_FOUND;
-    } else {
-        log_module(KC_LOG, LOG_DEBUG, "keycloak_update_user_credentials: Failed with HTTP %ld: %s",
-            http_code, chunk.response ? chunk.response : "no response");
-    }
-
-cleanup:
-    if (chunk.response) {
-        memset(chunk.response, 0, chunk.size);
-        free(chunk.response);
-    }
-    if (json_body) {
-        memset(json_body, 0, strlen(json_body));
-        free(json_body);
-    }
-    free(uri);
-
-    return result;
-}
+/* NOTE: keycloak_update_user_credentials() removed - was dead code (never called).
+ * Use keycloak_update_user_representation() with kc_user_update.cred_data instead. */
 
 int keycloak_update_user_representation(struct kc_realm realm, struct kc_client client,
                                         const char* user_id,

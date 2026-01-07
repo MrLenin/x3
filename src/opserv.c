@@ -1392,10 +1392,11 @@ static MODCMD_FUNC(cmd_unjupe)
 static MODCMD_FUNC(cmd_jump)
 {
     extern struct cManagerNode cManager;
-    void uplink_select(char *name);
+    int uplink_select(char *name);
     struct uplinkNode *uplink_find(char *name);
     struct uplinkNode *uplink;
     char *target;
+    int select_result;
 
     target = unsplit_string(argv+1, argc-1, NULL);
 
@@ -1415,7 +1416,12 @@ static MODCMD_FUNC(cmd_jump)
     }
 
     reply("OSMSG_UPLINK_CONNECTING", uplink->name, uplink->host, uplink->port);
-    uplink_select(target);
+    select_result = uplink_select(target);
+    if (select_result != 0) {
+        /* This shouldn't happen when selecting a specific available uplink */
+        reply("OSMSG_UPLINK_DISABLED", target);
+        return 0;
+    }
     irc_squit(self, "Reconnecting.", NULL);
     return 1;
 }

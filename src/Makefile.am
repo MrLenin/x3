@@ -93,6 +93,8 @@ x3_SOURCES = \
 	x3_ssl.c x3_ssl.h \
 	x3_compress.c x3_compress.h \
 	webpush.c webpush.h \
+	mempool.c mempool.h \
+	threadpool.c threadpool.h \
 	version.c version.h
 
 checkdb_SOURCES = checkdb.c common.h compat.c compat.h dict-splay.c dict.h recdb.c recdb.h saxdb.c saxdb.h tools.c conf.h log.h modcmd.h saxdb.h timeq.h

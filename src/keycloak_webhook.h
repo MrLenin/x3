@@ -50,6 +50,7 @@ struct kc_webhook_stats {
     unsigned long events_received;
     unsigned long events_processed;
     unsigned long events_invalid;
+    unsigned long events_queued;          /* Events currently in async queue */
     unsigned long cache_invalidations;
     unsigned long fingerprint_deletions;
     unsigned long fingerprint_additions;  /* Fingerprints pre-cached from webhook */

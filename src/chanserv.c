@@ -780,6 +780,9 @@ struct kc_async_sync_ctx {
 /* Global async context - only one channel sync at a time */
 static struct kc_async_sync_ctx *kc_async_ctx = NULL;
 
+/* Flag to indicate this is a standalone sync (not part of a batch) */
+static int kc_async_standalone = 0;
+
 /**
  * FNV-1a hash for membership lists
  * Computes a hash from sorted (username, access_level) pairs
@@ -10982,32 +10985,53 @@ kc_async_sync_channel_done(int synced)
     if (!kc_async_ctx) return;
 
     const char *chan_name = kc_async_ctx->channel;
+    int is_standalone = kc_async_standalone;
 
     if (synced > 0) {
         /* Channel had changes */
-        kc_sync.total_entries += synced;
-        kc_sync.channels_done++;
         log_module(CS_LOG, LOG_DEBUG, "Async sync of %s: %d entries", chan_name, synced);
+        if (!is_standalone) {
+            kc_sync.total_entries += synced;
+            kc_sync.channels_done++;
+        } else {
+            /* Update global stats for standalone syncs */
+            kc_stats.successful_syncs++;
+            kc_stats.total_entries += synced;
+        }
     } else if (synced == 0) {
         /* No changes needed (hash matched or empty) */
-        kc_sync.channels_skipped++;
-        kc_sync.channels_done++;
+        if (!is_standalone) {
+            kc_sync.channels_skipped++;
+            kc_sync.channels_done++;
+        } else {
+            kc_stats.successful_syncs++;
+        }
     } else {
         /* Sync failed */
-        kc_sync.channels_failed++;
         x3_lmdb_chansync_record_failure(chan_name);
-        if (kc_sync.failure_count < KC_MAX_FAILURES_TRACKED) {
-            safestrncpy(kc_sync.failures[kc_sync.failure_count].channel,
-                        chan_name, CHANNELLEN+1);
-            kc_sync.failures[kc_sync.failure_count].error_code = synced;
-            kc_sync.failure_count++;
-        }
         log_module(CS_LOG, LOG_DEBUG, "Async sync of %s failed", chan_name);
+        if (!is_standalone) {
+            kc_sync.channels_failed++;
+            if (kc_sync.failure_count < KC_MAX_FAILURES_TRACKED) {
+                safestrncpy(kc_sync.failures[kc_sync.failure_count].channel,
+                            chan_name, CHANNELLEN+1);
+                kc_sync.failures[kc_sync.failure_count].error_code = synced;
+                kc_sync.failure_count++;
+            }
+        } else {
+            kc_stats.failed_syncs++;
+        }
     }
 
     /* Free current context */
     kc_async_ctx_free(kc_async_ctx);
     kc_async_ctx = NULL;
+    kc_async_standalone = 0;
+
+    /* For standalone syncs, we're done - no batch processing */
+    if (is_standalone) {
+        return;
+    }
 
     /* Trigger next channel or complete */
     if (chanserv_conf.keycloak_sync_distributed &&
@@ -11254,6 +11278,41 @@ chanserv_sync_keycloak_channel_async(const char *channel)
 
     log_module(CS_LOG, LOG_DEBUG, "chanserv_sync_keycloak_channel_async: Started async sync for %s", channel);
     return 0;
+}
+
+/**
+ * Start async sync of a single channel as a standalone operation (not part of batch)
+ * Used by webhook handlers for immediate async syncs
+ * @param channel Channel name (with #)
+ * @return 0 on success (async started), -1 on error
+ */
+static int
+chanserv_sync_keycloak_channel_async_standalone(const char *channel)
+{
+    /* Check if an async operation is already in progress */
+    if (kc_async_ctx != NULL) {
+        log_module(CS_LOG, LOG_DEBUG,
+                   "chanserv_sync_keycloak_channel_async_standalone: Another async sync in progress, queuing %s",
+                   channel);
+        /* Fall back to sync for now - the async slot is busy */
+        int synced = chanserv_sync_keycloak_channel(channel);
+        if (synced >= 0) {
+            kc_stats.successful_syncs++;
+            kc_stats.total_entries += synced;
+        } else {
+            kc_stats.failed_syncs++;
+        }
+        return synced >= 0 ? 0 : -1;
+    }
+
+    /* Mark this as a standalone sync */
+    kc_async_standalone = 1;
+
+    int rc = chanserv_sync_keycloak_channel_async(channel);
+    if (rc < 0) {
+        kc_async_standalone = 0;
+    }
+    return rc;
 }
 
 /* Process next channel in async batch or complete */
@@ -11973,18 +12032,15 @@ chanserv_queue_keycloak_sync(const char *channel, int priority)
 
     log_module(CS_LOG, LOG_INFO, "Queuing immediate Keycloak sync for %s (priority: %d)", channel, priority);
 
-    /* For immediate priority, sync right now if no batch is running */
+    /* For immediate priority, start async sync if no batch is running */
     if (priority >= KC_SYNC_PRIORITY_IMMEDIATE && !kc_sync.in_progress) {
-        int synced = chanserv_sync_keycloak_channel(channel);
-        if (synced >= 0) {
-            kc_stats.successful_syncs++;
-            kc_stats.total_entries += synced;
-            log_module(CS_LOG, LOG_DEBUG, "Immediate sync of %s: %d entries", channel, synced);
+        int rc = chanserv_sync_keycloak_channel_async_standalone(channel);
+        if (rc == 0) {
+            log_module(CS_LOG, LOG_DEBUG, "Started async immediate sync for %s", channel);
         } else {
-            kc_stats.failed_syncs++;
-            log_module(CS_LOG, LOG_WARNING, "Immediate sync of %s failed", channel);
+            log_module(CS_LOG, LOG_WARNING, "Failed to start async sync for %s", channel);
         }
-        return synced >= 0 ? 0 : -1;
+        return rc;
     }
 
     /* For HIGH priority during batch, add to pending queue */
@@ -12026,10 +12082,9 @@ chanserv_queue_keycloak_sync(const char *channel, int priority)
         return 0;
     }
 
-    /* For lower priorities without batch running, sync immediately */
+    /* For lower priorities without batch running, start async sync */
     if (!kc_sync.in_progress) {
-        int synced = chanserv_sync_keycloak_channel(channel);
-        return synced >= 0 ? 0 : -1;
+        return chanserv_sync_keycloak_channel_async_standalone(channel);
     }
 
     /* NORMAL/LOW priority during batch - will be covered by ongoing batch */

@@ -16,6 +16,7 @@
 #include "x3_lmdb.h"
 #include "nickserv.h"
 #include "chanserv.h"  /* For chanserv_queue_keycloak_sync, kc_group_path_to_channel */
+#include "timeq.h"     /* For async event processing */
 
 #include <string.h>
 #include <stdlib.h>
@@ -41,6 +42,20 @@ static struct io_fd *webhook_listener = NULL;
 /* Statistics */
 static struct kc_webhook_stats stats = {0};
 
+/* Async event queue */
+#define WEBHOOK_QUEUE_MAX 1000  /* Max queued events before dropping */
+
+struct webhook_event {
+    char *payload;
+    size_t payload_len;
+    struct webhook_event *next;
+};
+
+static struct webhook_event *event_queue_head = NULL;
+static struct webhook_event *event_queue_tail = NULL;
+static unsigned int event_queue_size = 0;
+static int process_scheduled = 0;
+
 /* HTTP connection state */
 struct webhook_conn {
     struct io_fd *fd;
@@ -63,6 +78,8 @@ static int process_webhook_request(struct webhook_conn *conn);
 static int parse_http_headers(struct webhook_conn *conn);
 static int handle_keycloak_event(const char *body, size_t body_len);
 static void send_http_response(struct io_fd *fd, int status, const char *message);
+static void webhook_process_queue(void *data);
+static int webhook_queue_event(const char *payload, size_t len);
 
 /*
  * Initialize webhook listener
@@ -124,11 +141,24 @@ keycloak_webhook_init(void)
 void
 keycloak_webhook_shutdown(void)
 {
+    struct webhook_event *evt, *next;
+
     if (webhook_listener) {
         ioset_close(webhook_listener, 1);
         webhook_listener = NULL;
         log_module(webhook_log, LOG_INFO, "Keycloak webhook listener closed");
     }
+
+    /* Drain the event queue */
+    for (evt = event_queue_head; evt; evt = next) {
+        next = evt->next;
+        free(evt->payload);
+        free(evt);
+    }
+    event_queue_head = event_queue_tail = NULL;
+    event_queue_size = 0;
+    process_scheduled = 0;
+
     free(webhook_secret);
     webhook_secret = NULL;
     free(webhook_bind_address);
@@ -352,6 +382,90 @@ parse_http_headers(struct webhook_conn *conn)
 }
 
 /*
+ * Queue an event for async processing
+ */
+static int
+webhook_queue_event(const char *payload, size_t len)
+{
+    struct webhook_event *evt;
+
+    if (event_queue_size >= WEBHOOK_QUEUE_MAX) {
+        log_module(webhook_log, LOG_WARNING,
+                   "Webhook queue full (%u events), dropping event", event_queue_size);
+        return -1;
+    }
+
+    evt = calloc(1, sizeof(*evt));
+    if (!evt)
+        return -1;
+
+    evt->payload = malloc(len + 1);
+    if (!evt->payload) {
+        free(evt);
+        return -1;
+    }
+
+    memcpy(evt->payload, payload, len);
+    evt->payload[len] = '\0';
+    evt->payload_len = len;
+    evt->next = NULL;
+
+    /* Add to tail of queue */
+    if (event_queue_tail) {
+        event_queue_tail->next = evt;
+    } else {
+        event_queue_head = evt;
+    }
+    event_queue_tail = evt;
+    event_queue_size++;
+    stats.events_queued = event_queue_size;
+
+    /* Schedule processing if not already scheduled */
+    if (!process_scheduled) {
+        process_scheduled = 1;
+        timeq_add(now, webhook_process_queue, NULL);
+    }
+
+    return 0;
+}
+
+/*
+ * Process queued events (called from timeq)
+ */
+static void
+webhook_process_queue(UNUSED_ARG(void *data))
+{
+    struct webhook_event *evt;
+    int batch = 0;
+    const int batch_max = 10;  /* Process up to 10 events per iteration */
+
+    process_scheduled = 0;
+
+    while (event_queue_head && batch < batch_max) {
+        evt = event_queue_head;
+        event_queue_head = evt->next;
+        if (!event_queue_head)
+            event_queue_tail = NULL;
+        event_queue_size--;
+
+        /* Process the event */
+        handle_keycloak_event(evt->payload, evt->payload_len);
+
+        free(evt->payload);
+        free(evt);
+        batch++;
+    }
+
+    stats.events_queued = event_queue_size;
+
+    /* If more events remain, schedule another processing round */
+    if (event_queue_head && !process_scheduled) {
+        process_scheduled = 1;
+        timeq_add(now, webhook_process_queue, NULL);
+    }
+}
+
+/*
  * Process a complete webhook request
  */
 static int
@@ -393,8 +507,14 @@ process_webhook_request(struct webhook_conn *conn)
     body += 4;
     body_len = conn->content_length;
 
-    /* Process the event */
-    return handle_keycloak_event(body, body_len);
+    /* Queue the event for async processing - return immediately */
+    if (webhook_queue_event(body, body_len) < 0) {
+        stats.events_invalid++;
+        return -1;
+    }
+
+    log_module(webhook_log, LOG_DEBUG, "Webhook event queued (queue size: %u)", event_queue_size);
+    return 0;
 }
 
 /*

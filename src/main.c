@@ -42,6 +42,8 @@
 
 #include "x3_ssl.h"
 #include "password.h"
+#include "mempool.h"
+#include "threadpool.h"
 
 #ifdef HAVE_GETOPT_H
 #include <getopt.h>
@@ -255,6 +257,26 @@ int main(int argc, char *argv[])
     MAIN_LOG = log_register_type("x3", "file:main.log");
     if (debug)
         log_debug();
+
+    /* Initialize memory pools early (before other modules that use them) */
+    if (mempool_init_global() < 0) {
+        log_module(MAIN_LOG, LOG_WARNING, "Failed to initialize memory pools, continuing without");
+    }
+
+    /* Initialize thread pool for async operations */
+    {
+        struct tp_config tp_cfg = {
+            .min_threads = 2,
+            .max_threads = 4,
+            .queue_size = 500,
+            .idle_timeout_sec = 60,
+            .name = "x3-workers"
+        };
+        if (threadpool_init(&tp_cfg) < 0) {
+            log_module(MAIN_LOG, LOG_WARNING, "Failed to initialize thread pool, continuing without");
+        }
+    }
+
     ioset_init();
     init_structs();
     init_parse();

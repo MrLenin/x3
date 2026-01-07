@@ -259,7 +259,7 @@ void STRUCTNAME##_clean(struct STRUCTNAME *list) {\
 
 struct handle_info;
 char *intervalString(char *output, time_t interval, struct handle_info *hi);
-int getipbyname(const char *name, unsigned long *ip);
+/* NOTE: getipbyname() removed - was dead code. Use SAR (sar_getaddr) for async DNS. */
 int set_policer_param(const char *param, void *data, void *extra);
 const char *strtab(unsigned int ii);
 char *time2str(time_t thetime);

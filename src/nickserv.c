@@ -266,6 +266,23 @@ static struct access_token *kc_admin_token = NULL;
 static time_t kc_token_expires = 0;
 static int keycloak_available = 1;  /* Track Keycloak availability */
 
+/* Token waiter queue for async token refresh (Phase 5) */
+typedef void (*kc_token_waiter_cb)(void *ctx, int result, struct access_token *token);
+
+struct kc_token_waiter {
+    kc_token_waiter_cb callback;     /* Callback when token ready */
+    void *context;                    /* Opaque context for callback */
+    struct kc_token_waiter *next;    /* Queue linkage */
+};
+
+static struct kc_token_waiter *kc_token_waiters = NULL;  /* Waiter queue head */
+static int kc_token_refresh_pending = 0;  /* 1 if refresh in progress */
+
+/* Forward declarations for async token functions */
+static int kc_token_refresh_callback(void *session, int result, struct access_token *token);
+static void kc_notify_token_waiters(int result, struct access_token *token);
+int kc_ensure_token_async(kc_token_waiter_cb callback, void *context);
+
 /* Forward declarations for Keycloak wrapper functions */
 static int kc_ensure_token(void);
 static int kc_check_auth(const char *handle, const char *password);
@@ -6166,6 +6183,132 @@ kc_ensure_token(void)
     kc_client_config.access_token = kc_admin_token;
     kc_token_expires = now_time + kc_admin_token->expires_in;
     return KC_SUCCESS;
+}
+
+/*
+ * Notify all waiters that token refresh completed.
+ * Clears the waiter queue and calls each callback.
+ */
+static void
+kc_notify_token_waiters(int result, struct access_token *token)
+{
+    struct kc_token_waiter *waiter, *next;
+
+    /* Clear refresh pending flag */
+    kc_token_refresh_pending = 0;
+
+    /* Process all waiters */
+    waiter = kc_token_waiters;
+    kc_token_waiters = NULL;
+
+    while (waiter) {
+        next = waiter->next;
+        if (waiter->callback) {
+            waiter->callback(waiter->context, result, token);
+        }
+        free(waiter);
+        waiter = next;
+    }
+}
+
+/*
+ * Callback from keycloak_get_client_token_async() when refresh completes.
+ */
+static int
+kc_token_refresh_callback(void *session, int result, struct access_token *token)
+{
+    (void)session;  /* Unused */
+
+    if (result == KC_SUCCESS && token) {
+        /* Update cached token */
+        if (kc_admin_token) {
+            keycloak_free_access_token(kc_admin_token);
+        }
+        kc_admin_token = token;
+        kc_client_config.access_token = kc_admin_token;
+        kc_token_expires = time(NULL) + token->expires_in;
+        kc_set_available(1);
+        log_module(NS_LOG, LOG_DEBUG, "Async token refresh successful (expires in %ld sec)",
+                   token->expires_in);
+    } else {
+        kc_set_available(0);
+        log_module(NS_LOG, LOG_WARNING, "Async token refresh failed: %s",
+                   kc_strerror(result));
+    }
+
+    /* Notify all waiters */
+    kc_notify_token_waiters(result, result == KC_SUCCESS ? kc_admin_token : NULL);
+    return 0;  /* Session continues (not terminal) */
+}
+
+/*
+ * Async version of kc_ensure_token().
+ * If token is valid, calls callback immediately.
+ * If refresh needed and not in progress, starts refresh and queues callback.
+ * If refresh already in progress, just queues callback.
+ *
+ * Returns:
+ *   1 - Token valid, callback called immediately with KC_SUCCESS
+ *   0 - Refresh started/pending, callback will be called when done
+ *  -1 - Error (invalid args, out of memory, or refresh start failed)
+ */
+int
+kc_ensure_token_async(kc_token_waiter_cb callback, void *context)
+{
+    time_t now_time = time(NULL);
+    struct kc_token_waiter *waiter;
+
+    if (!callback) {
+        log_module(NS_LOG, LOG_ERROR, "kc_ensure_token_async: no callback");
+        return -1;
+    }
+
+    /* Check if token is still valid (with 60s margin) */
+    if (kc_admin_token && kc_token_expires > (now_time + 60)) {
+        kc_client_config.access_token = kc_admin_token;
+        /* Token valid - invoke callback immediately */
+        callback(context, KC_SUCCESS, kc_admin_token);
+        return 1;
+    }
+
+    /* Token needs refresh - add to waiter queue */
+    waiter = calloc(1, sizeof(*waiter));
+    if (!waiter) {
+        log_module(NS_LOG, LOG_ERROR, "kc_ensure_token_async: out of memory");
+        return -1;
+    }
+    waiter->callback = callback;
+    waiter->context = context;
+    waiter->next = kc_token_waiters;
+    kc_token_waiters = waiter;
+
+    /* If refresh not already in progress, start it */
+    if (!kc_token_refresh_pending) {
+        kc_token_refresh_pending = 1;
+
+        /* Free old token before refresh */
+        if (kc_admin_token) {
+            keycloak_free_access_token(kc_admin_token);
+            kc_admin_token = NULL;
+            kc_client_config.access_token = NULL;
+        }
+
+        if (keycloak_get_client_token_async(kc_realm_config, kc_client_config,
+                                             NULL, kc_token_refresh_callback) < 0) {
+            log_module(NS_LOG, LOG_ERROR, "kc_ensure_token_async: failed to start refresh");
+            /* Remove the waiter we just added and fail */
+            kc_token_waiters = waiter->next;
+            free(waiter);
+            kc_token_refresh_pending = 0;
+            return -1;
+        }
+
+        log_module(NS_LOG, LOG_DEBUG, "kc_ensure_token_async: started async refresh");
+    } else {
+        log_module(NS_LOG, LOG_DEBUG, "kc_ensure_token_async: refresh pending, queued waiter");
+    }
+
+    return 0;
 }
 
 /* Check authentication via Keycloak password grant */

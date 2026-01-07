@@ -1124,17 +1124,9 @@ intervalString(char *output, time_t interval, struct handle_info *hi)
     return output;
 }
 
-int
-getipbyname(const char *name, unsigned long *ip)
-{
-    struct hostent *he = gethostbyname(name);
-    if (!he)
-        return 0;
-    if (he->h_addrtype != AF_INET)
-        return 0;
-    memcpy(ip, he->h_addr_list[0], sizeof(*ip));
-    return 1;
-}
+/* NOTE: getipbyname() removed - was dead code (never called).
+ * Used blocking gethostbyname() which should be avoided anyway.
+ * Use SAR (sar_getaddr) for async DNS resolution instead. */
 
 DEFINE_LIST(string_buffer, char)
 

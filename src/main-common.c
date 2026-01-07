@@ -1,5 +1,7 @@
 extern FILE *replay_file;
 
+#include "mempool.h"
+#include "threadpool.h"
 
 time_t boot_time;
 time_t burst_begin;
@@ -16,6 +18,11 @@ char **services_argv;
 int services_argc;
 
 struct cManagerNode cManager;
+
+/* Non-blocking reconnect support */
+int reconnect_pending = 0;
+int uplink_connect(void);  /* Forward declaration for callback */
+static void uplink_reconnect_callback(void *data);  /* Forward declaration */
 
 struct policer_params *oper_policer_params, *luser_policer_params, *god_policer_params;
 
@@ -84,7 +91,7 @@ static const struct message_entry msgtab[] = {
     { NULL, NULL }
 };
 
-void uplink_select(char *name);
+int uplink_select(char *name);
 
 static int
 uplink_insert(const char *key, void *data, UNUSED_ARG(void *extra))
@@ -216,13 +223,23 @@ uplink_compile(void)
        an uplink that was just deleted, select a new one. */
     if(cManager.uplink == oldUplink)
     {
+        int select_result;
+
         if(oldUplink)
         {
             irc_squit(self, "Uplinks updated; selecting new uplink.", NULL);
         }
 
         cManager.uplink = NULL;
-        uplink_select(NULL);
+        select_result = uplink_select(NULL);
+        if (select_result < 0) {
+            log_module(MAIN_LOG, LOG_FATAL, "No valid uplinks after config reload.");
+            /* Don't exit here - let the normal flow handle it */
+        } else if (select_result > 0) {
+            /* Schedule reconnect after delay */
+            reconnect_pending = 1;
+            timeq_add(now + select_result, uplink_reconnect_callback, NULL);
+        }
     }
 }
 
@@ -247,7 +264,12 @@ uplink_find(char *name)
     return NULL;
 }
 
-void
+/**
+ * Select an uplink to connect to.
+ * @param name Specific uplink name to select, or NULL to auto-select
+ * @return 0 on success (uplink selected), positive value = delay seconds needed, -1 on fatal error
+ */
+int
 uplink_select(char *name)
 {
     struct uplinkNode *start, *uplink, *next;
@@ -256,7 +278,7 @@ uplink_select(char *name)
     if(!cManager.enabled || !cManager.uplinks)
     {
         log_module(MAIN_LOG, LOG_FATAL, "No uplinks enabled; giving up.");
-        exit(1);
+        return -1;  /* Fatal - caller should exit */
     }
 
     if(!cManager.uplink)
@@ -283,27 +305,45 @@ uplink_select(char *name)
             break;
         }
 
-        /* We've wrapped around the list. */
+        /* Skip bad uplinks first, before checking for wrap-around */
+        if(uplink->flags & UPLINK_UNAVAILABLE)
+        {
+            continue;
+        }
+
+        /* We've wrapped around the list - all uplinks have been tried */
         if(next == start)
         {
-            sleep((cManager.cycles >> 1) * 5);
+            /* Check if current uplink is usable before declaring failure */
+            if(!(uplink->flags & UPLINK_UNAVAILABLE) &&
+               (!name || !irccasecmp(uplink->name, name)))
+            {
+                /* Current uplink is usable, select it */
+                break;
+            }
+
+            /*
+             * All uplinks tried - instead of blocking with sleep(), return delay.
+             * Caller should schedule a retry via timeq.
+             * Delay formula: (cycles >> 1) * 5 seconds, i.e. 0, 5, 10, 15, ...
+             */
+            time_t delay = (cManager.cycles >> 1) * 5;
+            if (delay < 2) delay = 2;  /* Minimum 2 second delay */
+            if (delay > 120) delay = 120;  /* Cap at 2 minutes */
+
             cManager.cycles++;
 
             if(max_cycles && (cManager.cycles >= max_cycles))
             {
                 log_module(MAIN_LOG, LOG_ERROR, "Maximum uplink list cycles exceeded; giving up.");
-                exit(1);
+                return -1;  /* Fatal */
             }
 
-            /* Give the uplink currently in 'uplink' consideration,
-               and if not selected, break on the next iteration. */
-            stop = 1;
-        }
+            log_module(MAIN_LOG, LOG_INFO,
+                       "All uplinks tried, need to wait %ld seconds before retry (cycle %d).",
+                       (long)delay, cManager.cycles);
 
-        /* Skip bad uplinks. */
-        if(uplink->flags & UPLINK_UNAVAILABLE)
-        {
-            continue;
+            return (int)delay;  /* Caller should schedule retry */
         }
 
         if(name && irccasecmp(uplink->name, name))
@@ -329,19 +369,39 @@ uplink_select(char *name)
         if(!cManager.uplink || cManager.uplink->flags & UPLINK_UNAVAILABLE)
         {
             log_module(MAIN_LOG, LOG_ERROR, "All available uplinks exhausted; giving up.");
-            exit(1);
+            return -1;  /* Fatal */
         }
 
-        return;
+        return 0;  /* Keep current uplink */
     }
 
     cManager.uplink = uplink;
+    return 0;  /* Success */
+}
+
+/**
+ * Callback for deferred uplink reconnection.
+ * Called by timeq after the reconnect delay has elapsed.
+ */
+static void
+uplink_reconnect_callback(UNUSED_ARG(void *data))
+{
+    reconnect_pending = 0;
+    log_module(MAIN_LOG, LOG_DEBUG, "Reconnect timer fired, attempting connection.");
+    uplink_connect();
 }
 
 int
 uplink_connect(void)
 {
     struct uplinkNode *uplink = cManager.uplink;
+    int select_result;
+
+    /* If a reconnect is already scheduled, don't duplicate */
+    if(reconnect_pending)
+    {
+        return 0;
+    }
 
     if(uplink->state != DISCONNECTED)
     {
@@ -350,14 +410,37 @@ uplink_connect(void)
 
     if(uplink->flags & UPLINK_UNAVAILABLE)
     {
-        uplink_select(NULL);
+        select_result = uplink_select(NULL);
+        if (select_result < 0) {
+            /* Fatal error - all uplinks exhausted */
+            exit(1);
+        }
+        if (select_result > 0) {
+            /* Need to wait before retrying uplink list */
+            log_module(MAIN_LOG, LOG_INFO,
+                       "Scheduling uplink selection retry in %d seconds.",
+                       select_result);
+            reconnect_pending = 1;
+            timeq_add(now + select_result, uplink_reconnect_callback, NULL);
+            return 0;
+        }
         uplink = cManager.uplink;
     }
 
     if(uplink->tries)
     {
-        /* This delay could scale with the number of tries. */
-        sleep(2);
+        /*
+         * Instead of blocking with sleep(), schedule a callback.
+         * This allows the event loop to continue processing other events.
+         * Delay scales with number of tries: 2s, 4s, 8s, ... capped at 60s.
+         */
+        time_t delay = 2 << (uplink->tries > 4 ? 4 : uplink->tries - 1);
+        if (delay > 60) delay = 60;
+        log_module(MAIN_LOG, LOG_INFO, "Scheduling reconnect in %ld seconds (attempt %d).",
+                   (long)delay, uplink->tries + 1);
+        reconnect_pending = 1;
+        timeq_add(now + delay, uplink_reconnect_callback, NULL);
+        return 0;
     }
 
     if(!create_socket_client(uplink))
@@ -366,7 +449,14 @@ uplink_connect(void)
         {
             /* This is a bad uplink, move on. */
             uplink->flags |= UPLINK_UNAVAILABLE;
-            uplink_select(NULL);
+            select_result = uplink_select(NULL);
+            if (select_result < 0) {
+                exit(1);
+            }
+            if (select_result > 0) {
+                reconnect_pending = 1;
+                timeq_add(now + select_result, uplink_reconnect_callback, NULL);
+            }
         }
 
         return 0;
@@ -611,6 +701,10 @@ license()
 void main_shutdown(UNUSED_ARG(void *extra))
 {
     struct uplinkNode *ul, *ul_next;
+
+    /* Shutdown thread pool first (waits for running tasks) */
+    threadpool_shutdown(5000);
+
     ioset_cleanup();
     for (ul = cManager.uplinks; ul; ul = ul_next) {
         ul_next = ul->next;
@@ -627,4 +721,7 @@ void main_shutdown(UNUSED_ARG(void *extra))
     policer_params_delete(luser_policer_params);
     if (replay_file)
         fclose(replay_file);
+
+    /* Cleanup memory pools last (other modules may have used them) */
+    mempool_cleanup_global();
 }

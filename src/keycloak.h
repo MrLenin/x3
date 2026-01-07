@@ -193,20 +193,8 @@ int keycloak_update_user(struct kc_realm realm, struct kc_client client,
                          const char* user_id, const char* new_password,
                          const char* new_email);
 
-/**
- * Updates a user's password credentials using pre-hashed password (credential import).
- * Uses Keycloak's credential import format to avoid sending plaintext passwords.
- * @param realm       Keycloak realm configuration
- * @param client      Client with admin access token
- * @param user_id     User's Keycloak ID (UUID)
- * @param cred_data   credentialData JSON from pw_export_keycloak()
- * @param secret_data secretData JSON from pw_export_keycloak()
- * @return KC_SUCCESS on success, KC_NOT_FOUND if user doesn't exist, KC_ERROR on failure
- * @deprecated Use keycloak_update_user_representation() instead
- */
-int keycloak_update_user_credentials(struct kc_realm realm, struct kc_client client,
-                                     const char* user_id,
-                                     const char* cred_data, const char* secret_data);
+/* NOTE: keycloak_update_user_credentials() removed - was dead code.
+ * Use keycloak_update_user_representation() with kc_user_update.cred_data instead. */
 
 /**
  * Update parameters for keycloak_update_user_representation().
@@ -592,6 +580,15 @@ typedef int (*kc_fingerprint_callback)(void *session, int result, char *username
 typedef int (*kc_introspect_callback)(void *session, int result, struct kc_token_info *token_info);
 
 /**
+ * Async client token callback type
+ * @param session      Opaque session pointer (waiter context)
+ * @param result       KC_SUCCESS or KC_ERROR/KC_TOKEN_ERROR
+ * @param access_token Token (only valid if result==KC_SUCCESS, ownership transferred to callback)
+ * @return 0 if session may continue processing, 1 if session is terminal
+ */
+typedef int (*kc_client_token_callback)(void *session, int result, struct access_token *access_token);
+
+/**
  * Start async authentication check against Keycloak
  * This function returns immediately and invokes the callback when complete.
  * Uses curl_multi integrated with X3's ioset event loop.
@@ -637,6 +634,20 @@ int keycloak_find_user_by_fingerprint_async(struct kc_realm realm, struct kc_cli
 int keycloak_introspect_token_async(struct kc_realm realm, struct kc_client client,
                                      const char *token, void *session,
                                      kc_introspect_callback callback);
+
+/**
+ * Start async client credentials token acquisition from Keycloak
+ * This function returns immediately and invokes the callback when complete.
+ * Used internally by kc_ensure_token_async() for non-blocking token refresh.
+ *
+ * @param realm    Keycloak realm configuration
+ * @param client   Client credentials (client_id, client_secret)
+ * @param session  Opaque session pointer (passed to callback)
+ * @param callback Function to call when token acquisition completes
+ * @return 0 on success (request started), -1 on error
+ */
+int keycloak_get_client_token_async(struct kc_realm realm, struct kc_client client,
+                                     void *session, kc_client_token_callback callback);
 
 /**
  * Set a user attribute asynchronously.

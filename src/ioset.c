@@ -86,6 +86,7 @@ wsa_strerror(int wsa_err)
 #define IS_EOL(CH) ((CH) == '\n')
 
 extern int uplink_connect(void);
+extern int reconnect_pending;  /* From main-common.c - set when reconnect is scheduled via timeq */
 int clock_skew;
 int do_write_dbs;
 int do_reopen;
@@ -648,8 +649,15 @@ ioset_run(void) {
     long timeout_ms;
 
     while (!quit_services) {
-        while (!socket_io_fd)
-            uplink_connect();
+        /*
+         * Try to connect to uplink if disconnected.
+         * If reconnect_pending is set, a timeq callback is scheduled to retry,
+         * so we break out and let the event loop process it.
+         */
+        while (!socket_io_fd && !reconnect_pending) {
+            if (!uplink_connect())
+                break;  /* Connection failed or pending, let event loop run */
+        }
 
         /* How long to sleep? (fill in select_timeout) */
         wakey = timeq_next();
