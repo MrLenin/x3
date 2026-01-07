@@ -247,6 +247,7 @@ void chanserv_sync_x3_metadata(struct chanData *cData, int sync_immutable);
 #define KC_SYNC_PRIORITY_IMMEDIATE 3
 
 int chanserv_queue_keycloak_sync(const char *channel, int priority);
+char *kc_group_path_to_channel(const char *group_path);
 #endif /* WITH_KEYCLOAK */
 
 #endif

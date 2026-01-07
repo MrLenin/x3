@@ -349,6 +349,66 @@ int x3_lmdb_chanaccess_clear(const char *channel);
  */
 void x3_lmdb_free_chanaccess_entries(struct lmdb_chanaccess_entry *entries);
 
+/* ========== Channel Sync Metadata (for Keycloak sync) ========== */
+
+/* Key prefix for channel sync metadata */
+#define LMDB_PREFIX_CHANSYNC "kcsyncmeta:"
+
+/* Channel sync metadata structure - persists across restarts */
+struct lmdb_chansync_meta {
+    uint64_t membership_hash;     /* Hash of last known membership (for incremental sync) */
+    time_t last_sync;             /* When this channel was last synced */
+    int consecutive_failures;     /* For exponential backoff */
+    time_t next_allowed_sync;     /* Don't retry before this time */
+    int last_entry_count;         /* Number of entries in last sync */
+};
+
+/**
+ * Get channel sync metadata
+ * @param channel Channel name (with #)
+ * @param meta_out Output structure
+ * @return LMDB_SUCCESS on success, LMDB_NOT_FOUND if not found, LMDB_ERROR on failure
+ */
+int x3_lmdb_chansync_get(const char *channel, struct lmdb_chansync_meta *meta_out);
+
+/**
+ * Set channel sync metadata
+ * @param channel Channel name (with #)
+ * @param meta Metadata to store
+ * @return LMDB_SUCCESS on success, LMDB_ERROR on failure
+ */
+int x3_lmdb_chansync_set(const char *channel, const struct lmdb_chansync_meta *meta);
+
+/**
+ * Delete channel sync metadata
+ * @param channel Channel name (with #)
+ * @return LMDB_SUCCESS on success, LMDB_NOT_FOUND if not found, LMDB_ERROR on failure
+ */
+int x3_lmdb_chansync_delete(const char *channel);
+
+/**
+ * Record a sync failure for a channel (increments counter, sets backoff)
+ * @param channel Channel name (with #)
+ * @return New consecutive failure count, or -1 on error
+ */
+int x3_lmdb_chansync_record_failure(const char *channel);
+
+/**
+ * Record a successful sync for a channel (resets failure counter)
+ * @param channel Channel name (with #)
+ * @param membership_hash Hash of current membership
+ * @param entry_count Number of entries synced
+ * @return LMDB_SUCCESS on success, LMDB_ERROR on failure
+ */
+int x3_lmdb_chansync_record_success(const char *channel, uint64_t membership_hash, int entry_count);
+
+/**
+ * Check if a channel is in backoff period
+ * @param channel Channel name (with #)
+ * @return 1 if in backoff, 0 if ok to sync, -1 on error
+ */
+int x3_lmdb_chansync_in_backoff(const char *channel);
+
 /* ========== Activity Data (lastseen/last_present) ========== */
 
 /* Key prefix for activity data */
@@ -1023,6 +1083,12 @@ void init_x3_lmdb(void);
 #define x3_lmdb_chanaccess_list_account(a, e) (-1)
 #define x3_lmdb_chanaccess_clear(c)     (-1)
 #define x3_lmdb_free_chanaccess_entries(e) do {} while(0)
+#define x3_lmdb_chansync_get(c, m)      (-2)
+#define x3_lmdb_chansync_set(c, m)      (-1)
+#define x3_lmdb_chansync_delete(c)      (-2)
+#define x3_lmdb_chansync_record_failure(c) (-1)
+#define x3_lmdb_chansync_record_success(c, h, e) (-1)
+#define x3_lmdb_chansync_in_backoff(c)  (0)
 #define x3_lmdb_activity_get(a, l, p)   (-2)
 #define x3_lmdb_activity_set(a, l, p)   (-1)
 #define x3_lmdb_activity_touch(a)       (-2)

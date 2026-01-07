@@ -1732,6 +1732,220 @@ void x3_lmdb_free_chanaccess_entries(struct lmdb_chanaccess_entry *entries)
     }
 }
 
+/* ========== Channel Sync Metadata (for Keycloak sync) ========== */
+
+/* Default exponential backoff: 30s, 60s, 120s, 240s, 480s, 960s, max 1h */
+#define KC_BACKOFF_BASE_SECS 30
+#define KC_BACKOFF_MAX_SECS  3600
+
+int x3_lmdb_chansync_get(const char *channel, struct lmdb_chansync_meta *meta_out)
+{
+    MDB_txn *txn;
+    MDB_val mkey, mdata;
+    char keybuf[LMDB_KEY_BUFFER_SIZE];
+    int rc;
+
+    if (!x3_lmdb_is_available() || !channel || !meta_out) {
+        return LMDB_ERROR;
+    }
+
+    /* Build key: "kcsyncmeta:<channel>" */
+    snprintf(keybuf, sizeof(keybuf), "%s%s", LMDB_PREFIX_CHANSYNC, channel);
+
+    mkey.mv_size = strlen(keybuf) + 1;
+    mkey.mv_data = keybuf;
+
+    rc = mdb_txn_begin(lmdb_env, NULL, MDB_RDONLY, &txn);
+    if (rc != 0) {
+        return LMDB_ERROR;
+    }
+
+    rc = mdb_get(txn, dbi_metadata, &mkey, &mdata);
+    mdb_txn_abort(txn);
+
+    if (rc == MDB_NOTFOUND) {
+        return LMDB_NOT_FOUND;
+    }
+    if (rc != 0) {
+        return LMDB_ERROR;
+    }
+
+    /* Parse stored data - binary format for efficiency */
+    if (mdata.mv_size != sizeof(struct lmdb_chansync_meta)) {
+        log_module(MAIN_LOG, LOG_WARNING, "x3_lmdb: chansync_get: size mismatch for %s (%zu vs %zu)",
+                   channel, mdata.mv_size, sizeof(struct lmdb_chansync_meta));
+        return LMDB_ERROR;
+    }
+
+    memcpy(meta_out, mdata.mv_data, sizeof(struct lmdb_chansync_meta));
+    return LMDB_SUCCESS;
+}
+
+int x3_lmdb_chansync_set(const char *channel, const struct lmdb_chansync_meta *meta)
+{
+    MDB_txn *txn;
+    MDB_val mkey, mdata;
+    char keybuf[LMDB_KEY_BUFFER_SIZE];
+    int rc;
+
+    if (!x3_lmdb_is_available() || !channel || !meta) {
+        return LMDB_ERROR;
+    }
+
+    /* Build key: "kcsyncmeta:<channel>" */
+    snprintf(keybuf, sizeof(keybuf), "%s%s", LMDB_PREFIX_CHANSYNC, channel);
+
+    mkey.mv_size = strlen(keybuf) + 1;
+    mkey.mv_data = keybuf;
+    mdata.mv_size = sizeof(struct lmdb_chansync_meta);
+    mdata.mv_data = (void *)meta;
+
+    rc = mdb_txn_begin(lmdb_env, NULL, 0, &txn);
+    if (rc != 0) {
+        return LMDB_ERROR;
+    }
+
+    rc = mdb_put(txn, dbi_metadata, &mkey, &mdata, 0);
+    if (rc != 0) {
+        mdb_txn_abort(txn);
+        return LMDB_ERROR;
+    }
+
+    rc = mdb_txn_commit(txn);
+    return (rc == 0) ? LMDB_SUCCESS : LMDB_ERROR;
+}
+
+int x3_lmdb_chansync_delete(const char *channel)
+{
+    MDB_txn *txn;
+    MDB_val mkey;
+    char keybuf[LMDB_KEY_BUFFER_SIZE];
+    int rc;
+
+    if (!x3_lmdb_is_available() || !channel) {
+        return LMDB_ERROR;
+    }
+
+    /* Build key: "kcsyncmeta:<channel>" */
+    snprintf(keybuf, sizeof(keybuf), "%s%s", LMDB_PREFIX_CHANSYNC, channel);
+
+    mkey.mv_size = strlen(keybuf) + 1;
+    mkey.mv_data = keybuf;
+
+    rc = mdb_txn_begin(lmdb_env, NULL, 0, &txn);
+    if (rc != 0) {
+        return LMDB_ERROR;
+    }
+
+    rc = mdb_del(txn, dbi_metadata, &mkey, NULL);
+    if (rc == MDB_NOTFOUND) {
+        mdb_txn_abort(txn);
+        return LMDB_NOT_FOUND;
+    }
+    if (rc != 0) {
+        mdb_txn_abort(txn);
+        return LMDB_ERROR;
+    }
+
+    rc = mdb_txn_commit(txn);
+    return (rc == 0) ? LMDB_SUCCESS : LMDB_ERROR;
+}
+
+int x3_lmdb_chansync_record_failure(const char *channel)
+{
+    struct lmdb_chansync_meta meta;
+    int rc;
+    time_t backoff_secs;
+
+    if (!channel) {
+        return -1;
+    }
+
+    /* Get existing metadata or initialize */
+    rc = x3_lmdb_chansync_get(channel, &meta);
+    if (rc == LMDB_NOT_FOUND) {
+        memset(&meta, 0, sizeof(meta));
+    } else if (rc != LMDB_SUCCESS) {
+        return -1;
+    }
+
+    /* Increment failure count */
+    meta.consecutive_failures++;
+
+    /* Calculate exponential backoff: base * 2^(failures-1), capped at max */
+    backoff_secs = KC_BACKOFF_BASE_SECS * (1 << (meta.consecutive_failures - 1));
+    if (backoff_secs > KC_BACKOFF_MAX_SECS) {
+        backoff_secs = KC_BACKOFF_MAX_SECS;
+    }
+
+    meta.next_allowed_sync = now + backoff_secs;
+
+    log_module(MAIN_LOG, LOG_DEBUG, "x3_lmdb: chansync_record_failure: %s failure #%d, backoff %ld secs",
+               channel, meta.consecutive_failures, (long)backoff_secs);
+
+    rc = x3_lmdb_chansync_set(channel, &meta);
+    if (rc != LMDB_SUCCESS) {
+        return -1;
+    }
+
+    return meta.consecutive_failures;
+}
+
+int x3_lmdb_chansync_record_success(const char *channel, uint64_t membership_hash, int entry_count)
+{
+    struct lmdb_chansync_meta meta;
+    int rc;
+
+    if (!channel) {
+        return LMDB_ERROR;
+    }
+
+    /* Get existing metadata or initialize */
+    rc = x3_lmdb_chansync_get(channel, &meta);
+    if (rc == LMDB_NOT_FOUND) {
+        memset(&meta, 0, sizeof(meta));
+    } else if (rc != LMDB_SUCCESS) {
+        return LMDB_ERROR;
+    }
+
+    /* Update metadata */
+    meta.membership_hash = membership_hash;
+    meta.last_sync = now;
+    meta.consecutive_failures = 0;  /* Reset on success */
+    meta.next_allowed_sync = 0;     /* No backoff */
+    meta.last_entry_count = entry_count;
+
+    return x3_lmdb_chansync_set(channel, &meta);
+}
+
+int x3_lmdb_chansync_in_backoff(const char *channel)
+{
+    struct lmdb_chansync_meta meta;
+    int rc;
+
+    if (!channel) {
+        return -1;
+    }
+
+    rc = x3_lmdb_chansync_get(channel, &meta);
+    if (rc == LMDB_NOT_FOUND) {
+        /* No metadata means no failures, not in backoff */
+        return 0;
+    }
+    if (rc != LMDB_SUCCESS) {
+        return -1;
+    }
+
+    /* Check if still in backoff period */
+    if (meta.next_allowed_sync > 0 && now < meta.next_allowed_sync) {
+        log_module(MAIN_LOG, LOG_DEBUG, "x3_lmdb: chansync_in_backoff: %s in backoff until %lu (now=%lu)",
+                   channel, (unsigned long)meta.next_allowed_sync, (unsigned long)now);
+        return 1;
+    }
+
+    return 0;
+}
+
 /* ========== Activity Data (lastseen/last_present) ========== */
 
 int x3_lmdb_activity_get(const char *account, time_t *lastseen_out, time_t *last_present_out)

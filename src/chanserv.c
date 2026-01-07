@@ -76,6 +76,7 @@ extern struct nickserv_config nickserv_conf;
 #define KEY_KEYCLOAK_SYNC_BATCH_DELAY "keycloak_sync_batch_delay"
 #define KEY_KEYCLOAK_SYNC_PRIORITIZE "keycloak_sync_prioritize"
 #define KEY_KEYCLOAK_SYNC_DISTRIBUTED "keycloak_sync_distributed"
+#define KEY_KEYCLOAK_SYNC_INCREMENTAL "keycloak_sync_incremental"
 #define KEY_CHANNEL_METADATA_TTL_ENABLED "channel_metadata_ttl_enabled"
 #define KEY_CHANNEL_METADATA_DEFAULT_TTL "channel_metadata_default_ttl"
 #define KEY_CHANNEL_IMMUTABLE_KEYS  "channel_immutable_keys"
@@ -699,6 +700,7 @@ static struct
     unsigned int        keycloak_sync_batch_delay; /* Ms between batches (default: 100) */
     unsigned int        keycloak_sync_prioritize : 1;  /* Enable priority sorting (default: ON) */
     unsigned int        keycloak_sync_distributed : 1; /* Enable distributed sync (default: ON) */
+    unsigned int        keycloak_sync_incremental : 1; /* Enable hash-based delta sync (default: ON) */
 
     /* Channel metadata TTL configuration */
     unsigned int        channel_metadata_ttl_enabled : 1;  /* Enable channel metadata expiry */
@@ -9372,17 +9374,21 @@ chanserv_conf_read(void)
     str = database_get_data(conf_node, KEY_KEYCLOAK_SYNC_DISTRIBUTED, RECDB_QSTRING);
     chanserv_conf.keycloak_sync_distributed = str ? !disabled_string(str) : 1;  /* ON by default */
 
+    str = database_get_data(conf_node, KEY_KEYCLOAK_SYNC_INCREMENTAL, RECDB_QSTRING);
+    chanserv_conf.keycloak_sync_incremental = str ? !disabled_string(str) : 1;  /* ON by default */
+
     /* Log Keycloak sync configuration */
     log_module(CS_LOG, LOG_INFO, "Keycloak access sync config: access_sync=%d, bidirectional=%d, hierarchical=%d, prefix=%s",
                chanserv_conf.keycloak_access_sync,
                chanserv_conf.keycloak_bidirectional,
                chanserv_conf.keycloak_hierarchical_groups,
                chanserv_conf.keycloak_group_prefix);
-    log_module(CS_LOG, LOG_DEBUG, "Keycloak sync batch config: batch_size=%u, batch_delay=%ums, prioritize=%d, distributed=%d",
+    log_module(CS_LOG, LOG_DEBUG, "Keycloak sync batch config: batch_size=%u, batch_delay=%ums, prioritize=%d, distributed=%d, incremental=%d",
                chanserv_conf.keycloak_sync_batch_size,
                chanserv_conf.keycloak_sync_batch_delay,
                chanserv_conf.keycloak_sync_prioritize,
-               chanserv_conf.keycloak_sync_distributed);
+               chanserv_conf.keycloak_sync_distributed,
+               chanserv_conf.keycloak_sync_incremental);
 
     /* Channel metadata TTL configuration */
     str = database_get_data(conf_node, KEY_CHANNEL_METADATA_TTL_ENABLED, RECDB_QSTRING);
@@ -11246,20 +11252,35 @@ chanserv_sync_keycloak_batch(UNUSED_ARG(void *data))
             continue;
         }
 
-        int synced = chanserv_sync_keycloak_channel(cData->channel->name);
+        const char *chan_name = cData->channel->name;
+
+        /* Check if channel is in backoff due to previous failures */
+        int in_backoff = x3_lmdb_chansync_in_backoff(chan_name);
+        if (in_backoff > 0) {
+            log_module(CS_LOG, LOG_DEBUG, "Keycloak sync: skipping %s (in backoff)", chan_name);
+            kc_sync.channels_skipped++;
+            continue;
+        }
+
+        int synced = chanserv_sync_keycloak_channel(chan_name);
         if (synced > 0) {
             kc_sync.total_entries += synced;
             kc_sync.channels_done++;
+            /* Record success with entry count as simple hash for now */
+            x3_lmdb_chansync_record_success(chan_name, (uint64_t)synced, synced);
         } else if (synced == 0) {
             /* No changes needed */
             kc_sync.channels_skipped++;
             kc_sync.channels_done++;
+            /* Still counts as success (channel was checked) */
+            x3_lmdb_chansync_record_success(chan_name, 0, 0);
         } else {
-            /* Sync failed */
+            /* Sync failed - record failure and apply backoff */
             kc_sync.channels_failed++;
+            x3_lmdb_chansync_record_failure(chan_name);
             if (kc_sync.failure_count < KC_MAX_FAILURES_TRACKED) {
                 safestrncpy(kc_sync.failures[kc_sync.failure_count].channel,
-                            cData->channel->name, CHANNELLEN+1);
+                            chan_name, CHANNELLEN+1);
                 kc_sync.failures[kc_sync.failure_count].error_code = synced;
                 kc_sync.failure_count++;
             }
@@ -11328,6 +11349,119 @@ kc_sync_build_queue(void)
     }
 
     return kc_sync.queue_size;
+}
+
+/**
+ * Convert a Keycloak group path to a channel name
+ * Handles both hierarchical (/irc-channels/#help) and flat (irc-channel-#help) modes
+ * @param group_path The Keycloak group path or name
+ * @return Allocated channel name (caller must free), or NULL if not a channel group
+ */
+char *
+kc_group_path_to_channel(const char *group_path)
+{
+    const char *prefix = chanserv_conf.keycloak_group_prefix;
+    size_t prefix_len;
+    const char *channel_start;
+    const char *channel_end;
+    size_t channel_len;
+    char *result;
+
+    if (!group_path || !prefix)
+        return NULL;
+
+    prefix_len = strlen(prefix);
+
+    if (chanserv_conf.keycloak_hierarchical_groups) {
+        /* Hierarchical mode: /irc-channels/#help or /irc-channels/#help/owner
+         * Group path format: /<prefix>/<channel>[/<suffix>]
+         */
+        const char *p = group_path;
+
+        /* Skip leading slash if present */
+        if (*p == '/')
+            p++;
+
+        /* Check for prefix match */
+        if (strncmp(p, prefix, prefix_len) != 0)
+            return NULL;
+
+        p += prefix_len;
+
+        /* Skip slash after prefix */
+        if (*p == '/')
+            p++;
+        else
+            return NULL;  /* Malformed path */
+
+        /* p now points to channel name (e.g., "#help" or "#help/owner") */
+        channel_start = p;
+
+        /* Find end of channel name (next slash or end of string) */
+        channel_end = strchr(channel_start, '/');
+        if (channel_end)
+            channel_len = channel_end - channel_start;
+        else
+            channel_len = strlen(channel_start);
+
+    } else {
+        /* Flat mode: irc-channel-#help or irc-channel-#help-owner
+         * Group name format: <prefix><channel>[-<suffix>]
+         */
+        const char *p = group_path;
+
+        /* Skip leading slash if present (shouldn't be, but be safe) */
+        if (*p == '/')
+            p++;
+
+        /* Check for prefix match */
+        if (strncmp(p, prefix, prefix_len) != 0)
+            return NULL;
+
+        p += prefix_len;
+
+        /* p now points to channel name (e.g., "#help" or "#help-owner") */
+        channel_start = p;
+
+        /* Channel names start with # and can't contain -suffix patterns
+         * We need to find where the channel ends and suffix begins
+         * Look for -owner, -coowner, -manager, -op, -halfop, -peon pattern
+         */
+        channel_end = NULL;
+        const char *dash = channel_start;
+        while ((dash = strchr(dash, '-')) != NULL) {
+            /* Check if this dash is followed by a known suffix */
+            if (strncmp(dash, "-owner", 6) == 0 ||
+                strncmp(dash, "-coowner", 8) == 0 ||
+                strncmp(dash, "-manager", 8) == 0 ||
+                strncmp(dash, "-op", 3) == 0 ||
+                strncmp(dash, "-halfop", 7) == 0 ||
+                strncmp(dash, "-peon", 5) == 0) {
+                channel_end = dash;
+                break;
+            }
+            dash++;
+        }
+
+        if (channel_end)
+            channel_len = channel_end - channel_start;
+        else
+            channel_len = strlen(channel_start);
+    }
+
+    /* Validate it looks like a channel name */
+    if (channel_len == 0 || channel_start[0] != '#')
+        return NULL;
+
+    /* Allocate and copy */
+    result = malloc(channel_len + 1);
+    if (!result)
+        return NULL;
+
+    memcpy(result, channel_start, channel_len);
+    result[channel_len] = '\0';
+
+    return result;
 }
 
 /**
