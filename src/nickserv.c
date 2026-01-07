@@ -1665,8 +1665,9 @@ static NICKSERV_FUNC(cmd_register)
     }
 
 
-    /* Capture email address if provided */
-    if (argc >= 4) {
+    /* Capture email address if provided and email verification is enabled */
+    if ((argc >= 4) && nickserv_conf.email_enabled) {
+        struct handle_info_list *hil;
         const char *str;
 
         /* Remember email address. */
@@ -1684,27 +1685,21 @@ static NICKSERV_FUNC(cmd_register)
             return 0;
         }
 
-        /* If email verification is enabled, do additional checks */
-        if (nickserv_conf.email_enabled) {
-            struct handle_info_list *hil;
-            /* If we do email verify, make sure we don't spam the address. */
-            if ((hil = dict_find(nickserv_email_dict, email_addr, NULL))) {
-                unsigned int nn;
-                for (nn=0; nn<hil->used; nn++) {
-                    if (hil->list[nn]->cookie) {
-                        reply("NSMSG_EMAIL_UNACTIVATED");
-                        return 0;
-                    }
-                }
-                if (hil->used >= nickserv_conf.handles_per_email) {
-                    reply("NSMSG_EMAIL_OVERUSED");
+        /* If we do email verify, make sure we don't spam the address. */
+        if ((hil = dict_find(nickserv_email_dict, email_addr, NULL))) {
+            unsigned int nn;
+            for (nn=0; nn<hil->used; nn++) {
+                if (hil->list[nn]->cookie) {
+                    reply("NSMSG_EMAIL_UNACTIVATED");
                     return 0;
                 }
             }
-            no_auth = 1;  /* Require email verification */
-        } else {
-            no_auth = 0;  /* Skip email verification */
+            if (hil->used >= nickserv_conf.handles_per_email) {
+                reply("NSMSG_EMAIL_OVERUSED");
+                return 0;
+            }
         }
+        no_auth = 1;  /* Require email verification */
     } else {
         email_addr = 0;
         no_auth = 0;
@@ -6250,6 +6245,7 @@ kc_do_modify(const char *handle, const char *hash, const char *email)
 {
     char cred_data[256];
     char secret_data[512];
+    struct kc_user_update update = {0};
 
     log_module(NS_LOG, LOG_DEBUG,
                "kc_do_modify: called for %s, hash=%s, email=%s",
@@ -6273,7 +6269,7 @@ kc_do_modify(const char *handle, const char *hash, const char *email)
     char *user_id = strdup(user.id);
     keycloak_user_free_fields(&user);
 
-    /* Update password hash if provided */
+    /* Build update struct with requested changes */
     if (hash) {
         if (pw_export_keycloak(hash, cred_data, sizeof(cred_data),
                                secret_data, sizeof(secret_data)) != 0) {
@@ -6283,20 +6279,18 @@ kc_do_modify(const char *handle, const char *hash, const char *email)
                        handle);
             /* Don't fail - just skip password update */
         } else {
-            rc = keycloak_update_user_credentials(kc_realm_config, kc_client_config,
-                                                   user_id, cred_data, secret_data);
-            if (rc != KC_SUCCESS) {
-                free(user_id);
-                return rc;
-            }
+            update.cred_data = cred_data;
+            update.secret_data = secret_data;
         }
     }
 
-    /* Update email if provided */
     if (email) {
-        rc = keycloak_update_user(kc_realm_config, kc_client_config,
-                                  user_id, NULL, email);
+        update.email = email;
     }
+
+    /* Single API call to update all fields */
+    rc = keycloak_update_user_representation(kc_realm_config, kc_client_config,
+                                             user_id, &update);
 
     free(user_id);
     return rc;
@@ -6310,7 +6304,7 @@ kc_delete_account(const char *handle)
         return KC_ERROR;
     }
 
-    /* First get user ID */
+    /* First get user ID (may be cached from recent create) */
     struct kc_user user;
     int rc = keycloak_get_user(kc_realm_config, kc_client_config, handle, &user);
     if (rc != KC_SUCCESS) {
@@ -6322,6 +6316,10 @@ kc_delete_account(const char *handle)
 
     rc = keycloak_delete_user(kc_realm_config, kc_client_config, user_id);
     free(user_id);
+
+    /* Invalidate cache entry regardless of delete result */
+    keycloak_invalidate_user_cache(handle);
+
     return rc;
 }
 

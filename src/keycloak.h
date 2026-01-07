@@ -174,6 +174,13 @@ void keycloak_free_users(struct kc_user* users, size_t count);
 void keycloak_free_access_token(struct access_token* token);
 
 /**
+ * Invalidate cached user ID for a username.
+ * Call after deleting a user to prevent stale cache entries.
+ * @param username  Username to remove from cache
+ */
+void keycloak_invalidate_user_cache(const char *username);
+
+/**
  * Updates a user's password and/or email in Keycloak
  * @param realm         Keycloak realm configuration
  * @param client        Client with admin access token
@@ -195,10 +202,33 @@ int keycloak_update_user(struct kc_realm realm, struct kc_client client,
  * @param cred_data   credentialData JSON from pw_export_keycloak()
  * @param secret_data secretData JSON from pw_export_keycloak()
  * @return KC_SUCCESS on success, KC_NOT_FOUND if user doesn't exist, KC_ERROR on failure
+ * @deprecated Use keycloak_update_user_representation() instead
  */
 int keycloak_update_user_credentials(struct kc_realm realm, struct kc_client client,
                                      const char* user_id,
                                      const char* cred_data, const char* secret_data);
+
+/**
+ * Update parameters for keycloak_update_user_representation().
+ * Set fields to NULL to skip updating them.
+ */
+struct kc_user_update {
+    const char* email;          /* New email address (NULL to skip) */
+    const char* cred_data;      /* credentialData JSON from pw_export_keycloak() (NULL to skip) */
+    const char* secret_data;    /* secretData JSON - required if cred_data is set */
+};
+
+/**
+ * Updates a user in Keycloak with any combination of fields in a single API call.
+ * @param realm       Keycloak realm configuration
+ * @param client      Client with admin access token
+ * @param user_id     User's Keycloak ID (UUID)
+ * @param update      Fields to update (NULL fields are skipped)
+ * @return KC_SUCCESS on success, KC_NOT_FOUND if user doesn't exist, KC_ERROR on failure
+ */
+int keycloak_update_user_representation(struct kc_realm realm, struct kc_client client,
+                                        const char* user_id,
+                                        const struct kc_user_update* update);
 
 /**
  * Deletes a user from Keycloak

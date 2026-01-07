@@ -55,6 +55,143 @@ static struct {
     char *realm_url;     /* URL of the realm this cache is for */
 } jwks_cache = {0};
 
+/*
+ * =============================================================================
+ * User ID Cache for HTTP Round-trip Optimization
+ * =============================================================================
+ *
+ * When creating a user, Keycloak returns the user ID in the Location header
+ * of the HTTP 201 response. We cache this to avoid a GET lookup when we need
+ * to update the user (e.g., syncing password hash after registration).
+ *
+ * Cache entries are short-lived (5 minutes) and used primarily during the
+ * registration → activation flow where multiple operations target the same user.
+ */
+
+#define KC_USERID_CACHE_TTL 300  /* 5 minutes */
+#define KC_USERID_CACHE_MAX 64   /* Max cached entries */
+
+struct kc_userid_entry {
+    char username[64];
+    char user_id[64];
+    time_t created;
+};
+
+static struct {
+    struct kc_userid_entry entries[KC_USERID_CACHE_MAX];
+    int count;
+} kc_userid_cache = {0};
+
+/* Cache a user ID (called after successful create) */
+static void
+kc_userid_cache_put(const char *username, const char *user_id)
+{
+    if (!username || !user_id) return;
+
+    /* Check if already cached (update timestamp) */
+    for (int i = 0; i < kc_userid_cache.count; i++) {
+        if (strcasecmp(kc_userid_cache.entries[i].username, username) == 0) {
+            safestrncpy(kc_userid_cache.entries[i].user_id, user_id,
+                        sizeof(kc_userid_cache.entries[i].user_id));
+            kc_userid_cache.entries[i].created = time(NULL);
+            log_module(KC_LOG, LOG_DEBUG, "userid_cache: Updated %s -> %s", username, user_id);
+            return;
+        }
+    }
+
+    /* Evict stale entries if full */
+    if (kc_userid_cache.count >= KC_USERID_CACHE_MAX) {
+        time_t now = time(NULL);
+        int oldest_idx = 0;
+        time_t oldest_time = kc_userid_cache.entries[0].created;
+
+        for (int i = 0; i < kc_userid_cache.count; i++) {
+            /* Prefer evicting expired entries */
+            if (now - kc_userid_cache.entries[i].created > KC_USERID_CACHE_TTL) {
+                oldest_idx = i;
+                break;
+            }
+            /* Otherwise evict oldest */
+            if (kc_userid_cache.entries[i].created < oldest_time) {
+                oldest_time = kc_userid_cache.entries[i].created;
+                oldest_idx = i;
+            }
+        }
+
+        log_module(KC_LOG, LOG_DEBUG, "userid_cache: Evicting %s to make room",
+                   kc_userid_cache.entries[oldest_idx].username);
+
+        /* Shift remaining entries if not last */
+        if (oldest_idx < kc_userid_cache.count - 1) {
+            memmove(&kc_userid_cache.entries[oldest_idx],
+                    &kc_userid_cache.entries[oldest_idx + 1],
+                    (kc_userid_cache.count - oldest_idx - 1) * sizeof(struct kc_userid_entry));
+        }
+        kc_userid_cache.count--;
+    }
+
+    /* Add new entry */
+    int idx = kc_userid_cache.count++;
+    safestrncpy(kc_userid_cache.entries[idx].username, username,
+                sizeof(kc_userid_cache.entries[idx].username));
+    safestrncpy(kc_userid_cache.entries[idx].user_id, user_id,
+                sizeof(kc_userid_cache.entries[idx].user_id));
+    kc_userid_cache.entries[idx].created = time(NULL);
+
+    log_module(KC_LOG, LOG_DEBUG, "userid_cache: Added %s -> %s (count=%d)",
+               username, user_id, kc_userid_cache.count);
+}
+
+/* Get cached user ID (returns NULL if not found or expired) */
+static const char *
+kc_userid_cache_get(const char *username)
+{
+    if (!username) return NULL;
+
+    time_t now = time(NULL);
+
+    for (int i = 0; i < kc_userid_cache.count; i++) {
+        if (strcasecmp(kc_userid_cache.entries[i].username, username) == 0) {
+            if (now - kc_userid_cache.entries[i].created > KC_USERID_CACHE_TTL) {
+                log_module(KC_LOG, LOG_DEBUG, "userid_cache: %s expired", username);
+                return NULL;
+            }
+            log_module(KC_LOG, LOG_DEBUG, "userid_cache: Hit %s -> %s",
+                       username, kc_userid_cache.entries[i].user_id);
+            return kc_userid_cache.entries[i].user_id;
+        }
+    }
+
+    return NULL;
+}
+
+/* Remove a cached entry (called on user delete) */
+static void
+kc_userid_cache_remove(const char *username)
+{
+    if (!username) return;
+
+    for (int i = 0; i < kc_userid_cache.count; i++) {
+        if (strcasecmp(kc_userid_cache.entries[i].username, username) == 0) {
+            if (i < kc_userid_cache.count - 1) {
+                memmove(&kc_userid_cache.entries[i],
+                        &kc_userid_cache.entries[i + 1],
+                        (kc_userid_cache.count - i - 1) * sizeof(struct kc_userid_entry));
+            }
+            kc_userid_cache.count--;
+            log_module(KC_LOG, LOG_DEBUG, "userid_cache: Removed %s", username);
+            return;
+        }
+    }
+}
+
+/* Public wrapper for cache invalidation */
+void
+keycloak_invalidate_user_cache(const char *username)
+{
+    kc_userid_cache_remove(username);
+}
+
 /* Forward declarations for JWT functions */
 static int jwks_refresh(struct kc_realm realm);
 static void jwks_cleanup(void);
@@ -694,6 +831,9 @@ enum http_method {
     HTTP_DELETE
 };
 
+/* Header callback type - receives each header line */
+typedef size_t (*curl_header_cb_ptr)(char *buffer, size_t size, size_t nitems, void *userdata);
+
 struct curl_opts {
     const char* uri;
     const char* header_list[10];
@@ -712,6 +852,9 @@ struct curl_opts {
     /* Binary POST data (alternative to post_fields) */
     const void* post_data;   /* Binary data pointer */
     size_t post_data_len;    /* Binary data length */
+    /* Response header capture (optional) */
+    curl_header_cb_ptr header_callback;  /* Called for each response header */
+    void* header_userdata;               /* Passed to header_callback */
 };
 
 /* Convenience initializer with sensible defaults */
@@ -1087,6 +1230,12 @@ curl_apply_opts(CURL *curl, struct curl_opts opts, struct memory *chunk_out,
         curl_easy_setopt(curl, CURLOPT_XOAUTH2_BEARER, opts.xoauth2_bearer);
     }
 
+    /* Response header capture (optional) */
+    if (opts.header_callback) {
+        curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, opts.header_callback);
+        curl_easy_setopt(curl, CURLOPT_HEADERDATA, opts.header_userdata);
+    }
+
     return 0;
 }
 
@@ -1177,7 +1326,39 @@ struct kc_async_request {
     size_t post_data_len;
     /* Timeout tracking (Phase 5.3) */
     time_t started;               /* When request was initiated */
+    /* User ID cache support (for KC_ASYNC_CREATE_USER) */
+    char *create_username;        /* Username being created (for cache population) */
+    char location_header[256];    /* Captured Location header from 201 response */
 };
+
+/* Header callback to capture Location header from HTTP 201 response */
+static size_t
+kc_header_callback(char *buffer, size_t size, size_t nitems, void *userdata)
+{
+    size_t realsize = size * nitems;
+    struct kc_async_request *req = (struct kc_async_request *)userdata;
+
+    /* Look for "Location:" header */
+    if (realsize > 10 && strncasecmp(buffer, "Location:", 9) == 0) {
+        const char *value = buffer + 9;
+        /* Skip leading whitespace */
+        while (*value == ' ' || *value == '\t') value++;
+
+        /* Copy value, stripping trailing \r\n */
+        size_t len = realsize - (value - buffer);
+        while (len > 0 && (value[len-1] == '\r' || value[len-1] == '\n'))
+            len--;
+
+        if (len > 0 && len < sizeof(req->location_header)) {
+            memcpy(req->location_header, value, len);
+            req->location_header[len] = '\0';
+            log_module(KC_LOG, LOG_DEBUG, "kc_header_callback: Captured Location: %s",
+                       req->location_header);
+        }
+    }
+
+    return realsize;
+}
 
 /* Called by curl when socket state changes */
 static int
@@ -1502,6 +1683,16 @@ kc_curl_check_completed(void)
                 if (http_code == 201) {
                     result = KC_SUCCESS;
                     log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async create_user: User created (HTTP 201)", req_id);
+
+                    /* Cache user ID from Location header for subsequent operations */
+                    if (req->create_username && req->location_header[0]) {
+                        /* Location format: .../users/{user-id} - extract last path segment */
+                        const char *user_id = strrchr(req->location_header, '/');
+                        if (user_id && user_id[1]) {
+                            user_id++;  /* Skip the '/' */
+                            kc_userid_cache_put(req->create_username, user_id);
+                        }
+                    }
                 } else if (http_code == 409) {
                     result = KC_USER_EXISTS;
                     log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async create_user: User exists (HTTP 409)", req_id);
@@ -1530,6 +1721,7 @@ kc_curl_check_completed(void)
             if (req->post_data_copy) free(req->post_data_copy);
             if (req->header_list) curl_slist_free_all(req->header_list);
             if (req->request_id) free(req->request_id);
+            if (req->create_username) free(req->create_username);
             free(req);
         }
     }
@@ -2314,6 +2506,14 @@ keycloak_create_user_async(struct kc_realm realm, struct kc_client client,
     req->type = KC_ASYNC_CREATE_USER;
     req->cb.generic = callback;
 
+    /* Store username for user ID caching */
+    req->create_username = strdup(username);
+    if (!req->create_username) {
+        log_module(KC_LOG, LOG_ERROR, "create_user_async: Failed to copy username");
+        free(req);
+        return -1;
+    }
+
     /* Build users endpoint URI */
     req->uri = kc_build_users_endpoint(realm);
     if (!req->uri) {
@@ -2332,7 +2532,10 @@ keycloak_create_user_async(struct kc_realm realm, struct kc_client client,
     req->post_fields = user_repr;
     user_repr = NULL;  /* Transfer ownership to req */
 
-    /* Build curl options */
+    /* Initialize location header buffer for user ID capture */
+    req->location_header[0] = '\0';
+
+    /* Build curl options with header callback for Location capture */
     struct curl_opts opts = CURL_OPTS_INIT;
     opts.uri = req->uri;
     opts.method = HTTP_POST;
@@ -2340,6 +2543,8 @@ keycloak_create_user_async(struct kc_realm realm, struct kc_client client,
     opts.post_fields = req->post_fields;
     opts.header_list[0] = "Content-Type: application/json";
     opts.header_count = 1;
+    opts.header_callback = kc_header_callback;
+    opts.header_userdata = req;
 
     if (curl_perform_async(req, opts) < 0) {
         log_module(KC_LOG, LOG_ERROR, "create_user_async: curl_perform_async failed");
@@ -2357,6 +2562,7 @@ error:
             memset(req->post_fields, 0, strlen(req->post_fields));
             free(req->post_fields);
         }
+        if (req->create_username) free(req->create_username);
         if (req->response.response) free(req->response.response);
         free(req);
     }
@@ -3214,11 +3420,29 @@ int keycloak_get_user(struct kc_realm realm, struct kc_client client,
         return KC_ERROR;
     }
 
+    /* Check user ID cache first (populated after user creation) */
+    const char *cached_id = kc_userid_cache_get(user);
+    if (cached_id) {
+        /* Cache hit - return minimal user struct with just the ID */
+        memset(kc_user_out, 0, sizeof(*kc_user_out));
+        kc_user_out->id = strdup(cached_id);
+        if (!kc_user_out->id) {
+            log_module(KC_LOG, LOG_DEBUG, "keycloak_get_user: Failed to copy cached ID");
+            return KC_ERROR;
+        }
+        log_module(KC_LOG, LOG_DEBUG, "keycloak_get_user: Cache hit for %s -> %s", user, cached_id);
+        return KC_SUCCESS;
+    }
+
+    /* Cache miss - do full HTTP GET */
     struct kc_user* kc_users = NULL;
     int result = keycloak_get_users(realm, client, user, NULL, true, &kc_users);
 
     if (result >= 1) {
-        /* User found */
+        /* User found - cache the ID for future lookups */
+        if (kc_users[0].id) {
+            kc_userid_cache_put(user, kc_users[0].id);
+        }
         *kc_user_out = kc_users[0];
         free(kc_users);
         return KC_SUCCESS;
@@ -3459,6 +3683,101 @@ int keycloak_update_user_credentials(struct kc_realm realm, struct kc_client cli
         result = KC_NOT_FOUND;
     } else {
         log_module(KC_LOG, LOG_DEBUG, "keycloak_update_user_credentials: Failed with HTTP %ld: %s",
+            http_code, chunk.response ? chunk.response : "no response");
+    }
+
+cleanup:
+    if (chunk.response) {
+        memset(chunk.response, 0, chunk.size);
+        free(chunk.response);
+    }
+    if (json_body) {
+        memset(json_body, 0, strlen(json_body));
+        free(json_body);
+    }
+    free(uri);
+
+    return result;
+}
+
+int keycloak_update_user_representation(struct kc_realm realm, struct kc_client client,
+                                        const char* user_id,
+                                        const struct kc_user_update* update)
+{
+    if (!realm.base_uri || !realm.realm || !client.access_token || !user_id || !update) {
+        log_module(KC_LOG, LOG_DEBUG, "keycloak_update_user_representation: Invalid arguments");
+        return KC_ERROR;
+    }
+
+    /* Check if there's anything to update */
+    if (!update->email && !update->cred_data) {
+        log_module(KC_LOG, LOG_DEBUG, "keycloak_update_user_representation: Nothing to update");
+        return KC_SUCCESS;
+    }
+
+    /* Credentials require both cred_data and secret_data */
+    if (update->cred_data && !update->secret_data) {
+        log_module(KC_LOG, LOG_DEBUG, "keycloak_update_user_representation: cred_data requires secret_data");
+        return KC_ERROR;
+    }
+
+    int result = KC_ERROR;
+    char *uri = kc_build_user_endpoint(realm, user_id);
+    char *json_body = NULL;
+    struct memory chunk = {0};
+
+    if (!uri) {
+        log_module(KC_LOG, LOG_DEBUG, "keycloak_update_user_representation: Failed to build uri");
+        goto cleanup;
+    }
+
+    /* Build UserRepresentation JSON with requested fields */
+    json_t* user_obj = json_object();
+
+    if (update->email) {
+        json_object_set_new(user_obj, "email", json_string(update->email));
+    }
+
+    if (update->cred_data && update->secret_data) {
+        json_t* cred_obj = json_object();
+        json_object_set_new(cred_obj, "type", json_string("password"));
+        json_object_set_new(cred_obj, "credentialData", json_string(update->cred_data));
+        json_object_set_new(cred_obj, "secretData", json_string(update->secret_data));
+
+        json_t* creds_array = json_array();
+        json_array_append_new(creds_array, cred_obj);
+        json_object_set_new(user_obj, "credentials", creds_array);
+    }
+
+    json_body = json_dumps(user_obj, JSON_COMPACT);
+    json_decref(user_obj);
+
+    if (!json_body) {
+        log_module(KC_LOG, LOG_DEBUG, "keycloak_update_user_representation: Failed to build JSON");
+        goto cleanup;
+    }
+
+    log_module(KC_LOG, LOG_DEBUG, "keycloak_update_user_representation: Updating user %s (email=%s, creds=%s)",
+               user_id, update->email ? "yes" : "no", update->cred_data ? "yes" : "no");
+
+    struct curl_opts opts = CURL_OPTS_INIT;
+    opts.uri = uri;
+    opts.method = HTTP_PUT;
+    opts.post_fields = json_body;
+    opts.xoauth2_bearer = client.access_token->access_token;
+    opts.header_list[0] = "Content-Type: application/json";
+    opts.header_count = 1;
+
+    long http_code = curl_perform(opts, &chunk);
+
+    if (http_code == 204) {
+        log_module(KC_LOG, LOG_DEBUG, "keycloak_update_user_representation: Updated (HTTP 204)");
+        result = KC_SUCCESS;
+    } else if (http_code == 404) {
+        log_module(KC_LOG, LOG_DEBUG, "keycloak_update_user_representation: User not found (HTTP 404)");
+        result = KC_NOT_FOUND;
+    } else {
+        log_module(KC_LOG, LOG_DEBUG, "keycloak_update_user_representation: Failed with HTTP %ld: %s",
             http_code, chunk.response ? chunk.response : "no response");
     }
 
