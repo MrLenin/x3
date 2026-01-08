@@ -1106,6 +1106,9 @@ valid_user_sslfp(struct userNode *user, struct handle_info *hi)
     return 0;
 }
 
+/* TODO: Remove excessive debug logging from this function.
+ * Some log statements expose passwords in plain text (security risk).
+ * Keep only the ERROR level log for NULL password check. */
 static int
 is_secure_password(const char *handle, const char *pass, struct userNode *user)
 {
@@ -6618,6 +6621,9 @@ cookie_async_token_callback(void *context, int result, struct access_token *toke
     ctx->state = COOKIE_STATE_LOOKUP;
 
     /* Start async user lookup using token manager's cached config */
+    /* Note: Log before async call because callback may free ctx synchronously */
+    log_module(NS_LOG, LOG_DEBUG, "COOKIE async: Token ready, starting user lookup for %s", ctx->handle);
+
     if (keycloak_get_user_async(keycloak_get_realm(), keycloak_get_authed_client(),
                                 ctx->handle, ctx,
                                 cookie_async_lookup_callback) != 0) {
@@ -6626,8 +6632,6 @@ cookie_async_token_callback(void *context, int result, struct access_token *toke
         cookie_async_ctx_free(ctx);
         return;
     }
-
-    log_module(NS_LOG, LOG_DEBUG, "COOKIE async: Token ready, started user lookup for %s", ctx->handle);
 }
 
 /* Phase 1 callback: Keycloak user lookup completed */
@@ -6694,6 +6698,9 @@ cookie_async_lookup_callback(void *session, int result, struct kc_user *kc_user)
 
     ctx->state = COOKIE_STATE_UPDATE;
 
+    /* Note: Log before async call because callback may free ctx synchronously */
+    log_module(NS_LOG, LOG_DEBUG, "COOKIE async: Starting phase 2 (update) for %s", ctx->handle);
+
     if (keycloak_update_user_representation_async(keycloak_get_realm(), keycloak_get_authed_client(),
                                                    ctx->user_id, &update,
                                                    ctx, cookie_async_update_callback) != 0) {
@@ -6703,7 +6710,6 @@ cookie_async_lookup_callback(void *session, int result, struct kc_user *kc_user)
         return 0;
     }
 
-    log_module(NS_LOG, LOG_DEBUG, "COOKIE async: Started phase 2 (update) for %s", ctx->handle);
     return 0;
 }
 
@@ -7900,12 +7906,14 @@ kc_try_auto_activate(struct handle_info *hi)
 
     /* Start async token acquisition */
     rc = keycloak_ensure_token_async(kc_auto_activate_token_cb, ctx);
-    if (rc != 0) {
+    if (rc < 0) {
         log_module(NS_LOG, LOG_DEBUG, "kc_try_auto_activate: Failed to start token acquisition for %s",
                    hi->handle);
         free(ctx);
         return;
     }
+    /* Note: rc == 1 means callback was invoked synchronously and ctx may already be freed
+     * or have started other async operations. rc == 0 means async pending. Either way, don't free ctx. */
 
     log_module(NS_LOG, LOG_DEBUG, "kc_try_auto_activate: Started async emailVerified check for %s",
                hi->handle);
@@ -8902,11 +8910,13 @@ nickserv_set_user_metadata(struct handle_info *hi, const char *key, const char *
                 snprintf(kc_ctx->attr_name, 128, "metadata.%s", key);
                 kc_ctx->attr_value = strdup((value && *value) ? stored_value : "");
                 if (kc_ctx->attr_value) {
-                    if (keycloak_ensure_token_async(kc_metadata_token_cb, kc_ctx) == 0) {
-                        /* Async started - consider optimistically successful for keycloak_ok */
+                    int kc_rc = keycloak_ensure_token_async(kc_metadata_token_cb, kc_ctx);
+                    if (kc_rc >= 0) {
+                        /* Async started (0) or callback invoked synchronously (1) - either way
+                         * the callback chain owns the context now. Consider optimistically successful. */
                         keycloak_ok = 1;
-                        log_module(NS_LOG, LOG_DEBUG, "nickserv_set_user_metadata: Started async Keycloak set %s.%s",
-                                   hi->handle, key);
+                        log_module(NS_LOG, LOG_DEBUG, "nickserv_set_user_metadata: %s async Keycloak set %s.%s",
+                                   kc_rc == 1 ? "Sync" : "Started", hi->handle, key);
                     } else {
                         log_module(NS_LOG, LOG_DEBUG, "nickserv_set_user_metadata: Failed to start async token");
                         kc_metadata_ctx_free(kc_ctx);
@@ -9117,8 +9127,10 @@ nickserv_get_user_metadata_async(struct handle_info *hi, const char *key)
     strncpy(ctx->handle, hi->handle, sizeof(ctx->handle) - 1);
     strncpy(ctx->key, key, sizeof(ctx->key) - 1);
 
-    /* Start async token acquisition - fire-and-forget */
-    if (keycloak_ensure_token_async(mdq_single_token_cb, ctx) != 0) {
+    /* Start async token acquisition - fire-and-forget
+     * Note: rc >= 0 means either async pending (0) or callback invoked synchronously (1).
+     * Only free context on error (rc < 0) when no callback was invoked. */
+    if (keycloak_ensure_token_async(mdq_single_token_cb, ctx) < 0) {
         log_module(NS_LOG, LOG_DEBUG, "mdq_single_async: Failed to start token acquisition for %s.%s",
                    hi->handle, key);
         free(ctx);
@@ -9483,15 +9495,18 @@ nickserv_sync_metadata_async(const char *handle, const char *nick, int use_nick)
         strncpy(ctx->nick, nick, sizeof(ctx->nick) - 1);
     ctx->use_nick = use_nick;
 
-    /* Start async token acquisition - fire-and-forget */
-    if (keycloak_ensure_token_async(metadata_sync_token_cb, ctx) != 0) {
+    /* Note: Log before async call because callback may free ctx synchronously */
+    log_module(NS_LOG, LOG_DEBUG, "metadata_sync_async: Starting async sync for %s (target=%s)",
+               handle, use_nick ? nick : handle);
+
+    /* Start async token acquisition - fire-and-forget
+     * Note: rc >= 0 means either async pending (0) or callback invoked synchronously (1).
+     * Only free context on error (rc < 0) when no callback was invoked. */
+    if (keycloak_ensure_token_async(metadata_sync_token_cb, ctx) < 0) {
         log_module(NS_LOG, LOG_DEBUG, "metadata_sync_async: Failed to start token acquisition for %s", handle);
         free(ctx);
         return;
     }
-
-    log_module(NS_LOG, LOG_DEBUG, "metadata_sync_async: Started async sync for %s (target=%s)",
-               handle, use_nick ? nick : handle);
 #else
     (void)handle;
     (void)nick;
@@ -9682,8 +9697,10 @@ nickserv_get_webpush_subscriptions_async(const char *account_name,
     ctx->caller_session = session;
     ctx->callback = callback;
 
-    /* Stage 1: Acquire token asynchronously */
-    if (keycloak_ensure_token_async(webpush_subs_token_cb, ctx) != 0) {
+    /* Stage 1: Acquire token asynchronously
+     * Note: rc >= 0 means either async pending (0) or callback invoked synchronously (1).
+     * Only free context on error (rc < 0) when no callback was invoked. */
+    if (keycloak_ensure_token_async(webpush_subs_token_cb, ctx) < 0) {
         log_module(NS_LOG, LOG_DEBUG, "webpush_subs_async: Failed to start token acquisition");
         free(ctx);
         return -1;
@@ -11925,22 +11942,37 @@ sasl_packet(struct SASLSession *session)
                 session->authzid = strdup(authzid);
             session->state = SASL_STATE_AUTHENTICATING;
 
-            /* Start async token acquisition → fingerprint lookup chain */
-            if (keycloak_ensure_token_async(sasl_external_token_callback,
-                                            sasl_async_ctx_new(session)) == 0) {
-                /* Request started - callback chain will handle cleanup */
-                free(raw);
-                return 1;
-            }
+            /* Create async context before the call so we can free it on error */
+            struct sasl_async_ctx *async_ctx = sasl_async_ctx_new(session);
+            if (!async_ctx) {
+                log_module(NS_LOG, LOG_ERROR, "SASL EXTERNAL: Out of memory for async context");
+                session->state = SASL_STATE_INIT;
+                if (session->authzid) {
+                    free(session->authzid);
+                    session->authzid = NULL;
+                }
+                hi = loc_auth_external(session->sslclifp, authzid, session->hostmask);
+            } else {
+                /* Start async token acquisition → fingerprint lookup chain
+                 * rc >= 0: callback chain started (0=async, 1=sync) - don't free context
+                 * rc < 0: error, no callback invoked - free context and fall back */
+                int rc = keycloak_ensure_token_async(sasl_external_token_callback, async_ctx);
+                if (rc >= 0) {
+                    /* Request started or completed synchronously - callback chain handles cleanup */
+                    free(raw);
+                    return 1;
+                }
 
-            /* Async failed - fall back to sync */
-            log_module(NS_LOG, LOG_WARNING, "SASL EXTERNAL: Async start failed, using sync");
-            session->state = SASL_STATE_INIT;
-            if (session->authzid) {
-                free(session->authzid);
-                session->authzid = NULL;
+                /* Async failed - free context and fall back to sync */
+                log_module(NS_LOG, LOG_WARNING, "SASL EXTERNAL: Async start failed, using sync");
+                free(async_ctx);
+                session->state = SASL_STATE_INIT;
+                if (session->authzid) {
+                    free(session->authzid);
+                    session->authzid = NULL;
+                }
+                hi = loc_auth_external(session->sslclifp, authzid, session->hostmask);
             }
-            hi = loc_auth_external(session->sslclifp, authzid, session->hostmask);
         } else {
             /* Keycloak disabled - use sync path */
             hi = loc_auth_external(session->sslclifp, authzid, session->hostmask);
@@ -13350,7 +13382,7 @@ init_nickserv(const char *nick)
     }
 
 #ifdef WITH_LDAP
-    ldap_do_init(nickserv_conf);
+    ldap_do_init();
 #endif
 
     message_register_table(msgtab);

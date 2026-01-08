@@ -3985,32 +3985,48 @@ static char* json_build_user_representation(const char *username, const char *em
 static char* json_build_user_with_hash(const char *username, const char *email,
                                        const char *cred_data, const char *secret_data)
 {
-    if (!username || !email || !cred_data || !secret_data) {
-        log_module(KC_LOG, LOG_DEBUG, "json_build_user_with_hash: Invalid arguments");
+    /* For user creation: username, email, cred_data, and secret_data all required
+     * For user updates: username can be NULL, and either email or credentials can be set
+     * If cred_data is set, secret_data must also be set */
+    if (cred_data && !secret_data) {
+        log_module(KC_LOG, LOG_DEBUG, "json_build_user_with_hash: cred_data requires secret_data");
+        return NULL;
+    }
+
+    /* Must have at least something to update/create */
+    if (!username && !email && !cred_data) {
+        log_module(KC_LOG, LOG_DEBUG, "json_build_user_with_hash: Nothing to include in JSON body");
         return NULL;
     }
 
     char* result = NULL;
 
     json_t* user_obj = json_object();
-    json_t* creds = json_array();
-    json_t* cred = json_object();
 
-    /* Build user object */
-    json_object_set_new(user_obj, "username", json_string(username));
-    json_object_set_new(user_obj, "email", json_string(email));
+    /* Build user object - only include fields that are set */
+    if (username) {
+        json_object_set_new(user_obj, "username", json_string(username));
+    }
+    if (email) {
+        json_object_set_new(user_obj, "email", json_string(email));
+    }
     json_object_set_new(user_obj, "enabled", json_true());
 
-    /* Build credential with pre-hashed password (credential import format) */
-    json_object_set_new(cred, "type", json_string("password"));
+    /* Build credential with pre-hashed password if provided */
+    if (cred_data && secret_data) {
+        json_t* creds = json_array();
+        json_t* cred = json_object();
 
-    /* credentialData and secretData must be JSON strings containing JSON */
-    json_object_set_new(cred, "credentialData", json_string(cred_data));
-    json_object_set_new(cred, "secretData", json_string(secret_data));
-    json_object_set_new(cred, "temporary", json_false());
+        json_object_set_new(cred, "type", json_string("password"));
 
-    json_array_append_new(creds, cred);
-    json_object_set_new(user_obj, "credentials", creds);
+        /* credentialData and secretData must be JSON strings containing JSON */
+        json_object_set_new(cred, "credentialData", json_string(cred_data));
+        json_object_set_new(cred, "secretData", json_string(secret_data));
+        json_object_set_new(cred, "temporary", json_false());
+
+        json_array_append_new(creds, cred);
+        json_object_set_new(user_obj, "credentials", creds);
+    }
 
     result = json_dumps(user_obj, JSON_COMPACT);
 

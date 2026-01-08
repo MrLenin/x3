@@ -10682,8 +10682,8 @@ kc_async_ctx_free(struct kc_async_sync_ctx *ctx)
 {
     if (!ctx) return;
     if (ctx->group_id) free(ctx->group_id);
-    if (ctx->client.access_token)
-        keycloak_free_access_token(ctx->client.access_token);
+    /* Note: ctx->client.access_token is a reference to keycloak module's token,
+     * NOT owned by this context - do not free it here */
     free(ctx);
 }
 
