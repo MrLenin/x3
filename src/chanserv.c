@@ -1980,6 +1980,20 @@ unregister_channel(struct chanData *channel, const char *reason)
 
     wipe_adduser_pending(channel->channel, NULL);
 
+#ifdef WITH_KEYCLOAK
+    /* Queue deletion of user access attributes before deleting local users */
+    if (nickserv_conf.keycloak_enable && chanserv_conf.keycloak_access_sync) {
+        struct userData *uData;
+        for (uData = channel->users; uData; uData = uData->next) {
+            if (uData->handle && uData->handle->handle) {
+                /* Queue async deletion of user's channel access attribute */
+                chanserv_push_keycloak_access(channel->channel->name,
+                                               uData->handle->handle, 0);
+            }
+        }
+    }
+#endif
+
     while(channel->users)
     del_channel_user(channel->users, 0);
 
@@ -11208,7 +11222,8 @@ enum adduser_state {
     ADDUSER_CREATE_GROUP,    /* Create channel group if needed */
     ADDUSER_SET_LEVEL,       /* Set access level attribute */
     ADDUSER_ADD_USER,        /* Add user to group (final step) */
-    ADDUSER_REMOVE_USER,     /* Remove user from group (access=0) */
+    ADDUSER_REMOVE_ATTR,     /* Delete user attribute (access=0, first step) */
+    ADDUSER_REMOVE_USER,     /* Remove user from group (access=0, second step) */
     ADDUSER_DONE
 };
 
@@ -11237,6 +11252,7 @@ static int adduser_lookup_group_cb(void *session, int result, char *group_id);
 static int adduser_ensure_parent_cb(void *session, int result, char *group_id);
 static int adduser_create_group_cb(void *session, int result, char *group_id);
 static int adduser_set_level_cb(void *session, int result);
+static int adduser_remove_attr_cb(void *session, int result);
 static int adduser_final_cb(void *session, int result);
 
 /* Free ADDUSER async context */
@@ -11357,25 +11373,39 @@ adduser_lookup_group_cb(void *session, int result, char *group_id)
                ctx->channel, ctx->username, result, group_id ? group_id : "(null)");
 
     if (ctx->access == 0) {
-        /* REMOVAL: If group exists, remove user; if not, nothing to do */
+        /* REMOVAL: First delete user attribute, then remove from group */
         if (result == KC_SUCCESS && group_id) {
             ctx->group_id = group_id;
-            ctx->state = ADDUSER_REMOVE_USER;
+            ctx->state = ADDUSER_REMOVE_ATTR;
 
-            if (keycloak_remove_user_from_group_async(ctx->realm, ctx->client,
-                                                       ctx->user_id, ctx->group_id,
-                                                       ctx, adduser_final_cb) < 0) {
-                log_module(CS_LOG, LOG_WARNING, "adduser_async[%s/%s]: Failed to start remove",
+            /* Delete the user attribute by setting to NULL (creates empty array) */
+            char attr_name[256];
+            snprintf(attr_name, sizeof(attr_name), "x3.channel.%s", ctx->channel);
+
+            if (keycloak_set_user_attribute_async(ctx->realm, ctx->client, ctx->user_id,
+                                                   attr_name, NULL, ctx,
+                                                   adduser_remove_attr_cb) < 0) {
+                log_module(CS_LOG, LOG_WARNING, "adduser_async[%s/%s]: Failed to start attr delete",
                            ctx->channel, ctx->username);
                 adduser_async_ctx_free(ctx);
                 return 0;
             }
         } else {
-            /* Group doesn't exist - nothing to remove */
-            log_module(CS_LOG, LOG_DEBUG, "adduser_async[%s/%s]: Group not found, nothing to remove",
-                       ctx->channel, ctx->username);
+            /* Group doesn't exist - still try to clean up any orphaned attribute */
             if (group_id) free(group_id);
-            adduser_async_ctx_free(ctx);
+
+            char attr_name[256];
+            snprintf(attr_name, sizeof(attr_name), "x3.channel.%s", ctx->channel);
+            ctx->state = ADDUSER_REMOVE_ATTR;
+
+            if (keycloak_set_user_attribute_async(ctx->realm, ctx->client, ctx->user_id,
+                                                   attr_name, NULL, ctx,
+                                                   adduser_final_cb) < 0) {
+                log_module(CS_LOG, LOG_DEBUG, "adduser_async[%s/%s]: No group, attr delete failed",
+                           ctx->channel, ctx->username);
+                adduser_async_ctx_free(ctx);
+                return 0;
+            }
         }
         return 0;
     }
@@ -11387,11 +11417,14 @@ adduser_lookup_group_cb(void *session, int result, char *group_id)
         ctx->state = ADDUSER_SET_LEVEL;
 
         char level_str[16];
+        char attr_name[256];
         snprintf(level_str, sizeof(level_str), "%u", ctx->access);
+        /* Store access level as USER attribute (per-user, per-channel granularity) */
+        snprintf(attr_name, sizeof(attr_name), "x3.channel.%s", ctx->channel);
 
-        if (keycloak_set_group_attribute_async(ctx->realm, ctx->client, ctx->group_id,
-                                                chanserv_conf.keycloak_access_level_attr,
-                                                level_str, ctx, adduser_set_level_cb) < 0) {
+        if (keycloak_set_user_attribute_async(ctx->realm, ctx->client, ctx->user_id,
+                                               attr_name, level_str, ctx,
+                                               adduser_set_level_cb) < 0) {
             log_module(CS_LOG, LOG_WARNING, "adduser_async[%s/%s]: Failed to start set level",
                        ctx->channel, ctx->username);
             adduser_async_ctx_free(ctx);
@@ -11480,14 +11513,17 @@ adduser_create_group_cb(void *session, int result, char *group_id)
 
     if (result == KC_SUCCESS && group_id) {
         ctx->group_id = group_id;
-    } else if (result == KC_USER_EXISTS) {
-        /* Group already exists - need to look it up */
+    } else if (result == KC_USER_EXISTS || (result == KC_SUCCESS && !group_id)) {
+        /* Group already exists, or was created but no Location header returned.
+         * In either case, need to look it up to get the ID. */
         if (group_id) {
             ctx->group_id = group_id;
         } else {
             /* Look up by path to get ID */
             char group_path[256];
             snprintf(group_path, sizeof(group_path), "/irc-channels/%s", ctx->channel);
+            log_module(CS_LOG, LOG_DEBUG, "adduser_async[%s/%s]: Looking up group by path (result=%d)",
+                       ctx->channel, ctx->username, result);
             if (keycloak_get_group_by_path_async(ctx->realm, ctx->client, group_path,
                                                   ctx, adduser_lookup_group_cb) < 0) {
                 log_module(CS_LOG, LOG_WARNING, "adduser_async[%s/%s]: Failed to lookup existing group",
@@ -11499,20 +11535,22 @@ adduser_create_group_cb(void *session, int result, char *group_id)
         }
     } else {
         if (group_id) free(group_id);
-        log_module(CS_LOG, LOG_WARNING, "adduser_async[%s/%s]: Failed to create group",
-                   ctx->channel, ctx->username);
+        log_module(CS_LOG, LOG_WARNING, "adduser_async[%s/%s]: Failed to create group (result=%d)",
+                   ctx->channel, ctx->username, result);
         adduser_async_ctx_free(ctx);
         return 0;
     }
 
-    /* Set access level attribute */
+    /* Set access level as USER attribute (per-user, per-channel granularity) */
     ctx->state = ADDUSER_SET_LEVEL;
     char level_str[16];
+    char attr_name[256];
     snprintf(level_str, sizeof(level_str), "%u", ctx->access);
+    snprintf(attr_name, sizeof(attr_name), "x3.channel.%s", ctx->channel);
 
-    if (keycloak_set_group_attribute_async(ctx->realm, ctx->client, ctx->group_id,
-                                            chanserv_conf.keycloak_access_level_attr,
-                                            level_str, ctx, adduser_set_level_cb) < 0) {
+    if (keycloak_set_user_attribute_async(ctx->realm, ctx->client, ctx->user_id,
+                                           attr_name, level_str, ctx,
+                                           adduser_set_level_cb) < 0) {
         log_module(CS_LOG, LOG_WARNING, "adduser_async[%s/%s]: Failed to start set level",
                    ctx->channel, ctx->username);
         adduser_async_ctx_free(ctx);
@@ -11543,6 +11581,36 @@ adduser_set_level_cb(void *session, int result)
     if (keycloak_add_user_to_group_async(ctx->realm, ctx->client, ctx->user_id,
                                           ctx->group_id, ctx, adduser_final_cb) < 0) {
         log_module(CS_LOG, LOG_WARNING, "adduser_async[%s/%s]: Failed to start add user",
+                   ctx->channel, ctx->username);
+        adduser_async_ctx_free(ctx);
+        return 0;
+    }
+
+    return 0;
+}
+
+/* Phase 5b: Attribute deletion completed (removal flow) */
+static int
+adduser_remove_attr_cb(void *session, int result)
+{
+    struct adduser_async_ctx *ctx = session;
+    if (!ctx) return 1;
+
+    log_module(CS_LOG, LOG_DEBUG, "adduser_async[%s/%s]: Remove attr result=%d",
+               ctx->channel, ctx->username, result);
+
+    /* Even if attribute deletion failed, proceed to remove from group */
+    if (result != KC_SUCCESS) {
+        log_module(CS_LOG, LOG_WARNING, "adduser_async[%s/%s]: Attr delete failed, continuing",
+                   ctx->channel, ctx->username);
+    }
+
+    /* Now remove user from group */
+    ctx->state = ADDUSER_REMOVE_USER;
+    if (keycloak_remove_user_from_group_async(ctx->realm, ctx->client,
+                                               ctx->user_id, ctx->group_id,
+                                               ctx, adduser_final_cb) < 0) {
+        log_module(CS_LOG, LOG_WARNING, "adduser_async[%s/%s]: Failed to start remove from group",
                    ctx->channel, ctx->username);
         adduser_async_ctx_free(ctx);
         return 0;
@@ -12483,6 +12551,94 @@ chanserv_kcsync_reset_channel(const char *channel)
         return 0;
     }
     return -1;
+}
+
+/**
+ * Apply a Keycloak-sourced channel access change to X3's internal state.
+ * Called from webhook handler when x3.channel.* attribute changes in Keycloak.
+ * Does NOT push back to Keycloak (avoids infinite loop).
+ */
+void
+chanserv_keycloak_access_update(const char *channel, const char *account,
+                                 unsigned short level)
+{
+    struct chanNode *cNode;
+    struct chanData *cData;
+    struct handle_info *handle;
+    struct userData *uData;
+
+    if (!channel || !account) {
+        log_module(CS_LOG, LOG_WARNING,
+                   "chanserv_keycloak_access_update: Invalid arguments");
+        return;
+    }
+
+    /* Find the channel */
+    cNode = GetChannel(channel);
+    if (!cNode || !cNode->channel_info) {
+        log_module(CS_LOG, LOG_DEBUG,
+                   "chanserv_keycloak_access_update: Channel %s not registered", channel);
+        return;
+    }
+    cData = cNode->channel_info;
+
+    /* Find the account */
+    handle = get_handle_info(account);
+    if (!handle) {
+        log_module(CS_LOG, LOG_DEBUG,
+                   "chanserv_keycloak_access_update: Account %s not found", account);
+        return;
+    }
+
+    /* Find existing user entry */
+    uData = GetChannelAccess(cData, handle);
+
+    if (level == 0) {
+        /* Remove access */
+        if (uData) {
+            log_module(CS_LOG, LOG_INFO,
+                       "chanserv_keycloak_access_update: Removing %s from %s (Keycloak)",
+                       account, channel);
+            del_channel_user(uData, 1);
+        }
+#ifdef WITH_LMDB
+        if (x3_lmdb_is_available()) {
+            x3_lmdb_chanaccess_delete(channel, account);
+        }
+#endif
+    } else {
+        /* Add or update access */
+        if (level > UL_OWNER) {
+            log_module(CS_LOG, LOG_WARNING,
+                       "chanserv_keycloak_access_update: Level %u too high, capping at %d",
+                       level, UL_OWNER);
+            level = UL_OWNER;
+        }
+
+        if (uData) {
+            /* Update existing */
+            log_module(CS_LOG, LOG_INFO,
+                       "chanserv_keycloak_access_update: Updating %s in %s: %d -> %d (Keycloak)",
+                       account, channel, uData->access, level);
+            uData->access = level;
+            uData->seen = now;
+        } else {
+            /* Add new */
+            log_module(CS_LOG, LOG_INFO,
+                       "chanserv_keycloak_access_update: Adding %s to %s with level %d (Keycloak)",
+                       account, channel, level);
+            uData = add_channel_user(cData, handle, level, now, NULL, 0);
+            if (uData) {
+                scan_user_presence(uData, NULL);
+            }
+        }
+
+#ifdef WITH_LMDB
+        if (x3_lmdb_is_available()) {
+            x3_lmdb_chanaccess_set(channel, account, level);
+        }
+#endif
+    }
 }
 
 #endif /* WITH_KEYCLOAK */

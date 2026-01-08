@@ -276,6 +276,8 @@ int chanserv_kcsync_get_stats(struct kc_sync_statistics *stats);
 int chanserv_kcsync_abort(void);
 int chanserv_kcsync_trigger_all(void);
 int chanserv_kcsync_reset_channel(const char *channel);
+void chanserv_keycloak_access_update(const char *channel, const char *account,
+                                      unsigned short level);
 #endif /* WITH_KEYCLOAK */
 
 #endif

@@ -1287,11 +1287,37 @@ struct kc_sock_info {
     curl_socket_t sockfd;
     struct io_fd *io_fd;
     int action;  /* CURL_POLL_IN, CURL_POLL_OUT, etc */
+    struct kc_sock_info *next_pending;  /* For deferred cleanup list */
 };
+
+/* Deferred cleanup list for sockets.
+ * curl_multi_socket_action can close sockets during a callback, but
+ * those sockets might still be in the current epoll event batch.
+ * We defer the actual free until after curl_multi_socket_action returns.
+ */
+static struct kc_sock_info *kc_pending_cleanup = NULL;
 
 /* Forward declarations */
 static void kc_curl_socket_ready(struct io_fd *fd);
 static void kc_curl_timeout_fired(void *data);
+
+/**
+ * Process deferred socket cleanup.
+ * Called after curl_multi_socket_action to free sockets that were
+ * marked for cleanup during the curl callback.
+ */
+static void
+kc_process_pending_cleanup(void)
+{
+    struct kc_sock_info *si;
+    while ((si = kc_pending_cleanup) != NULL) {
+        kc_pending_cleanup = si->next_pending;
+        if (si->io_fd) {
+            ioset_close(si->io_fd, 0);  /* Don't close fd, curl owns it */
+        }
+        free(si);
+    }
+}
 static void kc_curl_check_completed(void);
 
 /* Async request types */
@@ -1311,7 +1337,8 @@ enum kc_async_type {
     KC_ASYNC_UPDATE_USER,   /* Update user representation (Phase 3) */
     KC_ASYNC_GET_GROUP_PATH,/* Get group by path (Phase 4) */
     KC_ASYNC_CREATE_SUBGROUP,/* Create subgroup (Phase 4) */
-    KC_ASYNC_SET_GROUP_ATTR, /* Set group attribute (Phase 4) */
+    KC_ASYNC_SET_GROUP_ATTR, /* Set group attribute (Phase 4) - PUT phase */
+    KC_ASYNC_SET_GROUP_ATTR_GET, /* Set group attribute (Phase 4) - GET phase */
     KC_ASYNC_GET_GROUP_NAME, /* Get group by name (Phase 5 sync cleanup) */
     KC_ASYNC_DELETE_GROUP,   /* Delete group (Phase 5 sync cleanup) */
     KC_ASYNC_DELETE_USER,    /* Delete user (Phase 5.10) */
@@ -1359,6 +1386,9 @@ struct kc_async_request {
     /* Attribute operations (Phase 5.10) */
     char *attr_prefix;            /* For KC_ASYNC_LIST_ATTRS - prefix filter (allocated) */
     char *attr_name;              /* For KC_ASYNC_GET_ATTR - attribute name (allocated) */
+    /* Group attribute operations (GET-then-PUT flow) */
+    char *group_attr_value;       /* For KC_ASYNC_SET_GROUP_ATTR_GET - value to set (allocated) */
+    char *group_id;               /* For KC_ASYNC_SET_GROUP_ATTR_GET - group ID (allocated) */
 };
 
 /* Header callback to capture Location header from HTTP 201 response */
@@ -1401,10 +1431,17 @@ kc_curl_socket_cb(CURL *easy, curl_socket_t s, int what,
 
     if (what == CURL_POLL_REMOVE) {
         if (si) {
+            /* Mark io_fd as closed so ioset_events will skip it.
+             * This is critical: curl may close sockets during curl_multi_socket_action,
+             * but those sockets might still be in the current epoll event batch.
+             * By marking as IO_CLOSED, ioset_events will skip processing (line 578-579). */
             if (si->io_fd) {
-                ioset_close(si->io_fd, 0);  /* Don't close fd, curl owns it */
+                si->io_fd->state = IO_CLOSED;
             }
-            free(si);
+            /* Defer actual cleanup until after curl_multi_socket_action returns.
+             * This prevents use-after-free when processing remaining epoll events. */
+            si->next_pending = kc_pending_cleanup;
+            kc_pending_cleanup = si;
         }
         curl_multi_assign(kc_curl_multi, s, NULL);
         return 0;
@@ -1438,10 +1475,15 @@ static void
 kc_curl_socket_ready(struct io_fd *fd)
 {
     struct kc_sock_info *si = fd->data;
+    curl_socket_t sockfd;
     int running;
     int ev_bitmask = 0;
 
     if (!si || !kc_curl_multi) return;
+
+    /* Save sockfd before curl call - si may be freed during curl_multi_socket_action
+     * if curl decides to close this socket */
+    sockfd = si->sockfd;
 
     /* Determine events based on what curl requested */
     if (si->action & CURL_POLL_IN)
@@ -1449,8 +1491,12 @@ kc_curl_socket_ready(struct io_fd *fd)
     if (si->action & CURL_POLL_OUT)
         ev_bitmask |= CURL_CSELECT_OUT;
 
-    curl_multi_socket_action(kc_curl_multi, si->sockfd, ev_bitmask, &running);
+    curl_multi_socket_action(kc_curl_multi, sockfd, ev_bitmask, &running);
     kc_curl_check_completed();  /* Check for finished transfers */
+
+    /* Process any sockets that were marked for cleanup during curl_multi_socket_action.
+     * This must happen AFTER the curl call to avoid use-after-free in the epoll loop. */
+    kc_process_pending_cleanup();
 }
 
 /* Called by curl when timeout value changes */
@@ -1492,6 +1538,9 @@ kc_curl_timeout_fired(UNUSED_ARG(void *data))
 
     curl_multi_socket_action(kc_curl_multi, CURL_SOCKET_TIMEOUT, 0, &running);
     kc_curl_check_completed();
+
+    /* Process any sockets that were marked for cleanup during curl_multi_socket_action */
+    kc_process_pending_cleanup();
 }
 
 /* Parse fingerprint lookup response and invoke callback */
@@ -2276,6 +2325,9 @@ kc_async_init(void)
 static void
 kc_async_cleanup(void)
 {
+    /* Process any pending socket cleanup before shutting down curl */
+    kc_process_pending_cleanup();
+
     if (kc_curl_multi) {
         /* Remove any pending timers and clear poll hint */
         timeq_del(0, kc_curl_timeout_fired, NULL, TIMEQ_IGNORE_WHEN | TIMEQ_IGNORE_DATA);
@@ -3993,8 +4045,10 @@ static char* json_build_user_with_hash(const char *username, const char *email,
         return NULL;
     }
 
-    /* Must have at least something to update/create */
-    if (!username && !email && !cred_data) {
+    /* Must have at least something to update/create (check for non-empty) */
+    int has_username = username && username[0];
+    int has_email = email && email[0];
+    if (!has_username && !has_email && !cred_data) {
         log_module(KC_LOG, LOG_DEBUG, "json_build_user_with_hash: Nothing to include in JSON body");
         return NULL;
     }
@@ -4003,11 +4057,11 @@ static char* json_build_user_with_hash(const char *username, const char *email,
 
     json_t* user_obj = json_object();
 
-    /* Build user object - only include fields that are set */
-    if (username) {
+    /* Build user object - only include fields that are set and non-empty */
+    if (username && username[0]) {
         json_object_set_new(user_obj, "username", json_string(username));
     }
-    if (email) {
+    if (email && email[0]) {
         json_object_set_new(user_obj, "email", json_string(email));
     }
     json_object_set_new(user_obj, "enabled", json_true());
@@ -6631,7 +6685,7 @@ keycloak_update_user_representation_async(struct kc_realm realm, struct kc_clien
         goto error;
     }
 
-    /* Build JSON body using existing helper */
+    /* Build JSON body - utility function handles NULL username for updates */
     json_body = json_build_user_with_hash(NULL, update->email,
                                           update->cred_data, update->secret_data);
     if (!json_body) {

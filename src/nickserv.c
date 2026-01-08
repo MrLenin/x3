@@ -6981,7 +6981,11 @@ struct kc_modify_ctx {
     char *cred_data;       /* Allocated, may be NULL */
     char *secret_data;     /* Allocated, may be NULL */
     char *user_id;         /* Keycloak user UUID, allocated */
+    int retries;           /* Retry count for user-not-found race condition */
 };
+
+#define KC_MODIFY_MAX_RETRIES 3
+#define KC_MODIFY_RETRY_DELAY 2  /* seconds */
 
 static void kc_modify_ctx_free(struct kc_modify_ctx *ctx) {
     if (ctx) {
@@ -6996,6 +7000,30 @@ static void kc_modify_ctx_free(struct kc_modify_ctx *ctx) {
         }
         if (ctx->user_id) free(ctx->user_id);
         free(ctx);
+    }
+}
+
+/* Forward declaration for retry */
+static void kc_modify_token_cb(void *context, int result, struct access_token *token);
+
+/* Retry helper for timeq - restarts token acquisition */
+static void
+kc_modify_retry(void *data)
+{
+    struct kc_modify_ctx *ctx = data;
+    int rc;
+
+    if (!ctx) return;
+
+    log_module(NS_LOG, LOG_DEBUG, "kc_modify_retry[%s]: Retry %d of %d",
+               ctx->handle, ctx->retries, KC_MODIFY_MAX_RETRIES);
+
+    /* Start fresh token acquisition for retry */
+    rc = keycloak_ensure_token_async(kc_modify_token_cb, ctx);
+    if (rc < 0) {
+        log_module(NS_LOG, LOG_WARNING, "kc_modify_retry[%s]: Failed to start token acquisition: %d",
+                   ctx->handle, rc);
+        kc_modify_ctx_free(ctx);
     }
 }
 
@@ -7030,9 +7058,21 @@ kc_modify_user_cb(void *session, int result, struct kc_user *user)
     }
 
     if (result != KC_SUCCESS || !user || !user->id) {
-        log_module(NS_LOG, LOG_DEBUG, "kc_modify_user_cb[%s]: User not found in Keycloak",
-                   ctx->handle);
         if (user) keycloak_user_free_fields(user);
+
+        /* User not found - may be a race with kc_do_add(), schedule retry */
+        if (ctx->retries < KC_MODIFY_MAX_RETRIES) {
+            ctx->retries++;
+            log_module(NS_LOG, LOG_DEBUG,
+                       "kc_modify_user_cb[%s]: User not found, scheduling retry %d/%d in %ds",
+                       ctx->handle, ctx->retries, KC_MODIFY_MAX_RETRIES, KC_MODIFY_RETRY_DELAY);
+            timeq_add(now + KC_MODIFY_RETRY_DELAY, kc_modify_retry, ctx);
+            return 1;
+        }
+
+        log_module(NS_LOG, LOG_WARNING,
+                   "kc_modify_user_cb[%s]: User not found after %d retries, giving up",
+                   ctx->handle, ctx->retries);
         kc_modify_ctx_free(ctx);
         return 1;
     }
@@ -11775,7 +11815,6 @@ sasl_async_introspect_callback(void *ctx_ptr, int result, struct kc_token_info *
 
     if (result != KC_SUCCESS || !token_info) {
         log_module(NS_LOG, LOG_DEBUG, "SASL OAUTHBEARER: Token introspection failed");
-        irc_sasl(session->source, session->uid, "C", "eyJzdGF0dXMiOiJpbnZhbGlkX3Rva2VuIn0=");
         irc_sasl(session->source, session->uid, "D", "F");
         if (token_info) keycloak_free_token_info(token_info);
         sasl_delete_session(session);
@@ -11784,7 +11823,6 @@ sasl_async_introspect_callback(void *ctx_ptr, int result, struct kc_token_info *
 
     if (!token_info->active) {
         log_module(NS_LOG, LOG_DEBUG, "SASL OAUTHBEARER: Token is not active");
-        irc_sasl(session->source, session->uid, "C", "eyJzdGF0dXMiOiJpbnZhbGlkX3Rva2VuIn0=");
         irc_sasl(session->source, session->uid, "D", "F");
         keycloak_free_token_info(token_info);
         sasl_delete_session(session);
@@ -12070,8 +12108,6 @@ sasl_packet(struct SASLSession *session)
 
         if (!token_start || !*token_start) {
             log_module(NS_LOG, LOG_DEBUG, "SASL OAUTHBEARER: No bearer token found");
-            /* Send error per RFC 7628 */
-            irc_sasl(session->source, session->uid, "C", "eyJzdGF0dXMiOiJpbnZhbGlkX3Rva2VuIn0=");
             irc_sasl(session->source, session->uid, "D", "F");
             sasl_delete_session(session);
             free(raw);
@@ -12144,7 +12180,6 @@ sasl_packet(struct SASLSession *session)
                 /* JWT signature invalid or expired - reject immediately */
                 log_module(NS_LOG, LOG_DEBUG, "SASL OAUTHBEARER: JWT validation failed (invalid/expired)");
                 if (token_info) keycloak_free_token_info(token_info);
-                irc_sasl(session->source, session->uid, "C", "eyJzdGF0dXMiOiJpbnZhbGlkX3Rva2VuIn0=");
                 irc_sasl(session->source, session->uid, "D", "F");
                 sasl_delete_session(session);
                 free(raw);
@@ -12181,8 +12216,6 @@ sasl_packet(struct SASLSession *session)
 
         if (!hi) {
             log_module(NS_LOG, LOG_DEBUG, "SASL OAUTHBEARER: Authentication failed");
-            /* Send error response per RFC 7628 */
-            irc_sasl(session->source, session->uid, "C", "eyJzdGF0dXMiOiJpbnZhbGlkX3Rva2VuIn0=");
             irc_sasl(session->source, session->uid, "D", "F");
         } else {
             log_module(NS_LOG, LOG_DEBUG, "SASL OAUTHBEARER: Authentication succeeded for %s", hi->handle);
@@ -12822,6 +12855,32 @@ handle_sasl_input(struct server* source ,const char *uid, const char *subcmd, co
             log_module(NS_LOG, LOG_DEBUG, "SASL: Marking session %s as CANCELLED (async in progress)", sess->uid);
             sess->state = SASL_STATE_CANCELLED;
         } else {
+            sasl_delete_session(sess);
+        }
+        return;
+    }
+
+    /* Handle AUTHENTICATE + (end of chunked payload or empty response)
+     * Per SASL 3.2 spec: If the last 400-byte chunk completes the message exactly,
+     * client sends "+" to signal end. This is NOT data to append - it's a signal
+     * to process the accumulated buffer now.
+     * If sent with no accumulated data, it's an empty SASL response (invalid for
+     * mechanisms like PLAIN that require credentials). */
+    if (!strcmp(data, "+")) {
+        log_module(NS_LOG, LOG_DEBUG, "SASL: End of chunked payload for %s (buflen=%d)", sess->uid, sess->buflen);
+        if (sess->buf != NULL && sess->buflen > 0) {
+            /* Process the accumulated buffer */
+            if (!sasl_packet(sess)) {
+                /* Session still valid - reset buffer for next packet */
+                sess->buflen = 0;
+                if (sess->buf != NULL)
+                    free(sess->buf);
+                sess->buf = sess->p = NULL;
+            }
+        } else {
+            /* Empty SASL response - invalid for most mechanisms */
+            log_module(NS_LOG, LOG_DEBUG, "SASL: Empty payload for %s - failing", sess->uid);
+            irc_sasl(source, uid, "D", "F");
             sasl_delete_session(sess);
         }
         return;

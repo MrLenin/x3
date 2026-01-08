@@ -256,7 +256,7 @@ webhook_readable(struct io_fd *fd)
         if (new_size > KC_WEBHOOK_MAX_REQUEST) {
             log_module(webhook_log, LOG_WARNING, "Webhook request too large");
             send_http_response(fd, 413, "Request Too Large");
-            ioset_close(fd, 1);
+            ioset_close(fd, 3);  /* Flush response then close */
             return;
         }
         char *new_buf = realloc(conn->buffer, new_size);
@@ -275,7 +275,7 @@ webhook_readable(struct io_fd *fd)
     if (!conn->headers_complete) {
         if (parse_http_headers(conn) < 0) {
             send_http_response(fd, 400, "Bad Request");
-            ioset_close(fd, 1);
+            ioset_close(fd, 3);  /* Flush response then close */
             return;
         }
         if (!conn->headers_complete) {
@@ -306,7 +306,8 @@ webhook_readable(struct io_fd *fd)
         send_http_response(fd, 400, "Bad Request");
     }
 
-    ioset_close(fd, 1);
+    /* Use flag 3 to flush pending writes (2) and close socket (1) */
+    ioset_close(fd, 3);
 }
 
 /*
@@ -646,6 +647,33 @@ handle_keycloak_event(const char *body, size_t body_len)
                                 stats.metadata_invalidations++;
                                 stats.cache_invalidations++;
                                 invalidated = 1;
+                            }
+
+                            /* Check for x3.channel.* attribute changes (bidirectional access sync) */
+                            const char *key;
+                            json_t *value;
+                            json_object_foreach(attrs, key, value) {
+                                if (strncmp(key, "x3.channel.", 11) == 0) {
+                                    const char *channel = key + 11;  /* "#channelname" */
+                                    unsigned short level = 0;
+
+                                    /* Extract level from attribute value array */
+                                    if (json_is_array(value) && json_array_size(value) > 0) {
+                                        json_t *first = json_array_get(value, 0);
+                                        if (first && json_is_string(first)) {
+                                            level = (unsigned short)atoi(json_string_value(first));
+                                        }
+                                    }
+
+                                    log_module(webhook_log, LOG_INFO,
+                                               "Channel access changed for %s via Keycloak: %s = %u",
+                                               username, channel, level);
+
+                                    /* Apply to X3's internal access list */
+                                    chanserv_keycloak_access_update(channel, username, level);
+                                    stats.cache_invalidations++;
+                                    invalidated = 1;
+                                }
                             }
                         }
                         json_decref(rep_json);
