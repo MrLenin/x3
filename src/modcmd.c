@@ -2526,6 +2526,8 @@ create_default_binds(int rebind) {
     } def_binds[] = {
         { "ChanServ", { "ChanServ", NULL } },
         { "Global", { "Global", NULL } },
+        { "HistServ", { "HistServ", NULL } },
+        { "MemoServ", { "MemoServ", NULL } },
         { "NickServ", { "NickServ", NULL } },
         { "OpServ", { "OpServ", "modcmd", "sendmail", "saxdb", "proxycheck", NULL } },
         { "SpamServ", { "SpamServ", NULL } },
