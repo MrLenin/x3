@@ -192,6 +192,155 @@ keycloak_invalidate_user_cache(const char *username)
     kc_userid_cache_remove(username);
 }
 
+/*
+ * =============================================================================
+ * User Representation Cache for Safe Attribute Updates
+ * =============================================================================
+ *
+ * Keycloak's PUT /admin/realms/{realm}/users/{id} does FULL replacement of
+ * the user object. This means sending {"attributes": {"foo": ["bar"]}} will
+ * CLEAR the user's email, firstName, etc.
+ *
+ * This cache stores full user representations (from webhooks or GET) so that
+ * when updating attributes we can merge the new attribute into the existing
+ * representation and PUT the complete object.
+ *
+ * Cache population sources:
+ * - Webhook USER UPDATE events (contain full representation in payload)
+ * - Explicit GET when cache miss occurs during attribute update
+ *
+ * Cache invalidation:
+ * - User deleted: remove from cache
+ * - Webhook USER UPDATE: replace with new representation
+ */
+
+#define KC_USER_REPR_CACHE_MAX 128  /* Max cached user representations */
+
+struct kc_user_repr_entry {
+    char user_id[64];      /* Keycloak user UUID (key) */
+    json_t *repr;          /* Full user JSON object (jansson) */
+    time_t last_updated;   /* When this entry was last refreshed */
+};
+
+static struct {
+    struct kc_user_repr_entry entries[KC_USER_REPR_CACHE_MAX];
+    int count;
+} kc_user_repr_cache = {0};
+
+/* Store/update user representation in cache */
+void
+kc_user_repr_cache_put(const char *user_id, json_t *repr)
+{
+    if (!user_id || !repr) return;
+
+    /* Check if already cached (update in place) */
+    for (int i = 0; i < kc_user_repr_cache.count; i++) {
+        if (strcmp(kc_user_repr_cache.entries[i].user_id, user_id) == 0) {
+            /* Replace existing representation */
+            if (kc_user_repr_cache.entries[i].repr)
+                json_decref(kc_user_repr_cache.entries[i].repr);
+            kc_user_repr_cache.entries[i].repr = json_incref(repr);
+            kc_user_repr_cache.entries[i].last_updated = time(NULL);
+            log_module(KC_LOG, LOG_DEBUG, "user_repr_cache: Updated %s", user_id);
+            return;
+        }
+    }
+
+    /* Evict oldest entry if full */
+    if (kc_user_repr_cache.count >= KC_USER_REPR_CACHE_MAX) {
+        int oldest_idx = 0;
+        time_t oldest_time = kc_user_repr_cache.entries[0].last_updated;
+
+        for (int i = 1; i < kc_user_repr_cache.count; i++) {
+            if (kc_user_repr_cache.entries[i].last_updated < oldest_time) {
+                oldest_time = kc_user_repr_cache.entries[i].last_updated;
+                oldest_idx = i;
+            }
+        }
+
+        log_module(KC_LOG, LOG_DEBUG, "user_repr_cache: Evicting %s to make room",
+                   kc_user_repr_cache.entries[oldest_idx].user_id);
+
+        /* Free the old representation */
+        if (kc_user_repr_cache.entries[oldest_idx].repr)
+            json_decref(kc_user_repr_cache.entries[oldest_idx].repr);
+
+        /* Shift remaining entries if not last */
+        if (oldest_idx < kc_user_repr_cache.count - 1) {
+            memmove(&kc_user_repr_cache.entries[oldest_idx],
+                    &kc_user_repr_cache.entries[oldest_idx + 1],
+                    (kc_user_repr_cache.count - oldest_idx - 1) *
+                    sizeof(struct kc_user_repr_entry));
+        }
+        kc_user_repr_cache.count--;
+    }
+
+    /* Add new entry */
+    int idx = kc_user_repr_cache.count++;
+    safestrncpy(kc_user_repr_cache.entries[idx].user_id, user_id,
+                sizeof(kc_user_repr_cache.entries[idx].user_id));
+    kc_user_repr_cache.entries[idx].repr = json_incref(repr);
+    kc_user_repr_cache.entries[idx].last_updated = time(NULL);
+
+    log_module(KC_LOG, LOG_DEBUG, "user_repr_cache: Added %s (count=%d)",
+               user_id, kc_user_repr_cache.count);
+}
+
+/* Get cached representation (returns borrowed reference, NULL if not found) */
+json_t *
+kc_user_repr_cache_get(const char *user_id)
+{
+    if (!user_id) return NULL;
+
+    for (int i = 0; i < kc_user_repr_cache.count; i++) {
+        if (strcmp(kc_user_repr_cache.entries[i].user_id, user_id) == 0) {
+            log_module(KC_LOG, LOG_DEBUG, "user_repr_cache: Hit for %s", user_id);
+            return kc_user_repr_cache.entries[i].repr;
+        }
+    }
+
+    log_module(KC_LOG, LOG_DEBUG, "user_repr_cache: Miss for %s", user_id);
+    return NULL;
+}
+
+/* Remove user from cache */
+void
+kc_user_repr_cache_remove(const char *user_id)
+{
+    if (!user_id) return;
+
+    for (int i = 0; i < kc_user_repr_cache.count; i++) {
+        if (strcmp(kc_user_repr_cache.entries[i].user_id, user_id) == 0) {
+            if (kc_user_repr_cache.entries[i].repr)
+                json_decref(kc_user_repr_cache.entries[i].repr);
+
+            if (i < kc_user_repr_cache.count - 1) {
+                memmove(&kc_user_repr_cache.entries[i],
+                        &kc_user_repr_cache.entries[i + 1],
+                        (kc_user_repr_cache.count - i - 1) *
+                        sizeof(struct kc_user_repr_entry));
+            }
+            kc_user_repr_cache.count--;
+            log_module(KC_LOG, LOG_DEBUG, "user_repr_cache: Removed %s", user_id);
+            return;
+        }
+    }
+}
+
+/* Cleanup entire cache (call from cleanup_keycloak) */
+static void
+kc_user_repr_cache_cleanup(void)
+{
+    for (int i = 0; i < kc_user_repr_cache.count; i++) {
+        if (kc_user_repr_cache.entries[i].repr) {
+            json_decref(kc_user_repr_cache.entries[i].repr);
+            kc_user_repr_cache.entries[i].repr = NULL;
+        }
+    }
+    kc_user_repr_cache.count = 0;
+    log_module(KC_LOG, LOG_DEBUG, "user_repr_cache: Cleaned up");
+}
+
 /* Forward declarations for JWT functions */
 static int jwks_refresh(struct kc_realm realm);
 static void jwks_cleanup(void);
@@ -248,6 +397,9 @@ cleanup_keycloak(void)
 
     /* Cleanup JWKS cache */
     jwks_cleanup();
+
+    /* Cleanup user representation cache */
+    kc_user_repr_cache_cleanup();
 
     if (kc_curl_handle) {
         curl_easy_cleanup(kc_curl_handle);
@@ -1343,7 +1495,8 @@ enum kc_async_type {
     KC_ASYNC_DELETE_GROUP,   /* Delete group (Phase 5 sync cleanup) */
     KC_ASYNC_DELETE_USER,    /* Delete user (Phase 5.10) */
     KC_ASYNC_LIST_ATTRS,     /* List user attributes (Phase 5.10) */
-    KC_ASYNC_GET_ATTR        /* Get user attribute (Phase 5.10) */
+    KC_ASYNC_GET_ATTR,       /* Get user attribute (Phase 5.10) */
+    KC_ASYNC_SET_USER_ATTR_GET  /* GET user before attribute update (cache miss case) */
 };
 
 /* Async request tracking */
@@ -1389,7 +1542,16 @@ struct kc_async_request {
     /* Group attribute operations (GET-then-PUT flow) */
     char *group_attr_value;       /* For KC_ASYNC_SET_GROUP_ATTR_GET - value to set (allocated) */
     char *group_id;               /* For KC_ASYNC_SET_GROUP_ATTR_GET - group ID (allocated) */
+    /* User attribute operations (GET-then-PUT flow for cache miss) */
+    char *user_attr_name;         /* For KC_ASYNC_SET_USER_ATTR_GET - attribute name (allocated) */
+    char *user_attr_value;        /* For KC_ASYNC_SET_USER_ATTR_GET - attribute value (allocated, NULL=delete) */
+    char *user_id_copy;           /* For KC_ASYNC_SET_USER_ATTR_GET - user ID for PUT phase (allocated) */
+    struct kc_realm realm_copy;   /* For KC_ASYNC_SET_USER_ATTR_GET - realm config copy */
+    struct kc_client client_copy; /* For KC_ASYNC_SET_USER_ATTR_GET - client config copy (access_token borrowed) */
 };
+
+/* Forward declaration for curl_perform_async (used in completion handler) */
+static int curl_perform_async(struct kc_async_request *req, struct curl_opts opts);
 
 /* Header callback to capture Location header from HTTP 201 response */
 static size_t
@@ -1426,24 +1588,39 @@ kc_curl_socket_cb(CURL *easy, curl_socket_t s, int what,
                   void *userp, void *sockp)
 {
     struct kc_sock_info *si = sockp;
+    CURLMcode mc;
     (void)easy;
     (void)userp;
 
+    log_module(KC_LOG, LOG_DEBUG, "kc_curl_socket_cb: fd=%d what=%d sockp=%p",
+               (int)s, what, sockp);
+
     if (what == CURL_POLL_REMOVE) {
+        log_module(KC_LOG, LOG_DEBUG, "kc_curl_socket_cb: REMOVE for fd=%d si=%p", (int)s, (void*)si);
         if (si) {
-            /* Mark io_fd as closed so ioset_events will skip it.
-             * This is critical: curl may close sockets during curl_multi_socket_action,
-             * but those sockets might still be in the current epoll event batch.
-             * By marking as IO_CLOSED, ioset_events will skip processing (line 578-579). */
+            /* Remove from epoll IMMEDIATELY to allow fd reuse.
+             * This is critical: curl may reuse the fd number for a new connection
+             * before our pending cleanup runs. If we don't remove from epoll now,
+             * we'll get "fd already in epoll" errors or double-registration issues.
+             *
+             * The io_fd structure is freed here, but we still defer freeing the
+             * kc_sock_info to prevent use-after-free in the current epoll event batch. */
             if (si->io_fd) {
-                si->io_fd->state = IO_CLOSED;
+                log_module(KC_LOG, LOG_DEBUG, "kc_curl_socket_cb: Removing fd=%d from epoll", (int)s);
+                ioset_close(si->io_fd, 0);  /* Remove from epoll, don't close fd (curl owns it) */
+                si->io_fd = NULL;  /* Mark as already cleaned up */
             }
-            /* Defer actual cleanup until after curl_multi_socket_action returns.
-             * This prevents use-after-free when processing remaining epoll events. */
+            /* Defer si structure cleanup until after curl_multi_socket_action returns. */
             si->next_pending = kc_pending_cleanup;
             kc_pending_cleanup = si;
+        } else {
+            log_module(KC_LOG, LOG_WARNING, "kc_curl_socket_cb: REMOVE called with NULL si for fd=%d", (int)s);
         }
-        curl_multi_assign(kc_curl_multi, s, NULL);
+        mc = curl_multi_assign(kc_curl_multi, s, NULL);
+        if (mc != CURLM_OK) {
+            log_module(KC_LOG, LOG_ERROR, "kc_curl_socket_cb: curl_multi_assign(NULL) failed for fd=%d: %s",
+                       (int)s, curl_multi_strerror(mc));
+        }
         return 0;
     }
 
@@ -1454,6 +1631,7 @@ kc_curl_socket_cb(CURL *easy, curl_socket_t s, int what,
         si->sockfd = s;
         si->io_fd = ioset_add(s);
         if (!si->io_fd) {
+            log_module(KC_LOG, LOG_ERROR, "kc_curl_socket_cb: ioset_add failed for fd=%d", (int)s);
             free(si);
             return 0;
         }
@@ -1461,8 +1639,15 @@ kc_curl_socket_cb(CURL *easy, curl_socket_t s, int what,
         si->io_fd->line_reads = 0;        /* Raw socket, no line buffering */
         si->io_fd->readable_cb = kc_curl_socket_ready;
         si->io_fd->data = si;
-        curl_multi_assign(kc_curl_multi, s, si);
-        log_module(KC_LOG, LOG_DEBUG, "kc_async: Registered socket %d with ioset", (int)s);
+        mc = curl_multi_assign(kc_curl_multi, s, si);
+        if (mc != CURLM_OK) {
+            log_module(KC_LOG, LOG_ERROR, "kc_curl_socket_cb: curl_multi_assign failed for fd=%d: %s",
+                       (int)s, curl_multi_strerror(mc));
+            ioset_close(si->io_fd, 0);
+            free(si);
+            return 0;
+        }
+        log_module(KC_LOG, LOG_DEBUG, "kc_async: Registered socket %d with ioset, si=%p", (int)s, (void*)si);
     }
 
     si->action = what;
@@ -2277,6 +2462,108 @@ kc_curl_check_completed(void)
                 }
                 break;
             }
+            case KC_ASYNC_SET_USER_ATTR_GET: {
+                /* GET phase completed for user attribute update (cache miss case).
+                 * Now merge the attribute and issue PUT with full representation. */
+                int result = KC_ERROR;
+
+                if (http_code == 200 && req->response.response) {
+                    json_error_t error;
+                    json_t *repr = json_loads(req->response.response, 0, &error);
+                    if (repr) {
+                        /* Cache this representation for future updates */
+                        json_t *id_json = json_object_get(repr, "id");
+                        if (id_json && json_is_string(id_json)) {
+                            kc_user_repr_cache_put(json_string_value(id_json), repr);
+                        }
+
+                        /* Get or create attributes object */
+                        json_t *attrs = json_object_get(repr, "attributes");
+                        if (!attrs) {
+                            attrs = json_object();
+                            json_object_set_new(repr, "attributes", attrs);
+                        }
+
+                        /* Set the attribute (or remove if value is NULL) */
+                        if (req->user_attr_value) {
+                            json_t *attr_array = json_array();
+                            json_array_append_new(attr_array, json_string(req->user_attr_value));
+                            json_object_set_new(attrs, req->user_attr_name, attr_array);
+                        } else {
+                            /* NULL value = delete attribute */
+                            json_object_del(attrs, req->user_attr_name);
+                        }
+
+                        /* Now issue the PUT with full representation */
+                        char *json_body = json_dumps(repr, JSON_COMPACT);
+                        json_decref(repr);
+
+                        if (json_body) {
+                            /* Build PUT request */
+                            char *put_uri = kc_build_user_endpoint(req->realm_copy, req->user_id_copy);
+                            if (put_uri) {
+                                struct kc_async_request *put_req = calloc(1, sizeof(*put_req));
+                                if (put_req) {
+                                    put_req->session = req->session;
+                                    put_req->type = KC_ASYNC_SET_ATTR;
+                                    put_req->cb.generic = req->cb.generic;
+                                    put_req->uri = put_uri;
+                                    put_req->post_fields = json_body;
+
+                                    struct curl_opts opts = CURL_OPTS_INIT;
+                                    opts.uri = put_req->uri;
+                                    opts.method = HTTP_PUT;
+                                    opts.post_fields = put_req->post_fields;
+                                    opts.xoauth2_bearer = req->client_copy.access_token->access_token;
+                                    opts.header_list[0] = "Content-Type: application/json";
+                                    opts.header_count = 1;
+
+                                    if (curl_perform_async(put_req, opts) == 0) {
+                                        log_module(KC_LOG, LOG_DEBUG,
+                                                   "[%s] kc_async set_user_attr_get: GET succeeded, "
+                                                   "issued PUT with merged attributes for %s.%s",
+                                                   req_id, req->user_id_copy, req->user_attr_name);
+                                        /* PUT request is now in flight, will call callback when done.
+                                         * Don't call callback here - the PUT completion will do it. */
+                                        result = KC_SUCCESS;
+                                    } else {
+                                        log_module(KC_LOG, LOG_ERROR,
+                                                   "[%s] kc_async set_user_attr_get: Failed to start PUT",
+                                                   req_id);
+                                        free(put_uri);
+                                        free(json_body);
+                                        free(put_req);
+                                    }
+                                } else {
+                                    free(put_uri);
+                                    free(json_body);
+                                }
+                            } else {
+                                free(json_body);
+                            }
+                        }
+                    } else {
+                        log_module(KC_LOG, LOG_ERROR,
+                                   "[%s] kc_async set_user_attr_get: Invalid JSON: %s",
+                                   req_id, error.text);
+                    }
+                } else if (http_code == 404) {
+                    result = KC_NOT_FOUND;
+                    log_module(KC_LOG, LOG_DEBUG,
+                               "[%s] kc_async set_user_attr_get: User not found (HTTP 404)",
+                               req_id);
+                } else {
+                    log_module(KC_LOG, LOG_ERROR,
+                               "[%s] kc_async set_user_attr_get: GET failed (HTTP %ld)",
+                               req_id, http_code);
+                }
+
+                /* Only call callback on error - success continues to PUT phase */
+                if (result != KC_SUCCESS && req->cb.generic) {
+                    req->cb.generic(req->session, result);
+                }
+                break;
+            }
             }
 
             /* Cleanup - return handle to pool for reuse */
@@ -2297,6 +2584,9 @@ kc_curl_check_completed(void)
             if (req->create_username) free(req->create_username);
             if (req->attr_prefix) free(req->attr_prefix);
             if (req->attr_name) free(req->attr_name);
+            if (req->user_attr_name) free(req->user_attr_name);
+            if (req->user_attr_value) free(req->user_attr_value);
+            if (req->user_id_copy) free(req->user_id_copy);
             free(req);
         }
     }
@@ -2732,6 +3022,15 @@ error:
 /**
  * Set a user attribute asynchronously.
  * This is useful for non-blocking attribute updates during SASL flows.
+ *
+ * Uses the user representation cache to safely merge the attribute without
+ * clobbering other fields (email, firstName, etc.) that Keycloak's PUT
+ * would otherwise clear.
+ *
+ * Flow:
+ * 1. Check cache for full user representation
+ * 2. If cache hit: merge attribute into representation, PUT full object
+ * 3. If cache miss: GET user first, cache, then merge and PUT
  */
 int
 keycloak_set_user_attribute_async(struct kc_realm realm, struct kc_client client,
@@ -2749,73 +3048,147 @@ keycloak_set_user_attribute_async(struct kc_realm realm, struct kc_client client
         return -1;
     }
 
-    /* Allocate request structure */
+    /* Check user representation cache */
+    json_t *cached_repr = kc_user_repr_cache_get(user_id);
+
+    if (cached_repr) {
+        /* Cache hit - merge attribute into cached representation and PUT */
+        log_module(KC_LOG, LOG_DEBUG, "set_attr_async: Cache hit for %s, merging attribute %s",
+                   user_id, attr_name);
+
+        /* Deep copy the representation so we can modify it */
+        json_t *repr = json_deep_copy(cached_repr);
+        if (!repr) {
+            log_module(KC_LOG, LOG_ERROR, "set_attr_async: Failed to copy cached repr");
+            return -1;
+        }
+
+        /* Get or create attributes object */
+        json_t *attrs = json_object_get(repr, "attributes");
+        if (!attrs) {
+            attrs = json_object();
+            json_object_set_new(repr, "attributes", attrs);
+        }
+
+        /* Set or delete the attribute */
+        if (attr_value) {
+            json_t *attr_array = json_array();
+            json_array_append_new(attr_array, json_string(attr_value));
+            json_object_set_new(attrs, attr_name, attr_array);
+        } else {
+            /* NULL value = delete attribute */
+            json_object_del(attrs, attr_name);
+        }
+
+        /* Serialize for PUT */
+        json_body = json_dumps(repr, JSON_COMPACT);
+        json_decref(repr);
+
+        if (!json_body) {
+            log_module(KC_LOG, LOG_ERROR, "set_attr_async: Failed to build JSON from cache");
+            return -1;
+        }
+
+        /* Allocate request structure for PUT */
+        req = calloc(1, sizeof(*req));
+        if (!req) {
+            log_module(KC_LOG, LOG_ERROR, "set_attr_async: Out of memory");
+            free(json_body);
+            return -1;
+        }
+        req->session = session;
+        req->type = KC_ASYNC_SET_ATTR;
+        req->cb.generic = callback;
+
+        /* Build URI */
+        req->uri = kc_build_user_endpoint(realm, user_id);
+        if (!req->uri) {
+            log_module(KC_LOG, LOG_ERROR, "set_attr_async: Failed to build URI");
+            free(json_body);
+            free(req);
+            return -1;
+        }
+
+        req->post_fields = json_body;
+
+        /* Issue PUT */
+        struct curl_opts opts = CURL_OPTS_INIT;
+        opts.uri = req->uri;
+        opts.method = HTTP_PUT;
+        opts.post_fields = req->post_fields;
+        opts.xoauth2_bearer = client.access_token->access_token;
+        opts.header_list[0] = "Content-Type: application/json";
+        opts.header_count = 1;
+
+        if (curl_perform_async(req, opts) < 0) {
+            log_module(KC_LOG, LOG_ERROR, "set_attr_async: curl_perform_async failed");
+            free(req->uri);
+            free(req->post_fields);
+            free(req);
+            return -1;
+        }
+
+        log_module(KC_LOG, LOG_DEBUG, "set_attr_async: Started PUT with merged repr for %s.%s",
+                   user_id, attr_name);
+        return 0;
+    }
+
+    /* Cache miss - need to GET user first, then PUT */
+    log_module(KC_LOG, LOG_DEBUG, "set_attr_async: Cache miss for %s, doing GET first", user_id);
+
     req = calloc(1, sizeof(*req));
     if (!req) {
         log_module(KC_LOG, LOG_ERROR, "set_attr_async: Out of memory");
         return -1;
     }
     req->session = session;
-    req->type = KC_ASYNC_SET_ATTR;
+    req->type = KC_ASYNC_SET_USER_ATTR_GET;
     req->cb.generic = callback;
 
-    /* Build URI */
+    /* Store attribute info for use after GET completes */
+    req->user_attr_name = strdup(attr_name);
+    req->user_attr_value = attr_value ? strdup(attr_value) : NULL;
+    req->user_id_copy = strdup(user_id);
+
+    if (!req->user_attr_name || !req->user_id_copy ||
+        (attr_value && !req->user_attr_value)) {
+        log_module(KC_LOG, LOG_ERROR, "set_attr_async: Failed to copy strings");
+        goto error;
+    }
+
+    /* Store realm/client for PUT phase */
+    req->realm_copy = realm;
+    req->client_copy = client;
+
+    /* Build GET URI */
     req->uri = kc_build_user_endpoint(realm, user_id);
     if (!req->uri) {
-        log_module(KC_LOG, LOG_ERROR, "set_attr_async: Failed to build URI");
+        log_module(KC_LOG, LOG_ERROR, "set_attr_async: Failed to build URI for GET");
         goto error;
     }
 
-    /* Build JSON body - partial update with just the attribute */
-    json_t *attrs = json_object();
-    json_t *attr_array = json_array();
-    if (attr_value) {
-        json_array_append_new(attr_array, json_string(attr_value));
-    }
-    json_object_set_new(attrs, attr_name, attr_array);
-
-    json_t *user_obj = json_object();
-    json_object_set_new(user_obj, "attributes", attrs);
-    json_body = json_dumps(user_obj, JSON_COMPACT);
-    json_decref(user_obj);
-
-    if (!json_body) {
-        log_module(KC_LOG, LOG_ERROR, "set_attr_async: Failed to build JSON");
-        goto error;
-    }
-
-    /* Store post fields in request for cleanup */
-    req->post_fields = json_body;
-    json_body = NULL;  /* Transferred ownership */
-
-    /* Use unified async API */
+    /* Issue GET */
     struct curl_opts opts = CURL_OPTS_INIT;
     opts.uri = req->uri;
-    opts.method = HTTP_PUT;
-    opts.post_fields = req->post_fields;
+    opts.method = HTTP_GET;
     opts.xoauth2_bearer = client.access_token->access_token;
-    opts.header_list[0] = "Content-Type: application/json";
-    opts.header_count = 1;
 
     if (curl_perform_async(req, opts) < 0) {
-        log_module(KC_LOG, LOG_ERROR, "set_attr_async: curl_perform_async failed");
+        log_module(KC_LOG, LOG_ERROR, "set_attr_async: curl_perform_async failed for GET");
         goto error;
     }
 
-    log_module(KC_LOG, LOG_DEBUG, "set_attr_async: Started attribute update for %s.%s",
+    log_module(KC_LOG, LOG_DEBUG, "set_attr_async: Started GET for %s before setting %s",
                user_id, attr_name);
     return 0;
 
 error:
-    if (json_body) free(json_body);
     if (req) {
         if (req->easy) curl_easy_cleanup(req->easy);
         if (req->uri) free(req->uri);
-        if (req->post_fields) {
-            memset(req->post_fields, 0, strlen(req->post_fields));
-            free(req->post_fields);
-        }
-        if (req->response.response) free(req->response.response);
+        if (req->user_attr_name) free(req->user_attr_name);
+        if (req->user_attr_value) free(req->user_attr_value);
+        if (req->user_id_copy) free(req->user_id_copy);
         free(req);
     }
     return -1;
@@ -2824,6 +3197,9 @@ error:
 /**
  * Set a multi-valued user attribute asynchronously.
  * Used for attributes like x509_fingerprints that have multiple values.
+ *
+ * Uses the user representation cache when available to safely merge the
+ * attribute without clobbering other fields.
  */
 int
 keycloak_set_user_attribute_array_async(struct kc_realm realm, struct kc_client client,
@@ -2840,6 +3216,96 @@ keycloak_set_user_attribute_array_async(struct kc_realm realm, struct kc_client 
         log_module(KC_LOG, LOG_DEBUG, "set_attr_array_async: Invalid arguments");
         return -1;
     }
+
+    /* Check user representation cache */
+    json_t *cached_repr = kc_user_repr_cache_get(user_id);
+
+    if (cached_repr) {
+        /* Cache hit - merge attribute into cached representation and PUT */
+        log_module(KC_LOG, LOG_DEBUG, "set_attr_array_async: Cache hit for %s, merging attribute %s",
+                   user_id, attr_name);
+
+        /* Deep copy the representation so we can modify it */
+        json_t *repr = json_deep_copy(cached_repr);
+        if (!repr) {
+            log_module(KC_LOG, LOG_ERROR, "set_attr_array_async: Failed to copy cached repr");
+            return -1;
+        }
+
+        /* Get or create attributes object */
+        json_t *attrs = json_object_get(repr, "attributes");
+        if (!attrs) {
+            attrs = json_object();
+            json_object_set_new(repr, "attributes", attrs);
+        }
+
+        /* Build attribute array */
+        json_t *attr_array = json_array();
+        for (size_t i = 0; i < value_count; i++) {
+            if (values && values[i]) {
+                json_array_append_new(attr_array, json_string(values[i]));
+            }
+        }
+        json_object_set_new(attrs, attr_name, attr_array);
+
+        /* Serialize for PUT */
+        json_body = json_dumps(repr, JSON_COMPACT);
+        json_decref(repr);
+
+        if (!json_body) {
+            log_module(KC_LOG, LOG_ERROR, "set_attr_array_async: Failed to build JSON from cache");
+            return -1;
+        }
+
+        /* Allocate request structure for PUT */
+        req = calloc(1, sizeof(*req));
+        if (!req) {
+            log_module(KC_LOG, LOG_ERROR, "set_attr_array_async: Out of memory");
+            free(json_body);
+            return -1;
+        }
+        req->session = session;
+        req->type = KC_ASYNC_SET_ATTR;
+        req->cb.generic = callback;
+
+        /* Build URI */
+        req->uri = kc_build_user_endpoint(realm, user_id);
+        if (!req->uri) {
+            log_module(KC_LOG, LOG_ERROR, "set_attr_array_async: Failed to build URI");
+            free(json_body);
+            free(req);
+            return -1;
+        }
+
+        req->post_fields = json_body;
+
+        /* Issue PUT */
+        struct curl_opts opts = CURL_OPTS_INIT;
+        opts.uri = req->uri;
+        opts.method = HTTP_PUT;
+        opts.post_fields = req->post_fields;
+        opts.xoauth2_bearer = client.access_token->access_token;
+        opts.header_list[0] = "Content-Type: application/json";
+        opts.header_count = 1;
+
+        if (curl_perform_async(req, opts) < 0) {
+            log_module(KC_LOG, LOG_ERROR, "set_attr_array_async: curl_perform_async failed");
+            free(req->uri);
+            free(req->post_fields);
+            free(req);
+            return -1;
+        }
+
+        log_module(KC_LOG, LOG_DEBUG, "set_attr_array_async: Started PUT with merged repr for %s.%s (%zu values)",
+                   user_id, attr_name, value_count);
+        return 0;
+    }
+
+    /* Cache miss - fall back to partial update
+     * Note: This may clear other user fields, but for arrays (like x509_fingerprints)
+     * we typically use this function after user registration when cache isn't populated yet.
+     * Future: could add GET-then-PUT flow like keycloak_set_user_attribute_async. */
+    log_module(KC_LOG, LOG_DEBUG, "set_attr_array_async: Cache miss for %s, using partial update", user_id);
 
     /* Allocate request structure */
     req = calloc(1, sizeof(*req));
@@ -4776,12 +5242,19 @@ cleanup:
     return result;
 }
 
+/**
+ * Set a user attribute synchronously.
+ *
+ * Uses the user representation cache when available to safely merge the
+ * attribute without clobbering other fields (email, firstName, etc.).
+ * If cache miss, performs GET first to fetch the full representation.
+ */
 int keycloak_set_user_attribute(struct kc_realm realm, struct kc_client client,
                                 const char* user_id, const char* attr_name,
                                 const char* attr_value)
 {
     if (!realm.base_uri || !realm.realm || !client.access_token ||
-        !user_id || !attr_name || !attr_value) {
+        !user_id || !attr_name) {
         log_module(KC_LOG, LOG_DEBUG, "keycloak_set_user_attribute: Invalid arguments");
         return KC_ERROR;
     }
@@ -4790,6 +5263,7 @@ int keycloak_set_user_attribute(struct kc_realm realm, struct kc_client client,
     char *uri = NULL;
     char *json_body = NULL;
     struct memory chunk = {0};
+    json_t *repr = NULL;
 
     uri = kc_build_user_endpoint(realm, user_id);
     if (!uri) {
@@ -4797,21 +5271,84 @@ int keycloak_set_user_attribute(struct kc_realm realm, struct kc_client client,
         goto cleanup;
     }
 
-    /* Build JSON: { "attributes": { "attr_name": ["attr_value"] } } */
-    json_t* user_obj = json_object();
-    json_t* attrs = json_object();
-    json_t* values = json_array();
-    json_array_append_new(values, json_string(attr_value));
-    json_object_set_new(attrs, attr_name, values);
-    json_object_set_new(user_obj, "attributes", attrs);
-    json_body = json_dumps(user_obj, JSON_COMPACT);
-    json_decref(user_obj);
+    /* Check user representation cache */
+    json_t *cached_repr = kc_user_repr_cache_get(user_id);
 
+    if (cached_repr) {
+        /* Cache hit - use cached representation */
+        log_module(KC_LOG, LOG_DEBUG, "keycloak_set_user_attribute: Cache hit for %s", user_id);
+        repr = json_deep_copy(cached_repr);
+    } else {
+        /* Cache miss - fetch user first */
+        log_module(KC_LOG, LOG_DEBUG, "keycloak_set_user_attribute: Cache miss for %s, fetching", user_id);
+
+        struct curl_opts get_opts = CURL_OPTS_INIT;
+        get_opts.uri = uri;
+        get_opts.method = HTTP_GET;
+        get_opts.xoauth2_bearer = client.access_token->access_token;
+
+        long http_code = curl_perform(get_opts, &chunk);
+
+        if (http_code == 200 && chunk.response) {
+            json_error_t error;
+            repr = json_loads(chunk.response, 0, &error);
+            if (repr) {
+                /* Cache the fetched representation */
+                json_t *id_json = json_object_get(repr, "id");
+                if (id_json && json_is_string(id_json)) {
+                    kc_user_repr_cache_put(json_string_value(id_json), repr);
+                }
+            } else {
+                log_module(KC_LOG, LOG_DEBUG, "keycloak_set_user_attribute: Failed to parse GET response: %s", error.text);
+            }
+        } else if (http_code == 404) {
+            result = KC_NOT_FOUND;
+            log_module(KC_LOG, LOG_DEBUG, "keycloak_set_user_attribute: User not found (HTTP 404)");
+            goto cleanup;
+        } else {
+            log_module(KC_LOG, LOG_DEBUG, "keycloak_set_user_attribute: GET failed with HTTP %ld", http_code);
+            goto cleanup;
+        }
+
+        /* Clear GET response before PUT */
+        if (chunk.response) {
+            memset(chunk.response, 0, chunk.size);
+            free(chunk.response);
+            chunk.response = NULL;
+            chunk.size = 0;
+        }
+    }
+
+    if (!repr) {
+        log_module(KC_LOG, LOG_DEBUG, "keycloak_set_user_attribute: No representation available");
+        goto cleanup;
+    }
+
+    /* Get or create attributes object */
+    json_t *attrs = json_object_get(repr, "attributes");
+    if (!attrs) {
+        attrs = json_object();
+        json_object_set_new(repr, "attributes", attrs);
+    }
+
+    /* Set or delete the attribute */
+    if (attr_value) {
+        json_t* values = json_array();
+        json_array_append_new(values, json_string(attr_value));
+        json_object_set_new(attrs, attr_name, values);
+    } else {
+        /* NULL value = delete attribute */
+        json_object_del(attrs, attr_name);
+    }
+
+    /* Serialize for PUT */
+    json_body = json_dumps(repr, JSON_COMPACT);
     if (!json_body) {
         log_module(KC_LOG, LOG_DEBUG, "keycloak_set_user_attribute: Failed to build JSON");
         goto cleanup;
     }
 
+    /* Issue PUT with full representation */
     struct curl_opts opts = CURL_OPTS_INIT;
     opts.uri = uri;
     opts.method = HTTP_PUT;
@@ -4834,6 +5371,9 @@ int keycloak_set_user_attribute(struct kc_realm realm, struct kc_client client,
     }
 
 cleanup:
+    if (repr) {
+        json_decref(repr);
+    }
     if (chunk.response) {
         memset(chunk.response, 0, chunk.size);
         free(chunk.response);

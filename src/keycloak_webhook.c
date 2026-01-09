@@ -16,6 +16,7 @@
 #include "x3_lmdb.h"
 #include "nickserv.h"
 #include "chanserv.h"  /* For chanserv_queue_keycloak_sync, kc_group_path_to_channel */
+#include "keycloak.h"  /* For kc_user_repr_cache_put/remove */
 #include "timeq.h"     /* For async event processing */
 
 #include <string.h>
@@ -615,6 +616,15 @@ handle_keycloak_event(const char *body, size_t body_len)
                 log_module(webhook_log, LOG_INFO,
                            "User deleted via Keycloak: %s", username);
                 keycloak_invalidate_user_caches(username, 1, 1);
+
+                /* Also remove from user representation cache.
+                 * Extract user_id from resource_path (e.g., "users/<uuid>") */
+                if (resource_path && strncmp(resource_path, "users/", 6) == 0) {
+                    const char *user_id = resource_path + 6;
+                    kc_user_repr_cache_remove(user_id);
+                    log_module(webhook_log, LOG_DEBUG,
+                               "Removed user representation cache for %s", user_id);
+                }
             } else if (strcmp(operation_type, "UPDATE") == 0) {
                 /* User updated - check for x3-specific attribute changes */
                 int invalidated = 0;
@@ -622,6 +632,18 @@ handle_keycloak_event(const char *body, size_t body_len)
                 if (representation) {
                     json_t *rep_json = json_loads(representation, 0, NULL);
                     if (rep_json) {
+                        /* Cache the full user representation for safe attribute updates.
+                         * This enables keycloak_set_user_attribute_async() to merge
+                         * attributes without clobbering email/firstName/etc. */
+                        json_t *user_id_json = json_object_get(rep_json, "id");
+                        if (user_id_json && json_is_string(user_id_json)) {
+                            const char *user_id = json_string_value(user_id_json);
+                            kc_user_repr_cache_put(user_id, rep_json);
+                            log_module(webhook_log, LOG_DEBUG,
+                                       "Cached user representation for %s (id=%s)",
+                                       username, user_id);
+                        }
+
                         json_t *attrs = json_object_get(rep_json, "attributes");
                         if (attrs && json_is_object(attrs)) {
                             /* Check for x3_opserv_level change */

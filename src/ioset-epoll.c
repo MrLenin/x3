@@ -60,16 +60,31 @@ ioset_epoll_add(struct io_fd *fd)
     evt.events = ioset_epoll_events(fd);
     evt.data.ptr = fd;
     res = epoll_ctl(epoll_fd, EPOLL_CTL_ADD, fd->fd, &evt);
-    if (res < 0)
-        log_module(MAIN_LOG, LOG_ERROR, "Unable to add fd %d to epoll: %s", fd->fd, strerror(errno));
+    if (res < 0) {
+        if (errno == EEXIST) {
+            /* fd already in epoll - likely a race condition with fd reuse.
+             * Try to update the existing entry with our new io_fd pointer. */
+            log_module(MAIN_LOG, LOG_DEBUG, "fd %d already in epoll, updating instead", fd->fd);
+            res = epoll_ctl(epoll_fd, EPOLL_CTL_MOD, fd->fd, &evt);
+            if (res < 0)
+                log_module(MAIN_LOG, LOG_ERROR, "Unable to update existing fd %d in epoll: %s", fd->fd, strerror(errno));
+        } else {
+            log_module(MAIN_LOG, LOG_ERROR, "Unable to add fd %d to epoll: %s", fd->fd, strerror(errno));
+        }
+    }
 }
 
 static void
 ioset_epoll_remove(struct io_fd *fd, int closed)
 {
     static struct epoll_event evt;
-    if (!closed)
-        (void)epoll_ctl(epoll_fd, EPOLL_CTL_DEL, fd->fd, &evt);
+    if (!closed) {
+        int res = epoll_ctl(epoll_fd, EPOLL_CTL_DEL, fd->fd, &evt);
+        if (res < 0 && errno != ENOENT && errno != EBADF) {
+            /* ENOENT means already removed (fd was closed), EBADF means fd invalid */
+            log_module(MAIN_LOG, LOG_WARNING, "Unable to remove fd %d from epoll: %s", fd->fd, strerror(errno));
+        }
+    }
 }
 
 static void
@@ -81,8 +96,18 @@ ioset_epoll_update(struct io_fd *fd)
     evt.events = ioset_epoll_events(fd);
     evt.data.ptr = fd;
     res = epoll_ctl(epoll_fd, EPOLL_CTL_MOD, fd->fd, &evt);
-    if (res < 0)
-        log_module(MAIN_LOG, LOG_ERROR, "Unable to modify fd %d for epoll: %s", fd->fd, strerror(errno));
+    if (res < 0) {
+        if (errno == ENOENT) {
+            /* fd not in epoll - try to add it instead.
+             * This can happen if the fd was closed and reopened (kernel auto-removes on close). */
+            log_module(MAIN_LOG, LOG_DEBUG, "fd %d not in epoll for MOD, trying ADD instead", fd->fd);
+            res = epoll_ctl(epoll_fd, EPOLL_CTL_ADD, fd->fd, &evt);
+            if (res < 0)
+                log_module(MAIN_LOG, LOG_ERROR, "Unable to add fd %d to epoll (after MOD failed): %s", fd->fd, strerror(errno));
+        } else {
+            log_module(MAIN_LOG, LOG_ERROR, "Unable to modify fd %d for epoll: %s", fd->fd, strerror(errno));
+        }
+    }
 }
 
 static void

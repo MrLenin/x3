@@ -181,6 +181,34 @@ void keycloak_free_access_token(struct access_token* token);
 void keycloak_invalidate_user_cache(const char *username);
 
 /**
+ * User representation cache for safe attribute updates.
+ * Keycloak's PUT does full replacement, so we cache full representations
+ * to enable safe attribute merging.
+ */
+
+/**
+ * Store/update a user representation in the cache.
+ * Called from webhook handler when USER UPDATE events arrive.
+ * @param user_id  Keycloak user UUID
+ * @param repr     Full user JSON object (reference count will be incremented)
+ */
+void kc_user_repr_cache_put(const char *user_id, json_t *repr);
+
+/**
+ * Get cached user representation.
+ * @param user_id  Keycloak user UUID
+ * @return Borrowed reference to cached JSON (NULL if not found)
+ */
+json_t *kc_user_repr_cache_get(const char *user_id);
+
+/**
+ * Remove a user from the representation cache.
+ * Called when user is deleted.
+ * @param user_id  Keycloak user UUID
+ */
+void kc_user_repr_cache_remove(const char *user_id);
+
+/**
  * Updates a user's password and/or email in Keycloak
  * @param realm         Keycloak realm configuration
  * @param client        Client with admin access token
