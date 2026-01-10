@@ -39,4 +39,9 @@ struct io_engine {
 
 void ioset_events(struct io_fd *fd, int readable, int writable);
 
+/* Deferred free mechanism - set to 1 during event loop iteration,
+ * so ioset_close() knows to defer free() calls */
+extern int ioset_in_event_loop;
+void ioset_process_deferred_frees(void);
+
 #endif /* !defined(IOSET_IMPL_H) */

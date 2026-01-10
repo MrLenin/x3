@@ -95,6 +95,21 @@ static struct io_fd *active_fd;
 /* Millisecond poll hint for async HTTP (curl_multi integration) */
 static long poll_hint_ms = 0;
 
+/* Deferred free mechanism for io_fd structures.
+ * When an fd is closed during event processing (e.g., curl socket callback
+ * closing another socket still in the epoll events array), we defer the
+ * actual free() until after the event loop iteration completes.
+ * This prevents use-after-free bugs in the epoll loop.
+ */
+#define MAX_DEFERRED_FREES 64
+struct deferred_free_entry {
+    struct io_fd *fd;
+    int os_close;
+};
+static struct deferred_free_entry deferred_frees[MAX_DEFERRED_FREES];
+static int deferred_free_count = 0;
+int ioset_in_event_loop = 0;  /* Non-static so epoll/kevent loops can set it */
+
 static void
 ioq_init(struct ioq *ioq, int size) {
     ioq->buf = malloc(size);
@@ -379,10 +394,27 @@ ioset_try_write(struct io_fd *fd) {
     }
 }
 
+/* Process any io_fd structures that were deferred for freeing.
+ * Called at the end of each event loop iteration.
+ */
+void
+ioset_process_deferred_frees(void) {
+    int ii;
+    for (ii = 0; ii < deferred_free_count; ii++) {
+        free(deferred_frees[ii].fd);
+    }
+    deferred_free_count = 0;
+}
+
 void
 ioset_close(struct io_fd *fdp, int os_close) {
     if (!fdp)
         return;
+
+    /* Mark as closed immediately - this prevents the epoll loop from
+     * processing events for this fd if it's still in the events array */
+    fdp->state = IO_CLOSED;
+
     if (active_fd == fdp)
         active_fd = NULL;
     if (fdp->destroy_cb)
@@ -423,7 +455,16 @@ ioset_close(struct io_fd *fdp, int os_close) {
         close(fdp->fd);
     engine->remove(fdp, os_close & 1);
 #endif
-    free(fdp);
+
+    /* Defer the actual free() if we're in the event loop, to prevent
+     * use-after-free when another fd in the same epoll batch is closed */
+    if (ioset_in_event_loop && deferred_free_count < MAX_DEFERRED_FREES) {
+        deferred_frees[deferred_free_count].fd = fdp;
+        deferred_frees[deferred_free_count].os_close = os_close;
+        deferred_free_count++;
+    } else {
+        free(fdp);
+    }
 }
 
 static void

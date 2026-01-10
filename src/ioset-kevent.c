@@ -120,11 +120,20 @@ ioset_kevent_loop(struct timeval *timeout)
     now = time(NULL) + clock_skew;
 
     /* Process the events we got. */
+    ioset_in_event_loop = 1;
     for (ii = 0; ii < res; ++ii) {
+	struct io_fd *fd = events[ii].udata;
+	/* Skip fds that were closed during this event batch */
+	if (fd->state == IO_CLOSED)
+	    continue;
 	is_write = events[ii].filter == EVFILT_WRITE;
 	is_read = events[ii].filter == EVFILT_READ;
-	ioset_events(events[ii].udata, is_read, is_write);
+	ioset_events(fd, is_read, is_write);
     }
+    ioset_in_event_loop = 0;
+
+    /* Free any io_fd structures that were closed during event processing */
+    ioset_process_deferred_frees();
 
     return 0;
 }

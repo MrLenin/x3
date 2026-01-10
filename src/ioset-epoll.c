@@ -137,10 +137,20 @@ ioset_epoll_loop(struct timeval *timeout)
         return 1;
     }
 
+    ioset_in_event_loop = 1;
     for (ii = 0; ii < res; ++ii) {
+        struct io_fd *fd = evts[ii].data.ptr;
+        /* Skip fds that were closed during this event batch.
+         * ioset_close() sets state to IO_CLOSED before deferring the free. */
+        if (fd->state == IO_CLOSED)
+            continue;
         events = evts[ii].events;
-        ioset_events(evts[ii].data.ptr, (events & (EPOLLIN | EPOLLHUP)), (events & EPOLLOUT));
+        ioset_events(fd, (events & (EPOLLIN | EPOLLHUP)), (events & EPOLLOUT));
     }
+    ioset_in_event_loop = 0;
+
+    /* Free any io_fd structures that were closed during event processing */
+    ioset_process_deferred_frees();
 
     return 0;
 }

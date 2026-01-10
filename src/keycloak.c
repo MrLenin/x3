@@ -341,6 +341,153 @@ kc_user_repr_cache_cleanup(void)
     log_module(KC_LOG, LOG_DEBUG, "user_repr_cache: Cleaned up");
 }
 
+/*
+ * =============================================================================
+ * Attribute Update Coalescing
+ * =============================================================================
+ *
+ * When multiple attribute updates for the same user arrive rapidly (e.g., during
+ * account setup or bulk operations), we batch them into a single Keycloak API call.
+ *
+ * Flow:
+ * 1. First attr update for a user creates a pending entry and schedules flush
+ * 2. Subsequent attrs for same user are added to pending entry
+ * 3. After delay, flush callback merges all pending attrs and issues single PUT
+ */
+
+#define KC_COALESCE_DELAY_SEC 1       /* Flush after 1 second of no new updates */
+#define KC_COALESCE_MAX_PENDING 64    /* Max pending attr changes per user */
+
+/* Single pending attribute change */
+struct kc_pending_attr {
+    char *name;                       /* Attribute name (heap allocated) */
+    char *value;                      /* Attribute value (NULL = delete attr) */
+};
+
+/* Pending updates for one user - owns all memory */
+struct kc_pending_user_update {
+    char user_id[64];                 /* Keycloak user UUID */
+    struct kc_pending_attr attrs[KC_COALESCE_MAX_PENDING];
+    int attr_count;
+    time_t scheduled_flush;           /* When flush was scheduled */
+    kc_async_callback cb;             /* Last callback wins */
+    void *session;                    /* Last session wins */
+    struct kc_pending_user_update *next;
+};
+
+static struct kc_pending_user_update *kc_pending_updates = NULL;
+
+/* Forward declarations for coalescing functions */
+static void kc_coalesce_flush_cb(void *data);
+static void kc_pending_update_free(struct kc_pending_user_update *p);
+static void kc_coalesce_cleanup(void);
+
+/* Free a pending update structure and all its contents */
+static void
+kc_pending_update_free(struct kc_pending_user_update *p)
+{
+    if (!p) return;
+    for (int i = 0; i < p->attr_count; i++) {
+        free(p->attrs[i].name);
+        free(p->attrs[i].value);
+    }
+    free(p);
+}
+
+/* Cleanup all pending updates (called on shutdown) */
+static void
+kc_coalesce_cleanup(void)
+{
+    struct kc_pending_user_update *p, *next;
+    int count = 0;
+
+    for (p = kc_pending_updates; p; p = next) {
+        next = p->next;
+        /* Cancel the scheduled timeq callback to prevent use-after-free */
+        timeq_del(0, kc_coalesce_flush_cb, p, TIMEQ_IGNORE_WHEN);
+        kc_pending_update_free(p);
+        count++;
+    }
+    kc_pending_updates = NULL;
+
+    if (count > 0) {
+        log_module(KC_LOG, LOG_DEBUG, "coalesce: Cleaned up %d pending updates", count);
+    }
+}
+
+/* Find existing pending update for user, or create new one */
+static struct kc_pending_user_update *
+kc_coalesce_get_or_create(const char *user_id)
+{
+    struct kc_pending_user_update *p;
+
+    /* Find existing */
+    for (p = kc_pending_updates; p; p = p->next) {
+        if (strcmp(p->user_id, user_id) == 0)
+            return p;
+    }
+
+    /* Create new */
+    p = calloc(1, sizeof(*p));
+    if (!p) {
+        log_module(KC_LOG, LOG_ERROR, "coalesce: Out of memory");
+        return NULL;
+    }
+
+    safestrncpy(p->user_id, user_id, sizeof(p->user_id));
+    p->scheduled_flush = now + KC_COALESCE_DELAY_SEC;
+    p->next = kc_pending_updates;
+    kc_pending_updates = p;
+
+    /* Schedule flush callback */
+    timeq_add(p->scheduled_flush, kc_coalesce_flush_cb, p);
+
+    log_module(KC_LOG, LOG_DEBUG, "coalesce: Created pending update for %s, flush in %ds",
+               user_id, KC_COALESCE_DELAY_SEC);
+    return p;
+}
+
+/* Add an attribute to pending update */
+static int
+kc_coalesce_add_attr(struct kc_pending_user_update *p,
+                     const char *attr_name, const char *attr_value,
+                     kc_async_callback cb, void *session)
+{
+    /* Check if this attr already pending (update in place) */
+    for (int i = 0; i < p->attr_count; i++) {
+        if (strcmp(p->attrs[i].name, attr_name) == 0) {
+            free(p->attrs[i].value);
+            p->attrs[i].value = attr_value ? strdup(attr_value) : NULL;
+            p->cb = cb;       /* Last callback wins */
+            p->session = session;
+            log_module(KC_LOG, LOG_DEBUG, "coalesce: Updated pending attr %s for %s",
+                       attr_name, p->user_id);
+            return 0;
+        }
+    }
+
+    /* Add new attr */
+    if (p->attr_count >= KC_COALESCE_MAX_PENDING) {
+        log_module(KC_LOG, LOG_WARNING, "coalesce: Too many pending attrs for %s",
+                   p->user_id);
+        return -1;
+    }
+
+    p->attrs[p->attr_count].name = strdup(attr_name);
+    p->attrs[p->attr_count].value = attr_value ? strdup(attr_value) : NULL;
+    if (!p->attrs[p->attr_count].name) {
+        log_module(KC_LOG, LOG_ERROR, "coalesce: Out of memory for attr name");
+        return -1;
+    }
+    p->attr_count++;
+    p->cb = cb;
+    p->session = session;
+
+    log_module(KC_LOG, LOG_DEBUG, "coalesce: Added pending attr %s for %s (count=%d)",
+               attr_name, p->user_id, p->attr_count);
+    return 0;
+}
+
 /* Forward declarations for JWT functions */
 static int jwks_refresh(struct kc_realm realm);
 static void jwks_cleanup(void);
@@ -358,6 +505,20 @@ static int json_read_kc_user(json_t* user_object, struct kc_user* user_out);
 
 /* Forward declaration for exit handler */
 static void keycloak_exit_handler(void *extra);
+
+/*
+ * Token Manager State (defined early for use by async functions)
+ * The actual initialization and management functions are defined later.
+ */
+static struct {
+    int initialized;                       /* 1 if initialized */
+    struct kc_realm realm;                 /* Cached realm config */
+    struct kc_client client;               /* Cached client config */
+    struct access_token *token;            /* Cached admin token */
+    time_t token_expires;                  /* When token expires */
+    int refresh_pending;                   /* 1 if refresh in progress */
+    int available;                         /* Keycloak availability flag */
+} kc_token_mgr = {0};
 
 void
 init_keycloak(void)
@@ -392,7 +553,10 @@ static void kc_async_cleanup(void);
 void
 cleanup_keycloak(void)
 {
-    /* Cleanup async infrastructure first */
+    /* Cleanup pending coalesced updates first (cancels timeq callbacks) */
+    kc_coalesce_cleanup();
+
+    /* Cleanup async infrastructure */
     kc_async_cleanup();
 
     /* Cleanup JWKS cache */
@@ -1496,7 +1660,8 @@ enum kc_async_type {
     KC_ASYNC_DELETE_USER,    /* Delete user (Phase 5.10) */
     KC_ASYNC_LIST_ATTRS,     /* List user attributes (Phase 5.10) */
     KC_ASYNC_GET_ATTR,       /* Get user attribute (Phase 5.10) */
-    KC_ASYNC_SET_USER_ATTR_GET  /* GET user before attribute update (cache miss case) */
+    KC_ASYNC_SET_USER_ATTR_GET, /* GET user before attribute update (cache miss case) */
+    KC_ASYNC_COALESCE_GET    /* GET user before coalesced attribute update (cache miss) */
 };
 
 /* Async request tracking */
@@ -1548,6 +1713,12 @@ struct kc_async_request {
     char *user_id_copy;           /* For KC_ASYNC_SET_USER_ATTR_GET - user ID for PUT phase (allocated) */
     struct kc_realm realm_copy;   /* For KC_ASYNC_SET_USER_ATTR_GET - realm config copy */
     struct kc_client client_copy; /* For KC_ASYNC_SET_USER_ATTR_GET - client config copy (access_token borrowed) */
+    char *bearer_token_copy;      /* Owned copy of bearer token for async request lifetime */
+    /* Retry logic for transient errors (5xx, 429, connection errors) */
+    int retry_count;              /* Current retry attempt (0 = first try) */
+    int max_retries;              /* Maximum retries for this request (default: 2) */
+    /* Coalescing support - pointer to pending update (owned by coalesce subsystem) */
+    struct kc_pending_user_update *coalesce_pending;
 };
 
 /* Forward declaration for curl_perform_async (used in completion handler) */
@@ -1820,6 +1991,151 @@ kc_async_complete_introspect(struct kc_async_request *req, long http_code)
     req->cb.introspect(req->session, KC_SUCCESS, token_info);
 }
 
+/* Async retry configuration */
+#define KC_ASYNC_MAX_RETRIES 2
+#define KC_ASYNC_RETRY_BASE_DELAY_SEC 1
+
+/* Forward declarations for retry logic */
+static void kc_async_retry_cb(void *data);
+static void kc_async_request_cleanup(struct kc_async_request *req);
+
+/* Check if an error is retryable */
+static int
+kc_async_is_retryable(CURLcode curl_res, long http_code)
+{
+    /* Retryable CURL errors (connection/network issues) */
+    if (curl_res == CURLE_COULDNT_CONNECT ||
+        curl_res == CURLE_OPERATION_TIMEDOUT ||
+        curl_res == CURLE_GOT_NOTHING ||
+        curl_res == CURLE_RECV_ERROR ||
+        curl_res == CURLE_SEND_ERROR) {
+        return 1;
+    }
+    /* Retryable HTTP codes (server errors, rate limiting) */
+    if (http_code >= 500 || http_code == 429) {
+        return 1;
+    }
+    return 0;
+}
+
+/* Schedule a retry for an async request using timeq */
+static int
+kc_async_schedule_retry(struct kc_async_request *req)
+{
+    const char *req_id = req->request_id ? req->request_id : "-";
+
+    /* Use default max_retries if not explicitly set */
+    int max_retries = req->max_retries > 0 ? req->max_retries : KC_ASYNC_MAX_RETRIES;
+
+    if (req->retry_count >= max_retries) {
+        log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async: Max retries (%d) exceeded",
+                   req_id, max_retries);
+        return 0;  /* Max retries exceeded */
+    }
+
+    req->retry_count++;
+
+    /* Exponential backoff: 1s, 2s, 4s... */
+    int delay_sec = KC_ASYNC_RETRY_BASE_DELAY_SEC * (1 << (req->retry_count - 1));
+    time_t retry_time = now + delay_sec;
+
+    log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async: Scheduling retry %d/%d in %ds",
+               req_id, req->retry_count, req->max_retries, delay_sec);
+
+    timeq_add(retry_time, kc_async_retry_cb, req);
+    return 1;  /* Retry scheduled */
+}
+
+/* Callback fired by timeq to retry an async request */
+static void
+kc_async_retry_cb(void *data)
+{
+    struct kc_async_request *req = data;
+    const char *req_id = req->request_id ? req->request_id : "-";
+    CURLMcode mc;
+
+    if (!kc_curl_multi) {
+        log_module(KC_LOG, LOG_ERROR, "[%s] kc_async retry: curl_multi not initialized", req_id);
+        /* Call error callback and cleanup */
+        if (req->cb.generic)
+            req->cb.generic(req->session, KC_ERROR);
+        kc_async_request_cleanup(req);
+        return;
+    }
+
+    /* Reset response buffer for retry */
+    if (req->response.response) {
+        free(req->response.response);
+        req->response.response = NULL;
+        req->response.size = 0;
+    }
+
+    /* Reset timing */
+    req->started = time(NULL);
+
+    int max_retries = req->max_retries > 0 ? req->max_retries : KC_ASYNC_MAX_RETRIES;
+    log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async: Executing retry %d/%d",
+               req_id, req->retry_count, max_retries);
+
+    /* Re-add to curl multi */
+    mc = curl_multi_add_handle(kc_curl_multi, req->easy);
+    if (mc != CURLM_OK) {
+        log_module(KC_LOG, LOG_ERROR, "[%s] kc_async retry: curl_multi_add_handle failed: %s",
+                   req_id, curl_multi_strerror(mc));
+        /* Call error callback and cleanup */
+        if (req->cb.generic)
+            req->cb.generic(req->session, KC_ERROR);
+        kc_async_request_cleanup(req);
+        return;
+    }
+
+    /* Kick curl to start processing */
+    int running;
+    curl_multi_socket_action(kc_curl_multi, CURL_SOCKET_TIMEOUT, 0, &running);
+}
+
+/* Cleanup an async request - frees all allocated resources */
+static void
+kc_async_request_cleanup(struct kc_async_request *req)
+{
+    if (!req) return;
+
+    /* Return curl handle to pool */
+    if (req->easy) {
+        if (kc_curl_multi) {
+            curl_multi_remove_handle(kc_curl_multi, req->easy);
+        }
+        kc_handle_pool_put(req->easy);
+    }
+
+    /* Free response buffer (securely zero first) */
+    if (req->response.response) {
+        memset(req->response.response, 0, req->response.size);
+        free(req->response.response);
+    }
+
+    /* Free allocated strings */
+    if (req->uri) free(req->uri);
+    if (req->post_fields) {
+        memset(req->post_fields, 0, strlen(req->post_fields));
+        free(req->post_fields);
+    }
+    if (req->post_data_copy) free(req->post_data_copy);
+    if (req->header_list) curl_slist_free_all(req->header_list);
+    if (req->request_id) free(req->request_id);
+    if (req->create_username) free(req->create_username);
+    if (req->attr_prefix) free(req->attr_prefix);
+    if (req->attr_name) free(req->attr_name);
+    if (req->user_attr_name) free(req->user_attr_name);
+    if (req->user_attr_value) free(req->user_attr_value);
+    if (req->user_id_copy) free(req->user_id_copy);
+    if (req->bearer_token_copy) free(req->bearer_token_copy);
+    if (req->group_attr_value) free(req->group_attr_value);
+    if (req->group_id) free(req->group_id);
+
+    free(req);
+}
+
 /* Check for completed transfers and invoke callbacks */
 static void
 kc_curl_check_completed(void)
@@ -1862,6 +2178,47 @@ kc_curl_check_completed(void)
             } else {
                 log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async: CURL error: %s (after %lds)",
                            req_id, curl_easy_strerror(msg->data.result), (long)elapsed);
+            }
+
+            /* Check for retryable errors on supported operation types.
+             * Auth/introspect operations should fail fast - no retry.
+             * Attribute and group operations benefit from retry on transient errors. */
+            if (kc_async_is_retryable(msg->data.result, http_code)) {
+                /* Only retry certain operation types */
+                int should_retry = 0;
+                switch (req->type) {
+                case KC_ASYNC_SET_ATTR:
+                case KC_ASYNC_GROUP_ADD:
+                case KC_ASYNC_GROUP_REMOVE:
+                case KC_ASYNC_CREATE_USER:
+                case KC_ASYNC_DELETE_USER:
+                case KC_ASYNC_UPDATE_USER:
+                case KC_ASYNC_GET_USER:
+                case KC_ASYNC_SET_USER_ATTR_GET:
+                case KC_ASYNC_SET_GROUP_ATTR:
+                case KC_ASYNC_SET_GROUP_ATTR_GET:
+                case KC_ASYNC_GET_GROUP_PATH:
+                case KC_ASYNC_GET_GROUP_NAME:
+                case KC_ASYNC_CREATE_SUBGROUP:
+                case KC_ASYNC_DELETE_GROUP:
+                case KC_ASYNC_LIST_ATTRS:
+                case KC_ASYNC_GET_ATTR:
+                case KC_ASYNC_GROUP_INFO:
+                case KC_ASYNC_GROUP_MEMBERS:
+                case KC_ASYNC_COALESCE_GET:
+                    should_retry = 1;
+                    break;
+                default:
+                    /* Auth, fingerprint, introspect, webpush, client_token - no retry */
+                    break;
+                }
+
+                if (should_retry && kc_async_schedule_retry(req)) {
+                    /* Retry scheduled - remove from multi but don't cleanup yet */
+                    curl_multi_remove_handle(kc_curl_multi, easy);
+                    continue;  /* Skip to next message */
+                }
+                /* Fall through if retry not scheduled (max retries exceeded or not retryable type) */
             }
 
             /* Dispatch based on request type */
@@ -2510,29 +2867,41 @@ kc_curl_check_completed(void)
                                     put_req->uri = put_uri;
                                     put_req->post_fields = json_body;
 
-                                    struct curl_opts opts = CURL_OPTS_INIT;
-                                    opts.uri = put_req->uri;
-                                    opts.method = HTTP_PUT;
-                                    opts.post_fields = put_req->post_fields;
-                                    opts.xoauth2_bearer = req->client_copy.access_token->access_token;
-                                    opts.header_list[0] = "Content-Type: application/json";
-                                    opts.header_count = 1;
-
-                                    if (curl_perform_async(put_req, opts) == 0) {
-                                        log_module(KC_LOG, LOG_DEBUG,
-                                                   "[%s] kc_async set_user_attr_get: GET succeeded, "
-                                                   "issued PUT with merged attributes for %s.%s",
-                                                   req_id, req->user_id_copy, req->user_attr_name);
-                                        /* PUT request is now in flight, will call callback when done.
-                                         * Don't call callback here - the PUT completion will do it. */
-                                        result = KC_SUCCESS;
-                                    } else {
+                                    /* Copy bearer token for PUT request lifetime (original req will be freed) */
+                                    put_req->bearer_token_copy = strdup(req->bearer_token_copy);
+                                    if (!put_req->bearer_token_copy) {
                                         log_module(KC_LOG, LOG_ERROR,
-                                                   "[%s] kc_async set_user_attr_get: Failed to start PUT",
+                                                   "[%s] kc_async set_user_attr_get: Failed to copy bearer token",
                                                    req_id);
                                         free(put_uri);
                                         free(json_body);
                                         free(put_req);
+                                    } else {
+                                        struct curl_opts opts = CURL_OPTS_INIT;
+                                        opts.uri = put_req->uri;
+                                        opts.method = HTTP_PUT;
+                                        opts.post_fields = put_req->post_fields;
+                                        opts.xoauth2_bearer = put_req->bearer_token_copy;
+                                        opts.header_list[0] = "Content-Type: application/json";
+                                        opts.header_count = 1;
+
+                                        if (curl_perform_async(put_req, opts) == 0) {
+                                            log_module(KC_LOG, LOG_DEBUG,
+                                                       "[%s] kc_async set_user_attr_get: GET succeeded, "
+                                                       "issued PUT with merged attributes for %s.%s",
+                                                       req_id, req->user_id_copy, req->user_attr_name);
+                                            /* PUT request is now in flight, will call callback when done.
+                                             * Don't call callback here - the PUT completion will do it. */
+                                            result = KC_SUCCESS;
+                                        } else {
+                                            log_module(KC_LOG, LOG_ERROR,
+                                                       "[%s] kc_async set_user_attr_get: Failed to start PUT",
+                                                       req_id);
+                                            free(put_req->bearer_token_copy);
+                                            free(put_uri);
+                                            free(json_body);
+                                            free(put_req);
+                                        }
                                     }
                                 } else {
                                     free(put_uri);
@@ -2564,30 +2933,138 @@ kc_curl_check_completed(void)
                 }
                 break;
             }
+            case KC_ASYNC_COALESCE_GET: {
+                /* GET phase completed for coalesced attribute update (cache miss case).
+                 * Merge all pending attributes and issue single PUT. */
+                struct kc_pending_user_update *pending = req->coalesce_pending;
+                int result = KC_ERROR;
+
+                if (!pending) {
+                    log_module(KC_LOG, LOG_ERROR,
+                               "[%s] kc_async coalesce_get: No pending update context",
+                               req_id);
+                    break;
+                }
+
+                if (http_code == 200 && req->response.response) {
+                    json_error_t error;
+                    json_t *repr = json_loads(req->response.response, 0, &error);
+                    if (repr) {
+                        /* Cache this representation for future updates */
+                        json_t *id_json = json_object_get(repr, "id");
+                        if (id_json && json_is_string(id_json)) {
+                            kc_user_repr_cache_put(json_string_value(id_json), repr);
+                        }
+
+                        /* Get or create attributes object */
+                        json_t *attrs = json_object_get(repr, "attributes");
+                        if (!attrs) {
+                            attrs = json_object();
+                            json_object_set_new(repr, "attributes", attrs);
+                        }
+
+                        /* Merge ALL pending attributes */
+                        for (int i = 0; i < pending->attr_count; i++) {
+                            if (pending->attrs[i].value) {
+                                json_t *attr_array = json_array();
+                                json_array_append_new(attr_array, json_string(pending->attrs[i].value));
+                                json_object_set_new(attrs, pending->attrs[i].name, attr_array);
+                            } else {
+                                /* NULL value = delete attribute */
+                                json_object_del(attrs, pending->attrs[i].name);
+                            }
+                        }
+
+                        /* Now issue PUT with full representation */
+                        char *json_body = json_dumps(repr, JSON_COMPACT);
+                        json_decref(repr);
+
+                        if (json_body) {
+                            char *put_uri = kc_build_user_endpoint(req->realm_copy, pending->user_id);
+                            if (put_uri) {
+                                struct kc_async_request *put_req = calloc(1, sizeof(*put_req));
+                                if (put_req) {
+                                    put_req->session = pending->session;
+                                    put_req->type = KC_ASYNC_SET_ATTR;
+                                    put_req->cb.generic = pending->cb;
+                                    put_req->uri = put_uri;
+                                    put_req->post_fields = json_body;
+
+                                    /* Get fresh token for PUT request */
+                                    if (kc_token_mgr.token && kc_token_mgr.token->access_token) {
+                                        put_req->bearer_token_copy = strdup(kc_token_mgr.token->access_token);
+                                    }
+
+                                    if (!put_req->bearer_token_copy) {
+                                        log_module(KC_LOG, LOG_ERROR,
+                                                   "[%s] kc_async coalesce_get: Failed to get bearer token for PUT",
+                                                   req_id);
+                                        free(put_uri);
+                                        free(json_body);
+                                        free(put_req);
+                                    } else {
+                                        struct curl_opts opts = CURL_OPTS_INIT;
+                                        opts.uri = put_req->uri;
+                                        opts.method = HTTP_PUT;
+                                        opts.post_fields = put_req->post_fields;
+                                        opts.xoauth2_bearer = put_req->bearer_token_copy;
+                                        opts.header_list[0] = "Content-Type: application/json";
+                                        opts.header_count = 1;
+
+                                        if (curl_perform_async(put_req, opts) == 0) {
+                                            log_module(KC_LOG, LOG_DEBUG,
+                                                       "[%s] kc_async coalesce_get: GET succeeded, "
+                                                       "issued PUT with %d merged attrs for %s",
+                                                       req_id, pending->attr_count, pending->user_id);
+                                            result = KC_SUCCESS;
+                                        } else {
+                                            log_module(KC_LOG, LOG_ERROR,
+                                                       "[%s] kc_async coalesce_get: Failed to start PUT",
+                                                       req_id);
+                                            free(put_req->bearer_token_copy);
+                                            free(put_uri);
+                                            free(json_body);
+                                            free(put_req);
+                                        }
+                                    }
+                                } else {
+                                    free(put_uri);
+                                    free(json_body);
+                                }
+                            } else {
+                                free(json_body);
+                            }
+                        }
+                    } else {
+                        log_module(KC_LOG, LOG_ERROR,
+                                   "[%s] kc_async coalesce_get: Invalid JSON: %s",
+                                   req_id, error.text);
+                    }
+                } else if (http_code == 404) {
+                    result = KC_NOT_FOUND;
+                    log_module(KC_LOG, LOG_DEBUG,
+                               "[%s] kc_async coalesce_get: User not found (HTTP 404)",
+                               req_id);
+                } else {
+                    log_module(KC_LOG, LOG_ERROR,
+                               "[%s] kc_async coalesce_get: GET failed (HTTP %ld)",
+                               req_id, http_code);
+                }
+
+                /* On error, call callback. On success, PUT will call callback when done. */
+                if (result != KC_SUCCESS && pending->cb) {
+                    pending->cb(pending->session, result);
+                }
+
+                /* Free the pending update - we're done with it either way */
+                kc_pending_update_free(pending);
+                req->coalesce_pending = NULL;  /* Don't double-free in cleanup */
+                break;
+            }
             }
 
-            /* Cleanup - return handle to pool for reuse */
-            curl_multi_remove_handle(kc_curl_multi, easy);
-            kc_handle_pool_put(easy);
-            if (req->response.response) {
-                memset(req->response.response, 0, req->response.size);
-                free(req->response.response);
-            }
-            if (req->uri) free(req->uri);
-            if (req->post_fields) {
-                memset(req->post_fields, 0, strlen(req->post_fields));
-                free(req->post_fields);
-            }
-            if (req->post_data_copy) free(req->post_data_copy);
-            if (req->header_list) curl_slist_free_all(req->header_list);
-            if (req->request_id) free(req->request_id);
-            if (req->create_username) free(req->create_username);
-            if (req->attr_prefix) free(req->attr_prefix);
-            if (req->attr_name) free(req->attr_name);
-            if (req->user_attr_name) free(req->user_attr_name);
-            if (req->user_attr_value) free(req->user_attr_value);
-            if (req->user_id_copy) free(req->user_id_copy);
-            free(req);
+            /* Cleanup request */
+            kc_async_request_cleanup(req);
         }
     }
 }
@@ -2906,10 +3383,21 @@ keycloak_find_user_by_fingerprint_async(struct kc_realm realm, struct kc_client 
         goto error;
     }
 
+    /* Copy bearer token from global manager (avoids use-after-free if ctx has stale pointer) */
+    if (!kc_token_mgr.token || !kc_token_mgr.token->access_token) {
+        log_module(KC_LOG, LOG_ERROR, "fingerprint_async: No valid token available (token refresh in progress?)");
+        goto error;
+    }
+    req->bearer_token_copy = strdup(kc_token_mgr.token->access_token);
+    if (!req->bearer_token_copy) {
+        log_module(KC_LOG, LOG_ERROR, "fingerprint_async: Failed to copy bearer token");
+        goto error;
+    }
+
     /* Use unified async API */
     struct curl_opts opts = CURL_OPTS_INIT;
     opts.uri = req->uri;
-    opts.xoauth2_bearer = client.access_token->access_token;
+    opts.xoauth2_bearer = req->bearer_token_copy;
     opts.method = HTTP_GET;
 
     if (curl_perform_async(req, opts) < 0) {
@@ -2927,6 +3415,7 @@ error:
     if (req) {
         if (req->easy) curl_easy_cleanup(req->easy);
         if (req->uri) free(req->uri);
+        if (req->bearer_token_copy) free(req->bearer_token_copy);
         if (req->response.response) free(req->response.response);
         free(req);
     }
@@ -3020,17 +3509,17 @@ error:
 }
 
 /**
- * Set a user attribute asynchronously.
- * This is useful for non-blocking attribute updates during SASL flows.
+ * Set a user attribute asynchronously with coalescing.
  *
- * Uses the user representation cache to safely merge the attribute without
- * clobbering other fields (email, firstName, etc.) that Keycloak's PUT
- * would otherwise clear.
+ * Multiple attribute updates for the same user within KC_COALESCE_DELAY_SEC
+ * are batched into a single Keycloak API call. This reduces API load when
+ * multiple attributes are set in quick succession (e.g., during account setup).
  *
  * Flow:
- * 1. Check cache for full user representation
- * 2. If cache hit: merge attribute into representation, PUT full object
- * 3. If cache miss: GET user first, cache, then merge and PUT
+ * 1. Find or create pending update entry for this user
+ * 2. Add attribute to pending list (overwrites if same attr already pending)
+ * 3. On first attr for user, schedule flush callback after delay
+ * 4. Flush merges all pending attrs and issues single PUT
  */
 int
 keycloak_set_user_attribute_async(struct kc_realm realm, struct kc_client client,
@@ -3038,29 +3527,81 @@ keycloak_set_user_attribute_async(struct kc_realm realm, struct kc_client client
                                    const char *attr_value, void *session,
                                    kc_async_callback callback)
 {
-    struct kc_async_request *req = NULL;
-    char *json_body = NULL;
+    (void)realm;   /* Realm taken from global token manager at flush time */
+    (void)client;  /* Client token taken from global token manager at flush time */
 
     /* Validate inputs */
-    if (!realm.base_uri || !realm.realm || !client.access_token ||
-        !user_id || !attr_name || !callback) {
+    if (!user_id || !attr_name || !callback) {
         log_module(KC_LOG, LOG_DEBUG, "set_attr_async: Invalid arguments");
         return -1;
     }
 
+    /* Find or create pending update for this user */
+    struct kc_pending_user_update *p = kc_coalesce_get_or_create(user_id);
+    if (!p) {
+        log_module(KC_LOG, LOG_ERROR, "set_attr_async: Failed to create pending update");
+        return -1;
+    }
+
+    /* Add attribute to pending list */
+    if (kc_coalesce_add_attr(p, attr_name, attr_value, callback, session) < 0) {
+        log_module(KC_LOG, LOG_ERROR, "set_attr_async: Failed to add attr to pending");
+        return -1;
+    }
+
+    return 0;
+}
+
+/**
+ * Flush callback for coalesced attribute updates.
+ * Called by timeq after the coalesce delay expires.
+ */
+static void
+kc_coalesce_flush_cb(void *data)
+{
+    struct kc_pending_user_update *p = data;
+    struct kc_pending_user_update **pp;
+
+    /* Unlink from pending list */
+    for (pp = &kc_pending_updates; *pp; pp = &(*pp)->next) {
+        if (*pp == p) {
+            *pp = p->next;
+            break;
+        }
+    }
+
+    log_module(KC_LOG, LOG_DEBUG, "coalesce: Flushing %d attrs for user %s",
+               p->attr_count, p->user_id);
+
+    if (p->attr_count == 0) {
+        /* Nothing to flush */
+        kc_pending_update_free(p);
+        return;
+    }
+
+    /* Check if we have a valid token */
+    if (!kc_token_mgr.token || !kc_token_mgr.token->access_token) {
+        log_module(KC_LOG, LOG_ERROR, "coalesce: No valid token for flush");
+        if (p->cb) p->cb(p->session, KC_ERROR);
+        kc_pending_update_free(p);
+        return;
+    }
+
     /* Check user representation cache */
-    json_t *cached_repr = kc_user_repr_cache_get(user_id);
+    json_t *cached_repr = kc_user_repr_cache_get(p->user_id);
 
     if (cached_repr) {
-        /* Cache hit - merge attribute into cached representation and PUT */
-        log_module(KC_LOG, LOG_DEBUG, "set_attr_async: Cache hit for %s, merging attribute %s",
-                   user_id, attr_name);
+        /* Cache hit - merge all pending attrs and issue PUT directly */
+        log_module(KC_LOG, LOG_DEBUG, "coalesce: Cache hit for %s, merging %d attrs",
+                   p->user_id, p->attr_count);
 
         /* Deep copy the representation so we can modify it */
         json_t *repr = json_deep_copy(cached_repr);
         if (!repr) {
-            log_module(KC_LOG, LOG_ERROR, "set_attr_async: Failed to copy cached repr");
-            return -1;
+            log_module(KC_LOG, LOG_ERROR, "coalesce: Failed to copy cached repr");
+            if (p->cb) p->cb(p->session, KC_ERROR);
+            kc_pending_update_free(p);
+            return;
         }
 
         /* Get or create attributes object */
@@ -3070,128 +3611,130 @@ keycloak_set_user_attribute_async(struct kc_realm realm, struct kc_client client
             json_object_set_new(repr, "attributes", attrs);
         }
 
-        /* Set or delete the attribute */
-        if (attr_value) {
-            json_t *attr_array = json_array();
-            json_array_append_new(attr_array, json_string(attr_value));
-            json_object_set_new(attrs, attr_name, attr_array);
-        } else {
-            /* NULL value = delete attribute */
-            json_object_del(attrs, attr_name);
+        /* Merge all pending attribute changes */
+        for (int i = 0; i < p->attr_count; i++) {
+            if (p->attrs[i].value) {
+                json_t *attr_array = json_array();
+                json_array_append_new(attr_array, json_string(p->attrs[i].value));
+                json_object_set_new(attrs, p->attrs[i].name, attr_array);
+            } else {
+                /* NULL value = delete attribute */
+                json_object_del(attrs, p->attrs[i].name);
+            }
         }
 
         /* Serialize for PUT */
-        json_body = json_dumps(repr, JSON_COMPACT);
+        char *json_body = json_dumps(repr, JSON_COMPACT);
         json_decref(repr);
 
         if (!json_body) {
-            log_module(KC_LOG, LOG_ERROR, "set_attr_async: Failed to build JSON from cache");
-            return -1;
+            log_module(KC_LOG, LOG_ERROR, "coalesce: Failed to serialize JSON");
+            if (p->cb) p->cb(p->session, KC_ERROR);
+            kc_pending_update_free(p);
+            return;
         }
 
-        /* Allocate request structure for PUT */
-        req = calloc(1, sizeof(*req));
+        /* Build PUT request */
+        struct kc_async_request *req = calloc(1, sizeof(*req));
         if (!req) {
-            log_module(KC_LOG, LOG_ERROR, "set_attr_async: Out of memory");
+            log_module(KC_LOG, LOG_ERROR, "coalesce: Out of memory for request");
             free(json_body);
-            return -1;
+            if (p->cb) p->cb(p->session, KC_ERROR);
+            kc_pending_update_free(p);
+            return;
         }
-        req->session = session;
-        req->type = KC_ASYNC_SET_ATTR;
-        req->cb.generic = callback;
 
-        /* Build URI */
-        req->uri = kc_build_user_endpoint(realm, user_id);
-        if (!req->uri) {
-            log_module(KC_LOG, LOG_ERROR, "set_attr_async: Failed to build URI");
+        req->session = p->session;
+        req->type = KC_ASYNC_SET_ATTR;
+        req->cb.generic = p->cb;
+        req->uri = kc_build_user_endpoint(kc_token_mgr.realm, p->user_id);
+        req->post_fields = json_body;
+        req->bearer_token_copy = strdup(kc_token_mgr.token->access_token);
+
+        if (!req->uri || !req->bearer_token_copy) {
+            log_module(KC_LOG, LOG_ERROR, "coalesce: Failed to build request");
+            if (req->uri) free(req->uri);
+            if (req->bearer_token_copy) free(req->bearer_token_copy);
             free(json_body);
             free(req);
-            return -1;
+            if (p->cb) p->cb(p->session, KC_ERROR);
+            kc_pending_update_free(p);
+            return;
         }
 
-        req->post_fields = json_body;
-
-        /* Issue PUT */
         struct curl_opts opts = CURL_OPTS_INIT;
         opts.uri = req->uri;
         opts.method = HTTP_PUT;
         opts.post_fields = req->post_fields;
-        opts.xoauth2_bearer = client.access_token->access_token;
+        opts.xoauth2_bearer = req->bearer_token_copy;
         opts.header_list[0] = "Content-Type: application/json";
         opts.header_count = 1;
 
         if (curl_perform_async(req, opts) < 0) {
-            log_module(KC_LOG, LOG_ERROR, "set_attr_async: curl_perform_async failed");
+            log_module(KC_LOG, LOG_ERROR, "coalesce: curl_perform_async failed");
             free(req->uri);
+            free(req->bearer_token_copy);
             free(req->post_fields);
             free(req);
-            return -1;
+            if (p->cb) p->cb(p->session, KC_ERROR);
+            kc_pending_update_free(p);
+            return;
         }
 
-        log_module(KC_LOG, LOG_DEBUG, "set_attr_async: Started PUT with merged repr for %s.%s",
-                   user_id, attr_name);
-        return 0;
+        log_module(KC_LOG, LOG_DEBUG, "coalesce: Started PUT with %d merged attrs for %s",
+                   p->attr_count, p->user_id);
+        kc_pending_update_free(p);
+        return;
     }
 
-    /* Cache miss - need to GET user first, then PUT */
-    log_module(KC_LOG, LOG_DEBUG, "set_attr_async: Cache miss for %s, doing GET first", user_id);
+    /* Cache miss - need to GET user first, then merge and PUT */
+    log_module(KC_LOG, LOG_DEBUG, "coalesce: Cache miss for %s, doing GET first", p->user_id);
 
-    req = calloc(1, sizeof(*req));
+    struct kc_async_request *req = calloc(1, sizeof(*req));
     if (!req) {
-        log_module(KC_LOG, LOG_ERROR, "set_attr_async: Out of memory");
-        return -1;
-    }
-    req->session = session;
-    req->type = KC_ASYNC_SET_USER_ATTR_GET;
-    req->cb.generic = callback;
-
-    /* Store attribute info for use after GET completes */
-    req->user_attr_name = strdup(attr_name);
-    req->user_attr_value = attr_value ? strdup(attr_value) : NULL;
-    req->user_id_copy = strdup(user_id);
-
-    if (!req->user_attr_name || !req->user_id_copy ||
-        (attr_value && !req->user_attr_value)) {
-        log_module(KC_LOG, LOG_ERROR, "set_attr_async: Failed to copy strings");
-        goto error;
+        log_module(KC_LOG, LOG_ERROR, "coalesce: Out of memory for GET request");
+        if (p->cb) p->cb(p->session, KC_ERROR);
+        kc_pending_update_free(p);
+        return;
     }
 
-    /* Store realm/client for PUT phase */
-    req->realm_copy = realm;
-    req->client_copy = client;
+    req->session = p->session;
+    req->type = KC_ASYNC_COALESCE_GET;
+    req->cb.generic = p->cb;
+    req->coalesce_pending = p;  /* Transfer ownership to request */
+    req->realm_copy = kc_token_mgr.realm;
 
-    /* Build GET URI */
-    req->uri = kc_build_user_endpoint(realm, user_id);
-    if (!req->uri) {
-        log_module(KC_LOG, LOG_ERROR, "set_attr_async: Failed to build URI for GET");
-        goto error;
+    req->uri = kc_build_user_endpoint(kc_token_mgr.realm, p->user_id);
+    req->bearer_token_copy = strdup(kc_token_mgr.token->access_token);
+
+    if (!req->uri || !req->bearer_token_copy) {
+        log_module(KC_LOG, LOG_ERROR, "coalesce: Failed to build GET request");
+        if (req->uri) free(req->uri);
+        if (req->bearer_token_copy) free(req->bearer_token_copy);
+        free(req);
+        if (p->cb) p->cb(p->session, KC_ERROR);
+        kc_pending_update_free(p);
+        return;
     }
 
-    /* Issue GET */
     struct curl_opts opts = CURL_OPTS_INIT;
     opts.uri = req->uri;
     opts.method = HTTP_GET;
-    opts.xoauth2_bearer = client.access_token->access_token;
+    opts.xoauth2_bearer = req->bearer_token_copy;
 
     if (curl_perform_async(req, opts) < 0) {
-        log_module(KC_LOG, LOG_ERROR, "set_attr_async: curl_perform_async failed for GET");
-        goto error;
-    }
-
-    log_module(KC_LOG, LOG_DEBUG, "set_attr_async: Started GET for %s before setting %s",
-               user_id, attr_name);
-    return 0;
-
-error:
-    if (req) {
-        if (req->easy) curl_easy_cleanup(req->easy);
-        if (req->uri) free(req->uri);
-        if (req->user_attr_name) free(req->user_attr_name);
-        if (req->user_attr_value) free(req->user_attr_value);
-        if (req->user_id_copy) free(req->user_id_copy);
+        log_module(KC_LOG, LOG_ERROR, "coalesce: curl_perform_async failed for GET");
+        free(req->uri);
+        free(req->bearer_token_copy);
         free(req);
+        if (p->cb) p->cb(p->session, KC_ERROR);
+        kc_pending_update_free(p);
+        return;
     }
-    return -1;
+
+    log_module(KC_LOG, LOG_DEBUG, "coalesce: Started GET for %s before merging %d attrs",
+               p->user_id, p->attr_count);
+    /* Ownership of p transferred to req->coalesce_pending - don't free here */
 }
 
 /**
@@ -3279,18 +3822,36 @@ keycloak_set_user_attribute_array_async(struct kc_realm realm, struct kc_client 
 
         req->post_fields = json_body;
 
+        /* Copy bearer token from global manager (avoids use-after-free if ctx has stale pointer) */
+        if (!kc_token_mgr.token || !kc_token_mgr.token->access_token) {
+            log_module(KC_LOG, LOG_ERROR, "set_attr_array_async: No valid token available (token refresh in progress?)");
+            free(req->uri);
+            free(req->post_fields);
+            free(req);
+            return -1;
+        }
+        req->bearer_token_copy = strdup(kc_token_mgr.token->access_token);
+        if (!req->bearer_token_copy) {
+            log_module(KC_LOG, LOG_ERROR, "set_attr_array_async: Failed to copy bearer token");
+            free(req->uri);
+            free(req->post_fields);
+            free(req);
+            return -1;
+        }
+
         /* Issue PUT */
         struct curl_opts opts = CURL_OPTS_INIT;
         opts.uri = req->uri;
         opts.method = HTTP_PUT;
         opts.post_fields = req->post_fields;
-        opts.xoauth2_bearer = client.access_token->access_token;
+        opts.xoauth2_bearer = req->bearer_token_copy;
         opts.header_list[0] = "Content-Type: application/json";
         opts.header_count = 1;
 
         if (curl_perform_async(req, opts) < 0) {
             log_module(KC_LOG, LOG_ERROR, "set_attr_array_async: curl_perform_async failed");
             free(req->uri);
+            free(req->bearer_token_copy);
             free(req->post_fields);
             free(req);
             return -1;
@@ -3349,12 +3910,23 @@ keycloak_set_user_attribute_array_async(struct kc_realm realm, struct kc_client 
     req->post_fields = json_body;
     json_body = NULL;  /* Transferred ownership */
 
+    /* Copy bearer token from global manager (avoids use-after-free if ctx has stale pointer) */
+    if (!kc_token_mgr.token || !kc_token_mgr.token->access_token) {
+        log_module(KC_LOG, LOG_ERROR, "set_attr_array_async: No valid token available (token refresh in progress?)");
+        goto error;
+    }
+    req->bearer_token_copy = strdup(kc_token_mgr.token->access_token);
+    if (!req->bearer_token_copy) {
+        log_module(KC_LOG, LOG_ERROR, "set_attr_array_async: Failed to copy bearer token");
+        goto error;
+    }
+
     /* Use unified async API */
     struct curl_opts opts = CURL_OPTS_INIT;
     opts.uri = req->uri;
     opts.method = HTTP_PUT;
     opts.post_fields = req->post_fields;
-    opts.xoauth2_bearer = client.access_token->access_token;
+    opts.xoauth2_bearer = req->bearer_token_copy;
     opts.header_list[0] = "Content-Type: application/json";
     opts.header_count = 1;
 
@@ -3372,6 +3944,7 @@ error:
     if (req) {
         if (req->easy) curl_easy_cleanup(req->easy);
         if (req->uri) free(req->uri);
+        if (req->bearer_token_copy) free(req->bearer_token_copy);
         if (req->post_fields) {
             memset(req->post_fields, 0, strlen(req->post_fields));
             free(req->post_fields);
@@ -3433,12 +4006,23 @@ keycloak_set_email_verified_async(struct kc_realm realm, struct kc_client client
     req->post_fields = json_body;
     json_body = NULL;  /* Transferred ownership */
 
+    /* Copy bearer token from global manager (avoids use-after-free if ctx has stale pointer) */
+    if (!kc_token_mgr.token || !kc_token_mgr.token->access_token) {
+        log_module(KC_LOG, LOG_ERROR, "set_email_verified_async: No valid token available (token refresh in progress?)");
+        goto error;
+    }
+    req->bearer_token_copy = strdup(kc_token_mgr.token->access_token);
+    if (!req->bearer_token_copy) {
+        log_module(KC_LOG, LOG_ERROR, "set_email_verified_async: Failed to copy bearer token");
+        goto error;
+    }
+
     /* Use unified async API */
     struct curl_opts opts = CURL_OPTS_INIT;
     opts.uri = req->uri;
     opts.method = HTTP_PUT;
     opts.post_fields = req->post_fields;
-    opts.xoauth2_bearer = client.access_token->access_token;
+    opts.xoauth2_bearer = req->bearer_token_copy;
     opts.header_list[0] = "Content-Type: application/json";
     opts.header_count = 1;
 
@@ -3456,6 +4040,7 @@ error:
     if (req) {
         if (req->easy) curl_easy_cleanup(req->easy);
         if (req->uri) free(req->uri);
+        if (req->bearer_token_copy) free(req->bearer_token_copy);
         if (req->post_fields) {
             memset(req->post_fields, 0, strlen(req->post_fields));
             free(req->post_fields);
@@ -3501,11 +4086,22 @@ keycloak_add_user_to_group_async(struct kc_realm realm, struct kc_client client,
         goto error;
     }
 
+    /* Copy bearer token from global manager (avoids use-after-free if ctx has stale pointer) */
+    if (!kc_token_mgr.token || !kc_token_mgr.token->access_token) {
+        log_module(KC_LOG, LOG_ERROR, "add_group_async: No valid token available (token refresh in progress?)");
+        goto error;
+    }
+    req->bearer_token_copy = strdup(kc_token_mgr.token->access_token);
+    if (!req->bearer_token_copy) {
+        log_module(KC_LOG, LOG_ERROR, "add_group_async: Failed to copy bearer token");
+        goto error;
+    }
+
     /* Use unified async API - PUT with no body */
     struct curl_opts opts = CURL_OPTS_INIT;
     opts.uri = req->uri;
     opts.method = HTTP_PUT;
-    opts.xoauth2_bearer = client.access_token->access_token;
+    opts.xoauth2_bearer = req->bearer_token_copy;
 
     if (curl_perform_async(req, opts) < 0) {
         log_module(KC_LOG, LOG_ERROR, "add_group_async: curl_perform_async failed");
@@ -3520,6 +4116,7 @@ error:
     if (req) {
         if (req->easy) curl_easy_cleanup(req->easy);
         if (req->uri) free(req->uri);
+        if (req->bearer_token_copy) free(req->bearer_token_copy);
         if (req->response.response) free(req->response.response);
         free(req);
     }
@@ -3561,11 +4158,22 @@ keycloak_remove_user_from_group_async(struct kc_realm realm, struct kc_client cl
         goto error;
     }
 
+    /* Copy bearer token from global manager (avoids use-after-free if ctx has stale pointer) */
+    if (!kc_token_mgr.token || !kc_token_mgr.token->access_token) {
+        log_module(KC_LOG, LOG_ERROR, "remove_group_async: No valid token available (token refresh in progress?)");
+        goto error;
+    }
+    req->bearer_token_copy = strdup(kc_token_mgr.token->access_token);
+    if (!req->bearer_token_copy) {
+        log_module(KC_LOG, LOG_ERROR, "remove_group_async: Failed to copy bearer token");
+        goto error;
+    }
+
     /* Use unified async API - DELETE with no body */
     struct curl_opts opts = CURL_OPTS_INIT;
     opts.uri = req->uri;
     opts.method = HTTP_DELETE;
-    opts.xoauth2_bearer = client.access_token->access_token;
+    opts.xoauth2_bearer = req->bearer_token_copy;
 
     if (curl_perform_async(req, opts) < 0) {
         log_module(KC_LOG, LOG_ERROR, "remove_group_async: curl_perform_async failed");
@@ -3580,6 +4188,7 @@ error:
     if (req) {
         if (req->easy) curl_easy_cleanup(req->easy);
         if (req->uri) free(req->uri);
+        if (req->bearer_token_copy) free(req->bearer_token_copy);
         if (req->response.response) free(req->response.response);
         free(req);
     }
@@ -3740,11 +4349,22 @@ keycloak_create_user_async(struct kc_realm realm, struct kc_client client,
     /* Initialize location header buffer for user ID capture */
     req->location_header[0] = '\0';
 
+    /* Copy bearer token from global manager (avoids use-after-free if ctx has stale pointer) */
+    if (!kc_token_mgr.token || !kc_token_mgr.token->access_token) {
+        log_module(KC_LOG, LOG_ERROR, "create_user_async: No valid token available (token refresh in progress?)");
+        goto error;
+    }
+    req->bearer_token_copy = strdup(kc_token_mgr.token->access_token);
+    if (!req->bearer_token_copy) {
+        log_module(KC_LOG, LOG_ERROR, "create_user_async: Failed to copy bearer token");
+        goto error;
+    }
+
     /* Build curl options with header callback for Location capture */
     struct curl_opts opts = CURL_OPTS_INIT;
     opts.uri = req->uri;
     opts.method = HTTP_POST;
-    opts.xoauth2_bearer = client.access_token->access_token;
+    opts.xoauth2_bearer = req->bearer_token_copy;
     opts.post_fields = req->post_fields;
     opts.header_list[0] = "Content-Type: application/json";
     opts.header_count = 1;
@@ -3763,6 +4383,7 @@ error:
     if (req) {
         if (req->easy) curl_easy_cleanup(req->easy);
         if (req->uri) free(req->uri);
+        if (req->bearer_token_copy) free(req->bearer_token_copy);
         if (req->post_fields) {
             memset(req->post_fields, 0, strlen(req->post_fields));
             free(req->post_fields);
@@ -3839,11 +4460,22 @@ keycloak_create_user_with_hash_async(struct kc_realm realm, struct kc_client cli
     /* Initialize location header buffer for user ID capture */
     req->location_header[0] = '\0';
 
+    /* Copy bearer token from global manager (avoids use-after-free if ctx has stale pointer) */
+    if (!kc_token_mgr.token || !kc_token_mgr.token->access_token) {
+        log_module(KC_LOG, LOG_ERROR, "create_user_with_hash_async: No valid token available (token refresh in progress?)");
+        goto error;
+    }
+    req->bearer_token_copy = strdup(kc_token_mgr.token->access_token);
+    if (!req->bearer_token_copy) {
+        log_module(KC_LOG, LOG_ERROR, "create_user_with_hash_async: Failed to copy bearer token");
+        goto error;
+    }
+
     /* Build curl options with header callback for Location capture */
     struct curl_opts opts = CURL_OPTS_INIT;
     opts.uri = req->uri;
     opts.method = HTTP_POST;
-    opts.xoauth2_bearer = client.access_token->access_token;
+    opts.xoauth2_bearer = req->bearer_token_copy;
     opts.post_fields = req->post_fields;
     opts.header_list[0] = "Content-Type: application/json";
     opts.header_count = 1;
@@ -3863,6 +4495,7 @@ error:
     if (req) {
         if (req->easy) curl_easy_cleanup(req->easy);
         if (req->uri) free(req->uri);
+        if (req->bearer_token_copy) free(req->bearer_token_copy);
         if (req->post_fields) {
             memset(req->post_fields, 0, strlen(req->post_fields));
             free(req->post_fields);
@@ -3932,11 +4565,22 @@ keycloak_list_user_attributes_async(struct kc_realm realm, struct kc_client clie
         goto error;
     }
 
+    /* Copy bearer token from global manager (avoids use-after-free if ctx has stale pointer) */
+    if (!kc_token_mgr.token || !kc_token_mgr.token->access_token) {
+        log_module(KC_LOG, LOG_ERROR, "list_user_attrs_async: No valid token available (token refresh in progress?)");
+        goto error;
+    }
+    req->bearer_token_copy = strdup(kc_token_mgr.token->access_token);
+    if (!req->bearer_token_copy) {
+        log_module(KC_LOG, LOG_ERROR, "list_user_attrs_async: Failed to copy bearer token");
+        goto error;
+    }
+
     /* Use unified async API */
     struct curl_opts opts = CURL_OPTS_INIT;
     opts.uri = req->uri;
     opts.method = HTTP_GET;
-    opts.xoauth2_bearer = client.access_token->access_token;
+    opts.xoauth2_bearer = req->bearer_token_copy;
 
     if (curl_perform_async(req, opts) < 0) {
         log_module(KC_LOG, LOG_ERROR, "list_user_attrs_async: curl_perform_async failed");
@@ -3950,6 +4594,7 @@ keycloak_list_user_attributes_async(struct kc_realm realm, struct kc_client clie
 error:
     if (req) {
         if (req->uri) free(req->uri);
+        if (req->bearer_token_copy) free(req->bearer_token_copy);
         if (req->attr_prefix) free(req->attr_prefix);
         free(req);
     }
@@ -4006,11 +4651,22 @@ keycloak_get_user_attribute_async(struct kc_realm realm, struct kc_client client
         goto error;
     }
 
+    /* Copy bearer token from global manager (avoids use-after-free if ctx has stale pointer) */
+    if (!kc_token_mgr.token || !kc_token_mgr.token->access_token) {
+        log_module(KC_LOG, LOG_ERROR, "get_user_attr_async: No valid token available (token refresh in progress?)");
+        goto error;
+    }
+    req->bearer_token_copy = strdup(kc_token_mgr.token->access_token);
+    if (!req->bearer_token_copy) {
+        log_module(KC_LOG, LOG_ERROR, "get_user_attr_async: Failed to copy bearer token");
+        goto error;
+    }
+
     /* Use unified async API */
     struct curl_opts opts = CURL_OPTS_INIT;
     opts.uri = req->uri;
     opts.method = HTTP_GET;
-    opts.xoauth2_bearer = client.access_token->access_token;
+    opts.xoauth2_bearer = req->bearer_token_copy;
 
     if (curl_perform_async(req, opts) < 0) {
         log_module(KC_LOG, LOG_ERROR, "get_user_attr_async: curl_perform_async failed");
@@ -4024,6 +4680,7 @@ keycloak_get_user_attribute_async(struct kc_realm realm, struct kc_client client
 error:
     if (req) {
         if (req->uri) free(req->uri);
+        if (req->bearer_token_copy) free(req->bearer_token_copy);
         if (req->attr_name) free(req->attr_name);
         free(req);
     }
@@ -7012,11 +7669,22 @@ keycloak_get_group_info_async(struct kc_realm realm, struct kc_client client,
         goto error;
     }
 
+    /* Copy bearer token from global manager (avoids use-after-free if ctx has stale pointer) */
+    if (!kc_token_mgr.token || !kc_token_mgr.token->access_token) {
+        log_module(KC_LOG, LOG_ERROR, "group_info_async: No valid token available (token refresh in progress?)");
+        goto error;
+    }
+    req->bearer_token_copy = strdup(kc_token_mgr.token->access_token);
+    if (!req->bearer_token_copy) {
+        log_module(KC_LOG, LOG_ERROR, "group_info_async: Failed to copy bearer token");
+        goto error;
+    }
+
     /* Use unified async API */
     struct curl_opts opts = CURL_OPTS_INIT;
     opts.uri = req->uri;
     opts.method = HTTP_GET;
-    opts.xoauth2_bearer = client.access_token->access_token;
+    opts.xoauth2_bearer = req->bearer_token_copy;
 
     if (curl_perform_async(req, opts) < 0) {
         log_module(KC_LOG, LOG_ERROR, "group_info_async: curl_perform_async failed");
@@ -7029,6 +7697,7 @@ keycloak_get_group_info_async(struct kc_realm realm, struct kc_client client,
 error:
     if (req) {
         if (req->uri) free(req->uri);
+        if (req->bearer_token_copy) free(req->bearer_token_copy);
         if (req->response.response) free(req->response.response);
         free(req);
     }
@@ -7070,11 +7739,22 @@ keycloak_get_group_members_async(struct kc_realm realm, struct kc_client client,
         goto error;
     }
 
+    /* Copy bearer token from global manager (avoids use-after-free if ctx has stale pointer) */
+    if (!kc_token_mgr.token || !kc_token_mgr.token->access_token) {
+        log_module(KC_LOG, LOG_ERROR, "group_members_async: No valid token available (token refresh in progress?)");
+        goto error;
+    }
+    req->bearer_token_copy = strdup(kc_token_mgr.token->access_token);
+    if (!req->bearer_token_copy) {
+        log_module(KC_LOG, LOG_ERROR, "group_members_async: Failed to copy bearer token");
+        goto error;
+    }
+
     /* Use unified async API */
     struct curl_opts opts = CURL_OPTS_INIT;
     opts.uri = req->uri;
     opts.method = HTTP_GET;
-    opts.xoauth2_bearer = client.access_token->access_token;
+    opts.xoauth2_bearer = req->bearer_token_copy;
 
     if (curl_perform_async(req, opts) < 0) {
         log_module(KC_LOG, LOG_ERROR, "group_members_async: curl_perform_async failed");
@@ -7087,6 +7767,7 @@ keycloak_get_group_members_async(struct kc_realm realm, struct kc_client client,
 error:
     if (req) {
         if (req->uri) free(req->uri);
+        if (req->bearer_token_copy) free(req->bearer_token_copy);
         if (req->response.response) free(req->response.response);
         free(req);
     }
@@ -7151,11 +7832,22 @@ keycloak_get_user_async(struct kc_realm realm, struct kc_client client,
         goto error;
     }
 
+    /* Copy bearer token from global manager (avoids use-after-free if ctx has stale pointer) */
+    if (!kc_token_mgr.token || !kc_token_mgr.token->access_token) {
+        log_module(KC_LOG, LOG_ERROR, "get_user_async: No valid token available (token refresh in progress?)");
+        goto error;
+    }
+    req->bearer_token_copy = strdup(kc_token_mgr.token->access_token);
+    if (!req->bearer_token_copy) {
+        log_module(KC_LOG, LOG_ERROR, "get_user_async: Failed to copy bearer token");
+        goto error;
+    }
+
     /* Use unified async API */
     struct curl_opts opts = CURL_OPTS_INIT;
     opts.uri = req->uri;
     opts.method = HTTP_GET;
-    opts.xoauth2_bearer = client.access_token->access_token;
+    opts.xoauth2_bearer = req->bearer_token_copy;
 
     if (curl_perform_async(req, opts) < 0) {
         log_module(KC_LOG, LOG_ERROR, "get_user_async: curl_perform_async failed");
@@ -7168,6 +7860,7 @@ keycloak_get_user_async(struct kc_realm realm, struct kc_client client,
 error:
     if (req) {
         if (req->uri) free(req->uri);
+        if (req->bearer_token_copy) free(req->bearer_token_copy);
         free(req);
     }
     return -1;
@@ -7234,11 +7927,22 @@ keycloak_update_user_representation_async(struct kc_realm realm, struct kc_clien
     }
     req->post_fields = json_body;
 
+    /* Copy bearer token from global manager (avoids use-after-free if ctx has stale pointer) */
+    if (!kc_token_mgr.token || !kc_token_mgr.token->access_token) {
+        log_module(KC_LOG, LOG_ERROR, "update_user_async: No valid token available (token refresh in progress?)");
+        goto error;
+    }
+    req->bearer_token_copy = strdup(kc_token_mgr.token->access_token);
+    if (!req->bearer_token_copy) {
+        log_module(KC_LOG, LOG_ERROR, "update_user_async: Failed to copy bearer token");
+        goto error;
+    }
+
     /* Use unified async API - PUT request */
     struct curl_opts opts = CURL_OPTS_INIT;
     opts.uri = req->uri;
     opts.method = HTTP_PUT;
-    opts.xoauth2_bearer = client.access_token->access_token;
+    opts.xoauth2_bearer = req->bearer_token_copy;
     opts.post_fields = json_body;
     opts.header_list[0] = "Content-Type: application/json";
     opts.header_count = 1;
@@ -7254,6 +7958,7 @@ keycloak_update_user_representation_async(struct kc_realm realm, struct kc_clien
 error:
     if (req) {
         if (req->uri) free(req->uri);
+        if (req->bearer_token_copy) free(req->bearer_token_copy);
         if (req->post_fields) free(req->post_fields);
         free(req);
     }
@@ -7295,11 +8000,22 @@ keycloak_get_group_by_path_async(struct kc_realm realm, struct kc_client client,
         goto error;
     }
 
+    /* Copy bearer token from global manager (avoids use-after-free if ctx has stale pointer) */
+    if (!kc_token_mgr.token || !kc_token_mgr.token->access_token) {
+        log_module(KC_LOG, LOG_ERROR, "get_group_path_async: No valid token available (token refresh in progress?)");
+        goto error;
+    }
+    req->bearer_token_copy = strdup(kc_token_mgr.token->access_token);
+    if (!req->bearer_token_copy) {
+        log_module(KC_LOG, LOG_ERROR, "get_group_path_async: Failed to copy bearer token");
+        goto error;
+    }
+
     /* Use unified async API */
     struct curl_opts opts = CURL_OPTS_INIT;
     opts.uri = req->uri;
     opts.method = HTTP_GET;
-    opts.xoauth2_bearer = client.access_token->access_token;
+    opts.xoauth2_bearer = req->bearer_token_copy;
 
     if (curl_perform_async(req, opts) < 0) {
         log_module(KC_LOG, LOG_ERROR, "get_group_path_async: curl_perform_async failed");
@@ -7312,6 +8028,7 @@ keycloak_get_group_by_path_async(struct kc_realm realm, struct kc_client client,
 error:
     if (req) {
         if (req->uri) free(req->uri);
+        if (req->bearer_token_copy) free(req->bearer_token_copy);
         free(req);
     }
     return -1;
@@ -7361,11 +8078,22 @@ keycloak_get_group_by_name_async(struct kc_realm realm, struct kc_client client,
         goto error;
     }
 
+    /* Copy bearer token from global manager (avoids use-after-free if ctx has stale pointer) */
+    if (!kc_token_mgr.token || !kc_token_mgr.token->access_token) {
+        log_module(KC_LOG, LOG_ERROR, "get_group_name_async: No valid token available (token refresh in progress?)");
+        goto error;
+    }
+    req->bearer_token_copy = strdup(kc_token_mgr.token->access_token);
+    if (!req->bearer_token_copy) {
+        log_module(KC_LOG, LOG_ERROR, "get_group_name_async: Failed to copy bearer token");
+        goto error;
+    }
+
     /* Use unified async API */
     struct curl_opts opts = CURL_OPTS_INIT;
     opts.uri = req->uri;
     opts.method = HTTP_GET;
-    opts.xoauth2_bearer = client.access_token->access_token;
+    opts.xoauth2_bearer = req->bearer_token_copy;
 
     if (curl_perform_async(req, opts) < 0) {
         log_module(KC_LOG, LOG_ERROR, "get_group_name_async: curl_perform_async failed");
@@ -7378,6 +8106,7 @@ keycloak_get_group_by_name_async(struct kc_realm realm, struct kc_client client,
 error:
     if (req) {
         if (req->uri) free(req->uri);
+        if (req->bearer_token_copy) free(req->bearer_token_copy);
         free(req);
     }
     return -1;
@@ -7418,11 +8147,22 @@ keycloak_delete_group_async(struct kc_realm realm, struct kc_client client,
         goto error;
     }
 
+    /* Copy bearer token from global manager (avoids use-after-free if ctx has stale pointer) */
+    if (!kc_token_mgr.token || !kc_token_mgr.token->access_token) {
+        log_module(KC_LOG, LOG_ERROR, "delete_group_async: No valid token available (token refresh in progress?)");
+        goto error;
+    }
+    req->bearer_token_copy = strdup(kc_token_mgr.token->access_token);
+    if (!req->bearer_token_copy) {
+        log_module(KC_LOG, LOG_ERROR, "delete_group_async: Failed to copy bearer token");
+        goto error;
+    }
+
     /* Use unified async API */
     struct curl_opts opts = CURL_OPTS_INIT;
     opts.uri = req->uri;
     opts.method = HTTP_DELETE;
-    opts.xoauth2_bearer = client.access_token->access_token;
+    opts.xoauth2_bearer = req->bearer_token_copy;
 
     if (curl_perform_async(req, opts) < 0) {
         log_module(KC_LOG, LOG_ERROR, "delete_group_async: curl_perform_async failed");
@@ -7435,6 +8175,7 @@ keycloak_delete_group_async(struct kc_realm realm, struct kc_client client,
 error:
     if (req) {
         if (req->uri) free(req->uri);
+        if (req->bearer_token_copy) free(req->bearer_token_copy);
         free(req);
     }
     return -1;
@@ -7475,11 +8216,22 @@ keycloak_delete_user_async(struct kc_realm realm, struct kc_client client,
         goto error;
     }
 
+    /* Copy bearer token from global manager (avoids use-after-free if ctx has stale pointer) */
+    if (!kc_token_mgr.token || !kc_token_mgr.token->access_token) {
+        log_module(KC_LOG, LOG_ERROR, "delete_user_async: No valid token available (token refresh in progress?)");
+        goto error;
+    }
+    req->bearer_token_copy = strdup(kc_token_mgr.token->access_token);
+    if (!req->bearer_token_copy) {
+        log_module(KC_LOG, LOG_ERROR, "delete_user_async: Failed to copy bearer token");
+        goto error;
+    }
+
     /* Use unified async API */
     struct curl_opts opts = CURL_OPTS_INIT;
     opts.uri = req->uri;
     opts.method = HTTP_DELETE;
-    opts.xoauth2_bearer = client.access_token->access_token;
+    opts.xoauth2_bearer = req->bearer_token_copy;
 
     if (curl_perform_async(req, opts) < 0) {
         log_module(KC_LOG, LOG_ERROR, "delete_user_async: curl_perform_async failed");
@@ -7492,6 +8244,7 @@ keycloak_delete_user_async(struct kc_realm realm, struct kc_client client,
 error:
     if (req) {
         if (req->uri) free(req->uri);
+        if (req->bearer_token_copy) free(req->bearer_token_copy);
         free(req);
     }
     return -1;
@@ -7544,11 +8297,22 @@ keycloak_create_subgroup_async(struct kc_realm realm, struct kc_client client,
     }
     req->post_fields = json_body;
 
+    /* Copy bearer token from global manager (avoids use-after-free if ctx has stale pointer) */
+    if (!kc_token_mgr.token || !kc_token_mgr.token->access_token) {
+        log_module(KC_LOG, LOG_ERROR, "create_subgroup_async: No valid token available (token refresh in progress?)");
+        goto error;
+    }
+    req->bearer_token_copy = strdup(kc_token_mgr.token->access_token);
+    if (!req->bearer_token_copy) {
+        log_module(KC_LOG, LOG_ERROR, "create_subgroup_async: Failed to copy bearer token");
+        goto error;
+    }
+
     /* Use unified async API - POST request */
     struct curl_opts opts = CURL_OPTS_INIT;
     opts.uri = req->uri;
     opts.method = HTTP_POST;
-    opts.xoauth2_bearer = client.access_token->access_token;
+    opts.xoauth2_bearer = req->bearer_token_copy;
     opts.post_fields = json_body;
     opts.header_list[0] = "Content-Type: application/json";
     opts.header_count = 1;
@@ -7564,6 +8328,7 @@ keycloak_create_subgroup_async(struct kc_realm realm, struct kc_client client,
 error:
     if (req) {
         if (req->uri) free(req->uri);
+        if (req->bearer_token_copy) free(req->bearer_token_copy);
         if (req->post_fields) free(req->post_fields);
         free(req);
     }
@@ -7625,11 +8390,22 @@ keycloak_set_group_attribute_async(struct kc_realm realm, struct kc_client clien
     }
     req->post_fields = json_body;
 
+    /* Copy bearer token from global manager (avoids use-after-free if ctx has stale pointer) */
+    if (!kc_token_mgr.token || !kc_token_mgr.token->access_token) {
+        log_module(KC_LOG, LOG_ERROR, "set_group_attr_async: No valid token available (token refresh in progress?)");
+        goto error;
+    }
+    req->bearer_token_copy = strdup(kc_token_mgr.token->access_token);
+    if (!req->bearer_token_copy) {
+        log_module(KC_LOG, LOG_ERROR, "set_group_attr_async: Failed to copy bearer token");
+        goto error;
+    }
+
     /* Use unified async API - PUT request */
     struct curl_opts opts = CURL_OPTS_INIT;
     opts.uri = req->uri;
     opts.method = HTTP_PUT;
-    opts.xoauth2_bearer = client.access_token->access_token;
+    opts.xoauth2_bearer = req->bearer_token_copy;
     opts.post_fields = json_body;
     opts.header_list[0] = "Content-Type: application/json";
     opts.header_count = 1;
@@ -7646,6 +8422,7 @@ keycloak_set_group_attribute_async(struct kc_realm realm, struct kc_client clien
 error:
     if (req) {
         if (req->uri) free(req->uri);
+        if (req->bearer_token_copy) free(req->bearer_token_copy);
         if (req->post_fields) free(req->post_fields);
         free(req);
     }
@@ -7657,18 +8434,8 @@ error:
  * Token Manager Implementation (Phase 5 Integration)
  * =============================================================================
  * Centralized token management for all Keycloak operations.
+ * Note: kc_token_mgr struct is defined earlier in the file for use by async functions.
  */
-
-/* Token manager state */
-static struct {
-    int initialized;                       /* 1 if initialized */
-    struct kc_realm realm;                 /* Cached realm config */
-    struct kc_client client;               /* Cached client config */
-    struct access_token *token;            /* Cached admin token */
-    time_t token_expires;                  /* When token expires */
-    int refresh_pending;                   /* 1 if refresh in progress */
-    int available;                         /* Keycloak availability flag */
-} kc_token_mgr = {0};
 
 /* Token waiter queue for async operations */
 struct kc_token_waiter {

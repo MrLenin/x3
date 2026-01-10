@@ -143,9 +143,19 @@ ioset_select_loop(struct timeval *timeout)
     }
 
     /* Call back anybody that has connect or read activity and wants to know. */
+    ioset_in_event_loop = 1;
     for (nn=0; nn<fds_size; nn++) {
-        ioset_events(fds[nn], FD_ISSET(nn, &read_fds) | FD_ISSET(nn, &except_fds), FD_ISSET(nn, &write_fds));
+        struct io_fd *fd = fds[nn];
+        /* Skip NULL fds and fds that were closed during this iteration */
+        if (!fd || fd->state == IO_CLOSED)
+            continue;
+        ioset_events(fd, FD_ISSET(nn, &read_fds) | FD_ISSET(nn, &except_fds), FD_ISSET(nn, &write_fds));
     }
+    ioset_in_event_loop = 0;
+
+    /* Free any io_fd structures that were closed during event processing */
+    ioset_process_deferred_frees();
+
     return 0;
 }
 

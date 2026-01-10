@@ -1106,9 +1106,6 @@ valid_user_sslfp(struct userNode *user, struct handle_info *hi)
     return 0;
 }
 
-/* TODO: Remove excessive debug logging from this function.
- * Some log statements expose passwords in plain text (security risk).
- * Keep only the ERROR level log for NULL password check. */
 static int
 is_secure_password(const char *handle, const char *pass, struct userNode *user)
 {
@@ -1116,28 +1113,21 @@ is_secure_password(const char *handle, const char *pass, struct userNode *user)
     unsigned int cnt_digits = 0, cnt_upper = 0, cnt_lower = 0;
     int p;
 
-    log_module(NS_LOG, LOG_DEBUG, "is_secure_password: ENTER handle=%s pass=%p user=%p", handle, (void*)pass, (void*)user);
     if (!pass) {
         log_module(NS_LOG, LOG_ERROR, "is_secure_password: pass is NULL!");
         return 0;
     }
-    log_module(NS_LOG, LOG_DEBUG, "is_secure_password: pass='%s'", pass);
     len = strlen(pass);
-    log_module(NS_LOG, LOG_DEBUG, "is_secure_password: len=%u min=%lu", len, nickserv_conf.password_min_length);
     if (len < nickserv_conf.password_min_length) {
-        log_module(NS_LOG, LOG_DEBUG, "is_secure_password: too short");
         if (user)
             send_message(user, nickserv, "NSMSG_PASSWORD_SHORT", nickserv_conf.password_min_length);
         return 0;
     }
-    log_module(NS_LOG, LOG_DEBUG, "is_secure_password: checking if matches handle");
     if (!irccasecmp(pass, handle)) {
-        log_module(NS_LOG, LOG_DEBUG, "is_secure_password: matches handle");
         if (user)
             send_message(user, nickserv, "NSMSG_PASSWORD_ACCOUNT");
         return 0;
     }
-    log_module(NS_LOG, LOG_DEBUG, "is_secure_password: checking weak_password_dict=%p", (void*)nickserv_conf.weak_password_dict);
     if (nickserv_conf.weak_password_dict) {
         char *sanity = dict_sanity_check(nickserv_conf.weak_password_dict);
         if (sanity) {
@@ -1145,17 +1135,7 @@ is_secure_password(const char *handle, const char *pass, struct userNode *user)
             free(sanity);
             p = 0;
         } else {
-            log_module(NS_LOG, LOG_DEBUG, "is_secure_password: dict sanity check passed, count=%d root=%p",
-                       dict_size(nickserv_conf.weak_password_dict),
-                       (void*)(nickserv_conf.weak_password_dict->root));
-            if (nickserv_conf.weak_password_dict->root) {
-                log_module(NS_LOG, LOG_DEBUG, "is_secure_password: root->key=%p '%s'",
-                           (void*)nickserv_conf.weak_password_dict->root->key,
-                           nickserv_conf.weak_password_dict->root->key ? nickserv_conf.weak_password_dict->root->key : "(null)");
-            }
-            log_module(NS_LOG, LOG_DEBUG, "is_secure_password: calling dict_find with pass='%s'", pass);
             dict_find(nickserv_conf.weak_password_dict, pass, &p);
-            log_module(NS_LOG, LOG_DEBUG, "is_secure_password: dict_find returned p=%d", p);
             if (p) {
                 if (user)
                     send_message(user, nickserv, "NSMSG_PASSWORD_DICTIONARY");
@@ -1163,7 +1143,6 @@ is_secure_password(const char *handle, const char *pass, struct userNode *user)
             }
         }
     } else {
-        log_module(NS_LOG, LOG_DEBUG, "is_secure_password: skipping dict check (dict is NULL)");
         p = 0;
     }
     for (i=0; i<len; i++) {
