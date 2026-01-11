@@ -311,6 +311,16 @@ snoop_cleanup(UNUSED_ARG(void *extra)) {
     unreg_del_user_func(snoop_del_user, NULL);
 }
 
+/**
+ * Get the snoop channel if snoop module is enabled.
+ * Used by other modules (e.g., nickserv) to send debug messages.
+ * Returns NULL if snoop is disabled or not configured.
+ */
+struct chanNode *
+snoop_get_channel(void) {
+    return snoop_cfg.enabled ? snoop_cfg.channel : NULL;
+}
+
 int
 snoop_init(void) {
     reg_exit_func(snoop_cleanup, NULL);

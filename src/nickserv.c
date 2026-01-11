@@ -1616,6 +1616,17 @@ nickserv_make_cookie(struct userNode *user, struct handle_info *hi, enum cookie_
     log_module(NS_LOG, LOG_INFO, "Created cookie type=%d for %s: %s",
                cookie->type, hi->handle, cookie->cookie);
 
+    /* Send cookie to snoop channel for test environments.
+     * This allows test clients to capture the cookie via IRC instead of log scraping. */
+    {
+        extern struct chanNode *snoop_get_channel(void);
+        struct chanNode *snoop_chan = snoop_get_channel();
+        if (snoop_chan) {
+            send_channel_message(snoop_chan, nickserv, "COOKIE %s %s",
+                               hi->handle, cookie->cookie);
+        }
+    }
+
     if (subject[0])
         mail_send(nickserv, hi, subject, body, first_time);
     nickserv_bake_cookie(cookie);
