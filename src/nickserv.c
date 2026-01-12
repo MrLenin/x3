@@ -7243,7 +7243,7 @@ static void kc_scram_sync_ctx_free(struct kc_scram_sync_ctx *ctx) {
 /* Forward declarations */
 static int kc_scram_sync_attr_cb(void *session, int result);
 static int kc_scram_sync_user_cb(void *session, int result, struct kc_user *user);
-static int kc_scram_sync_token_cb(void *session, int result, struct access_token *token);
+static void kc_scram_sync_token_cb(void *session, int result, struct access_token *token);
 
 /* Set the next SCRAM attribute */
 static void kc_scram_sync_next_attr(struct kc_scram_sync_ctx *ctx) {
@@ -7325,7 +7325,7 @@ static int kc_scram_sync_user_cb(void *session, int result, struct kc_user *user
 }
 
 /* Callback for token acquisition */
-static int kc_scram_sync_token_cb(void *session, int result, struct access_token *token) {
+static void kc_scram_sync_token_cb(void *session, int result, struct access_token *token) {
     struct kc_scram_sync_ctx *ctx = session;
     int rc;
     (void)token;
@@ -7334,18 +7334,17 @@ static int kc_scram_sync_token_cb(void *session, int result, struct access_token
         log_module(NS_LOG, LOG_DEBUG, "kc_scram_sync[%s]: Token acquisition failed: %d",
                    ctx->handle, result);
         kc_scram_sync_ctx_free(ctx);
-        return 0;
+        return;
     }
 
     /* Look up user by username */
-    rc = keycloak_get_user_by_username_async(keycloak_get_realm(), keycloak_get_authed_client(),
-                                             ctx->handle, ctx, kc_scram_sync_user_cb);
+    rc = keycloak_get_user_async(keycloak_get_realm(), keycloak_get_authed_client(),
+                                 ctx->handle, ctx, kc_scram_sync_user_cb);
     if (rc < 0) {
         log_module(NS_LOG, LOG_DEBUG, "kc_scram_sync[%s]: Failed to start user lookup",
                    ctx->handle);
         kc_scram_sync_ctx_free(ctx);
     }
-    return 0;
 }
 
 /**
@@ -7418,425 +7417,6 @@ static void kc_sync_scram(const char *handle) {
 }
 
 #endif /* WITH_LMDB && WITH_SSL */
-
-/* =============================================================================
- * SCRAM Credential Fetch from Keycloak (Async)
- *
- * When SASL SCRAM auth fails LMDB lookup, this async chain fetches the
- * x3_scram_* user attributes from Keycloak and resumes SCRAM auth.
- *
- * Chain: token_cb → user_cb → attrs_cb → resume/fail
- * =============================================================================
- */
-#if defined(WITH_LMDB) && defined(WITH_SSL) && defined(WITH_KEYCLOAK)
-
-/**
- * Free SCRAM fetch context.
- */
-static void
-scram_fetch_ctx_free(struct scram_fetch_ctx *ctx)
-{
-    if (!ctx) return;
-    if (ctx->user_id) free(ctx->user_id);
-    free(ctx);
-}
-
-/**
- * Validate SCRAM fetch context and return session if still valid.
- */
-static struct SASLSession *
-scram_fetch_validate(struct scram_fetch_ctx *ctx)
-{
-    struct SASLSession *session;
-    int found = 0;
-
-    if (!ctx || !sasl_session_dict) return NULL;
-
-    session = dict_find(sasl_session_dict, ctx->uid, &found);
-    if (!found || !session) {
-        log_module(NS_LOG, LOG_DEBUG, "SCRAM fetch: Session %s no longer exists", ctx->uid);
-        return NULL;
-    }
-
-    if (session->sequence != ctx->sequence) {
-        log_module(NS_LOG, LOG_DEBUG, "SCRAM fetch: Sequence mismatch for %s", ctx->uid);
-        return NULL;
-    }
-
-    if (session->state != SASL_STATE_SCRAM_FETCH) {
-        log_module(NS_LOG, LOG_DEBUG, "SCRAM fetch: Session %s not in SCRAM_FETCH state (%d)",
-                   ctx->uid, session->state);
-        return NULL;
-    }
-
-    return session;
-}
-
-/**
- * Fail SCRAM auth - send failure response and clean up.
- */
-static void
-scram_fetch_fail(struct scram_fetch_ctx *ctx, const char *reason)
-{
-    struct SASLSession *session;
-
-    log_module(NS_LOG, LOG_DEBUG, "SCRAM fetch failed for %s: %s", ctx->username, reason);
-
-    session = scram_fetch_validate(ctx);
-    if (session) {
-        irc_sasl(session->source, session->uid, "D", "F");
-        sasl_delete_session(session);
-    }
-    scram_fetch_ctx_free(ctx);
-}
-
-/**
- * Resume SCRAM auth after successfully fetching credentials.
- * Generates server-first message and sends to client.
- */
-static void
-scram_fetch_resume(struct scram_fetch_ctx *ctx, struct scram_credential *cred)
-{
-    struct SASLSession *session;
-    unsigned char server_nonce_bytes[16];
-    char response[512];
-
-    session = scram_fetch_validate(ctx);
-    if (!session) {
-        log_module(NS_LOG, LOG_DEBUG, "SCRAM fetch resume: Session %s gone", ctx->uid);
-        scram_fetch_ctx_free(ctx);
-        return;
-    }
-
-    /* Allocate SCRAM session state */
-    session->scram = calloc(1, sizeof(struct scram_session));
-    if (!session->scram) {
-        log_module(NS_LOG, LOG_ERROR, "SCRAM fetch resume: Out of memory");
-        irc_sasl(session->source, session->uid, "D", "F");
-        sasl_delete_session(session);
-        scram_fetch_ctx_free(ctx);
-        return;
-    }
-
-    /* Store credential and hash type */
-    memcpy(&session->scram->cred, cred, sizeof(*cred));
-    session->scram->hash_type = ctx->hash_type;
-    strncpy(session->scram->client_nonce, ctx->client_nonce, sizeof(session->scram->client_nonce) - 1);
-    session->scram->iteration = cred->iteration;
-
-    /* Generate server nonce */
-    if (RAND_bytes(server_nonce_bytes, sizeof(server_nonce_bytes)) != 1) {
-        log_module(NS_LOG, LOG_ERROR, "SCRAM fetch resume: Failed to generate server nonce");
-        free(session->scram);
-        session->scram = NULL;
-        irc_sasl(session->source, session->uid, "D", "F");
-        sasl_delete_session(session);
-        scram_fetch_ctx_free(ctx);
-        return;
-    }
-
-    {
-        char *server_nonce_ptr;
-        base64_encode_alloc((char *)server_nonce_bytes, sizeof(server_nonce_bytes), &server_nonce_ptr);
-        strncpy(session->scram->server_nonce, server_nonce_ptr, sizeof(session->scram->server_nonce) - 1);
-        session->scram->server_nonce[sizeof(session->scram->server_nonce) - 1] = '\0';
-        free(server_nonce_ptr);
-    }
-
-    /* Combined nonce */
-    snprintf(session->scram->combined_nonce, sizeof(session->scram->combined_nonce),
-             "%s%s", ctx->client_nonce, session->scram->server_nonce);
-
-    /* Base64 encode salt */
-    {
-        char *salt_ptr;
-        base64_encode_alloc((char *)cred->salt, SCRAM_SALT_LEN, &salt_ptr);
-        strncpy(session->scram->salt_b64, salt_ptr, sizeof(session->scram->salt_b64) - 1);
-        session->scram->salt_b64[sizeof(session->scram->salt_b64) - 1] = '\0';
-        free(salt_ptr);
-    }
-
-    /* Build server-first message */
-    snprintf(response, sizeof(response), "r=%s,s=%s,i=%u",
-             session->scram->combined_nonce,
-             session->scram->salt_b64,
-             session->scram->iteration);
-
-    /* Build auth message (client-first-bare + "," + server-first) */
-    session->scram->auth_message_len = snprintf(session->scram->auth_message,
-        sizeof(session->scram->auth_message),
-        "n=%s,r=%s,%s",
-        ctx->username, ctx->client_nonce, response);
-
-    log_module(NS_LOG, LOG_DEBUG, "SCRAM fetch resume: Sending server-first for %s: %s",
-               ctx->username, response);
-
-    /* Send base64-encoded server-first */
-    {
-        char *server_first_b64;
-        base64_encode_alloc(response, strlen(response), &server_first_b64);
-        irc_sasl(session->source, session->uid, "C", server_first_b64);
-        free(server_first_b64);
-    }
-
-    session->state = SASL_STATE_SCRAM_CHALLENGE;
-    scram_fetch_ctx_free(ctx);
-}
-
-/**
- * Callback stage 3: Keycloak attributes fetched.
- * Parse x3_scram_* attributes and resume SCRAM auth.
- */
-static int
-scram_fetch_attrs_cb(void *session, int result, struct kc_metadata_entry *entries)
-{
-    struct scram_fetch_ctx *ctx = (struct scram_fetch_ctx *)session;
-    struct kc_metadata_entry *entry;
-    const char *salt_b64 = NULL;
-    const char *iterations_str = NULL;
-    const char *stored_key_b64 = NULL;
-    const char *server_key_b64 = NULL;
-    struct scram_credential cred;
-    size_t hash_len;
-
-    if (result != KC_SUCCESS || !entries) {
-        log_module(NS_LOG, LOG_DEBUG, "SCRAM fetch: No x3_scram_ attributes for %s (%d)",
-                   ctx->username, result);
-        if (entries) keycloak_free_metadata_entries(entries);
-        scram_fetch_fail(ctx, "No SCRAM attributes in Keycloak");
-        return 1;
-    }
-
-    /* Parse x3_scram_* attributes */
-    for (entry = entries; entry; entry = entry->next) {
-        if (strcmp(entry->key, "x3_scram_salt") == 0) {
-            salt_b64 = entry->value;
-        } else if (strcmp(entry->key, "x3_scram_iterations") == 0) {
-            iterations_str = entry->value;
-        } else if (strcmp(entry->key, "x3_scram_stored_key") == 0) {
-            stored_key_b64 = entry->value;
-        } else if (strcmp(entry->key, "x3_scram_server_key") == 0) {
-            server_key_b64 = entry->value;
-        }
-    }
-
-    /* Verify all required attributes present */
-    if (!salt_b64 || !iterations_str || !stored_key_b64 || !server_key_b64) {
-        log_module(NS_LOG, LOG_DEBUG, "SCRAM fetch: Incomplete attributes for %s (salt=%s, iter=%s, stored=%s, server=%s)",
-                   ctx->username,
-                   salt_b64 ? "present" : "missing",
-                   iterations_str ? "present" : "missing",
-                   stored_key_b64 ? "present" : "missing",
-                   server_key_b64 ? "present" : "missing");
-        keycloak_free_metadata_entries(entries);
-        scram_fetch_fail(ctx, "Incomplete SCRAM attributes");
-        return 1;
-    }
-
-    /* Determine hash length for requested type */
-    switch (ctx->hash_type) {
-    case SCRAM_HASH_SHA1:
-        hash_len = SCRAM_SHA1_LEN;
-        break;
-    case SCRAM_HASH_SHA256:
-        hash_len = SCRAM_SHA256_LEN;
-        break;
-    case SCRAM_HASH_SHA512:
-        hash_len = SCRAM_SHA512_LEN;
-        break;
-    default:
-        keycloak_free_metadata_entries(entries);
-        scram_fetch_fail(ctx, "Unknown hash type");
-        return 1;
-    }
-
-    /* Parse into credential struct */
-    memset(&cred, 0, sizeof(cred));
-    cred.hash_type = ctx->hash_type;
-    cred.iteration = (unsigned int)strtoul(iterations_str, NULL, 10);
-    cred.hash_len = hash_len;
-
-    /* Decode base64 values */
-    {
-        char *decoded;
-        size_t decoded_len;
-
-        /* Salt */
-        if (!base64_decode_alloc(salt_b64, strlen(salt_b64), &decoded, &decoded_len) ||
-            decoded_len != SCRAM_SALT_LEN) {
-            log_module(NS_LOG, LOG_WARNING, "SCRAM fetch: Invalid salt for %s", ctx->username);
-            if (decoded) free(decoded);
-            keycloak_free_metadata_entries(entries);
-            scram_fetch_fail(ctx, "Invalid salt");
-            return 1;
-        }
-        memcpy(cred.salt, decoded, SCRAM_SALT_LEN);
-        free(decoded);
-
-        /* StoredKey */
-        if (!base64_decode_alloc(stored_key_b64, strlen(stored_key_b64), &decoded, &decoded_len) ||
-            decoded_len != hash_len) {
-            log_module(NS_LOG, LOG_WARNING, "SCRAM fetch: Invalid stored_key for %s (len=%zu, expected=%zu)",
-                       ctx->username, decoded_len, hash_len);
-            if (decoded) free(decoded);
-            keycloak_free_metadata_entries(entries);
-            scram_fetch_fail(ctx, "Invalid stored_key");
-            return 1;
-        }
-        memcpy(cred.stored_key, decoded, hash_len);
-        free(decoded);
-
-        /* ServerKey */
-        if (!base64_decode_alloc(server_key_b64, strlen(server_key_b64), &decoded, &decoded_len) ||
-            decoded_len != hash_len) {
-            log_module(NS_LOG, LOG_WARNING, "SCRAM fetch: Invalid server_key for %s", ctx->username);
-            if (decoded) free(decoded);
-            keycloak_free_metadata_entries(entries);
-            scram_fetch_fail(ctx, "Invalid server_key");
-            return 1;
-        }
-        memcpy(cred.server_key, decoded, hash_len);
-        free(decoded);
-    }
-
-    keycloak_free_metadata_entries(entries);
-
-    log_module(NS_LOG, LOG_INFO, "SCRAM fetch: Retrieved credentials from Keycloak for %s", ctx->username);
-
-    /* Store in LMDB cache for future use */
-    if (x3_lmdb_scram_acct_set(ctx->username, salt_b64, cred.iteration,
-                                stored_key_b64, server_key_b64,
-                                now, 0) == LMDB_SUCCESS) {
-        log_module(NS_LOG, LOG_DEBUG, "SCRAM fetch: Cached credentials in LMDB for %s", ctx->username);
-    }
-
-    /* Resume SCRAM auth */
-    scram_fetch_resume(ctx, &cred);
-    return 0;
-}
-
-/**
- * Callback stage 2: Keycloak user lookup complete.
- * Start fetching x3_scram_* attributes.
- */
-static int
-scram_fetch_user_cb(void *session, int result, struct kc_user *user)
-{
-    struct scram_fetch_ctx *ctx = (struct scram_fetch_ctx *)session;
-
-    if (result != KC_SUCCESS || !user || !user->id) {
-        log_module(NS_LOG, LOG_DEBUG, "SCRAM fetch: User %s not found in Keycloak (%d)",
-                   ctx->username, result);
-        if (user) keycloak_user_free_fields(user);
-        scram_fetch_fail(ctx, "User not found in Keycloak");
-        return 1;
-    }
-
-    /* Store user ID for attributes fetch */
-    ctx->user_id = strdup(user->id);
-    keycloak_user_free_fields(user);
-
-    if (!ctx->user_id) {
-        scram_fetch_fail(ctx, "Out of memory");
-        return 1;
-    }
-
-    log_module(NS_LOG, LOG_DEBUG, "SCRAM fetch: Got user ID for %s, fetching attributes", ctx->username);
-
-    /* Fetch x3_scram_* attributes */
-    if (keycloak_list_user_attributes_async(keycloak_get_realm(), keycloak_get_authed_client(),
-                                             ctx->user_id, "x3_scram_", ctx,
-                                             scram_fetch_attrs_cb) < 0) {
-        log_module(NS_LOG, LOG_WARNING, "SCRAM fetch: Failed to start attribute fetch for %s", ctx->username);
-        scram_fetch_fail(ctx, "Failed to start attribute fetch");
-        return 1;
-    }
-
-    return 0;  /* Continue - waiting for attrs callback */
-}
-
-/**
- * Callback stage 1: Token ready.
- * Start Keycloak user lookup.
- */
-static void
-scram_fetch_token_cb(void *context, int result, struct access_token *token)
-{
-    struct scram_fetch_ctx *ctx = (struct scram_fetch_ctx *)context;
-    (void)token;  /* We don't need the token directly */
-
-    if (result != KC_SUCCESS) {
-        log_module(NS_LOG, LOG_DEBUG, "SCRAM fetch: Token acquisition failed (%d)", result);
-        scram_fetch_fail(ctx, "Token acquisition failed");
-        return;
-    }
-
-    /* Validate session still exists */
-    if (!scram_fetch_validate(ctx)) {
-        log_module(NS_LOG, LOG_DEBUG, "SCRAM fetch: Session gone during token wait");
-        scram_fetch_ctx_free(ctx);
-        return;
-    }
-
-    log_module(NS_LOG, LOG_DEBUG, "SCRAM fetch: Token ready, looking up user %s", ctx->username);
-
-    /* Start user lookup */
-    if (keycloak_get_user_async(keycloak_get_realm(), keycloak_get_authed_client(),
-                                 ctx->username, ctx, scram_fetch_user_cb) < 0) {
-        log_module(NS_LOG, LOG_WARNING, "SCRAM fetch: Failed to start user lookup for %s", ctx->username);
-        scram_fetch_fail(ctx, "Failed to start user lookup");
-        return;
-    }
-}
-
-/**
- * Start async SCRAM credential fetch from Keycloak.
- *
- * @param session SASL session
- * @param username Account name to look up
- * @param client_nonce Client nonce from client-first message
- * @param hash_type Requested SCRAM hash type
- * @return 0 on success (async started), -1 on error
- */
-static int
-scram_fetch_start(struct SASLSession *session, const char *username,
-                  const char *client_nonce, enum scram_hash_type hash_type)
-{
-    struct scram_fetch_ctx *ctx;
-
-    if (!session || !username || !client_nonce) {
-        return -1;
-    }
-
-    ctx = calloc(1, sizeof(*ctx));
-    if (!ctx) {
-        log_module(NS_LOG, LOG_ERROR, "SCRAM fetch: Out of memory");
-        return -1;
-    }
-
-    ctx->session = session;
-    ctx->sequence = session->sequence;
-    safestrncpy(ctx->uid, session->uid, sizeof(ctx->uid));
-    safestrncpy(ctx->username, username, sizeof(ctx->username));
-    safestrncpy(ctx->client_nonce, client_nonce, sizeof(ctx->client_nonce));
-    ctx->hash_type = hash_type;
-
-    /* Mark session as fetching */
-    session->state = SASL_STATE_SCRAM_FETCH;
-
-    /* Start token acquisition (or use cached token) */
-    if (keycloak_ensure_token_async(scram_fetch_token_cb, ctx) < 0) {
-        log_module(NS_LOG, LOG_DEBUG, "SCRAM fetch: Failed to start token acquisition");
-        session->state = SASL_STATE_MECH_SELECTED;  /* Restore state */
-        free(ctx);
-        return -1;
-    }
-
-    log_module(NS_LOG, LOG_DEBUG, "SCRAM fetch: Started async credential fetch for %s", username);
-    return 0;
-}
-
-#endif /* WITH_LMDB && WITH_SSL && WITH_KEYCLOAK */
 
 /* Context for async delete account */
 struct kc_delete_account_ctx {
@@ -11794,6 +11374,413 @@ static int scram_fetch_attrs_cb(void *session, int result, struct kc_metadata_en
 static void scram_fetch_resume(struct scram_fetch_ctx *ctx, struct scram_credential *cred);
 static void scram_fetch_fail(struct scram_fetch_ctx *ctx, const char *reason);
 static void scram_fetch_ctx_free(struct scram_fetch_ctx *ctx);
+static struct SASLSession *scram_fetch_validate(struct scram_fetch_ctx *ctx);
+
+/**
+ * Free SCRAM fetch context.
+ */
+static void
+scram_fetch_ctx_free(struct scram_fetch_ctx *ctx)
+{
+    if (!ctx) return;
+    if (ctx->user_id) free(ctx->user_id);
+    free(ctx);
+}
+
+/**
+ * Validate SCRAM fetch context and return session if still valid.
+ */
+static struct SASLSession *
+scram_fetch_validate(struct scram_fetch_ctx *ctx)
+{
+    struct SASLSession *session;
+    int found = 0;
+
+    if (!ctx || !sasl_session_dict) return NULL;
+
+    session = dict_find(sasl_session_dict, ctx->uid, &found);
+    if (!found || !session) {
+        log_module(NS_LOG, LOG_DEBUG, "SCRAM fetch: Session %s no longer exists", ctx->uid);
+        return NULL;
+    }
+
+    if (session->sequence != ctx->sequence) {
+        log_module(NS_LOG, LOG_DEBUG, "SCRAM fetch: Sequence mismatch for %s", ctx->uid);
+        return NULL;
+    }
+
+    if (session->state != SASL_STATE_SCRAM_FETCH) {
+        log_module(NS_LOG, LOG_DEBUG, "SCRAM fetch: Session %s not in SCRAM_FETCH state (%d)",
+                   ctx->uid, session->state);
+        return NULL;
+    }
+
+    return session;
+}
+
+/**
+ * Fail SCRAM auth - send failure response and clean up.
+ */
+static void
+scram_fetch_fail(struct scram_fetch_ctx *ctx, const char *reason)
+{
+    struct SASLSession *session;
+
+    log_module(NS_LOG, LOG_DEBUG, "SCRAM fetch failed for %s: %s", ctx->username, reason);
+
+    session = scram_fetch_validate(ctx);
+    if (session) {
+        irc_sasl(session->source, session->uid, "D", "F");
+        sasl_delete_session(session);
+    }
+    scram_fetch_ctx_free(ctx);
+}
+
+/**
+ * Resume SCRAM auth after successfully fetching credentials.
+ * Generates server-first message and sends to client.
+ */
+static void
+scram_fetch_resume(struct scram_fetch_ctx *ctx, struct scram_credential *cred)
+{
+    struct SASLSession *session;
+    unsigned char server_nonce_bytes[16];
+    char response[512];
+
+    session = scram_fetch_validate(ctx);
+    if (!session) {
+        log_module(NS_LOG, LOG_DEBUG, "SCRAM fetch resume: Session %s gone", ctx->uid);
+        scram_fetch_ctx_free(ctx);
+        return;
+    }
+
+    /* Allocate SCRAM session state */
+    session->scram = calloc(1, sizeof(struct scram_session));
+    if (!session->scram) {
+        log_module(NS_LOG, LOG_ERROR, "SCRAM fetch resume: Out of memory");
+        irc_sasl(session->source, session->uid, "D", "F");
+        sasl_delete_session(session);
+        scram_fetch_ctx_free(ctx);
+        return;
+    }
+
+    /* Store credential and hash type */
+    memcpy(&session->scram->cred, cred, sizeof(*cred));
+    session->scram->hash_type = ctx->hash_type;
+    strncpy(session->scram->client_nonce, ctx->client_nonce, sizeof(session->scram->client_nonce) - 1);
+    session->scram->iteration = cred->iteration;
+
+    /* Generate server nonce */
+    if (RAND_bytes(server_nonce_bytes, sizeof(server_nonce_bytes)) != 1) {
+        log_module(NS_LOG, LOG_ERROR, "SCRAM fetch resume: Failed to generate server nonce");
+        free(session->scram);
+        session->scram = NULL;
+        irc_sasl(session->source, session->uid, "D", "F");
+        sasl_delete_session(session);
+        scram_fetch_ctx_free(ctx);
+        return;
+    }
+
+    {
+        char *server_nonce_ptr;
+        base64_encode_alloc((char *)server_nonce_bytes, sizeof(server_nonce_bytes), &server_nonce_ptr);
+        strncpy(session->scram->server_nonce, server_nonce_ptr, sizeof(session->scram->server_nonce) - 1);
+        session->scram->server_nonce[sizeof(session->scram->server_nonce) - 1] = '\0';
+        free(server_nonce_ptr);
+    }
+
+    /* Combined nonce */
+    snprintf(session->scram->combined_nonce, sizeof(session->scram->combined_nonce),
+             "%s%s", ctx->client_nonce, session->scram->server_nonce);
+
+    /* Base64 encode salt */
+    {
+        char *salt_ptr;
+        base64_encode_alloc((char *)cred->salt, SCRAM_SALT_LEN, &salt_ptr);
+        strncpy(session->scram->salt_b64, salt_ptr, sizeof(session->scram->salt_b64) - 1);
+        session->scram->salt_b64[sizeof(session->scram->salt_b64) - 1] = '\0';
+        free(salt_ptr);
+    }
+
+    /* Build server-first message */
+    snprintf(response, sizeof(response), "r=%s,s=%s,i=%u",
+             session->scram->combined_nonce,
+             session->scram->salt_b64,
+             session->scram->iteration);
+
+    /* Build auth message (client-first-bare + "," + server-first) */
+    session->scram->auth_message_len = snprintf(session->scram->auth_message,
+        sizeof(session->scram->auth_message),
+        "n=%s,r=%s,%s",
+        ctx->username, ctx->client_nonce, response);
+
+    log_module(NS_LOG, LOG_DEBUG, "SCRAM fetch resume: Sending server-first for %s: %s",
+               ctx->username, response);
+
+    /* Send base64-encoded server-first */
+    {
+        char *server_first_b64;
+        base64_encode_alloc(response, strlen(response), &server_first_b64);
+        irc_sasl(session->source, session->uid, "C", server_first_b64);
+        free(server_first_b64);
+    }
+
+    session->state = SASL_STATE_SCRAM_CHALLENGE;
+    scram_fetch_ctx_free(ctx);
+}
+
+/**
+ * Callback stage 3: Keycloak attributes fetched.
+ * Parse x3_scram_* attributes and resume SCRAM auth.
+ */
+static int
+scram_fetch_attrs_cb(void *session, int result, struct kc_metadata_entry *entries)
+{
+    struct scram_fetch_ctx *ctx = (struct scram_fetch_ctx *)session;
+    struct kc_metadata_entry *entry;
+    const char *salt_b64 = NULL;
+    const char *iterations_str = NULL;
+    const char *stored_key_b64 = NULL;
+    const char *server_key_b64 = NULL;
+    struct scram_credential cred;
+    size_t hash_len;
+
+    if (result != KC_SUCCESS || !entries) {
+        log_module(NS_LOG, LOG_DEBUG, "SCRAM fetch: No x3_scram_ attributes for %s (%d)",
+                   ctx->username, result);
+        if (entries) keycloak_free_metadata_entries(entries);
+        scram_fetch_fail(ctx, "No SCRAM attributes in Keycloak");
+        return 1;
+    }
+
+    /* Parse x3_scram_* attributes */
+    for (entry = entries; entry; entry = entry->next) {
+        if (strcmp(entry->key, "x3_scram_salt") == 0) {
+            salt_b64 = entry->value;
+        } else if (strcmp(entry->key, "x3_scram_iterations") == 0) {
+            iterations_str = entry->value;
+        } else if (strcmp(entry->key, "x3_scram_stored_key") == 0) {
+            stored_key_b64 = entry->value;
+        } else if (strcmp(entry->key, "x3_scram_server_key") == 0) {
+            server_key_b64 = entry->value;
+        }
+    }
+
+    /* Verify all required attributes present */
+    if (!salt_b64 || !iterations_str || !stored_key_b64 || !server_key_b64) {
+        log_module(NS_LOG, LOG_DEBUG, "SCRAM fetch: Incomplete attributes for %s (salt=%s, iter=%s, stored=%s, server=%s)",
+                   ctx->username,
+                   salt_b64 ? "present" : "missing",
+                   iterations_str ? "present" : "missing",
+                   stored_key_b64 ? "present" : "missing",
+                   server_key_b64 ? "present" : "missing");
+        keycloak_free_metadata_entries(entries);
+        scram_fetch_fail(ctx, "Incomplete SCRAM attributes");
+        return 1;
+    }
+
+    /* Determine hash length for requested type */
+    switch (ctx->hash_type) {
+    case SCRAM_HASH_SHA1:
+        hash_len = SCRAM_SHA1_LEN;
+        break;
+    case SCRAM_HASH_SHA256:
+        hash_len = SCRAM_SHA256_LEN;
+        break;
+    case SCRAM_HASH_SHA512:
+        hash_len = SCRAM_SHA512_LEN;
+        break;
+    default:
+        keycloak_free_metadata_entries(entries);
+        scram_fetch_fail(ctx, "Unknown hash type");
+        return 1;
+    }
+
+    /* Parse into credential struct */
+    memset(&cred, 0, sizeof(cred));
+    cred.hash_type = ctx->hash_type;
+    cred.iteration = (unsigned int)strtoul(iterations_str, NULL, 10);
+    cred.hash_len = hash_len;
+
+    /* Decode base64 values */
+    {
+        char *decoded;
+        size_t decoded_len;
+
+        /* Salt */
+        if (!base64_decode_alloc(salt_b64, strlen(salt_b64), &decoded, &decoded_len) ||
+            decoded_len != SCRAM_SALT_LEN) {
+            log_module(NS_LOG, LOG_WARNING, "SCRAM fetch: Invalid salt for %s", ctx->username);
+            if (decoded) free(decoded);
+            keycloak_free_metadata_entries(entries);
+            scram_fetch_fail(ctx, "Invalid salt");
+            return 1;
+        }
+        memcpy(cred.salt, decoded, SCRAM_SALT_LEN);
+        free(decoded);
+
+        /* StoredKey */
+        if (!base64_decode_alloc(stored_key_b64, strlen(stored_key_b64), &decoded, &decoded_len) ||
+            decoded_len != hash_len) {
+            log_module(NS_LOG, LOG_WARNING, "SCRAM fetch: Invalid stored_key for %s (len=%zu, expected=%zu)",
+                       ctx->username, decoded_len, hash_len);
+            if (decoded) free(decoded);
+            keycloak_free_metadata_entries(entries);
+            scram_fetch_fail(ctx, "Invalid stored_key");
+            return 1;
+        }
+        memcpy(cred.stored_key, decoded, hash_len);
+        free(decoded);
+
+        /* ServerKey */
+        if (!base64_decode_alloc(server_key_b64, strlen(server_key_b64), &decoded, &decoded_len) ||
+            decoded_len != hash_len) {
+            log_module(NS_LOG, LOG_WARNING, "SCRAM fetch: Invalid server_key for %s", ctx->username);
+            if (decoded) free(decoded);
+            keycloak_free_metadata_entries(entries);
+            scram_fetch_fail(ctx, "Invalid server_key");
+            return 1;
+        }
+        memcpy(cred.server_key, decoded, hash_len);
+        free(decoded);
+    }
+
+    keycloak_free_metadata_entries(entries);
+
+    log_module(NS_LOG, LOG_INFO, "SCRAM fetch: Retrieved credentials from Keycloak for %s", ctx->username);
+
+    /* Store in LMDB cache for future use */
+    if (x3_lmdb_scram_acct_set(ctx->username, salt_b64, cred.iteration,
+                                stored_key_b64, server_key_b64,
+                                now, 0) == LMDB_SUCCESS) {
+        log_module(NS_LOG, LOG_DEBUG, "SCRAM fetch: Cached credentials in LMDB for %s", ctx->username);
+    }
+
+    /* Resume SCRAM auth */
+    scram_fetch_resume(ctx, &cred);
+    return 0;
+}
+
+/**
+ * Callback stage 2: Keycloak user lookup complete.
+ * Start fetching x3_scram_* attributes.
+ */
+static int
+scram_fetch_user_cb(void *session, int result, struct kc_user *user)
+{
+    struct scram_fetch_ctx *ctx = (struct scram_fetch_ctx *)session;
+
+    if (result != KC_SUCCESS || !user || !user->id) {
+        log_module(NS_LOG, LOG_DEBUG, "SCRAM fetch: User %s not found in Keycloak (%d)",
+                   ctx->username, result);
+        if (user) keycloak_user_free_fields(user);
+        scram_fetch_fail(ctx, "User not found in Keycloak");
+        return 1;
+    }
+
+    /* Store user ID for attributes fetch */
+    ctx->user_id = strdup(user->id);
+    keycloak_user_free_fields(user);
+
+    if (!ctx->user_id) {
+        scram_fetch_fail(ctx, "Out of memory");
+        return 1;
+    }
+
+    log_module(NS_LOG, LOG_DEBUG, "SCRAM fetch: Got user ID for %s, fetching attributes", ctx->username);
+
+    /* Fetch x3_scram_* attributes */
+    if (keycloak_list_user_attributes_async(keycloak_get_realm(), keycloak_get_authed_client(),
+                                             ctx->user_id, "x3_scram_", ctx,
+                                             scram_fetch_attrs_cb) < 0) {
+        log_module(NS_LOG, LOG_WARNING, "SCRAM fetch: Failed to start attribute fetch for %s", ctx->username);
+        scram_fetch_fail(ctx, "Failed to start attribute fetch");
+        return 1;
+    }
+
+    return 0;  /* Continue - waiting for attrs callback */
+}
+
+/**
+ * Callback stage 1: Token ready.
+ * Start Keycloak user lookup.
+ */
+static void
+scram_fetch_token_cb(void *context, int result, struct access_token *token)
+{
+    struct scram_fetch_ctx *ctx = (struct scram_fetch_ctx *)context;
+    (void)token;  /* We don't need the token directly */
+
+    if (result != KC_SUCCESS) {
+        log_module(NS_LOG, LOG_DEBUG, "SCRAM fetch: Token acquisition failed (%d)", result);
+        scram_fetch_fail(ctx, "Token acquisition failed");
+        return;
+    }
+
+    /* Validate session still exists */
+    if (!scram_fetch_validate(ctx)) {
+        log_module(NS_LOG, LOG_DEBUG, "SCRAM fetch: Session gone during token wait");
+        scram_fetch_ctx_free(ctx);
+        return;
+    }
+
+    log_module(NS_LOG, LOG_DEBUG, "SCRAM fetch: Token ready, looking up user %s", ctx->username);
+
+    /* Start user lookup */
+    if (keycloak_get_user_async(keycloak_get_realm(), keycloak_get_authed_client(),
+                                 ctx->username, ctx, scram_fetch_user_cb) < 0) {
+        log_module(NS_LOG, LOG_WARNING, "SCRAM fetch: Failed to start user lookup for %s", ctx->username);
+        scram_fetch_fail(ctx, "Failed to start user lookup");
+        return;
+    }
+}
+
+/**
+ * Start async SCRAM credential fetch from Keycloak.
+ *
+ * @param session SASL session
+ * @param username Account name to look up
+ * @param client_nonce Client nonce from client-first message
+ * @param hash_type Requested SCRAM hash type
+ * @return 0 on success (async started), -1 on error
+ */
+static int
+scram_fetch_start(struct SASLSession *session, const char *username,
+                  const char *client_nonce, enum scram_hash_type hash_type)
+{
+    struct scram_fetch_ctx *ctx;
+
+    if (!session || !username || !client_nonce) {
+        return -1;
+    }
+
+    ctx = calloc(1, sizeof(*ctx));
+    if (!ctx) {
+        log_module(NS_LOG, LOG_ERROR, "SCRAM fetch: Out of memory");
+        return -1;
+    }
+
+    ctx->session = session;
+    ctx->sequence = session->sequence;
+    safestrncpy(ctx->uid, session->uid, sizeof(ctx->uid));
+    safestrncpy(ctx->username, username, sizeof(ctx->username));
+    safestrncpy(ctx->client_nonce, client_nonce, sizeof(ctx->client_nonce));
+    ctx->hash_type = hash_type;
+
+    /* Mark session as fetching */
+    session->state = SASL_STATE_SCRAM_FETCH;
+
+    /* Start token acquisition (or use cached token) */
+    if (keycloak_ensure_token_async(scram_fetch_token_cb, ctx) < 0) {
+        log_module(NS_LOG, LOG_DEBUG, "SCRAM fetch: Failed to start token acquisition");
+        session->state = SASL_STATE_MECH_SELECTED;  /* Restore state */
+        free(ctx);
+        return -1;
+    }
+
+    log_module(NS_LOG, LOG_DEBUG, "SCRAM fetch: Started async credential fetch for %s", username);
+    return 0;
+}
 #endif /* WITH_LMDB && WITH_SSL && WITH_KEYCLOAK */
 
 #ifdef WITH_LMDB
