@@ -11375,6 +11375,7 @@ static void scram_fetch_resume(struct scram_fetch_ctx *ctx, struct scram_credent
 static void scram_fetch_fail(struct scram_fetch_ctx *ctx, const char *reason);
 static void scram_fetch_ctx_free(struct scram_fetch_ctx *ctx);
 static struct SASLSession *scram_fetch_validate(struct scram_fetch_ctx *ctx);
+static void sasl_delete_session(struct SASLSession *session);
 
 /**
  * Free SCRAM fetch context.
