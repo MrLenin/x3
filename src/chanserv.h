@@ -232,6 +232,11 @@ void wipe_adduser_pending(struct chanNode *channel, struct userNode *user);
 int check_bans(struct userNode *user, const char *channel);
 int trace_check_bans(struct userNode *user, struct chanNode *chan);
 
+/* Channel rename permission check (for services-authorized renames) */
+void chanserv_check_rename_permission(struct userNode *user, const char *cookie,
+                                       const char *channel_name, const char *new_name,
+                                       struct server *origin_server);
+
 /* Channel metadata functions */
 int chanserv_set_channel_metadata(struct chanData *cData, const char *key, const char *value, int visibility);
 int chanserv_get_channel_metadata(struct chanData *cData, const char *key, char *value_out, int *visibility_out);

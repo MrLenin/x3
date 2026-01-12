@@ -217,6 +217,9 @@ static const struct message_entry msgtab[] = {
     { "CSMSG_MOVE_SUCCESS", "Channel registration has been moved to $b%s$b." },
     { "CSMSG_MOVE_NODELETE", "$b%s$b is protected from unregistration, and cannot be moved." },
 
+/* Channel renaming */
+    { "CSMSG_RENAME_SUCCESS", "Channel has been renamed to $b%s$b." },
+
 /* Channel merging */
     { "CSMSG_MERGE_SUCCESS", "Channel successfully merged into $b%s$b." },
     { "CSMSG_MERGE_SELF", "Merging cannot be performed if the source and target channels are the same." },
@@ -1204,6 +1207,79 @@ int check_user_level(struct chanNode *channel, struct userNode *user, enum level
     if((minimum > UL_OWNER) && (uData->access == UL_OWNER) && exempt_owner)
         return 1;
     return 0;
+}
+
+/* Check if a user has permission to rename a channel.
+ * Called when IRCd queries services for rename permission on a +R channel.
+ * Sends AC A (allow) or AC D :<reason> (deny) response.
+ */
+void
+chanserv_check_rename_permission(struct userNode *user, const char *cookie,
+                                  const char *channel_name, const char *new_name,
+                                  struct server *origin_server)
+{
+    struct chanNode *channel;
+    struct chanData *cData;
+    struct userData *uData;
+    const char *deny_reason = NULL;
+
+    /* Get the channel */
+    channel = GetChannel(channel_name);
+    if (!channel) {
+        deny_reason = "Channel not found";
+        goto deny;
+    }
+
+    /* Must be registered channel */
+    cData = channel->channel_info;
+    if (!cData) {
+        deny_reason = "Channel not registered";
+        goto deny;
+    }
+
+    /* Must be authenticated */
+    if (!user || !user->handle_info) {
+        deny_reason = "You must be authenticated to rename channels";
+        goto deny;
+    }
+
+    /* Check suspended - only staff can rename */
+    if (IsSuspended(cData)) {
+        if (user->handle_info->opserv_level < chanserv_conf.nodelete_level) {
+            deny_reason = "Channel is suspended";
+            goto deny;
+        }
+    }
+
+    /* Check access level - require UL_COOWNER (400) or higher */
+    uData = _GetChannelUser(cData, user->handle_info, 0, 0);
+    if (!uData || uData->access < UL_COOWNER) {
+        deny_reason = "Insufficient access (co-owner required)";
+        goto deny;
+    }
+
+    /* Validate new channel name */
+    if (!IsChannelName(new_name)) {
+        deny_reason = "Invalid channel name";
+        goto deny;
+    }
+
+    /* Check if new name already exists (registered or not) */
+    if (GetChannel(new_name)) {
+        deny_reason = "Channel name already in use";
+        goto deny;
+    }
+
+    /* All checks passed - allow the rename */
+    irc_rename_auth_allow(cookie);
+    log_module(CS_LOG, LOG_INFO, "%s (%s) authorized to rename %s to %s",
+               user->nick, user->handle_info->handle, channel_name, new_name);
+    return;
+
+deny:
+    irc_rename_auth_deny(cookie, deny_reason);
+    log_module(CS_LOG, LOG_INFO, "Denied %s rename of %s to %s: %s",
+               user ? user->nick : "unknown", channel_name, new_name, deny_reason);
 }
 
 /* Scan for other users authenticated to the same handle
@@ -3108,6 +3184,69 @@ static CHANSERV_FUNC(cmd_move)
                         channel->name, target->name, user->handle_info->handle);
 
     reply("CSMSG_MOVE_SUCCESS", target->name);
+    return 1;
+}
+
+static CHANSERV_FUNC(cmd_rename)
+{
+    const char *new_name;
+    const char *reason = NULL;
+    struct do_not_register *dnr;
+    struct userData *uData;
+
+    REQUIRE_PARAMS(2);
+
+    new_name = argv[1];
+    if (argc > 2)
+        reason = unsplit_string(argv + 2, argc - 2, NULL);
+
+    /* Check if channel is protected (NODELETE) */
+    if (IsProtected(channel->channel_info)) {
+        reply("CSMSG_MOVE_NODELETE", channel->name);
+        return 0;
+    }
+
+    /* Validate new channel name */
+    if (!IsChannelName(new_name)) {
+        reply("MSG_NOT_CHANNEL_NAME");
+        return 0;
+    }
+
+    /* Check if new name is forbidden */
+    if (opserv_bad_channel(new_name)) {
+        reply("CSMSG_ILLEGAL_CHANNEL", new_name);
+        return 0;
+    }
+
+    /* Check DNR unless forced by helper */
+    if (!IsHelping(user) || (argc < 4) || irccasecmp(argv[argc-1], "force")) {
+        for (uData = channel->channel_info->users; uData; uData = uData->next) {
+            if ((uData->access == UL_OWNER) && (dnr = chanserv_is_dnr(new_name, uData->handle))) {
+                if (!IsHelping(user))
+                    reply("CSMSG_DNR_CHANNEL_MOVE", new_name);
+                else
+                    chanserv_show_dnrs(user, cmd, new_name, uData->handle->handle);
+                return 0;
+            }
+        }
+    }
+
+    /* Check if new channel name already exists */
+    if (GetChannel(new_name)) {
+        reply("CSMSG_ALREADY_REGGED", new_name);
+        return 0;
+    }
+
+    /* Send RENAME command to the network */
+    irc_rename_channel(chanserv, channel, new_name, reason ? reason : "Channel renamed");
+
+    /* Note: The actual channel data update happens when we receive the
+     * RENAME back from the network in the rename handler callback */
+
+    global_message_args(MESSAGE_RECIPIENT_OPERS | MESSAGE_RECIPIENT_HELPERS, "CSMSG_CHANNEL_RENAMED",
+                        channel->name, new_name, user->handle_info->handle);
+
+    reply("CSMSG_RENAME_SUCCESS", new_name);
     return 1;
 }
 
@@ -12693,6 +12832,7 @@ init_chanserv(const char *nick)
     modcmd_register(chanserv_module, "dnrsearch remove", NULL, 0, 0, NULL);
     modcmd_register(chanserv_module, "dnrsearch count", NULL, 0, 0, NULL);
     DEFINE_COMMAND(move, 1, MODCMD_REQUIRE_AUTHED|MODCMD_REQUIRE_REGCHAN, "template", "register", NULL);
+    DEFINE_COMMAND(rename, 2, MODCMD_REQUIRE_AUTHED|MODCMD_REQUIRE_REGCHAN, "access", "coowner", NULL);
     DEFINE_COMMAND(csuspend, 2, MODCMD_REQUIRE_AUTHED|MODCMD_REQUIRE_REGCHAN|MODCMD_IGNORE_CSUSPEND, "flags", "+helping", NULL);
     DEFINE_COMMAND(cunsuspend, 1, MODCMD_REQUIRE_AUTHED|MODCMD_REQUIRE_REGCHAN|MODCMD_IGNORE_CSUSPEND, "flags", "+helping", NULL);
     DEFINE_COMMAND(createnote, 5, 0, "level", "800", NULL);

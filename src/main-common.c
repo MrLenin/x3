@@ -21,6 +21,7 @@ struct cManagerNode cManager;
 
 /* Non-blocking reconnect support */
 int reconnect_pending = 0;
+int reconnect_ready = 0;  /* Set when delay elapsed, cleared after connection attempt */
 int uplink_connect(void);  /* Forward declaration for callback */
 static void uplink_reconnect_callback(void *data);  /* Forward declaration */
 
@@ -382,11 +383,14 @@ uplink_select(char *name)
 /**
  * Callback for deferred uplink reconnection.
  * Called by timeq after the reconnect delay has elapsed.
+ * Sets reconnect_ready flag so uplink_connect() will skip the delay
+ * and actually attempt the connection.
  */
 static void
 uplink_reconnect_callback(UNUSED_ARG(void *data))
 {
     reconnect_pending = 0;
+    reconnect_ready = 1;  /* Signal that we've waited, now try connecting */
     log_module(MAIN_LOG, LOG_DEBUG, "Reconnect timer fired, attempting connection.");
     uplink_connect();
 }
@@ -427,7 +431,7 @@ uplink_connect(void)
         uplink = cManager.uplink;
     }
 
-    if(uplink->tries)
+    if(uplink->tries && !reconnect_ready)
     {
         /*
          * Instead of blocking with sleep(), schedule a callback.
@@ -442,6 +446,7 @@ uplink_connect(void)
         timeq_add(now + delay, uplink_reconnect_callback, NULL);
         return 0;
     }
+    reconnect_ready = 0;  /* Clear flag before attempting connection */
 
     if(!create_socket_client(uplink))
     {

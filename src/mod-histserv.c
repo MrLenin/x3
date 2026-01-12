@@ -226,6 +226,56 @@ format_timestamp(const char *ts_str)
     return buf;
 }
 
+/* Send content, splitting on embedded newlines for multiline messages.
+ * Nefarious stores multiline messages with \n separators.
+ * If ts is non-NULL, uses HSMSG_HISTORY_LINE format ([ts] <nick> content)
+ * Otherwise uses HSMSG_FETCH_LINE format (<nick> content) */
+static void
+send_content_lines(struct userNode *user, const char *nick, const char *content,
+                   const char *ts)
+{
+    char *content_copy;
+    char *line;
+    char *saveptr;
+    const char *msg_key;
+
+    msg_key = ts ? "HSMSG_HISTORY_LINE" : "HSMSG_FETCH_LINE";
+
+    /* Check if content has embedded newlines (multiline message) */
+    if (strchr(content, '\n') == NULL) {
+        /* Simple case - single line */
+        if (ts)
+            send_message(user, histserv, msg_key, ts, nick, content);
+        else
+            send_message(user, histserv, msg_key, nick, content);
+        return;
+    }
+
+    /* Multiline message - split and send each line */
+    content_copy = strdup(content);
+    if (!content_copy) {
+        if (ts)
+            send_message(user, histserv, msg_key, ts, nick, content);
+        else
+            send_message(user, histserv, msg_key, nick, content);
+        return;
+    }
+
+    line = strtok_r(content_copy, "\n", &saveptr);
+    while (line) {
+        /* Skip empty lines that might result from consecutive newlines */
+        if (*line) {
+            if (ts)
+                send_message(user, histserv, msg_key, ts, nick, line);
+            else
+                send_message(user, histserv, msg_key, nick, line);
+        }
+        line = strtok_r(NULL, "\n", &saveptr);
+    }
+
+    free(content_copy);
+}
+
 /* Generic callback for history queries */
 static void
 histserv_history_callback(const char *reqid, const char *target,
@@ -256,8 +306,8 @@ histserv_history_callback(const char *reqid, const char *target,
 
             for (r = results; r; r = r->next) {
                 nick = extract_nick(r->sender);
-                send_message(ctx->user, histserv, "HSMSG_FETCH_LINE",
-                            nick, r->content);
+                /* Use send_content_lines to handle multiline messages (NULL ts for FETCH format) */
+                send_content_lines(ctx->user, nick, r->content, NULL);
             }
 
             send_message(ctx->user, histserv, "HSMSG_FETCH_FOOTER");
@@ -270,8 +320,8 @@ histserv_history_callback(const char *reqid, const char *target,
             for (r = results; r; r = r->next) {
                 nick = extract_nick(r->sender);
                 ts = format_timestamp(r->timestamp);
-                send_message(ctx->user, histserv, "HSMSG_HISTORY_LINE",
-                            ts, nick, r->content);
+                /* Use send_content_lines to handle multiline messages */
+                send_content_lines(ctx->user, nick, r->content, ts);
             }
 
             send_message(ctx->user, histserv, "HSMSG_HISTORY_FOOTER", count);
@@ -663,6 +713,9 @@ histserv_init(void)
 {
     HS_LOG = log_register_type("HistServ", "file:histserv.log");
 
+    /* Register message strings */
+    message_register_table(msgtab);
+
     conf_register_reload(histserv_conf_read);
     reg_exit_func(histserv_cleanup, NULL);
 
@@ -675,11 +728,13 @@ histserv_init(void)
     histserv_conf.timestamp_format = "%H:%M:%S";
 
     histserv_module = module_register("HistServ", HS_LOG, "mod-histserv.help", NULL);
-    modcmd_register(histserv_module, "latest", cmd_latest, 2, MODCMD_REQUIRE_AUTHED, NULL);
-    modcmd_register(histserv_module, "before", cmd_before, 3, MODCMD_REQUIRE_AUTHED, NULL);
-    modcmd_register(histserv_module, "after",  cmd_after,  3, MODCMD_REQUIRE_AUTHED, NULL);
-    modcmd_register(histserv_module, "around", cmd_around, 3, MODCMD_REQUIRE_AUTHED, NULL);
-    modcmd_register(histserv_module, "fetch",  cmd_fetch,  3, MODCMD_REQUIRE_AUTHED, NULL);
+    /* Note: MODCMD_REQUIRE_AUTHED removed - authentication is enforced by
+     * histserv_conf.require_account check in command handlers if configured */
+    modcmd_register(histserv_module, "latest", cmd_latest, 2, 0, NULL);
+    modcmd_register(histserv_module, "before", cmd_before, 3, 0, NULL);
+    modcmd_register(histserv_module, "after",  cmd_after,  3, 0, NULL);
+    modcmd_register(histserv_module, "around", cmd_around, 3, 0, NULL);
+    modcmd_register(histserv_module, "fetch",  cmd_fetch,  3, 0, NULL);
 
     histserv_conf_read();
 

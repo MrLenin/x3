@@ -126,6 +126,7 @@
             " $bDNRSEARCH$b   Search the do-not-register list.",
             " $bUNREGISTER$b  Remove $C from a registered channel.",
             " $bMOVE$b        Transition one channel's registration to a new channel name.",
+            " $bRENAME$b      Rename a channel using IRCv3 channel rename protocol.",
             " $bMERGE$b       Merges a source and target channels' registration, ",
             "                 users, bans, and other data into the target channel.",
             " $bUNVISITED$b   List all channels that have not been visited in specified duration.",
@@ -441,7 +442,13 @@
         "$uSee Also:$u open, set");
 "MOVE" ("/msg $C MOVE <#channel> <destination>",
         "Transfers a channel's registration to a different channel along with the settings and user/ban lists. All the restrictions that apply for the $bregister$b command apply to $bmove$b.",
-        "$uSee Also:$u register, merge, unregister");
+        "$uSee Also:$u register, merge, rename, unregister");
+"RENAME" ("/msg $C RENAME <#channel> <new-name> [reason]",
+        "Renames a channel to a new name using the IRCv3 channel rename protocol.",
+        "All users, modes, bans, and other channel state are preserved. The channel registration moves with the channel.",
+        "You must be a co-owner (access level 400+) or owner to rename a channel.",
+        "If the channel has the NODELETE flag set, it cannot be renamed.",
+        "$uSee Also:$u move, register, unregister");
 "NETINFO" ("/msg $C NETINFO",
         "Displays some assorted pieces of information about network-wide $b$C$b statistics.",
         "$uSee Also:$u info, staff");

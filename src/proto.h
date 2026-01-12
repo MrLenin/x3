@@ -149,6 +149,7 @@ void irc_umode(struct userNode *target, const char *modes);
 void irc_kick(struct userNode *who, struct userNode *target, struct chanNode *from, const char *msg);
 void irc_part(struct userNode *who, struct chanNode *what, const char *reason);
 void irc_topic(struct userNode *service, struct userNode *who, struct chanNode *what, const char *topic);
+void irc_rename_channel(struct userNode *service, struct chanNode *channel, const char *newname, const char *reason);
 void irc_fetchtopic(struct userNode *from, const char *to);
 void irc_svsjoin(struct userNode *from, struct userNode *who, struct chanNode *to);
 void irc_svspart(struct userNode *from, struct userNode *who, struct chanNode *to);
@@ -173,6 +174,8 @@ void irc_raw_privs(struct userNode *target, const char *privs);
 
 /* account maintenance */
 void irc_rename(struct userNode *user, const char *new_handle);
+void irc_rename_auth_allow(const char *cookie);
+void irc_rename_auth_deny(const char *cookie, const char *reason);
 void irc_delete(struct userNode *user);
 void irc_account(struct userNode *user, const char *stamp, time_t timestamp);
 void irc_regnick(struct userNode *user);

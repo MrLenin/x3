@@ -315,6 +315,7 @@
 #define P10_PROTO               TYPE(PROTO)
 #define P10_QUIT                TYPE(QUIT)
 #define P10_REHASH              TYPE(REHASH)
+#define P10_RENAME              TYPE(RENAME)
 #define P10_REMOVE		TYPE(REMOVE)
 #define P10_RESET		TYPE(RESET)
 #define P10_RESTART             TYPE(RESTART)
@@ -390,6 +391,7 @@ static int extended_accounts;
 /* CHATHISTORY query infrastructure */
 #define CHATHISTORY_MAX_RESULTS 100
 #define CHATHISTORY_REQID_LEN 64
+#define CHATHISTORY_CHUNK_KEY_LEN 128
 
 /* struct chathistory_result and chathistory_callback_t defined in proto.h */
 
@@ -404,7 +406,30 @@ struct chathistory_pending {
     time_t created;
 };
 
+/* Structure for tracking multi-chunk base64 messages */
+struct chathistory_chunk {
+    char reqid[CHATHISTORY_REQID_LEN];
+    char msgid[64];
+    char timestamp[32];
+    int type;
+    char sender[64];
+    char account[64];
+    char *b64_data;           /* Accumulated base64 chunks */
+    size_t b64_len;           /* Current length */
+    size_t b64_alloc;         /* Allocated size */
+};
+
 static struct dict *chathistory_pending_queries;
+static struct dict *chathistory_pending_chunks;
+
+static void
+chathistory_chunk_free(void *data)
+{
+    struct chathistory_chunk *chunk = data;
+    if (chunk->b64_data)
+        free(chunk->b64_data);
+    free(chunk);
+}
 
 /* These correspond to 1 << X:      01234567890123456789012345 */
 const char irc_user_mode_chars[] = "oOiw dkgh    x  BnIX  azDRWHLq";
@@ -661,6 +686,18 @@ irc_rename(struct userNode *user, const char *new_handle)
 {
     if(extended_accounts)
         putsock("%s " P10_ACCOUNT " %s M %s", self->numeric, user->numeric, new_handle);
+}
+
+void
+irc_rename_auth_allow(const char *cookie)
+{
+    putsock("%s " P10_ACCOUNT " %s A", self->numeric, cookie);
+}
+
+void
+irc_rename_auth_deny(const char *cookie, const char *reason)
+{
+    putsock("%s " P10_ACCOUNT " %s D :%s", self->numeric, cookie, reason);
 }
 
 void
@@ -1268,6 +1305,18 @@ irc_topic(struct userNode *service, struct userNode *who, struct chanNode *what,
 }
 
 void
+irc_rename_channel(struct userNode *service, struct chanNode *channel,
+                   const char *newname, const char *reason)
+{
+    /* Send RENAME command to rename a channel
+     * Format: <numeric> RN <oldchan> <newchan> :<reason>
+     */
+    putsock("%s " P10_RENAME " %s %s :%s",
+            service ? service->numeric : self->numeric,
+            channel->name, newname, reason ? reason : "");
+}
+
+void
 irc_raw(const char *what)
 {
     putsock("%s", what);
@@ -1860,7 +1909,19 @@ static CMD_FUNC(cmd_account)
         return 1;
     }
     else if(!strcmp(argv[2],"R"))
-       call_account_func(user, argv[3]);
+    {
+        /* Check if this is a rename permission query:
+         * AC <user_numeric> R <cookie> <channel> RENAME <newname>
+         */
+        if (argc >= 7 && !strcmp(argv[5], "RENAME"))
+        {
+            /* Rename permission query from IRCd */
+            chanserv_check_rename_permission(user, argv[3], argv[4], argv[6], server);
+            return 1;
+        }
+        /* Otherwise it's a standard account registration */
+        call_account_func(user, argv[3]);
+    }
     else
         call_account_func(user, argv[2]); /* For backward compatability */
     return 1;
@@ -3424,12 +3485,17 @@ static CMD_FUNC(cmd_tagmsg)
 /** Handle CH (CHATHISTORY) command - P10 chathistory federation.
  * Format from Nefarious (optimized for efficiency):
  *   [SERVER] CH Q <target> <subcmd:1char> <ref> <limit> <reqid>   - Query
- *   [SERVER] CH R <reqid> <msgid> <ts> <type> <sender> <account> :<content>  - Response
+ *   [SERVER] CH R <reqid> <msgid> <ts> <type> <sender> <account> :<content>  - Response (plain)
+ *   [SERVER] CH B <reqid> <msgid> <ts> <type> <sender> <account> [+] :<b64>  - Response (base64)
+ *   [SERVER] CH B <reqid> <msgid> [+] :<b64>                                  - Continuation chunk
  *   [SERVER] CH E <reqid> <count>   - End response
  *
  * Subcmd codes: L=LATEST, B=BEFORE, A=AFTER, R=AROUND, W=BETWEEN, T=TARGETS
  * Ref format: <timestamp> (starts with digit), <msgid> (starts with letter), or *
  * Timestamps (<ts>) are Unix format: seconds.milliseconds (e.g., "1735689600.123")
+ *
+ * Base64 encoding (CH B) is used when content contains newlines or exceeds safe length.
+ * The + marker indicates more chunks are coming; absence means final/only chunk.
  *
  * X3 handles both incoming queries (responds with 0 messages since X3 doesn't store)
  * and outgoing query responses (for HistServ functionality).
@@ -3462,7 +3528,9 @@ static CMD_FUNC(cmd_chathistory)
         log_module(MAIN_LOG, LOG_DEBUG, "CHATHISTORY: Responded to query %s with 0 messages", reqid);
 
     } else if (subcmd[0] == 'R' && subcmd[1] == '\0') {
-        /* Response: CH R <reqid> <msgid> <ts> <type> <sender> <account> :<content> */
+        /* Response: CH R <reqid> <msgid> <ts> <type> <sender> <account> :<content>
+         * This is for normal (non-encoded) content without newlines.
+         */
         struct chathistory_result *result;
 
         if (argc < 8) {
@@ -3485,7 +3553,7 @@ static CMD_FUNC(cmd_chathistory)
         result->type = atoi(argv[5]);
         result->sender = strdup(argv[6]);
         result->account = strdup(argv[7]);
-        result->content = (argc > 8) ? strdup(argv[8]) : strdup("");
+        result->content = strdup(argc > 8 ? argv[8] : "");
 
         /* Append to results list */
         if (pending->results_tail) {
@@ -3499,6 +3567,147 @@ static CMD_FUNC(cmd_chathistory)
         log_module(MAIN_LOG, LOG_DEBUG,
                    "CHATHISTORY R: Added result %d for %s (msgid=%s)",
                    pending->count, reqid, result->msgid);
+
+    } else if (subcmd[0] == 'B' && subcmd[1] == '\0') {
+        /* Base64 Response: CH B <reqid> <msgid> <ts> <type> <sender> <account> [+] :<b64>
+         * Or continuation: CH B <reqid> <msgid> [+] :<b64>
+         *
+         * + marker means more chunks coming.
+         * No + marker means this is the final (or only) chunk.
+         */
+        char chunk_key[CHATHISTORY_CHUNK_KEY_LEN];
+        struct chathistory_chunk *chunk;
+        const char *b64_data;
+        int has_more = 0;
+        int is_continuation = 0;
+
+        if (argc < 4) {
+            log_module(MAIN_LOG, LOG_DEBUG, "CHATHISTORY B: Not enough parameters (%d)", argc);
+            return 0;
+        }
+
+        reqid = argv[2];
+
+        if (!chathistory_pending_queries ||
+            !(pending = dict_find(chathistory_pending_queries, reqid, NULL))) {
+            log_module(MAIN_LOG, LOG_DEBUG, "CHATHISTORY B: Unknown reqid %s", reqid);
+            return 1;
+        }
+
+        /* Initialize chunk dict if needed */
+        if (!chathistory_pending_chunks) {
+            chathistory_pending_chunks = dict_new();
+            dict_set_free_data(chathistory_pending_chunks, chathistory_chunk_free);
+        }
+
+        /* Determine message format based on argc:
+         * argc=5: continuation "CH B <reqid> <msgid> :<b64>" (final)
+         * argc=6: continuation "CH B <reqid> <msgid> + :<b64>" (more coming)
+         * argc=9: full "CH B <reqid> <msgid> <ts> <type> <sender> <account> :<b64>" (complete)
+         * argc=10: full "CH B <reqid> <msgid> <ts> <type> <sender> <account> + :<b64>" (first, more coming)
+         */
+        if (argc <= 6) {
+            /* Continuation chunk */
+            is_continuation = 1;
+            if (argc == 6 && strcmp(argv[4], "+") == 0) {
+                has_more = 1;
+                b64_data = argv[5];
+            } else {
+                has_more = 0;
+                b64_data = argv[4];
+            }
+        } else {
+            /* Full format (first or only chunk) */
+            is_continuation = 0;
+            if (argc == 10 && strcmp(argv[8], "+") == 0) {
+                has_more = 1;
+                b64_data = argv[9];
+            } else {
+                has_more = 0;
+                b64_data = argc > 8 ? argv[8] : "";
+            }
+        }
+
+        /* Create chunk key: reqid:msgid */
+        snprintf(chunk_key, sizeof(chunk_key), "%s:%s", reqid, argv[3]);
+
+        if (is_continuation) {
+            /* Find existing chunk */
+            chunk = dict_find(chathistory_pending_chunks, chunk_key, NULL);
+            if (!chunk) {
+                log_module(MAIN_LOG, LOG_DEBUG,
+                           "CHATHISTORY B: Continuation without start for %s", chunk_key);
+                return 1;
+            }
+        } else {
+            /* Create new chunk entry */
+            chunk = calloc(1, sizeof(*chunk));
+            strncpy(chunk->reqid, reqid, sizeof(chunk->reqid) - 1);
+            strncpy(chunk->msgid, argv[3], sizeof(chunk->msgid) - 1);
+            strncpy(chunk->timestamp, argv[4], sizeof(chunk->timestamp) - 1);
+            chunk->type = atoi(argv[5]);
+            strncpy(chunk->sender, argv[6], sizeof(chunk->sender) - 1);
+            strncpy(chunk->account, argv[7], sizeof(chunk->account) - 1);
+            chunk->b64_alloc = 1024;
+            chunk->b64_data = malloc(chunk->b64_alloc);
+            chunk->b64_data[0] = '\0';
+            chunk->b64_len = 0;
+
+            dict_insert(chathistory_pending_chunks, strdup(chunk_key), chunk);
+        }
+
+        /* Append base64 data to chunk */
+        size_t new_len = strlen(b64_data);
+        if (chunk->b64_len + new_len + 1 > chunk->b64_alloc) {
+            chunk->b64_alloc = (chunk->b64_len + new_len + 1) * 2;
+            chunk->b64_data = realloc(chunk->b64_data, chunk->b64_alloc);
+        }
+        memcpy(chunk->b64_data + chunk->b64_len, b64_data, new_len + 1);
+        chunk->b64_len += new_len;
+
+        log_module(MAIN_LOG, LOG_DEBUG,
+                   "CHATHISTORY B: Accumulated %zu bytes for %s (more=%d)",
+                   chunk->b64_len, chunk_key, has_more);
+
+        if (!has_more) {
+            /* Final chunk - decode and add to results */
+            struct chathistory_result *result;
+            char *decoded;
+            size_t decoded_len;
+
+            result = calloc(1, sizeof(*result));
+            result->msgid = strdup(chunk->msgid);
+            result->timestamp = strdup(chunk->timestamp);
+            result->type = chunk->type;
+            result->sender = strdup(chunk->sender);
+            result->account = strdup(chunk->account);
+
+            /* Decode base64 */
+            if (base64_decode_alloc(chunk->b64_data, chunk->b64_len,
+                                    &decoded, &decoded_len)) {
+                result->content = decoded;
+            } else {
+                log_module(MAIN_LOG, LOG_WARNING,
+                           "CHATHISTORY B: Base64 decode failed for %s", chunk_key);
+                result->content = strdup("[decode error]");
+            }
+
+            /* Append to results list */
+            if (pending->results_tail) {
+                pending->results_tail->next = result;
+            } else {
+                pending->results = result;
+            }
+            pending->results_tail = result;
+            pending->count++;
+
+            log_module(MAIN_LOG, LOG_DEBUG,
+                       "CHATHISTORY B: Decoded and added result %d for %s (msgid=%s, len=%zu)",
+                       pending->count, reqid, result->msgid, decoded_len);
+
+            /* Remove chunk entry */
+            dict_remove(chathistory_pending_chunks, chunk_key);
+        }
 
     } else if (subcmd[0] == 'E' && subcmd[1] == '\0') {
         /* End: CH E <reqid> <count> */
