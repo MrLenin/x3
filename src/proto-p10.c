@@ -3673,7 +3673,7 @@ static CMD_FUNC(cmd_chathistory)
             /* Final chunk - decode and add to results */
             struct chathistory_result *result;
             char *decoded;
-            size_t decoded_len;
+            size_t decoded_len = 0;
 
             result = calloc(1, sizeof(*result));
             result->msgid = strdup(chunk->msgid);
