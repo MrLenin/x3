@@ -4991,6 +4991,131 @@ int x3_lmdb_scram_acct_delete_all(const char *account)
     return count;
 }
 
+/**
+ * Set SCRAM credential for an account from pre-computed base64 values (SHA-256 only).
+ * Used by Keycloak webhook to pre-populate cache with credentials generated
+ * by the Keycloak SPI.
+ */
+int x3_lmdb_scram_acct_set(const char *account,
+                           const char *salt_b64,
+                           int iterations,
+                           const char *stored_key_b64,
+                           const char *server_key_b64,
+                           time_t timestamp,
+                           time_t ttl)
+{
+    MDB_txn *txn;
+    MDB_val key, data;
+    char lmdb_key[LMDB_KEY_BUFFER_SIZE];
+    char value_buf[512];
+    unsigned char salt[SCRAM_SALT_LEN];
+    unsigned char stored_key[SCRAM_SHA256_LEN];
+    unsigned char server_key[SCRAM_SHA256_LEN];
+    char salt_hex[SCRAM_SALT_LEN * 2 + 1];
+    char stored_key_hex[SCRAM_SHA256_LEN * 2 + 1];
+    char server_key_hex[SCRAM_SHA256_LEN * 2 + 1];
+    size_t decoded_len;
+    time_t expiry;
+    int rc, i;
+
+    if (!lmdb_initialized || !account || !salt_b64 || !stored_key_b64 || !server_key_b64) {
+        return LMDB_ERROR;
+    }
+
+    /* Decode base64 values */
+    {
+        char *decoded_salt;
+        if (!base64_decode_alloc(salt_b64, strlen(salt_b64), &decoded_salt, &decoded_len) ||
+            decoded_len != SCRAM_SALT_LEN) {
+            log_module(MAIN_LOG, LOG_WARNING, "x3_lmdb: scram_acct_set invalid salt for %s", account);
+            return LMDB_ERROR;
+        }
+        memcpy(salt, decoded_salt, SCRAM_SALT_LEN);
+        free(decoded_salt);
+    }
+
+    {
+        char *decoded_stored;
+        if (!base64_decode_alloc(stored_key_b64, strlen(stored_key_b64), &decoded_stored, &decoded_len) ||
+            decoded_len != SCRAM_SHA256_LEN) {
+            log_module(MAIN_LOG, LOG_WARNING, "x3_lmdb: scram_acct_set invalid stored_key for %s", account);
+            return LMDB_ERROR;
+        }
+        memcpy(stored_key, decoded_stored, SCRAM_SHA256_LEN);
+        free(decoded_stored);
+    }
+
+    {
+        char *decoded_server;
+        if (!base64_decode_alloc(server_key_b64, strlen(server_key_b64), &decoded_server, &decoded_len) ||
+            decoded_len != SCRAM_SHA256_LEN) {
+            log_module(MAIN_LOG, LOG_WARNING, "x3_lmdb: scram_acct_set invalid server_key for %s", account);
+            return LMDB_ERROR;
+        }
+        memcpy(server_key, decoded_server, SCRAM_SHA256_LEN);
+        free(decoded_server);
+    }
+
+    /* Convert to hex for storage (same format as scram_acct_create) */
+    for (i = 0; i < SCRAM_SALT_LEN; i++) {
+        sprintf(salt_hex + i * 2, "%02x", salt[i]);
+    }
+    salt_hex[SCRAM_SALT_LEN * 2] = '\0';
+
+    for (i = 0; i < SCRAM_SHA256_LEN; i++) {
+        sprintf(stored_key_hex + i * 2, "%02x", stored_key[i]);
+        sprintf(server_key_hex + i * 2, "%02x", server_key[i]);
+    }
+    stored_key_hex[SCRAM_SHA256_LEN * 2] = '\0';
+    server_key_hex[SCRAM_SHA256_LEN * 2] = '\0';
+
+    /* Calculate expiry */
+    expiry = ttl > 0 ? timestamp + ttl : 0;
+
+    /* Build LMDB key: scram_acct:<hash_type>:<account> */
+    snprintf(lmdb_key, sizeof(lmdb_key), "%s%d:%s",
+             LMDB_PREFIX_SCRAM_ACCT, (int)SCRAM_HASH_SHA256, account);
+
+    /* Build value: expiry:hashtype:iteration:salt:storedkey:serverkey:account */
+    snprintf(value_buf, sizeof(value_buf), "%lu:%d:%d:%s:%s:%s:%s",
+             (unsigned long)expiry, (int)SCRAM_HASH_SHA256, iterations,
+             salt_hex, stored_key_hex, server_key_hex, account);
+
+    /* Start write transaction */
+    rc = mdb_txn_begin(lmdb_env, NULL, 0, &txn);
+    if (rc != 0) {
+        log_module(MAIN_LOG, LOG_ERROR, "x3_lmdb: scram_acct_set txn_begin failed: %s",
+                   mdb_strerror(rc));
+        return LMDB_ERROR;
+    }
+
+    /* Store the credential */
+    key.mv_size = strlen(lmdb_key);
+    key.mv_data = lmdb_key;
+    data.mv_size = strlen(value_buf) + 1;
+    data.mv_data = value_buf;
+
+    rc = mdb_put(txn, dbi_metadata, &key, &data, 0);
+    if (rc != 0) {
+        mdb_txn_abort(txn);
+        log_module(MAIN_LOG, LOG_ERROR, "x3_lmdb: scram_acct_set mdb_put failed: %s",
+                   mdb_strerror(rc));
+        return LMDB_ERROR;
+    }
+
+    rc = mdb_txn_commit(txn);
+    if (rc != 0) {
+        log_module(MAIN_LOG, LOG_ERROR, "x3_lmdb: scram_acct_set commit failed: %s",
+                   mdb_strerror(rc));
+        return LMDB_ERROR;
+    }
+
+    log_module(MAIN_LOG, LOG_DEBUG, "x3_lmdb: Set SCRAM-SHA-256 credential for account %s from webhook",
+               account);
+
+    return LMDB_SUCCESS;
+}
+
 #else /* !WITH_SSL */
 
 /* Stub implementations when SSL is not available */
@@ -5143,6 +5268,20 @@ int x3_lmdb_scram_acct_delete_all(const char *account)
 {
     (void)account;
     return -1;
+}
+
+int x3_lmdb_scram_acct_set(const char *account,
+                           const char *salt_b64,
+                           int iterations,
+                           const char *stored_key_b64,
+                           const char *server_key_b64,
+                           time_t timestamp,
+                           time_t ttl)
+{
+    (void)account; (void)salt_b64; (void)iterations;
+    (void)stored_key_b64; (void)server_key_b64;
+    (void)timestamp; (void)ttl;
+    return LMDB_ERROR;
 }
 
 #endif /* WITH_SSL */

@@ -311,6 +311,9 @@ static void kc_do_add(const char *handle, const char *hash, const char *email);
 static void kc_do_modify(const char *handle, const char *hash, const char *email);
 static void kc_delete_account(const char *handle);
 static void kc_do_oslevel(const char *handle, int level, int oldlevel);
+#if defined(WITH_LMDB) && defined(WITH_SSL)
+static void kc_sync_scram(const char *handle);
+#endif
 static void kc_add2group(const char *handle, const char *group);
 static void kc_delfromgroup(const char *handle, const char *group);
 static void kc_sync_email_verified(const char *handle, int verified);
@@ -1464,6 +1467,9 @@ nickserv_register(struct userNode *user, struct userNode *settee, const char *ha
      * not create SCRAM credentials until after activation. */
     if (passwd && *passwd && !no_auth) {
         x3_lmdb_scram_acct_create_all(handle, passwd);
+#ifdef WITH_KEYCLOAK
+        kc_sync_scram(handle);
+#endif
     }
 #endif
     if (settee && !no_auth)
@@ -3482,6 +3488,9 @@ static NICKSERV_FUNC(cmd_cookie)
 #if defined(WITH_LMDB) && defined(WITH_SSL)
         /* Create SCRAM credentials - we have plaintext password here */
         x3_lmdb_scram_acct_create_all(hi->handle, password);
+#ifdef WITH_KEYCLOAK
+        kc_sync_scram(hi->handle);
+#endif
 #endif
 
         set_user_handle_info(user, hi, 1);
@@ -3551,6 +3560,9 @@ static NICKSERV_FUNC(cmd_cookie)
         /* Create new SCRAM credentials if we have plaintext password */
         if (pw_for_scram) {
             x3_lmdb_scram_acct_create_all(hi->handle, pw_for_scram);
+#ifdef WITH_KEYCLOAK
+            kc_sync_scram(hi->handle);
+#endif
         }
 #endif
 #endif
@@ -3732,6 +3744,9 @@ static NICKSERV_FUNC(cmd_pass)
     /* Revoke old SCRAM session tokens and create new password SCRAM credentials */
     x3_lmdb_scram_revoke_all(hi->handle);
     x3_lmdb_scram_acct_create_all(hi->handle, new_pass);
+#ifdef WITH_KEYCLOAK
+    kc_sync_scram(hi->handle);
+#endif
 #endif
 #endif
 
@@ -4431,6 +4446,9 @@ static OPTION_FUNC(opt_password)
 #if defined(WITH_LMDB) && defined(WITH_SSL)
     /* Create SCRAM credentials for the new password */
     x3_lmdb_scram_acct_create_all(hi->handle, argv[1]);
+#ifdef WITH_KEYCLOAK
+    kc_sync_scram(hi->handle);
+#endif
 #endif
 
     if (!(noreply))
@@ -6752,6 +6770,9 @@ cookie_async_update_callback(void *session, int result)
         /* Create SCRAM credentials if we have plaintext password */
         if (ctx->plaintext_password) {
             x3_lmdb_scram_acct_create_all(hi->handle, ctx->plaintext_password);
+#ifdef WITH_KEYCLOAK
+            kc_sync_scram(hi->handle);
+#endif
         }
 #endif
 
@@ -6777,6 +6798,9 @@ cookie_async_update_callback(void *session, int result)
         /* Create new SCRAM credentials if we have plaintext password */
         if (ctx->plaintext_password) {
             x3_lmdb_scram_acct_create_all(hi->handle, ctx->plaintext_password);
+#ifdef WITH_KEYCLOAK
+            kc_sync_scram(hi->handle);
+#endif
         }
 #endif
 #endif
@@ -7194,6 +7218,625 @@ kc_do_modify(const char *handle, const char *hash, const char *email)
     log_module(NS_LOG, LOG_DEBUG, "kc_do_modify[%s]: Started async token acquisition",
                handle);
 }
+
+/* ========== SCRAM Credential Sync to Keycloak ========== */
+#if defined(WITH_LMDB) && defined(WITH_SSL)
+
+/* Context for async SCRAM sync to Keycloak */
+struct kc_scram_sync_ctx {
+    char handle[NICKSERV_HANDLE_LEN + 1];
+    char salt_b64[64];
+    char iterations_str[16];
+    char stored_key_b64[64];
+    char server_key_b64[64];
+    char *user_id;      /* Keycloak user ID (from lookup) */
+    int attr_index;     /* Which attribute we're setting (0-3) */
+};
+
+static void kc_scram_sync_ctx_free(struct kc_scram_sync_ctx *ctx) {
+    if (ctx) {
+        free(ctx->user_id);
+        free(ctx);
+    }
+}
+
+/* Forward declarations */
+static int kc_scram_sync_attr_cb(void *session, int result);
+static int kc_scram_sync_user_cb(void *session, int result, struct kc_user *user);
+static int kc_scram_sync_token_cb(void *session, int result, struct access_token *token);
+
+/* Set the next SCRAM attribute */
+static void kc_scram_sync_next_attr(struct kc_scram_sync_ctx *ctx) {
+    const char *attr_name = NULL;
+    const char *attr_value = NULL;
+    int rc;
+
+    /* Select attribute based on index */
+    switch (ctx->attr_index) {
+    case 0:
+        attr_name = "x3_scram_salt";
+        attr_value = ctx->salt_b64;
+        break;
+    case 1:
+        attr_name = "x3_scram_iterations";
+        attr_value = ctx->iterations_str;
+        break;
+    case 2:
+        attr_name = "x3_scram_stored_key";
+        attr_value = ctx->stored_key_b64;
+        break;
+    case 3:
+        attr_name = "x3_scram_server_key";
+        attr_value = ctx->server_key_b64;
+        break;
+    default:
+        /* All done */
+        log_module(NS_LOG, LOG_DEBUG, "kc_scram_sync[%s]: All SCRAM attributes synced",
+                   ctx->handle);
+        kc_scram_sync_ctx_free(ctx);
+        return;
+    }
+
+    rc = keycloak_set_user_attribute_async(keycloak_get_realm(), keycloak_get_authed_client(),
+                                           ctx->user_id, attr_name, attr_value,
+                                           ctx, kc_scram_sync_attr_cb);
+    if (rc < 0) {
+        log_module(NS_LOG, LOG_WARNING, "kc_scram_sync[%s]: Failed to start attribute set for %s",
+                   ctx->handle, attr_name);
+        kc_scram_sync_ctx_free(ctx);
+    }
+}
+
+/* Callback for attribute set completion */
+static int kc_scram_sync_attr_cb(void *session, int result) {
+    struct kc_scram_sync_ctx *ctx = session;
+
+    if (result != KC_SUCCESS) {
+        log_module(NS_LOG, LOG_WARNING, "kc_scram_sync[%s]: Attribute %d set failed: %d",
+                   ctx->handle, ctx->attr_index, result);
+        kc_scram_sync_ctx_free(ctx);
+        return 0;
+    }
+
+    /* Move to next attribute */
+    ctx->attr_index++;
+    kc_scram_sync_next_attr(ctx);
+    return 0;
+}
+
+/* Callback for user lookup completion */
+static int kc_scram_sync_user_cb(void *session, int result, struct kc_user *user) {
+    struct kc_scram_sync_ctx *ctx = session;
+
+    if (result != KC_SUCCESS || !user || !user->id) {
+        log_module(NS_LOG, LOG_DEBUG, "kc_scram_sync[%s]: User lookup failed: %d",
+                   ctx->handle, result);
+        kc_scram_sync_ctx_free(ctx);
+        return 0;
+    }
+
+    ctx->user_id = strdup(user->id);
+    keycloak_user_free_fields(user);
+
+    /* Start setting attributes */
+    ctx->attr_index = 0;
+    kc_scram_sync_next_attr(ctx);
+    return 0;
+}
+
+/* Callback for token acquisition */
+static int kc_scram_sync_token_cb(void *session, int result, struct access_token *token) {
+    struct kc_scram_sync_ctx *ctx = session;
+    int rc;
+    (void)token;
+
+    if (result != KC_SUCCESS) {
+        log_module(NS_LOG, LOG_DEBUG, "kc_scram_sync[%s]: Token acquisition failed: %d",
+                   ctx->handle, result);
+        kc_scram_sync_ctx_free(ctx);
+        return 0;
+    }
+
+    /* Look up user by username */
+    rc = keycloak_get_user_by_username_async(keycloak_get_realm(), keycloak_get_authed_client(),
+                                             ctx->handle, ctx, kc_scram_sync_user_cb);
+    if (rc < 0) {
+        log_module(NS_LOG, LOG_DEBUG, "kc_scram_sync[%s]: Failed to start user lookup",
+                   ctx->handle);
+        kc_scram_sync_ctx_free(ctx);
+    }
+    return 0;
+}
+
+/**
+ * Sync SCRAM credentials to Keycloak user attributes (fire-and-forget async).
+ * Should be called after x3_lmdb_scram_acct_create_all() to keep Keycloak in sync.
+ *
+ * @param handle Account name
+ */
+static void kc_sync_scram(const char *handle) {
+    struct kc_scram_sync_ctx *ctx;
+    struct scram_credential cred;
+    char *salt_ptr = NULL;
+    char *stored_ptr = NULL;
+    char *server_ptr = NULL;
+    int rc;
+
+    if (!nickserv_conf.keycloak_enable || !handle) {
+        return;
+    }
+
+    /* Get the SHA-256 SCRAM credential from LMDB */
+    if (x3_lmdb_scram_acct_get(handle, SCRAM_HASH_SHA256, &cred) != LMDB_SUCCESS) {
+        log_module(NS_LOG, LOG_DEBUG, "kc_sync_scram[%s]: No SCRAM credential found",
+                   handle);
+        return;
+    }
+
+    /* Allocate context */
+    ctx = calloc(1, sizeof(*ctx));
+    if (!ctx) {
+        log_module(NS_LOG, LOG_ERROR, "kc_sync_scram[%s]: Out of memory", handle);
+        return;
+    }
+    safestrncpy(ctx->handle, handle, sizeof(ctx->handle));
+
+    /* Encode binary values to base64 */
+    base64_encode_alloc((char *)cred.salt, SCRAM_SALT_LEN, &salt_ptr);
+    base64_encode_alloc((char *)cred.stored_key, SCRAM_SHA256_LEN, &stored_ptr);
+    base64_encode_alloc((char *)cred.server_key, SCRAM_SHA256_LEN, &server_ptr);
+
+    if (!salt_ptr || !stored_ptr || !server_ptr) {
+        log_module(NS_LOG, LOG_ERROR, "kc_sync_scram[%s]: Base64 encode failed", handle);
+        free(salt_ptr);
+        free(stored_ptr);
+        free(server_ptr);
+        free(ctx);
+        return;
+    }
+
+    safestrncpy(ctx->salt_b64, salt_ptr, sizeof(ctx->salt_b64));
+    safestrncpy(ctx->stored_key_b64, stored_ptr, sizeof(ctx->stored_key_b64));
+    safestrncpy(ctx->server_key_b64, server_ptr, sizeof(ctx->server_key_b64));
+    snprintf(ctx->iterations_str, sizeof(ctx->iterations_str), "%u", cred.iteration);
+
+    free(salt_ptr);
+    free(stored_ptr);
+    free(server_ptr);
+
+    /* Start async token acquisition */
+    rc = keycloak_ensure_token_async(kc_scram_sync_token_cb, ctx);
+    if (rc < 0) {
+        log_module(NS_LOG, LOG_DEBUG, "kc_sync_scram[%s]: Failed to start token acquisition",
+                   handle);
+        kc_scram_sync_ctx_free(ctx);
+        return;
+    }
+
+    log_module(NS_LOG, LOG_DEBUG, "kc_sync_scram[%s]: Started SCRAM sync to Keycloak",
+               handle);
+}
+
+#endif /* WITH_LMDB && WITH_SSL */
+
+/* =============================================================================
+ * SCRAM Credential Fetch from Keycloak (Async)
+ *
+ * When SASL SCRAM auth fails LMDB lookup, this async chain fetches the
+ * x3_scram_* user attributes from Keycloak and resumes SCRAM auth.
+ *
+ * Chain: token_cb → user_cb → attrs_cb → resume/fail
+ * =============================================================================
+ */
+#if defined(WITH_LMDB) && defined(WITH_SSL) && defined(WITH_KEYCLOAK)
+
+/**
+ * Free SCRAM fetch context.
+ */
+static void
+scram_fetch_ctx_free(struct scram_fetch_ctx *ctx)
+{
+    if (!ctx) return;
+    if (ctx->user_id) free(ctx->user_id);
+    free(ctx);
+}
+
+/**
+ * Validate SCRAM fetch context and return session if still valid.
+ */
+static struct SASLSession *
+scram_fetch_validate(struct scram_fetch_ctx *ctx)
+{
+    struct SASLSession *session;
+    int found = 0;
+
+    if (!ctx || !sasl_session_dict) return NULL;
+
+    session = dict_find(sasl_session_dict, ctx->uid, &found);
+    if (!found || !session) {
+        log_module(NS_LOG, LOG_DEBUG, "SCRAM fetch: Session %s no longer exists", ctx->uid);
+        return NULL;
+    }
+
+    if (session->sequence != ctx->sequence) {
+        log_module(NS_LOG, LOG_DEBUG, "SCRAM fetch: Sequence mismatch for %s", ctx->uid);
+        return NULL;
+    }
+
+    if (session->state != SASL_STATE_SCRAM_FETCH) {
+        log_module(NS_LOG, LOG_DEBUG, "SCRAM fetch: Session %s not in SCRAM_FETCH state (%d)",
+                   ctx->uid, session->state);
+        return NULL;
+    }
+
+    return session;
+}
+
+/**
+ * Fail SCRAM auth - send failure response and clean up.
+ */
+static void
+scram_fetch_fail(struct scram_fetch_ctx *ctx, const char *reason)
+{
+    struct SASLSession *session;
+
+    log_module(NS_LOG, LOG_DEBUG, "SCRAM fetch failed for %s: %s", ctx->username, reason);
+
+    session = scram_fetch_validate(ctx);
+    if (session) {
+        irc_sasl(session->source, session->uid, "D", "F");
+        sasl_delete_session(session);
+    }
+    scram_fetch_ctx_free(ctx);
+}
+
+/**
+ * Resume SCRAM auth after successfully fetching credentials.
+ * Generates server-first message and sends to client.
+ */
+static void
+scram_fetch_resume(struct scram_fetch_ctx *ctx, struct scram_credential *cred)
+{
+    struct SASLSession *session;
+    unsigned char server_nonce_bytes[16];
+    char response[512];
+
+    session = scram_fetch_validate(ctx);
+    if (!session) {
+        log_module(NS_LOG, LOG_DEBUG, "SCRAM fetch resume: Session %s gone", ctx->uid);
+        scram_fetch_ctx_free(ctx);
+        return;
+    }
+
+    /* Allocate SCRAM session state */
+    session->scram = calloc(1, sizeof(struct scram_session));
+    if (!session->scram) {
+        log_module(NS_LOG, LOG_ERROR, "SCRAM fetch resume: Out of memory");
+        irc_sasl(session->source, session->uid, "D", "F");
+        sasl_delete_session(session);
+        scram_fetch_ctx_free(ctx);
+        return;
+    }
+
+    /* Store credential and hash type */
+    memcpy(&session->scram->cred, cred, sizeof(*cred));
+    session->scram->hash_type = ctx->hash_type;
+    strncpy(session->scram->client_nonce, ctx->client_nonce, sizeof(session->scram->client_nonce) - 1);
+    session->scram->iteration = cred->iteration;
+
+    /* Generate server nonce */
+    if (RAND_bytes(server_nonce_bytes, sizeof(server_nonce_bytes)) != 1) {
+        log_module(NS_LOG, LOG_ERROR, "SCRAM fetch resume: Failed to generate server nonce");
+        free(session->scram);
+        session->scram = NULL;
+        irc_sasl(session->source, session->uid, "D", "F");
+        sasl_delete_session(session);
+        scram_fetch_ctx_free(ctx);
+        return;
+    }
+
+    {
+        char *server_nonce_ptr;
+        base64_encode_alloc((char *)server_nonce_bytes, sizeof(server_nonce_bytes), &server_nonce_ptr);
+        strncpy(session->scram->server_nonce, server_nonce_ptr, sizeof(session->scram->server_nonce) - 1);
+        session->scram->server_nonce[sizeof(session->scram->server_nonce) - 1] = '\0';
+        free(server_nonce_ptr);
+    }
+
+    /* Combined nonce */
+    snprintf(session->scram->combined_nonce, sizeof(session->scram->combined_nonce),
+             "%s%s", ctx->client_nonce, session->scram->server_nonce);
+
+    /* Base64 encode salt */
+    {
+        char *salt_ptr;
+        base64_encode_alloc((char *)cred->salt, SCRAM_SALT_LEN, &salt_ptr);
+        strncpy(session->scram->salt_b64, salt_ptr, sizeof(session->scram->salt_b64) - 1);
+        session->scram->salt_b64[sizeof(session->scram->salt_b64) - 1] = '\0';
+        free(salt_ptr);
+    }
+
+    /* Build server-first message */
+    snprintf(response, sizeof(response), "r=%s,s=%s,i=%u",
+             session->scram->combined_nonce,
+             session->scram->salt_b64,
+             session->scram->iteration);
+
+    /* Build auth message (client-first-bare + "," + server-first) */
+    session->scram->auth_message_len = snprintf(session->scram->auth_message,
+        sizeof(session->scram->auth_message),
+        "n=%s,r=%s,%s",
+        ctx->username, ctx->client_nonce, response);
+
+    log_module(NS_LOG, LOG_DEBUG, "SCRAM fetch resume: Sending server-first for %s: %s",
+               ctx->username, response);
+
+    /* Send base64-encoded server-first */
+    {
+        char *server_first_b64;
+        base64_encode_alloc(response, strlen(response), &server_first_b64);
+        irc_sasl(session->source, session->uid, "C", server_first_b64);
+        free(server_first_b64);
+    }
+
+    session->state = SASL_STATE_SCRAM_CHALLENGE;
+    scram_fetch_ctx_free(ctx);
+}
+
+/**
+ * Callback stage 3: Keycloak attributes fetched.
+ * Parse x3_scram_* attributes and resume SCRAM auth.
+ */
+static int
+scram_fetch_attrs_cb(void *session, int result, struct kc_metadata_entry *entries)
+{
+    struct scram_fetch_ctx *ctx = (struct scram_fetch_ctx *)session;
+    struct kc_metadata_entry *entry;
+    const char *salt_b64 = NULL;
+    const char *iterations_str = NULL;
+    const char *stored_key_b64 = NULL;
+    const char *server_key_b64 = NULL;
+    struct scram_credential cred;
+    size_t hash_len;
+
+    if (result != KC_SUCCESS || !entries) {
+        log_module(NS_LOG, LOG_DEBUG, "SCRAM fetch: No x3_scram_ attributes for %s (%d)",
+                   ctx->username, result);
+        if (entries) keycloak_free_metadata_entries(entries);
+        scram_fetch_fail(ctx, "No SCRAM attributes in Keycloak");
+        return 1;
+    }
+
+    /* Parse x3_scram_* attributes */
+    for (entry = entries; entry; entry = entry->next) {
+        if (strcmp(entry->key, "x3_scram_salt") == 0) {
+            salt_b64 = entry->value;
+        } else if (strcmp(entry->key, "x3_scram_iterations") == 0) {
+            iterations_str = entry->value;
+        } else if (strcmp(entry->key, "x3_scram_stored_key") == 0) {
+            stored_key_b64 = entry->value;
+        } else if (strcmp(entry->key, "x3_scram_server_key") == 0) {
+            server_key_b64 = entry->value;
+        }
+    }
+
+    /* Verify all required attributes present */
+    if (!salt_b64 || !iterations_str || !stored_key_b64 || !server_key_b64) {
+        log_module(NS_LOG, LOG_DEBUG, "SCRAM fetch: Incomplete attributes for %s (salt=%s, iter=%s, stored=%s, server=%s)",
+                   ctx->username,
+                   salt_b64 ? "present" : "missing",
+                   iterations_str ? "present" : "missing",
+                   stored_key_b64 ? "present" : "missing",
+                   server_key_b64 ? "present" : "missing");
+        keycloak_free_metadata_entries(entries);
+        scram_fetch_fail(ctx, "Incomplete SCRAM attributes");
+        return 1;
+    }
+
+    /* Determine hash length for requested type */
+    switch (ctx->hash_type) {
+    case SCRAM_HASH_SHA1:
+        hash_len = SCRAM_SHA1_LEN;
+        break;
+    case SCRAM_HASH_SHA256:
+        hash_len = SCRAM_SHA256_LEN;
+        break;
+    case SCRAM_HASH_SHA512:
+        hash_len = SCRAM_SHA512_LEN;
+        break;
+    default:
+        keycloak_free_metadata_entries(entries);
+        scram_fetch_fail(ctx, "Unknown hash type");
+        return 1;
+    }
+
+    /* Parse into credential struct */
+    memset(&cred, 0, sizeof(cred));
+    cred.hash_type = ctx->hash_type;
+    cred.iteration = (unsigned int)strtoul(iterations_str, NULL, 10);
+    cred.hash_len = hash_len;
+
+    /* Decode base64 values */
+    {
+        char *decoded;
+        size_t decoded_len;
+
+        /* Salt */
+        if (!base64_decode_alloc(salt_b64, strlen(salt_b64), &decoded, &decoded_len) ||
+            decoded_len != SCRAM_SALT_LEN) {
+            log_module(NS_LOG, LOG_WARNING, "SCRAM fetch: Invalid salt for %s", ctx->username);
+            if (decoded) free(decoded);
+            keycloak_free_metadata_entries(entries);
+            scram_fetch_fail(ctx, "Invalid salt");
+            return 1;
+        }
+        memcpy(cred.salt, decoded, SCRAM_SALT_LEN);
+        free(decoded);
+
+        /* StoredKey */
+        if (!base64_decode_alloc(stored_key_b64, strlen(stored_key_b64), &decoded, &decoded_len) ||
+            decoded_len != hash_len) {
+            log_module(NS_LOG, LOG_WARNING, "SCRAM fetch: Invalid stored_key for %s (len=%zu, expected=%zu)",
+                       ctx->username, decoded_len, hash_len);
+            if (decoded) free(decoded);
+            keycloak_free_metadata_entries(entries);
+            scram_fetch_fail(ctx, "Invalid stored_key");
+            return 1;
+        }
+        memcpy(cred.stored_key, decoded, hash_len);
+        free(decoded);
+
+        /* ServerKey */
+        if (!base64_decode_alloc(server_key_b64, strlen(server_key_b64), &decoded, &decoded_len) ||
+            decoded_len != hash_len) {
+            log_module(NS_LOG, LOG_WARNING, "SCRAM fetch: Invalid server_key for %s", ctx->username);
+            if (decoded) free(decoded);
+            keycloak_free_metadata_entries(entries);
+            scram_fetch_fail(ctx, "Invalid server_key");
+            return 1;
+        }
+        memcpy(cred.server_key, decoded, hash_len);
+        free(decoded);
+    }
+
+    keycloak_free_metadata_entries(entries);
+
+    log_module(NS_LOG, LOG_INFO, "SCRAM fetch: Retrieved credentials from Keycloak for %s", ctx->username);
+
+    /* Store in LMDB cache for future use */
+    if (x3_lmdb_scram_acct_set(ctx->username, salt_b64, cred.iteration,
+                                stored_key_b64, server_key_b64,
+                                now, 0) == LMDB_SUCCESS) {
+        log_module(NS_LOG, LOG_DEBUG, "SCRAM fetch: Cached credentials in LMDB for %s", ctx->username);
+    }
+
+    /* Resume SCRAM auth */
+    scram_fetch_resume(ctx, &cred);
+    return 0;
+}
+
+/**
+ * Callback stage 2: Keycloak user lookup complete.
+ * Start fetching x3_scram_* attributes.
+ */
+static int
+scram_fetch_user_cb(void *session, int result, struct kc_user *user)
+{
+    struct scram_fetch_ctx *ctx = (struct scram_fetch_ctx *)session;
+
+    if (result != KC_SUCCESS || !user || !user->id) {
+        log_module(NS_LOG, LOG_DEBUG, "SCRAM fetch: User %s not found in Keycloak (%d)",
+                   ctx->username, result);
+        if (user) keycloak_user_free_fields(user);
+        scram_fetch_fail(ctx, "User not found in Keycloak");
+        return 1;
+    }
+
+    /* Store user ID for attributes fetch */
+    ctx->user_id = strdup(user->id);
+    keycloak_user_free_fields(user);
+
+    if (!ctx->user_id) {
+        scram_fetch_fail(ctx, "Out of memory");
+        return 1;
+    }
+
+    log_module(NS_LOG, LOG_DEBUG, "SCRAM fetch: Got user ID for %s, fetching attributes", ctx->username);
+
+    /* Fetch x3_scram_* attributes */
+    if (keycloak_list_user_attributes_async(keycloak_get_realm(), keycloak_get_authed_client(),
+                                             ctx->user_id, "x3_scram_", ctx,
+                                             scram_fetch_attrs_cb) < 0) {
+        log_module(NS_LOG, LOG_WARNING, "SCRAM fetch: Failed to start attribute fetch for %s", ctx->username);
+        scram_fetch_fail(ctx, "Failed to start attribute fetch");
+        return 1;
+    }
+
+    return 0;  /* Continue - waiting for attrs callback */
+}
+
+/**
+ * Callback stage 1: Token ready.
+ * Start Keycloak user lookup.
+ */
+static void
+scram_fetch_token_cb(void *context, int result, struct access_token *token)
+{
+    struct scram_fetch_ctx *ctx = (struct scram_fetch_ctx *)context;
+    (void)token;  /* We don't need the token directly */
+
+    if (result != KC_SUCCESS) {
+        log_module(NS_LOG, LOG_DEBUG, "SCRAM fetch: Token acquisition failed (%d)", result);
+        scram_fetch_fail(ctx, "Token acquisition failed");
+        return;
+    }
+
+    /* Validate session still exists */
+    if (!scram_fetch_validate(ctx)) {
+        log_module(NS_LOG, LOG_DEBUG, "SCRAM fetch: Session gone during token wait");
+        scram_fetch_ctx_free(ctx);
+        return;
+    }
+
+    log_module(NS_LOG, LOG_DEBUG, "SCRAM fetch: Token ready, looking up user %s", ctx->username);
+
+    /* Start user lookup */
+    if (keycloak_get_user_async(keycloak_get_realm(), keycloak_get_authed_client(),
+                                 ctx->username, ctx, scram_fetch_user_cb) < 0) {
+        log_module(NS_LOG, LOG_WARNING, "SCRAM fetch: Failed to start user lookup for %s", ctx->username);
+        scram_fetch_fail(ctx, "Failed to start user lookup");
+        return;
+    }
+}
+
+/**
+ * Start async SCRAM credential fetch from Keycloak.
+ *
+ * @param session SASL session
+ * @param username Account name to look up
+ * @param client_nonce Client nonce from client-first message
+ * @param hash_type Requested SCRAM hash type
+ * @return 0 on success (async started), -1 on error
+ */
+static int
+scram_fetch_start(struct SASLSession *session, const char *username,
+                  const char *client_nonce, enum scram_hash_type hash_type)
+{
+    struct scram_fetch_ctx *ctx;
+
+    if (!session || !username || !client_nonce) {
+        return -1;
+    }
+
+    ctx = calloc(1, sizeof(*ctx));
+    if (!ctx) {
+        log_module(NS_LOG, LOG_ERROR, "SCRAM fetch: Out of memory");
+        return -1;
+    }
+
+    ctx->session = session;
+    ctx->sequence = session->sequence;
+    safestrncpy(ctx->uid, session->uid, sizeof(ctx->uid));
+    safestrncpy(ctx->username, username, sizeof(ctx->username));
+    safestrncpy(ctx->client_nonce, client_nonce, sizeof(ctx->client_nonce));
+    ctx->hash_type = hash_type;
+
+    /* Mark session as fetching */
+    session->state = SASL_STATE_SCRAM_FETCH;
+
+    /* Start token acquisition (or use cached token) */
+    if (keycloak_ensure_token_async(scram_fetch_token_cb, ctx) < 0) {
+        log_module(NS_LOG, LOG_DEBUG, "SCRAM fetch: Failed to start token acquisition");
+        session->state = SASL_STATE_MECH_SELECTED;  /* Restore state */
+        free(ctx);
+        return -1;
+    }
+
+    log_module(NS_LOG, LOG_DEBUG, "SCRAM fetch: Started async credential fetch for %s", username);
+    return 0;
+}
+
+#endif /* WITH_LMDB && WITH_SSL && WITH_KEYCLOAK */
 
 /* Context for async delete account */
 struct kc_delete_account_ctx {
@@ -10830,6 +11473,9 @@ reg_complete_registration(struct RegSession *session)
         /* Create SCRAM credentials - we have plaintext password in session */
         if (session->password_plain[0]) {
             x3_lmdb_scram_acct_create_all(session->account, session->password_plain);
+#ifdef WITH_KEYCLOAK
+            kc_sync_scram(session->account);
+#endif
         }
 #endif
 
@@ -11013,7 +11659,8 @@ enum sasl_state {
     SASL_STATE_CANCELLED,         /* Client disconnected during auth */
     SASL_STATE_TIMEOUT,           /* Session timed out */
     SASL_STATE_SCRAM_CHALLENGE,   /* SCRAM: sent server-first, waiting for client-final */
-    SASL_STATE_SCRAM_VERIFY       /* SCRAM: verifying client proof */
+    SASL_STATE_SCRAM_VERIFY,      /* SCRAM: verifying client proof */
+    SASL_STATE_SCRAM_FETCH        /* SCRAM: fetching credentials from Keycloak */
 };
 
 struct SASLSession
@@ -11124,6 +11771,31 @@ sasl_session_is_terminal(struct SASLSession *session)
 /* Negative auth cache TTL - how long to remember failed auths */
 #define AUTHFAIL_CACHE_TTL 60  /* 60 seconds */
 
+#if defined(WITH_LMDB) && defined(WITH_SSL) && defined(WITH_KEYCLOAK)
+/**
+ * Context for async SCRAM credential fetch from Keycloak.
+ * Used when LMDB doesn't have SCRAM credentials and we need to
+ * fetch x3_scram_* user attributes from Keycloak.
+ */
+struct scram_fetch_ctx {
+    struct SASLSession *session;
+    uint32_t sequence;              /* Session sequence for validation */
+    char uid[128];                  /* Copy of UID */
+    char username[NICKSERV_HANDLE_LEN + 1];  /* Account name */
+    char client_nonce[48];          /* Client nonce from client-first */
+    char *user_id;                  /* Keycloak user ID (allocated) */
+    enum scram_hash_type hash_type; /* Requested hash type */
+};
+
+/* Forward declarations for SCRAM fetch callbacks */
+static void scram_fetch_token_cb(void *ctx, int result, struct access_token *token);
+static int scram_fetch_user_cb(void *session, int result, struct kc_user *user);
+static int scram_fetch_attrs_cb(void *session, int result, struct kc_metadata_entry *entries);
+static void scram_fetch_resume(struct scram_fetch_ctx *ctx, struct scram_credential *cred);
+static void scram_fetch_fail(struct scram_fetch_ctx *ctx, const char *reason);
+static void scram_fetch_ctx_free(struct scram_fetch_ctx *ctx);
+#endif /* WITH_LMDB && WITH_SSL && WITH_KEYCLOAK */
+
 #ifdef WITH_LMDB
 /**
  * Compute MD5 hash of credentials for negative cache lookup
@@ -11194,8 +11866,117 @@ cache_authfail(const char *cred_hash)
     log_module(NS_LOG, LOG_DEBUG, "Cached auth failure for hash %s", cred_hash);
 }
 
+/* Positive auth cache TTL - how long to cache successful auths
+ * Safe with 1 hour TTL since Keycloak webhook invalidates on password change */
+#define AUTHSUCCESS_CACHE_TTL 3600  /* 1 hour */
+
+/**
+ * Check if credentials are in the positive auth cache
+ * Key format: authsuccess:<username_lower>
+ * Value format: <timestamp>:<password_hash>
+ * @param username The username to check
+ * @param password_hash The MD5 hash of username:password
+ * @return 1 if cache hit (password matches), 0 if miss
+ */
+static int
+check_authsuccess_cache(const char *username, const char *password_hash)
+{
+    char lmdb_key[128];
+    char cached_value[128];
+    char username_lower[64];
+    char *colon;
+    time_t cached_time;
+
+    if (!username || !password_hash)
+        return 0;
+
+    /* Lowercase username for key */
+    strncpy(username_lower, username, sizeof(username_lower) - 1);
+    username_lower[sizeof(username_lower) - 1] = '\0';
+    for (char *p = username_lower; *p; p++) *p = tolower((unsigned char)*p);
+
+    snprintf(lmdb_key, sizeof(lmdb_key), "%s%s", LMDB_PREFIX_AUTHSUCCESS, username_lower);
+
+    if (x3_lmdb_get(LMDB_DB_METADATA, lmdb_key, cached_value, sizeof(cached_value)) == LMDB_SUCCESS) {
+        /* Parse timestamp:password_hash */
+        colon = strchr(cached_value, ':');
+        if (colon) {
+            *colon = '\0';
+            cached_time = (time_t)strtoul(cached_value, NULL, 10);
+            if (now - cached_time < AUTHSUCCESS_CACHE_TTL) {
+                /* Check password hash matches */
+                if (strcmp(colon + 1, password_hash) == 0) {
+                    log_module(NS_LOG, LOG_DEBUG, "Positive auth cache hit for %s (age=%lu)",
+                               username, (unsigned long)(now - cached_time));
+                    return 1;  /* Cache hit - credentials valid */
+                }
+                /* Password hash mismatch - user may have changed password */
+                log_module(NS_LOG, LOG_DEBUG, "Positive auth cache password mismatch for %s",
+                           username);
+            }
+            /* Expired or mismatched - delete stale entry */
+            x3_lmdb_delete(LMDB_DB_METADATA, lmdb_key);
+        }
+    }
+    return 0;  /* Not in cache or cache miss */
+}
+
+/**
+ * Add credentials to the positive auth cache
+ * @param username The username
+ * @param password_hash The MD5 hash of username:password
+ */
+static void
+cache_authsuccess(const char *username, const char *password_hash)
+{
+    char lmdb_key[128];
+    char cache_value[128];
+    char username_lower[64];
+
+    if (!username || !password_hash)
+        return;
+
+    /* Lowercase username for key */
+    strncpy(username_lower, username, sizeof(username_lower) - 1);
+    username_lower[sizeof(username_lower) - 1] = '\0';
+    for (char *p = username_lower; *p; p++) *p = tolower((unsigned char)*p);
+
+    snprintf(lmdb_key, sizeof(lmdb_key), "%s%s", LMDB_PREFIX_AUTHSUCCESS, username_lower);
+    snprintf(cache_value, sizeof(cache_value), "%lu:%s", (unsigned long)now, password_hash);
+    x3_lmdb_set(LMDB_DB_METADATA, lmdb_key, cache_value);
+    log_module(NS_LOG, LOG_DEBUG, "Cached auth success for %s", username);
+}
+
+/**
+ * Invalidate positive auth cache for a user
+ * Called by keycloak_webhook when password changes
+ * @param username The username to invalidate
+ */
+void
+invalidate_authsuccess_cache(const char *username)
+{
+    char lmdb_key[128];
+    char username_lower[64];
+
+    if (!username)
+        return;
+
+    /* Lowercase username for key */
+    strncpy(username_lower, username, sizeof(username_lower) - 1);
+    username_lower[sizeof(username_lower) - 1] = '\0';
+    for (char *p = username_lower; *p; p++) *p = tolower((unsigned char)*p);
+
+    snprintf(lmdb_key, sizeof(lmdb_key), "%s%s", LMDB_PREFIX_AUTHSUCCESS, username_lower);
+    x3_lmdb_delete(LMDB_DB_METADATA, lmdb_key);
+    log_module(NS_LOG, LOG_DEBUG, "Invalidated auth success cache for %s", username);
+}
+
+#endif /* WITH_LMDB */
+
 /* Fingerprint failure cache TTL - how long to remember failed fingerprint lookups */
 #define FPFAIL_CACHE_TTL 60  /* 60 seconds */
+
+#ifdef WITH_LMDB
 
 /**
  * Check if fingerprint is in the negative lookup cache
@@ -11320,7 +12101,8 @@ sasl_delete_stale(UNUSED_ARG(void *data))
                        sess->uid, (long)(now - sess->last_activity), sess->state);
             delcount++;
             /* If async auth in progress, mark as timed out - callback will clean up */
-            if (sess->state == SASL_STATE_AUTHENTICATING) {
+            if (sess->state == SASL_STATE_AUTHENTICATING ||
+                sess->state == SASL_STATE_SCRAM_FETCH) {
                 log_module(NS_LOG, LOG_DEBUG, "SASL: Marking session %s as TIMEOUT (async in progress)", sess->uid);
                 sess->state = SASL_STATE_TIMEOUT;
             } else {
@@ -11537,6 +12319,11 @@ sasl_async_auth_callback(void *ctx_ptr, int result)
         /* Auto-register certificate if enabled and user has one */
         if (nickserv_conf.cert_autoregister && session->sslclifp && session->sslclifp[0]) {
             nickserv_addsslfp_silent(hi, session->sslclifp);
+        }
+
+        /* Cache successful auth for faster future logins (only for non-impersonating users) */
+        if (!hii && session->cred_hash[0]) {
+            cache_authsuccess(hi->handle, session->cred_hash);
         }
 
         irc_sasl(session->source, session->uid, "D", "S");
@@ -12334,6 +13121,20 @@ sasl_packet(struct SASLSession *session)
             } else {
                 /* Regular account flow: look up by account name */
                 if (x3_lmdb_scram_acct_get(username, mech_hash_type, &cred) != LMDB_SUCCESS) {
+#ifdef WITH_KEYCLOAK
+                    /* LMDB cache miss - try fetching from Keycloak user attributes */
+                    if (nickserv_conf.keycloak_enable) {
+                        log_module(NS_LOG, LOG_DEBUG, "SASL %s: No local SCRAM for %s, trying Keycloak",
+                                   mech_name, username);
+                        if (scram_fetch_start(session, username, client_nonce, mech_hash_type) == 0) {
+                            /* Async fetch started - callback will resume or fail */
+                            free(raw);
+                            return 0;  /* Continue - waiting for async */
+                        }
+                        log_module(NS_LOG, LOG_DEBUG, "SASL %s: Keycloak fetch failed to start for %s",
+                                   mech_name, username);
+                    }
+#endif
                     log_module(NS_LOG, LOG_DEBUG, "SASL %s: No SCRAM credential for account %s", mech_name, username);
                     irc_sasl(session->source, session->uid, "D", "F");
                     sasl_delete_session(session);
@@ -12675,6 +13476,27 @@ sasl_packet(struct SASLSession *session)
                 free(raw);
                 return 1;
             }
+
+            /* Check positive auth cache - skip Keycloak for recently validated credentials */
+            if (check_authsuccess_cache(authcid, session->cred_hash)) {
+                struct handle_info *cached_hi = get_handle_info(authcid);
+                if (cached_hi && !HANDLE_FLAGGED(cached_hi, SUSPENDED)) {
+                    /* Cache hit - fast track to success */
+                    log_module(NS_LOG, LOG_DEBUG, "SASL: Positive cache hit - fast-tracking auth for %s", authcid);
+                    char buffer[256];
+                    snprintf(buffer, sizeof(buffer), "%s " FMT_TIME_T, cached_hi->handle, cached_hi->registered);
+                    irc_sasl(session->source, session->uid, "L", buffer);
+                    irc_sasl(session->source, session->uid, "D", "S");
+                    free(raw);
+                    return 1;
+                }
+                /* Account not found or suspended - invalidate cache and proceed with Keycloak */
+                if (!cached_hi) {
+                    log_module(NS_LOG, LOG_DEBUG, "SASL: Positive cache hit but account %s not found locally, proceeding to Keycloak", authcid);
+                } else {
+                    log_module(NS_LOG, LOG_DEBUG, "SASL: Positive cache hit but account %s is suspended", authcid);
+                }
+            }
 #endif
 
             /* Store credentials for callback */
@@ -12800,7 +13622,8 @@ handle_sasl_input(struct server* source ,const char *uid, const char *subcmd, co
         log_module(NS_LOG, LOG_DEBUG, "SASL: Resetting stale session for %s (had mech=%s, age=%lds, state=%d)",
                    uid, sess->mech, (long)(now - sess->created), sess->state);
         /* If async auth in progress, mark as cancelled - callback will clean up */
-        if (sess->state == SASL_STATE_AUTHENTICATING) {
+        if (sess->state == SASL_STATE_AUTHENTICATING ||
+            sess->state == SASL_STATE_SCRAM_FETCH) {
             log_module(NS_LOG, LOG_DEBUG, "SASL: Marking old session %s as CANCELLED (async in progress)", sess->uid);
             sess->state = SASL_STATE_CANCELLED;
         } else {
@@ -12817,7 +13640,8 @@ handle_sasl_input(struct server* source ,const char *uid, const char *subcmd, co
     if (!strcmp(subcmd, "D"))
     {
         /* Check if async auth is in progress */
-        if (sess->state == SASL_STATE_AUTHENTICATING) {
+        if (sess->state == SASL_STATE_AUTHENTICATING ||
+            sess->state == SASL_STATE_SCRAM_FETCH) {
             /* Mark as cancelled - callback will clean up */
             log_module(NS_LOG, LOG_DEBUG, "SASL: Marking session %s as cancelled (async in progress)", sess->uid);
             sess->state = SASL_STATE_CANCELLED;
@@ -12841,7 +13665,8 @@ handle_sasl_input(struct server* source ,const char *uid, const char *subcmd, co
         log_module(NS_LOG, LOG_DEBUG, "SASL: Client aborted authentication for %s (state=%d)", sess->uid, sess->state);
         irc_sasl(source, uid, "D", "A");
         /* If async auth in progress, mark as cancelled - callback will clean up */
-        if (sess->state == SASL_STATE_AUTHENTICATING) {
+        if (sess->state == SASL_STATE_AUTHENTICATING ||
+            sess->state == SASL_STATE_SCRAM_FETCH) {
             log_module(NS_LOG, LOG_DEBUG, "SASL: Marking session %s as CANCELLED (async in progress)", sess->uid);
             sess->state = SASL_STATE_CANCELLED;
         } else {
@@ -12892,7 +13717,8 @@ handle_sasl_input(struct server* source ,const char *uid, const char *subcmd, co
             log_module(NS_LOG, LOG_DEBUG, "SASL: Buffer overflow for %s (state=%d)", sess->uid, sess->state);
             irc_sasl(source, uid, "D", "F");
             /* If async auth in progress, mark as failed - callback will clean up */
-            if (sess->state == SASL_STATE_AUTHENTICATING) {
+            if (sess->state == SASL_STATE_AUTHENTICATING ||
+                sess->state == SASL_STATE_SCRAM_FETCH) {
                 log_module(NS_LOG, LOG_DEBUG, "SASL: Marking session %s as FAILED (async in progress)", sess->uid);
                 sess->state = SASL_STATE_FAILED;
             } else {
@@ -13242,6 +14068,9 @@ nickserv_ircv3_verify(struct userNode *user, const char *handle,
         const char *pending_password = pending_scram_get(handle);
         if (pending_password) {
             x3_lmdb_scram_acct_create_all(hi->handle, pending_password);
+#ifdef WITH_KEYCLOAK
+            kc_sync_scram(hi->handle);
+#endif
             pending_scram_remove(handle);
         }
     }

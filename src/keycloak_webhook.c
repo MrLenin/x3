@@ -752,11 +752,17 @@ handle_keycloak_event(const char *body, size_t body_len)
                     json_t *type = json_object_get(rep_json, "type");
                     const char *cred_type = type && json_is_string(type) ? json_string_value(type) : NULL;
 
-                    /* Try to get username from representation or authDetails */
+                    /* Try to get username from root (webhook SPI), representation, or authDetails */
                     const char *username = NULL;
-                    json_t *user_uname = json_object_get(rep_json, "username");
-                    if (user_uname && json_is_string(user_uname)) {
-                        username = json_string_value(user_uname);
+                    json_t *root_uname = json_object_get(root, "username");
+                    if (root_uname && json_is_string(root_uname)) {
+                        username = json_string_value(root_uname);
+                    }
+                    if (!username) {
+                        json_t *user_uname = json_object_get(rep_json, "username");
+                        if (user_uname && json_is_string(user_uname)) {
+                            username = json_string_value(user_uname);
+                        }
                     }
                     if (!username) {
                         json_t *auth = json_object_get(root, "authDetails");
@@ -768,14 +774,62 @@ handle_keycloak_event(const char *body, size_t body_len)
                     }
 
                     if (cred_type && strcmp(cred_type, "password") == 0 && username) {
-                        /* Password credential changed - invalidate SCRAM caches */
+                        /* Password credential changed - invalidate all auth caches */
                         log_module(webhook_log, LOG_INFO,
-                                   "Password changed for %s via Keycloak - invalidating SCRAM caches",
+                                   "Password changed for %s via Keycloak - invalidating auth caches",
                                    username);
+                        /* Invalidate positive auth cache */
+                        invalidate_authsuccess_cache(username);
+                        /* Invalidate SCRAM caches */
                         x3_lmdb_scram_revoke_all(username);
                         x3_lmdb_scram_acct_delete_all(username);
                         stats.scram_invalidations++;
                         stats.cache_invalidations++;
+
+                        /* Check for SCRAM credentials in webhook payload (from Keycloak SPI) */
+                        json_t *scram = json_object_get(root, "scram");
+                        if (scram && json_is_object(scram)) {
+                            json_t *salt = json_object_get(scram, "salt");
+                            json_t *iterations = json_object_get(scram, "iterations");
+                            json_t *stored_key = json_object_get(scram, "storedKey");
+                            json_t *server_key = json_object_get(scram, "serverKey");
+
+                            if (salt && json_is_string(salt) &&
+                                iterations && json_is_integer(iterations) &&
+                                stored_key && json_is_string(stored_key) &&
+                                server_key && json_is_string(server_key)) {
+
+                                log_module(webhook_log, LOG_INFO,
+                                           "Pre-populating SCRAM cache for %s from webhook",
+                                           username);
+
+                                /* Pre-populate account-level SCRAM cache (scram_acct:)
+                                 * This eliminates the need for Keycloak lookup on first auth */
+                                int rc = x3_lmdb_scram_acct_set(
+                                    username,
+                                    json_string_value(salt),
+                                    (int)json_integer_value(iterations),
+                                    json_string_value(stored_key),
+                                    json_string_value(server_key),
+                                    now,
+                                    0  /* No TTL - refreshed on next password change */
+                                );
+
+                                if (rc == LMDB_SUCCESS) {
+                                    log_module(webhook_log, LOG_DEBUG,
+                                               "SCRAM cache pre-populated for %s", username);
+                                    stats.cache_invalidations++;  /* Count as a cache update */
+                                } else {
+                                    log_module(webhook_log, LOG_WARNING,
+                                               "Failed to pre-populate SCRAM cache for %s: %d",
+                                               username, rc);
+                                }
+                            } else {
+                                log_module(webhook_log, LOG_DEBUG,
+                                           "Incomplete SCRAM credentials in webhook for %s",
+                                           username);
+                            }
+                        }
                     } else if (cred_type && strcmp(cred_type, "x509") == 0 &&
                                strcmp(operation_type, "CREATE") == 0) {
                         /* New X.509 certificate - pre-warm fingerprint cache */

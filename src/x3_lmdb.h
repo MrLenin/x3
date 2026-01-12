@@ -52,6 +52,7 @@ struct lmdb_chansync_meta {
 #define LMDB_PREFIX_SESSION "session:"  /* Session tokens: token_id → expiry:username */
 #define LMDB_PREFIX_SESSVER "sessver:"  /* Session version: username → version_number */
 #define LMDB_PREFIX_SCRAM_ACCT "scram_acct:"  /* Account SCRAM: hash_type:account → SCRAM verifier */
+#define LMDB_PREFIX_AUTHSUCCESS "authsuccess:"  /* Successful auth cache: username → timestamp:password_hash */
 
 /* Metadata entry for iteration */
 struct lmdb_metadata_entry {
@@ -940,6 +941,28 @@ int x3_lmdb_scram_acct_get(const char *account, enum scram_hash_type hash_type,
  * @return Number of credentials deleted, -1 on error
  */
 int x3_lmdb_scram_acct_delete_all(const char *account);
+
+/**
+ * Set SCRAM credential for an account from pre-computed values (SHA-256 only).
+ * Used by Keycloak webhook to pre-populate cache with credentials generated
+ * by the Keycloak SPI.
+ *
+ * @param account Account name
+ * @param salt_b64 Base64-encoded salt
+ * @param iterations Iteration count
+ * @param stored_key_b64 Base64-encoded StoredKey
+ * @param server_key_b64 Base64-encoded ServerKey
+ * @param timestamp Creation timestamp (usually now)
+ * @param ttl Time-to-live in seconds (0 = no expiry)
+ * @return LMDB_SUCCESS on success, LMDB_ERROR on failure
+ */
+int x3_lmdb_scram_acct_set(const char *account,
+                           const char *salt_b64,
+                           int iterations,
+                           const char *stored_key_b64,
+                           const char *server_key_b64,
+                           time_t timestamp,
+                           time_t ttl);
 
 /**
  * Derive SCRAM keys from password and salt (generic for any hash type)
