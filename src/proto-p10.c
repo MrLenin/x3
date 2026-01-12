@@ -3685,6 +3685,10 @@ static CMD_FUNC(cmd_chathistory)
             /* Decode base64 */
             if (base64_decode_alloc(chunk->b64_data, chunk->b64_len,
                                     &decoded, &decoded_len)) {
+                /* Null-terminate for use as C string.
+                 * base64_decode_alloc allocates 3*(inlen/4)+2 bytes,
+                 * which provides padding for the null terminator. */
+                decoded[decoded_len] = '\0';
                 result->content = decoded;
             } else {
                 log_module(MAIN_LOG, LOG_WARNING,
