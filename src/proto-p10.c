@@ -3131,8 +3131,8 @@ static CMD_FUNC(cmd_metadataquery)
         struct chanData *cData = channel ? channel->channel_info : NULL;
         if (!cData) {
             log_module(MAIN_LOG, LOG_DEBUG, "MDQ: Channel %s not registered", target);
-            /* Send error response so IRCd doesn't wait for timeout */
-            irc_metadata(target, "*", "NOTARGET", METADATA_VIS_ERROR);
+            /* Send error response with original key so IRCd matches pending request */
+            irc_metadata(target, key, "NOTARGET", METADATA_VIS_ERROR);
             return 1;
         }
 
@@ -3152,8 +3152,8 @@ static CMD_FUNC(cmd_metadataquery)
     hi = get_handle_info(target);
     if (!hi) {
         log_module(MAIN_LOG, LOG_DEBUG, "MDQ: Account %s not found", target);
-        /* Send error response so IRCd doesn't wait for timeout */
-        irc_metadata(target, "*", "NOTARGET", METADATA_VIS_ERROR);
+        /* Send error response with original key so IRCd matches pending request */
+        irc_metadata(target, key, "NOTARGET", METADATA_VIS_ERROR);
         return 1;
     }
 
