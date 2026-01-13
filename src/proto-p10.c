@@ -719,7 +719,14 @@ irc_account(struct userNode *user, const char *stamp, time_t timestamp)
 void
 irc_metadata(const char *target, const char *key, const char *value, int visibility)
 {
-    const char *vis_token = (visibility == METADATA_VIS_PRIVATE) ? "P" : "*";
+    const char *vis_token;
+    if (visibility == METADATA_VIS_ERROR)
+        vis_token = "!";  /* Error marker */
+    else if (visibility == METADATA_VIS_PRIVATE)
+        vis_token = "P";
+    else
+        vis_token = "*";
+
     if (value && *value)
         putsock("%s " P10_METADATA " %s %s %s :%s", self->numeric, target, key, vis_token, value);
     else
@@ -3124,6 +3131,8 @@ static CMD_FUNC(cmd_metadataquery)
         struct chanData *cData = channel ? channel->channel_info : NULL;
         if (!cData) {
             log_module(MAIN_LOG, LOG_DEBUG, "MDQ: Channel %s not registered", target);
+            /* Send error response so IRCd doesn't wait for timeout */
+            irc_metadata(target, "*", "NOTARGET", METADATA_VIS_ERROR);
             return 1;
         }
 
@@ -3143,6 +3152,8 @@ static CMD_FUNC(cmd_metadataquery)
     hi = get_handle_info(target);
     if (!hi) {
         log_module(MAIN_LOG, LOG_DEBUG, "MDQ: Account %s not found", target);
+        /* Send error response so IRCd doesn't wait for timeout */
+        irc_metadata(target, "*", "NOTARGET", METADATA_VIS_ERROR);
         return 1;
     }
 

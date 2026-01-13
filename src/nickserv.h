@@ -371,6 +371,7 @@ enum nickserv_verify_result nickserv_ircv3_verify(struct userNode *user,
 /** Metadata visibility levels */
 #define METADATA_VIS_PUBLIC  0  /* Anyone can see */
 #define METADATA_VIS_PRIVATE 1  /* Only owner can see */
+#define METADATA_VIS_ERROR   2  /* Error response (no such target) */
 
 /** Maximum length of a metadata key */
 #define METADATA_KEY_LEN 64
