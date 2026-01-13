@@ -135,6 +135,7 @@ enum histserv_query_type {
 /* Pending query context for async callback */
 struct histserv_query_ctx {
     struct userNode *user;
+    char numeric[COMBO_NUMERIC_LEN + 1];  /* User numeric for validation after async */
     char target[CHANNELLEN + 1];
     char ref[128];
     enum histserv_query_type type;
@@ -424,12 +425,22 @@ histserv_history_callback(const char *reqid, const char *target,
 {
     struct histserv_query_ctx *ctx = extra;
     struct chathistory_result *r;
+    struct userNode *user;
     const char *ts;
 
     (void)reqid;
     (void)target;
 
-    if (!ctx || !ctx->user) {
+    if (!ctx) {
+        chathistory_result_free(results);
+        return;
+    }
+
+    /* Re-validate user is still connected by looking up their numeric.
+     * The stored user pointer may be dangling if user disconnected during async query. */
+    user = GetUserN(ctx->numeric);
+    if (!user || user != ctx->user) {
+        /* User disconnected or numeric was reassigned */
         chathistory_result_free(results);
         free(ctx);
         return;
@@ -614,6 +625,7 @@ static HISTSERV_FUNC(cmd_latest)
     /* Create query context */
     ctx = calloc(1, sizeof(*ctx));
     ctx->user = user;
+    strncpy(ctx->numeric, user->numeric, COMBO_NUMERIC_LEN);
     strncpy(ctx->target, resolved_target, sizeof(ctx->target) - 1);
     strncpy(ctx->ref, ref, sizeof(ctx->ref) - 1);
     ctx->type = QUERY_LATEST;
@@ -664,6 +676,7 @@ static HISTSERV_FUNC(cmd_before)
     /* Create query context */
     ctx = calloc(1, sizeof(*ctx));
     ctx->user = user;
+    strncpy(ctx->numeric, user->numeric, COMBO_NUMERIC_LEN);
     strncpy(ctx->target, resolved_target, sizeof(ctx->target) - 1);
     strncpy(ctx->ref, ref, sizeof(ctx->ref) - 1);
     ctx->type = QUERY_BEFORE;
@@ -714,6 +727,7 @@ static HISTSERV_FUNC(cmd_after)
     /* Create query context */
     ctx = calloc(1, sizeof(*ctx));
     ctx->user = user;
+    strncpy(ctx->numeric, user->numeric, COMBO_NUMERIC_LEN);
     strncpy(ctx->target, resolved_target, sizeof(ctx->target) - 1);
     strncpy(ctx->ref, ref, sizeof(ctx->ref) - 1);
     ctx->type = QUERY_AFTER;
@@ -764,6 +778,7 @@ static HISTSERV_FUNC(cmd_around)
     /* Create query context */
     ctx = calloc(1, sizeof(*ctx));
     ctx->user = user;
+    strncpy(ctx->numeric, user->numeric, COMBO_NUMERIC_LEN);
     strncpy(ctx->target, resolved_target, sizeof(ctx->target) - 1);
     strncpy(ctx->ref, ref, sizeof(ctx->ref) - 1);
     ctx->type = QUERY_AROUND;
@@ -800,6 +815,7 @@ static HISTSERV_FUNC(cmd_fetch)
     /* Create query context */
     ctx = calloc(1, sizeof(*ctx));
     ctx->user = user;
+    strncpy(ctx->numeric, user->numeric, COMBO_NUMERIC_LEN);
     strncpy(ctx->target, resolved_target, sizeof(ctx->target) - 1);
     strncpy(ctx->ref, msgid, sizeof(ctx->ref) - 1);
     ctx->type = QUERY_FETCH;
