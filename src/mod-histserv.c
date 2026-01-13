@@ -54,15 +54,50 @@ static const struct message_entry msgtab[] = {
     { "HSMSG_FETCH_HEADER", "=== Message %s in %s ===" },
     { "HSMSG_FETCH_LINE", "<%s> %s" },
     { "HSMSG_FETCH_FOOTER", "=== End of message ===" },
+    /* Event type formats for non-PRIVMSG/NOTICE history entries */
+    { "HSMSG_FETCH_JOIN", "* %s has joined" },
+    { "HSMSG_FETCH_PART", "* %s has left (%s)" },
+    { "HSMSG_FETCH_PART_NOREASON", "* %s has left" },
+    { "HSMSG_FETCH_QUIT", "* %s has quit (%s)" },
+    { "HSMSG_FETCH_QUIT_NOREASON", "* %s has quit" },
+    { "HSMSG_FETCH_KICK", "* %s was kicked (%s)" },
+    { "HSMSG_FETCH_KICK_NOREASON", "* %s was kicked" },
+    { "HSMSG_FETCH_MODE", "* %s sets mode: %s" },
+    { "HSMSG_FETCH_TOPIC", "* %s changes topic to: %s" },
+    { "HSMSG_FETCH_TAGMSG", "* %s sent a tag-only message" },
     { "HSMSG_HISTORY_HEADER", "=== Chat history for %s ===" },
     { "HSMSG_DM_HISTORY_HEADER", "=== DM history with %s ===" },
     { "HSMSG_HISTORY_LINE", "[%s] <%s> %s" },
+    /* Event type formats with timestamps */
+    { "HSMSG_HISTORY_JOIN", "[%s] * %s has joined" },
+    { "HSMSG_HISTORY_PART", "[%s] * %s has left (%s)" },
+    { "HSMSG_HISTORY_PART_NOREASON", "[%s] * %s has left" },
+    { "HSMSG_HISTORY_QUIT", "[%s] * %s has quit (%s)" },
+    { "HSMSG_HISTORY_QUIT_NOREASON", "[%s] * %s has quit" },
+    { "HSMSG_HISTORY_KICK", "[%s] * %s was kicked (%s)" },
+    { "HSMSG_HISTORY_KICK_NOREASON", "[%s] * %s was kicked" },
+    { "HSMSG_HISTORY_MODE", "[%s] * %s sets mode: %s" },
+    { "HSMSG_HISTORY_TOPIC", "[%s] * %s changes topic to: %s" },
+    { "HSMSG_HISTORY_TAGMSG", "[%s] * %s sent a tag-only message" },
     { "HSMSG_HISTORY_FOOTER", "=== End of history (%d messages) ===" },
     { "HSMSG_INVALID_TIME", "$b%s$b is not a valid time format. Use: 5m, 1h, 2d, or unix timestamp." },
     { "HSMSG_REQUIRE_AUTH", "You must be authenticated to use this command." },
     { "HSMSG_DM_REQUIRE_AUTH", "You must be authenticated to view DM history." },
     { "HSMSG_DM_DISABLED", "DM history is not enabled on this server." },
     { NULL, NULL }
+};
+
+/* History message types (must match nefarious/include/history.h) */
+enum histserv_msg_type {
+    HTYPE_PRIVMSG = 0,
+    HTYPE_NOTICE  = 1,
+    HTYPE_JOIN    = 2,
+    HTYPE_PART    = 3,
+    HTYPE_QUIT    = 4,
+    HTYPE_KICK    = 5,
+    HTYPE_MODE    = 6,
+    HTYPE_TOPIC   = 7,
+    HTYPE_TAGMSG  = 8
 };
 
 struct userNode *histserv;
@@ -281,6 +316,106 @@ send_content_lines(struct userNode *user, const char *nick, const char *content,
     free(content_copy);
 }
 
+/* Send a single history result, formatting based on event type.
+ * For PRIVMSG/NOTICE: uses send_content_lines for multiline support
+ * For other events: uses type-specific format string
+ * ts can be NULL for FETCH queries (no timestamp shown) */
+static void
+send_history_result(struct userNode *user, struct chathistory_result *r, const char *ts)
+{
+    const char *nick = extract_nick(r->sender);
+    int type = r->type;
+    const char *content = r->content;
+
+    /* PRIVMSG (0) and NOTICE (1) use content-based display */
+    if (type == HTYPE_PRIVMSG || type == HTYPE_NOTICE) {
+        send_content_lines(user, nick, content, ts);
+        return;
+    }
+
+    /* For other event types, use type-specific formatting */
+    switch (type) {
+    case HTYPE_JOIN:
+        if (ts)
+            send_message(user, histserv, "HSMSG_HISTORY_JOIN", ts, nick);
+        else
+            send_message(user, histserv, "HSMSG_FETCH_JOIN", nick);
+        break;
+
+    case HTYPE_PART:
+        if (ts) {
+            if (content[0])
+                send_message(user, histserv, "HSMSG_HISTORY_PART", ts, nick, content);
+            else
+                send_message(user, histserv, "HSMSG_HISTORY_PART_NOREASON", ts, nick);
+        } else {
+            if (content[0])
+                send_message(user, histserv, "HSMSG_FETCH_PART", nick, content);
+            else
+                send_message(user, histserv, "HSMSG_FETCH_PART_NOREASON", nick);
+        }
+        break;
+
+    case HTYPE_QUIT:
+        if (ts) {
+            if (content[0])
+                send_message(user, histserv, "HSMSG_HISTORY_QUIT", ts, nick, content);
+            else
+                send_message(user, histserv, "HSMSG_HISTORY_QUIT_NOREASON", ts, nick);
+        } else {
+            if (content[0])
+                send_message(user, histserv, "HSMSG_FETCH_QUIT", nick, content);
+            else
+                send_message(user, histserv, "HSMSG_FETCH_QUIT_NOREASON", nick);
+        }
+        break;
+
+    case HTYPE_KICK:
+        if (ts) {
+            if (content[0])
+                send_message(user, histserv, "HSMSG_HISTORY_KICK", ts, nick, content);
+            else
+                send_message(user, histserv, "HSMSG_HISTORY_KICK_NOREASON", ts, nick);
+        } else {
+            if (content[0])
+                send_message(user, histserv, "HSMSG_FETCH_KICK", nick, content);
+            else
+                send_message(user, histserv, "HSMSG_FETCH_KICK_NOREASON", nick);
+        }
+        break;
+
+    case HTYPE_MODE:
+        if (ts)
+            send_message(user, histserv, "HSMSG_HISTORY_MODE", ts, nick,
+                         content[0] ? content : "(unknown)");
+        else
+            send_message(user, histserv, "HSMSG_FETCH_MODE", nick,
+                         content[0] ? content : "(unknown)");
+        break;
+
+    case HTYPE_TOPIC:
+        if (ts)
+            send_message(user, histserv, "HSMSG_HISTORY_TOPIC", ts, nick,
+                         content[0] ? content : "(cleared)");
+        else
+            send_message(user, histserv, "HSMSG_FETCH_TOPIC", nick,
+                         content[0] ? content : "(cleared)");
+        break;
+
+    case HTYPE_TAGMSG:
+        if (ts)
+            send_message(user, histserv, "HSMSG_HISTORY_TAGMSG", ts, nick);
+        else
+            send_message(user, histserv, "HSMSG_FETCH_TAGMSG", nick);
+        break;
+
+    default:
+        /* Unknown type - fall back to content-based display */
+        send_content_lines(user, nick, content, ts);
+        break;
+    }
+}
+
 /* Generic callback for history queries */
 static void
 histserv_history_callback(const char *reqid, const char *target,
@@ -289,7 +424,6 @@ histserv_history_callback(const char *reqid, const char *target,
 {
     struct histserv_query_ctx *ctx = extra;
     struct chathistory_result *r;
-    const char *nick;
     const char *ts;
 
     (void)reqid;
@@ -310,9 +444,8 @@ histserv_history_callback(const char *reqid, const char *target,
                          ctx->ref, ctx->target);
 
             for (r = results; r; r = r->next) {
-                nick = extract_nick(r->sender);
-                /* Use send_content_lines to handle multiline messages (NULL ts for FETCH format) */
-                send_content_lines(ctx->user, nick, r->content, NULL);
+                /* Use send_history_result for type-aware formatting (NULL ts for FETCH) */
+                send_history_result(ctx->user, r, NULL);
             }
 
             send_message(ctx->user, histserv, "HSMSG_FETCH_FOOTER");
@@ -323,10 +456,9 @@ histserv_history_callback(const char *reqid, const char *target,
                          ctx->target);
 
             for (r = results; r; r = r->next) {
-                nick = extract_nick(r->sender);
                 ts = format_timestamp(r->timestamp);
-                /* Use send_content_lines to handle multiline messages */
-                send_content_lines(ctx->user, nick, r->content, ts);
+                /* Use send_history_result for type-aware formatting */
+                send_history_result(ctx->user, r, ts);
             }
 
             send_message(ctx->user, histserv, "HSMSG_HISTORY_FOOTER", count);

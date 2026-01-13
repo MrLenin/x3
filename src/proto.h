@@ -196,7 +196,7 @@ void irc_vapid_broadcast(const char *vapid_pubkey);
 struct chathistory_result {
     char *msgid;
     char *timestamp;
-    int type;           /* 0=privmsg, 1=notice, 2=action */
+    int type;           /* 0=PRIVMSG, 1=NOTICE, 2=JOIN, 3=PART, 4=QUIT, 5=KICK, 6=MODE, 7=TOPIC, 8=TAGMSG */
     char *sender;       /* nick!user@host */
     char *account;
     char *content;
