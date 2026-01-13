@@ -226,8 +226,8 @@ format_timestamp(const char *ts_str)
     return buf;
 }
 
-/* Send content, splitting on embedded newlines for multiline messages.
- * Nefarious stores multiline messages with \n separators.
+/* Send content, splitting on multiline separators.
+ * New content uses \x1F (Unit Separator), legacy content uses \n.
  * If ts is non-NULL, uses HSMSG_HISTORY_LINE format ([ts] <nick> content)
  * Otherwise uses HSMSG_FETCH_LINE format (<nick> content) */
 static void
@@ -238,11 +238,16 @@ send_content_lines(struct userNode *user, const char *nick, const char *content,
     char *line;
     char *saveptr;
     const char *msg_key;
+    const char *separator;
 
     msg_key = ts ? "HSMSG_HISTORY_LINE" : "HSMSG_FETCH_LINE";
 
-    /* Check if content has embedded newlines (multiline message) */
-    if (strchr(content, '\n') == NULL) {
+    /* Check for multiline separator - prefer \x1F (new), fallback to \n (legacy) */
+    if (strchr(content, '\x1F') != NULL) {
+        separator = "\x1F";
+    } else if (strchr(content, '\n') != NULL) {
+        separator = "\n";
+    } else {
         /* Simple case - single line */
         if (ts)
             send_message(user, histserv, msg_key, ts, nick, content);
@@ -251,7 +256,7 @@ send_content_lines(struct userNode *user, const char *nick, const char *content,
         return;
     }
 
-    /* Multiline message - split and send each line */
+    /* Multiline message - split on separator and send each line */
     content_copy = strdup(content);
     if (!content_copy) {
         if (ts)
@@ -261,16 +266,16 @@ send_content_lines(struct userNode *user, const char *nick, const char *content,
         return;
     }
 
-    line = strtok_r(content_copy, "\n", &saveptr);
+    line = strtok_r(content_copy, separator, &saveptr);
     while (line) {
-        /* Skip empty lines that might result from consecutive newlines */
+        /* Skip empty lines that might result from consecutive separators */
         if (*line) {
             if (ts)
                 send_message(user, histserv, msg_key, ts, nick, line);
             else
                 send_message(user, histserv, msg_key, nick, line);
         }
-        line = strtok_r(NULL, "\n", &saveptr);
+        line = strtok_r(NULL, separator, &saveptr);
     }
 
     free(content_copy);

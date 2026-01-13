@@ -1449,6 +1449,20 @@ irc_sasl(struct server* dest, const char *identifier, const char *subcmd, const 
 }
 
 void
+irc_sasl_login(struct server* dest, const char *identifier, const char *account, time_t registered)
+{
+    /* Send SASL L (login) response with account and timestamp as separate params:
+     * SASL dest uid L account :timestamp
+     * This ensures account name doesn't include the timestamp with a space.
+     */
+    if (registered > 0) {
+        putsock("%s " P10_SASL " %s %s L %s :" FMT_TIME_T, self->numeric, dest->numeric, identifier, account, registered);
+    } else {
+        putsock("%s " P10_SASL " %s %s L %s", self->numeric, dest->numeric, identifier, account);
+    }
+}
+
+void
 irc_sasl_mechs_broadcast(const char *mechs)
 {
     /* Broadcast SASL mechanism list to all servers: SASL * * M :PLAIN,EXTERNAL,... */

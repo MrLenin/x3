@@ -12269,8 +12269,7 @@ sasl_async_auth_callback(void *ctx_ptr, int result)
             snprintf(buffer, sizeof(buffer), "%s " FMT_TIME_T, hii->handle, hii->registered);
             irc_sasl(session->source, session->uid, "I", buffer);
         }
-        snprintf(buffer, sizeof(buffer), "%s " FMT_TIME_T, hi->handle, hi->registered);
-        irc_sasl(session->source, session->uid, "L", buffer);
+        irc_sasl_login(session->source, session->uid, hi->handle, hi->registered);
 
 #ifdef WITH_LMDB
         /* Issue session token for faster reconnects (only for non-impersonating users) */
@@ -12388,8 +12387,7 @@ sasl_external_token_callback(void *context, int result, struct access_token *tok
 #ifdef WITH_KEYCLOAK
             kc_try_auto_activate(hi);
 #endif
-            snprintf(buffer, sizeof(buffer), "%s "FMT_TIME_T, hi->handle, hi->registered);
-            irc_sasl(session->source, session->uid, "L", buffer);
+            irc_sasl_login(session->source, session->uid, hi->handle, hi->registered);
             irc_sasl(session->source, session->uid, "D", "S");
         }
         free(ctx);
@@ -12423,8 +12421,7 @@ sasl_external_token_callback(void *context, int result, struct access_token *tok
 #ifdef WITH_KEYCLOAK
         kc_try_auto_activate(hi);
 #endif
-        snprintf(buffer, sizeof(buffer), "%s "FMT_TIME_T, hi->handle, hi->registered);
-        irc_sasl(session->source, session->uid, "L", buffer);
+        irc_sasl_login(session->source, session->uid, hi->handle, hi->registered);
         irc_sasl(session->source, session->uid, "D", "S");
     }
     free(ctx);
@@ -12520,9 +12517,8 @@ sasl_async_fingerprint_callback(void *ctx_ptr, int result, char *username)
         /* Try to auto-activate if user has pending activation and Keycloak says verified */
         kc_try_auto_activate(hi);
 
-        snprintf(buffer, sizeof(buffer), "%s " FMT_TIME_T, hi->handle, hi->registered);
         log_module(NS_LOG, LOG_DEBUG, "SASL EXTERNAL: Authenticated as %s", hi->handle);
-        irc_sasl(session->source, session->uid, "L", buffer);
+        irc_sasl_login(session->source, session->uid, hi->handle, hi->registered);
         irc_sasl(session->source, session->uid, "D", "S");
     } else {
         log_module(NS_LOG, LOG_DEBUG, "SASL EXTERNAL: No matching account for fingerprint");
@@ -12646,9 +12642,8 @@ sasl_async_introspect_callback(void *ctx_ptr, int result, struct kc_token_info *
         /* Try to auto-activate if user has pending activation and Keycloak says verified */
         kc_try_auto_activate(hi);
 
-        snprintf(buffer, sizeof(buffer), "%s " FMT_TIME_T, hi->handle, hi->registered);
         log_module(NS_LOG, LOG_DEBUG, "SASL OAUTHBEARER: Authenticated as %s", hi->handle);
-        irc_sasl(session->source, session->uid, "L", buffer);
+        irc_sasl_login(session->source, session->uid, hi->handle, hi->registered);
         irc_sasl(session->source, session->uid, "D", "S");
     } else {
         log_module(NS_LOG, LOG_DEBUG, "SASL OAUTHBEARER: No local account for %s (autocreate=%d)", username, nickserv_conf.keycloak_autocreate);
@@ -12801,9 +12796,8 @@ sasl_packet(struct SASLSession *session)
             /* Try to auto-activate if user has pending activation and Keycloak says verified */
             kc_try_auto_activate(hi);
 #endif
-            snprintf(buffer, sizeof(buffer), "%s "FMT_TIME_T, hi->handle, hi->registered);
             log_module(NS_LOG, LOG_DEBUG, "SASL EXTERNAL: Authenticated as %s", hi->handle);
-            irc_sasl(session->source, session->uid, "L", buffer);
+            irc_sasl_login(session->source, session->uid, hi->handle, hi->registered);
             irc_sasl(session->source, session->uid, "D", "S");
         }
 
@@ -12928,8 +12922,7 @@ sasl_packet(struct SASLSession *session)
                     kc_try_auto_activate(hi);
 
                     log_module(NS_LOG, LOG_DEBUG, "SASL OAUTHBEARER: JWT validated locally, user=%s", hi->handle);
-                    snprintf(buffer, sizeof(buffer), "%s " FMT_TIME_T, hi->handle, hi->registered);
-                    irc_sasl(session->source, session->uid, "L", buffer);
+                    irc_sasl_login(session->source, session->uid, hi->handle, hi->registered);
                     irc_sasl(session->source, session->uid, "D", "S");
                 } else {
                     log_module(NS_LOG, LOG_DEBUG, "SASL OAUTHBEARER: No local account for %s (autocreate=%d)", username, nickserv_conf.keycloak_autocreate);
@@ -12984,8 +12977,7 @@ sasl_packet(struct SASLSession *session)
             irc_sasl(session->source, session->uid, "D", "F");
         } else {
             log_module(NS_LOG, LOG_DEBUG, "SASL OAUTHBEARER: Authentication succeeded for %s", hi->handle);
-            snprintf(buffer, sizeof(buffer), "%s "FMT_TIME_T, hi->handle, hi->registered);
-            irc_sasl(session->source, session->uid, "L", buffer);
+            irc_sasl_login(session->source, session->uid, hi->handle, hi->registered);
             irc_sasl(session->source, session->uid, "D", "S");
         }
 
@@ -13353,9 +13345,7 @@ sasl_packet(struct SASLSession *session)
             log_module(NS_LOG, LOG_DEBUG, "SASL %s: Authentication succeeded for %s", mech_name, hi->handle);
 
             /* Send L (login) then D S (done success) */
-            static char buffer[256];
-            snprintf(buffer, sizeof(buffer), "%s "FMT_TIME_T, hi->handle, hi->registered);
-            irc_sasl(session->source, session->uid, "L", buffer);
+            irc_sasl_login(session->source, session->uid, hi->handle, hi->registered);
             irc_sasl(session->source, session->uid, "D", "S");
 
             free(server_final_b64);
@@ -13429,10 +13419,8 @@ sasl_packet(struct SASLSession *session)
                         if (token_hi) {
                             /* Check if suspended */
                             if (!HANDLE_FLAGGED(token_hi, SUSPENDED)) {
-                                static char buffer[256];
                                 log_module(NS_LOG, LOG_DEBUG, "SASL: Session token valid for %s", authcid);
-                                snprintf(buffer, sizeof(buffer), "%s "FMT_TIME_T, token_hi->handle, token_hi->registered);
-                                irc_sasl(session->source, session->uid, "L", buffer);
+                                irc_sasl_login(session->source, session->uid, token_hi->handle, token_hi->registered);
                                 irc_sasl(session->source, session->uid, "D", "S");
                                 sasl_delete_session(session);
                                 free(raw);
@@ -13471,9 +13459,7 @@ sasl_packet(struct SASLSession *session)
                 if (cached_hi && !HANDLE_FLAGGED(cached_hi, SUSPENDED)) {
                     /* Cache hit - fast track to success */
                     log_module(NS_LOG, LOG_DEBUG, "SASL: Positive cache hit - fast-tracking auth for %s", authcid);
-                    char buffer[256];
-                    snprintf(buffer, sizeof(buffer), "%s " FMT_TIME_T, cached_hi->handle, cached_hi->registered);
-                    irc_sasl(session->source, session->uid, "L", buffer);
+                    irc_sasl_login(session->source, session->uid, cached_hi->handle, cached_hi->registered);
                     irc_sasl(session->source, session->uid, "D", "S");
                     free(raw);
                     return 1;
@@ -13551,8 +13537,7 @@ sasl_packet(struct SASLSession *session)
                         irc_sasl(session->source, session->uid, "I", buffer);
                     }
                     log_module(NS_LOG, LOG_DEBUG, "SASL: Valid credentials supplied");
-                    snprintf(buffer, sizeof(buffer), "%s "FMT_TIME_T, hi->handle, hi->registered);
-                    irc_sasl(session->source, session->uid, "L", buffer);
+                    irc_sasl_login(session->source, session->uid, hi->handle, hi->registered);
 
                     /* Auto-register certificate if enabled and user has one */
                     if (nickserv_conf.cert_autoregister && session->sslclifp && session->sslclifp[0]) {
@@ -13695,6 +13680,12 @@ handle_sasl_input(struct server* source ,const char *uid, const char *subcmd, co
     if (sess->p == NULL)
     {
         sess->buf = (char *)malloc(len + 1);
+        if (!sess->buf) {
+            log_module(NS_LOG, LOG_WARNING, "SASL: Memory allocation failed for %s (malloc %d bytes)", sess->uid, len + 1);
+            irc_sasl(source, uid, "D", "F");
+            sasl_delete_session(sess);
+            return;
+        }
         sess->p = sess->buf;
         sess->buflen = len;
     }
@@ -13715,7 +13706,18 @@ handle_sasl_input(struct server* source ,const char *uid, const char *subcmd, co
             return;
         }
 
-        sess->buf = (char *)realloc(sess->buf, sess->buflen + len + 1);
+        char *new_buf = (char *)realloc(sess->buf, sess->buflen + len + 1);
+        if (!new_buf) {
+            log_module(NS_LOG, LOG_WARNING, "SASL: Memory reallocation failed for %s (realloc %d bytes)", sess->uid, sess->buflen + len + 1);
+            irc_sasl(source, uid, "D", "F");
+            /* Free existing buffer before deleting session */
+            free(sess->buf);
+            sess->buf = sess->p = NULL;
+            sess->buflen = 0;
+            sasl_delete_session(sess);
+            return;
+        }
+        sess->buf = new_buf;
         sess->p = sess->buf + sess->buflen;
         sess->buflen += len;
     }

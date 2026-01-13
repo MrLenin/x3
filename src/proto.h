@@ -187,6 +187,7 @@ void irc_metadataquery(const char *target, const char *key);
 void irc_mark(struct userNode *user, char *mark);
 void irc_sno(unsigned int mask, char const* format, ...);
 void irc_sasl(struct server* dest, const char *identifier, const char *subcmd, const char *data);
+void irc_sasl_login(struct server* dest, const char *identifier, const char *account, time_t registered);
 void irc_sasl_mechs_broadcast(const char *mechs);
 void irc_regreply(const char *user_numeric, char status, const char *account, const char *message);
 void irc_vapid_broadcast(const char *vapid_pubkey);
