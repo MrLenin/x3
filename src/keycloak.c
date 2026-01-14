@@ -4,8 +4,12 @@
 
 #include <string.h>
 #include <time.h>
+#ifdef HAVE_PTHREAD_H
+#include <pthread.h>
+#endif
 
 #include "keycloak.h"
+#include "threadpool.h"
 #include "common.h"
 #include "log.h"
 #include "ioset.h"
@@ -557,7 +561,14 @@ static void keycloak_exit_handler(void *extra);
 /*
  * Token Manager State (defined early for use by async functions)
  * The actual initialization and management functions are defined later.
+ *
+ * Thread-safety: The token can be read by worker threads (for HTTP auth).
+ * kc_token_lock protects reads/writes to the token field.
  */
+#ifdef HAVE_PTHREAD_H
+static pthread_mutex_t kc_token_lock = PTHREAD_MUTEX_INITIALIZER;
+#endif
+
 static struct {
     int initialized;                       /* 1 if initialized */
     struct kc_realm realm;                 /* Cached realm config */
@@ -567,6 +578,31 @@ static struct {
     int refresh_pending;                   /* 1 if refresh in progress */
     int available;                         /* Keycloak availability flag */
 } kc_token_mgr = {0};
+
+/*
+ * Thread-safe helper to get a copy of the current bearer token.
+ * Returns a newly allocated string that must be freed by the caller.
+ * Returns NULL if no token is available.
+ */
+static char *
+kc_get_token_copy(void)
+{
+    char *token_copy = NULL;
+
+#ifdef HAVE_PTHREAD_H
+    pthread_mutex_lock(&kc_token_lock);
+#endif
+
+    if (kc_token_mgr.token && kc_token_mgr.token->access_token) {
+        token_copy = strdup(kc_token_mgr.token->access_token);
+    }
+
+#ifdef HAVE_PTHREAD_H
+    pthread_mutex_unlock(&kc_token_lock);
+#endif
+
+    return token_copy;
+}
 
 void
 init_keycloak(void)
@@ -4965,6 +5001,189 @@ curl_perform_json(const char *uri, enum http_method method,
     return curl_perform(opts, response);
 }
 
+/*
+ * =============================================================================
+ * Async HTTP Worker Infrastructure
+ *
+ * For offloading blocking sync HTTP calls to the threadpool.
+ * Worker functions run in background threads; callbacks run in main thread.
+ * =============================================================================
+ */
+
+/* Work structure for async HTTP operations */
+struct kc_http_work {
+    /* Input (copied by caller, owned by worker) */
+    char *uri;
+    char *post_data;
+    char *bearer_token;
+    enum http_method method;
+    int max_retries;
+
+    /* Output (written by worker) */
+    struct memory response;
+    long http_code;
+    int result;  /* KC_SUCCESS, KC_ERROR, etc. */
+
+    /* Callback (runs in main thread) */
+    void (*callback)(struct kc_http_work *work, void *ctx);
+    void *callback_ctx;
+};
+
+/* Worker function - runs in threadpool thread */
+static void *
+kc_http_worker(void *arg)
+{
+    struct kc_http_work *work = arg;
+    CURL *curl;
+    struct curl_slist *headers = NULL;
+    CURLcode res;
+
+    curl = curl_easy_init();
+    if (!curl) {
+        work->result = KC_ERROR;
+        work->http_code = 0;
+        return NULL;
+    }
+
+    /* Initialize response */
+    work->response.response = NULL;
+    work->response.size = 0;
+
+    /* Set up curl options */
+    curl_easy_setopt(curl, CURLOPT_URL, work->uri);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, kc_write_callback);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &work->response);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 30L);
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 10L);
+    curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+    curl_easy_setopt(curl, CURLOPT_TCP_NODELAY, 1L);
+
+    /* Set HTTP method */
+    switch (work->method) {
+    case HTTP_GET:
+        curl_easy_setopt(curl, CURLOPT_HTTPGET, 1L);
+        break;
+    case HTTP_POST:
+        curl_easy_setopt(curl, CURLOPT_POST, 1L);
+        if (work->post_data)
+            curl_easy_setopt(curl, CURLOPT_POSTFIELDS, work->post_data);
+        break;
+    case HTTP_PUT:
+        curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "PUT");
+        if (work->post_data)
+            curl_easy_setopt(curl, CURLOPT_POSTFIELDS, work->post_data);
+        break;
+    case HTTP_DELETE:
+        curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "DELETE");
+        break;
+    }
+
+    /* Set headers */
+    headers = curl_slist_append(headers, "Content-Type: application/json");
+    if (work->bearer_token) {
+        char auth_header[512];
+        snprintf(auth_header, sizeof(auth_header), "Authorization: Bearer %s", work->bearer_token);
+        headers = curl_slist_append(headers, auth_header);
+    }
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+
+    /* Perform blocking HTTP */
+    res = curl_easy_perform(curl);
+
+    if (res == CURLE_OK) {
+        curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &work->http_code);
+        work->result = KC_SUCCESS;
+    } else {
+        work->http_code = 0;
+        work->result = KC_ERROR;
+    }
+
+    curl_slist_free_all(headers);
+    curl_easy_cleanup(curl);
+
+    return NULL;
+}
+
+/* Callback wrapper - runs in main thread via threadpool notification */
+static void
+kc_http_done(void *result, void *user_data, tp_state_t state)
+{
+    struct kc_http_work *work = user_data;
+    (void)result;
+
+    if (state != TP_STATE_COMPLETED) {
+        work->result = KC_ERROR;
+    }
+
+    /* Call user callback */
+    if (work->callback) {
+        work->callback(work, work->callback_ctx);
+    }
+
+    /* Cleanup work struct */
+    free(work->uri);
+    if (work->post_data) {
+        memset(work->post_data, 0, strlen(work->post_data));  /* Zero sensitive data */
+        free(work->post_data);
+    }
+    free(work->bearer_token);
+    /* Note: response is owned by callback, not freed here */
+    free(work);
+}
+
+/*
+ * Submit an async HTTP request to the threadpool.
+ * Returns 0 on successful submission, -1 on error.
+ * The callback will be invoked in the main thread when complete.
+ */
+static int
+kc_http_async(const char *uri, enum http_method method, const char *post_data,
+              void (*callback)(struct kc_http_work *, void *), void *ctx)
+{
+    struct kc_http_work *work;
+    char *token;
+
+    if (!threadpool_is_initialized()) {
+        log_module(KC_LOG, LOG_DEBUG, "kc_http_async: Threadpool not available");
+        return -1;
+    }
+
+    work = calloc(1, sizeof(*work));
+    if (!work)
+        return -1;
+
+    work->uri = strdup(uri);
+    work->method = method;
+    work->post_data = post_data ? strdup(post_data) : NULL;
+    work->max_retries = 1;
+    work->callback = callback;
+    work->callback_ctx = ctx;
+
+    /* Get token copy (thread-safe) */
+    token = kc_get_token_copy();
+    work->bearer_token = token;  /* Takes ownership */
+
+    if (!work->uri || (post_data && !work->post_data)) {
+        free(work->uri);
+        free(work->post_data);
+        free(work->bearer_token);
+        free(work);
+        return -1;
+    }
+
+    /* Submit to threadpool */
+    if (!threadpool_submit(kc_http_worker, work, kc_http_done, work, TP_PRIORITY_NORMAL)) {
+        log_module(KC_LOG, LOG_DEBUG, "kc_http_async: Failed to submit to threadpool");
+        free(work->uri);
+        free(work->post_data);
+        free(work->bearer_token);
+        free(work);
+        return -1;
+    }
+
+    return 0;
+}
+
 static int json_read_object_string(json_t* object, const char* key,
     char** value_out, size_t* value_out_size)
 {
@@ -8576,11 +8795,17 @@ keycloak_token_manager_shutdown(void)
     if (!kc_token_mgr.initialized)
         return;
 
-    /* Free cached token */
+    /* Free cached token (with lock for worker thread safety) */
+#ifdef HAVE_PTHREAD_H
+    pthread_mutex_lock(&kc_token_lock);
+#endif
     if (kc_token_mgr.token) {
         keycloak_free_access_token(kc_token_mgr.token);
         kc_token_mgr.token = NULL;
     }
+#ifdef HAVE_PTHREAD_H
+    pthread_mutex_unlock(&kc_token_lock);
+#endif
 
     /* Free pending waiters */
     for (waiter = kc_token_waiters; waiter; waiter = next) {
@@ -8614,24 +8839,39 @@ keycloak_ensure_token(void)
         return KC_SUCCESS;
     }
 
-    /* Free old token if exists */
+    /* Free old token if exists (with lock for worker thread safety) */
+#ifdef HAVE_PTHREAD_H
+    pthread_mutex_lock(&kc_token_lock);
+#endif
     if (kc_token_mgr.token) {
         keycloak_free_access_token(kc_token_mgr.token);
         kc_token_mgr.token = NULL;
         kc_token_mgr.client.access_token = NULL;
     }
+#ifdef HAVE_PTHREAD_H
+    pthread_mutex_unlock(&kc_token_lock);
+#endif
 
     /* Get new token synchronously */
+    struct access_token *new_token = NULL;
     int rc = keycloak_get_client_token(kc_token_mgr.realm, kc_token_mgr.client,
-                                        &kc_token_mgr.token);
+                                        &new_token);
     if (rc != KC_SUCCESS) {
         kc_token_mgr.available = 0;
         return rc;
     }
 
+    /* Update with lock */
+#ifdef HAVE_PTHREAD_H
+    pthread_mutex_lock(&kc_token_lock);
+#endif
+    kc_token_mgr.token = new_token;
     kc_token_mgr.available = 1;
     kc_token_mgr.client.access_token = kc_token_mgr.token;
     kc_token_mgr.token_expires = now_time + kc_token_mgr.token->expires_in;
+#ifdef HAVE_PTHREAD_H
+    pthread_mutex_unlock(&kc_token_lock);
+#endif
     return KC_SUCCESS;
 }
 
@@ -8664,7 +8904,10 @@ kc_token_refresh_cb(void *session, int result, struct access_token *token)
     (void)session;
 
     if (result == KC_SUCCESS && token) {
-        /* Update cached token */
+        /* Update cached token (with lock for worker thread safety) */
+#ifdef HAVE_PTHREAD_H
+        pthread_mutex_lock(&kc_token_lock);
+#endif
         if (kc_token_mgr.token) {
             keycloak_free_access_token(kc_token_mgr.token);
         }
@@ -8672,6 +8915,9 @@ kc_token_refresh_cb(void *session, int result, struct access_token *token)
         kc_token_mgr.client.access_token = token;
         kc_token_mgr.token_expires = time(NULL) + token->expires_in;
         kc_token_mgr.available = 1;
+#ifdef HAVE_PTHREAD_H
+        pthread_mutex_unlock(&kc_token_lock);
+#endif
         kc_stats.token_refreshes++;  /* Track successful token refreshes */
         log_module(KC_LOG, LOG_DEBUG, "Async token refresh successful (expires in %ld sec)",
                    token->expires_in);
@@ -8732,12 +8978,18 @@ keycloak_ensure_token_async(kc_token_callback callback, void *ctx)
     if (!kc_token_mgr.refresh_pending) {
         kc_token_mgr.refresh_pending = 1;
 
-        /* Free old token before refresh */
+        /* Free old token before refresh (with lock for worker thread safety) */
+#ifdef HAVE_PTHREAD_H
+        pthread_mutex_lock(&kc_token_lock);
+#endif
         if (kc_token_mgr.token) {
             keycloak_free_access_token(kc_token_mgr.token);
             kc_token_mgr.token = NULL;
             kc_token_mgr.client.access_token = NULL;
         }
+#ifdef HAVE_PTHREAD_H
+        pthread_mutex_unlock(&kc_token_lock);
+#endif
 
         if (keycloak_get_client_token_async(kc_token_mgr.realm, kc_token_mgr.client,
                                              NULL, kc_token_refresh_cb) < 0) {
