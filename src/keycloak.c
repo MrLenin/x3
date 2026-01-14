@@ -5051,7 +5051,7 @@ kc_http_worker(void *arg)
 
     /* Set up curl options */
     curl_easy_setopt(curl, CURLOPT_URL, work->uri);
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, kc_write_callback);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curl_write_cb);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &work->response);
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, 30L);
     curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 10L);
@@ -5136,7 +5136,7 @@ kc_http_done(void *result, void *user_data, tp_state_t state)
  * Returns 0 on successful submission, -1 on error.
  * The callback will be invoked in the main thread when complete.
  */
-static int
+static int __attribute__((unused))
 kc_http_async(const char *uri, enum http_method method, const char *post_data,
               void (*callback)(struct kc_http_work *, void *), void *ctx)
 {
