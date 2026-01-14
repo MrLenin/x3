@@ -10838,7 +10838,7 @@ static void
 kc_async_ctx_free(struct kc_async_sync_ctx *ctx)
 {
     if (!ctx) return;
-    if (ctx->group_id) free(ctx->group_id);
+    if (ctx->group_id) pool_strfree(ctx->group_id);  /* pool_strdup'd in keycloak.c */
     /* Note: ctx->client.access_token is a reference to keycloak module's token,
      * NOT owned by this context - do not free it here */
     free(ctx);
@@ -11034,7 +11034,7 @@ kc_async_group_id_cb(void *session, int result, char *group_id)
 
     if (!ctx) {
         log_module(CS_LOG, LOG_ERROR, "kc_async_group_id_cb: NULL context");
-        if (group_id) free(group_id);
+        if (group_id) pool_strfree(group_id);
         return 1;  /* Terminal */
     }
 
@@ -11508,7 +11508,7 @@ adduser_lookup_group_cb(void *session, int result, char *group_id)
 {
     struct adduser_async_ctx *ctx = session;
     if (!ctx) {
-        if (group_id) free(group_id);
+        if (group_id) pool_strfree(group_id);
         return 1;
     }
 
@@ -11535,7 +11535,7 @@ adduser_lookup_group_cb(void *session, int result, char *group_id)
             }
         } else {
             /* Group doesn't exist - still try to clean up any orphaned attribute */
-            if (group_id) free(group_id);
+            if (group_id) pool_strfree(group_id);
 
             char attr_name[256];
             snprintf(attr_name, sizeof(attr_name), "x3.channel.%s", ctx->channel);
@@ -11575,7 +11575,7 @@ adduser_lookup_group_cb(void *session, int result, char *group_id)
         }
     } else {
         /* Group doesn't exist - need to create it */
-        if (group_id) free(group_id);
+        if (group_id) pool_strfree(group_id);
         ctx->state = ADDUSER_ENSURE_PARENT;
 
         /* First ensure parent group exists */
@@ -11596,7 +11596,7 @@ adduser_ensure_parent_cb(void *session, int result, char *group_id)
 {
     struct adduser_async_ctx *ctx = session;
     if (!ctx) {
-        if (group_id) free(group_id);
+        if (group_id) pool_strfree(group_id);
         return 1;
     }
 
@@ -11610,7 +11610,7 @@ adduser_ensure_parent_cb(void *session, int result, char *group_id)
         /* Parent doesn't exist - need to create it first (sync for simplicity) */
         log_module(CS_LOG, LOG_DEBUG, "adduser_async[%s/%s]: Parent not found, creating sync",
                    ctx->channel, ctx->username);
-        if (group_id) free(group_id);
+        if (group_id) pool_strfree(group_id);
 
         /* Fall back to sync for parent creation (rare case) */
         int rc = keycloak_ensure_channels_parent(ctx->realm, ctx->client, &ctx->parent_id);
@@ -11621,7 +11621,7 @@ adduser_ensure_parent_cb(void *session, int result, char *group_id)
             return 0;
         }
     } else {
-        if (group_id) free(group_id);
+        if (group_id) pool_strfree(group_id);
         log_module(CS_LOG, LOG_WARNING, "adduser_async[%s/%s]: Parent lookup failed",
                    ctx->channel, ctx->username);
         adduser_async_ctx_free(ctx);
@@ -11647,7 +11647,7 @@ adduser_create_group_cb(void *session, int result, char *group_id)
 {
     struct adduser_async_ctx *ctx = session;
     if (!ctx) {
-        if (group_id) free(group_id);
+        if (group_id) pool_strfree(group_id);
         return 1;
     }
 
@@ -11677,7 +11677,7 @@ adduser_create_group_cb(void *session, int result, char *group_id)
             return 0;  /* Will continue in lookup callback */
         }
     } else {
-        if (group_id) free(group_id);
+        if (group_id) pool_strfree(group_id);
         log_module(CS_LOG, LOG_WARNING, "adduser_async[%s/%s]: Failed to create group (result=%d)",
                    ctx->channel, ctx->username, result);
         adduser_async_ctx_free(ctx);
@@ -11986,7 +11986,7 @@ kc_delete_group_id_cb(void *session, int result, char *group_id)
     if (!ctx) {
         log_module(CS_LOG, LOG_ERROR, "kc_delete_group_id_cb: NULL context");
         if (group_id)
-            free(group_id);
+            pool_strfree(group_id);
         return KC_ERROR;
     }
 
@@ -12003,7 +12003,7 @@ kc_delete_group_id_cb(void *session, int result, char *group_id)
                    ctx->channel, result);
         free(ctx);
         if (group_id)
-            free(group_id);
+            pool_strfree(group_id);
         return KC_ERROR;
     }
 
@@ -12013,7 +12013,7 @@ kc_delete_group_id_cb(void *session, int result, char *group_id)
 
     /* Start async delete */
     rc = keycloak_delete_group_async(realm, client, group_id, ctx, kc_delete_group_done_cb);
-    free(group_id);
+    pool_strfree(group_id);
 
     if (rc < 0) {
         log_module(CS_LOG, LOG_WARNING, "kc_delete_group_id_cb[%s]: Failed to start async delete: %d",

@@ -7289,14 +7289,14 @@ struct kc_modify_ctx {
 
 static void kc_modify_ctx_free(struct kc_modify_ctx *ctx) {
     if (ctx) {
-        if (ctx->email) free(ctx->email);
+        if (ctx->email) pool_strfree(ctx->email);
         if (ctx->cred_data) {
             memset(ctx->cred_data, 0, strlen(ctx->cred_data));
-            free(ctx->cred_data);
+            pool_strfree(ctx->cred_data);
         }
         if (ctx->secret_data) {
             memset(ctx->secret_data, 0, strlen(ctx->secret_data));
-            free(ctx->secret_data);
+            pool_strfree(ctx->secret_data);
         }
         if (ctx->user_id) pool_strfree(ctx->user_id);
         free(ctx);
@@ -8715,8 +8715,8 @@ static void
 kc_metadata_ctx_free(struct kc_metadata_ctx *ctx)
 {
     if (ctx) {
-        if (ctx->attr_name) free(ctx->attr_name);
-        if (ctx->attr_value) free(ctx->attr_value);
+        if (ctx->attr_name) free(ctx->attr_name);  /* malloc'd */
+        if (ctx->attr_value) pool_strfree(ctx->attr_value);  /* pool_strdup'd */
         free(ctx);
     }
 }
