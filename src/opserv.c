@@ -33,6 +33,7 @@
 #include "saxdb.h"
 #include "shun.h"
 #include "x3_lmdb.h"
+#include "keycloak.h"
 
 #include <tre/regex.h>
 
@@ -478,6 +479,16 @@ static const struct message_entry msgtab[] = {
     { "OSMSG_KCSYNC_NOT_RUNNING", "No Keycloak sync is currently running." },
     { "OSMSG_KCSYNC_RESET_OK", "Reset sync state for $b%s$b." },
     { "OSMSG_KCSYNC_RESET_FAILED", "Failed to reset sync state for $b%s$b." },
+
+    { "OSMSG_KC_STATS_HDR", "Keycloak HTTP Statistics:" },
+    { "OSMSG_KC_STATS_REQUESTS", "  HTTP Requests: %lu total, %lu errors" },
+    { "OSMSG_KC_STATS_LATENCY", "  Latency: avg %lu ms, min %lu ms, max %lu ms" },
+    { "OSMSG_KC_STATS_JWKS", "  JWKS Cache: %lu hits, %lu misses" },
+    { "OSMSG_KC_STATS_USER", "  User Cache: %lu hits, %lu misses" },
+    { "OSMSG_KC_STATS_TOKEN", "  Token Refreshes: %lu" },
+    { "OSMSG_KC_STATS_LAST", "  Last Request: %s" },
+    { "OSMSG_KC_STATS_NONE", "  No Keycloak requests recorded." },
+    { "OSMSG_KC_NOT_AVAILABLE", "Keycloak is not available." },
 
     { NULL, NULL }
 };
@@ -2956,6 +2967,50 @@ static MODCMD_FUNC(cmd_lmdb_stats)
     return 1;
 #else
     reply("OSMSG_LMDB_NOT_AVAILABLE");
+    return 0;
+#endif
+}
+
+static MODCMD_FUNC(cmd_stats_keycloak)
+{
+#ifdef WITH_KEYCLOAK
+    struct kc_stats stats;
+    char time_buf[64];
+    struct tm *tm_info;
+    unsigned long avg_latency;
+
+    if (!keycloak_is_available()) {
+        reply("OSMSG_KC_NOT_AVAILABLE");
+        return 0;
+    }
+
+    keycloak_get_stats(&stats);
+
+    if (stats.http_requests == 0) {
+        reply("OSMSG_KC_STATS_HDR");
+        reply("OSMSG_KC_STATS_NONE");
+        return 1;
+    }
+
+    reply("OSMSG_KC_STATS_HDR");
+    reply("OSMSG_KC_STATS_REQUESTS", stats.http_requests, stats.http_errors);
+
+    avg_latency = stats.http_requests > 0 ? stats.total_latency_ms / stats.http_requests : 0;
+    reply("OSMSG_KC_STATS_LATENCY", avg_latency, stats.min_latency_ms, stats.max_latency_ms);
+
+    reply("OSMSG_KC_STATS_JWKS", stats.jwks_cache_hits, stats.jwks_cache_misses);
+    reply("OSMSG_KC_STATS_USER", stats.user_cache_hits, stats.user_cache_misses);
+    reply("OSMSG_KC_STATS_TOKEN", stats.token_refreshes);
+
+    if (stats.last_request_time > 0) {
+        tm_info = localtime(&stats.last_request_time);
+        strftime(time_buf, sizeof(time_buf), "%Y-%m-%d %H:%M:%S", tm_info);
+        reply("OSMSG_KC_STATS_LAST", time_buf);
+    }
+
+    return 1;
+#else
+    reply("OSMSG_KC_NOT_AVAILABLE");
     return 0;
 #endif
 }
@@ -7800,6 +7855,8 @@ init_opserv(const char *nick)
     opserv_define_func("LMDB SNAPSHOT", cmd_lmdb_snapshot, 600, 0, 0);
     opserv_define_func("LMDB EXPORT", cmd_lmdb_export, 600, 0, 0);
     opserv_define_func("LMDB STATS", cmd_lmdb_stats, 100, 0, 0);
+    /* Keycloak stats */
+    opserv_define_func("STATS KEYCLOAK", cmd_stats_keycloak, 100, 0, 0);
     opserv_define_func("TRACE", cmd_trace, 100, 0, 3);
     opserv_define_func("TRACE PRINT", NULL, 0, 0, 0);
     opserv_define_func("TRACE COUNT", NULL, 0, 0, 0);

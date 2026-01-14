@@ -82,6 +82,50 @@ static struct {
     int count;
 } kc_userid_cache = {0};
 
+/*
+ * =============================================================================
+ * Performance Statistics
+ * =============================================================================
+ */
+
+static struct kc_stats kc_stats = {0};
+
+/* Update stats after an HTTP request */
+static void
+kc_stats_record_request(unsigned long latency_ms, int is_error)
+{
+    kc_stats.http_requests++;
+    kc_stats.total_latency_ms += latency_ms;
+    kc_stats.last_request_time = time(NULL);
+
+    if (latency_ms > kc_stats.max_latency_ms) {
+        kc_stats.max_latency_ms = latency_ms;
+    }
+    if (kc_stats.min_latency_ms == 0 || latency_ms < kc_stats.min_latency_ms) {
+        kc_stats.min_latency_ms = latency_ms;
+    }
+
+    if (is_error) {
+        kc_stats.http_errors++;
+    }
+}
+
+/* Public API: get stats snapshot */
+void
+keycloak_get_stats(struct kc_stats *stats_out)
+{
+    if (stats_out) {
+        *stats_out = kc_stats;
+    }
+}
+
+/* Public API: reset stats */
+void
+keycloak_reset_stats(void)
+{
+    memset(&kc_stats, 0, sizeof(kc_stats));
+}
+
 /* Cache a user ID (called after successful create) */
 static void
 kc_userid_cache_put(const char *username, const char *user_id)
@@ -154,14 +198,17 @@ kc_userid_cache_get(const char *username)
         if (strcasecmp(kc_userid_cache.entries[i].username, username) == 0) {
             if (now - kc_userid_cache.entries[i].created > KC_USERID_CACHE_TTL) {
                 log_module(KC_LOG, LOG_DEBUG, "userid_cache: %s expired", username);
+                kc_stats.user_cache_misses++;
                 return NULL;
             }
             log_module(KC_LOG, LOG_DEBUG, "userid_cache: Hit %s -> %s",
                        username, kc_userid_cache.entries[i].user_id);
+            kc_stats.user_cache_hits++;
             return kc_userid_cache.entries[i].user_id;
         }
     }
 
+    kc_stats.user_cache_misses++;
     return NULL;
 }
 
@@ -1005,6 +1052,7 @@ keycloak_validate_jwt_local(struct kc_realm realm, const char *token,
 
     /* Ensure JWKS is cached */
     if (jwks_refresh(realm) != KC_SUCCESS) {
+        kc_stats.jwks_cache_misses++;  /* Need HTTP introspection */
         return KC_ERROR;  /* Can't validate locally, need fallback */
     }
 
@@ -1052,12 +1100,14 @@ keycloak_validate_jwt_local(struct kc_realm realm, const char *token,
     if (!alg || strcmp(alg, "RS256") != 0) {
         log_module(KC_LOG, LOG_DEBUG, "Unsupported JWT algorithm: %s", alg ? alg : "null");
         json_decref(hdr);
+        kc_stats.jwks_cache_misses++;  /* Need HTTP introspection */
         return KC_ERROR;  /* Fall back to introspection */
     }
 
     if (!kid) {
         log_module(KC_LOG, LOG_DEBUG, "JWT missing kid");
         json_decref(hdr);
+        kc_stats.jwks_cache_misses++;  /* Need HTTP introspection */
         return KC_ERROR;
     }
 
@@ -1070,6 +1120,7 @@ keycloak_validate_jwt_local(struct kc_realm realm, const char *token,
     if (!pkey) {
         log_module(KC_LOG, LOG_DEBUG, "Unknown kid in JWT: %s", kid_copy);
         free(kid_copy);
+        kc_stats.jwks_cache_misses++;  /* Need HTTP introspection */
         return KC_ERROR;  /* Unknown key - might need JWKS refresh or fallback */
     }
     free(kid_copy);
@@ -1101,6 +1152,7 @@ keycloak_validate_jwt_local(struct kc_realm realm, const char *token,
 
     if (result == KC_SUCCESS) {
         *info_out = info;
+        kc_stats.jwks_cache_hits++;  /* Validated locally, no HTTP needed */
         log_module(KC_LOG, LOG_DEBUG, "JWT validated locally: user=%s",
                    info->username ? info->username : "unknown");
     } else {
@@ -2172,12 +2224,28 @@ kc_curl_check_completed(void)
                 }
             }
 
-            /* Get HTTP response code */
+            /* Get HTTP response code and timing */
+            double total_time = 0;
+            unsigned long latency_ms;
+            int is_error;
+
             if (msg->data.result == CURLE_OK) {
                 curl_easy_getinfo(easy, CURLINFO_RESPONSE_CODE, &http_code);
+                curl_easy_getinfo(easy, CURLINFO_TOTAL_TIME, &total_time);
             } else {
                 log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async: CURL error: %s (after %lds)",
                            req_id, curl_easy_strerror(msg->data.result), (long)elapsed);
+            }
+
+            /* Record async request stats */
+            latency_ms = (unsigned long)(total_time * 1000);
+            is_error = (msg->data.result != CURLE_OK || http_code >= 500);
+            kc_stats_record_request(latency_ms, is_error);
+
+            /* Log slow async requests */
+            if (latency_ms > 1000) {
+                log_module(KC_LOG, LOG_INFO, "[%s] Async request slow: %lu ms (HTTP %ld, type=%d)",
+                           req_id, latency_ms, http_code, req->type);
             }
 
             /* Check for retryable errors on supported operation types.
@@ -4807,10 +4875,33 @@ static long curl_perform(struct curl_opts opts, struct memory* chunk_out)
             continue;  /* Try again if retries left */
         }
 
-        /* Perform request (blocking) */
-        res = curl_easy_perform(curl);
-        http_code = 0;
-        curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+        /* Perform request (blocking) with timing */
+        {
+            struct timeval tv_start, tv_end;
+            unsigned long latency_ms;
+            int is_error;
+
+            gettimeofday(&tv_start, NULL);
+            res = curl_easy_perform(curl);
+            gettimeofday(&tv_end, NULL);
+
+            http_code = 0;
+            curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+
+            /* Calculate latency */
+            latency_ms = (tv_end.tv_sec - tv_start.tv_sec) * 1000 +
+                         (tv_end.tv_usec - tv_start.tv_usec) / 1000;
+            is_error = (res != CURLE_OK || http_code >= 500);
+
+            /* Record stats */
+            kc_stats_record_request(latency_ms, is_error);
+
+            /* Log slow requests */
+            if (latency_ms > 1000) {
+                log_module(KC_LOG, LOG_INFO, "[%s] Slow request: %lu ms (HTTP %ld)",
+                           req_id, latency_ms, http_code);
+            }
+        }
 
         if (res == CURLE_OK && http_code > 0 && http_code < 500 && http_code != 429) {
             /* Success or non-retryable client error */
@@ -8580,6 +8671,7 @@ kc_token_refresh_cb(void *session, int result, struct access_token *token)
         kc_token_mgr.client.access_token = token;
         kc_token_mgr.token_expires = time(NULL) + token->expires_in;
         kc_token_mgr.available = 1;
+        kc_stats.token_refreshes++;  /* Track successful token refreshes */
         log_module(KC_LOG, LOG_DEBUG, "Async token refresh successful (expires in %ld sec)",
                    token->expires_in);
     } else {

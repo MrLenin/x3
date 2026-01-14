@@ -1189,6 +1189,44 @@ void keycloak_set_available(int available);
  */
 int keycloak_is_available(void);
 
+/*
+ * =============================================================================
+ * Performance Statistics (for STATS KEYCLOAK)
+ * =============================================================================
+ */
+
+/**
+ * Keycloak HTTP request statistics.
+ * All times are in milliseconds.
+ */
+struct kc_stats {
+    unsigned long http_requests;      /* Total HTTP requests made */
+    unsigned long http_errors;        /* Requests that failed (curl error or HTTP 5xx) */
+    unsigned long total_latency_ms;   /* Sum of all request latencies */
+    unsigned long max_latency_ms;     /* Maximum single request latency */
+    unsigned long min_latency_ms;     /* Minimum single request latency (0 if none) */
+    unsigned long jwks_cache_hits;    /* JWT validated locally (no HTTP) */
+    unsigned long jwks_cache_misses;  /* JWT required JWKS fetch */
+    unsigned long user_cache_hits;    /* User ID found in cache */
+    unsigned long user_cache_misses;  /* User ID required HTTP lookup */
+    unsigned long token_refreshes;    /* Admin token refreshes */
+    time_t last_request_time;         /* Timestamp of last HTTP request */
+};
+
+/**
+ * Get current Keycloak statistics.
+ * Thread-safe snapshot of current metrics.
+ *
+ * @param stats_out  Output pointer for stats (caller provides storage)
+ */
+void keycloak_get_stats(struct kc_stats *stats_out);
+
+/**
+ * Reset Keycloak statistics to zero.
+ * Typically called during startup or on operator request.
+ */
+void keycloak_reset_stats(void);
+
 #endif /* WITH_KEYCLOAK */
 
 #endif /* KEYCLOAK_H */
