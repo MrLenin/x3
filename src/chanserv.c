@@ -7533,7 +7533,7 @@ handle_svccmd_unbind(struct svccmd *target, UNUSED_ARG(void *extra)) {
 static CHANSERV_FUNC(cmd_set)
 {
     struct svccmd *subcmd;
-    char buf[MAXLEN];
+    static char buf[MAXLEN];  /* static: used in argv, must persist for logging */
     unsigned int ii;
 
     /* Check if we need to (re-)initialize set_shows_list. */
