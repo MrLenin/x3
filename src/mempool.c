@@ -22,12 +22,10 @@
 #include <stdlib.h>
 #include <stdint.h>
 
-/* Magic numbers for debug builds */
-#ifndef NDEBUG
+/* Magic numbers for pool validation (always enabled for pool_strfree safety) */
 #define MEMPOOL_MAGIC       0xDEADBEEF
 #define MEMPOOL_FREE_MAGIC  0xFEEDFACE
 #define MEMPOOL_ALLOC_MAGIC 0xCAFEBABE
-#endif
 
 /* Maximum number of pools we track for dump_all */
 #define MAX_POOLS 64
@@ -44,8 +42,8 @@ struct slab {
 struct pool_obj_header {
     mempool_t *pool;             /* Owner pool for validation */
     struct pool_obj_header *next_free;  /* Next in free list (when free) */
+    unsigned int magic;          /* For corruption detection (always enabled for pool_strfree) */
 #ifndef NDEBUG
-    unsigned int magic;          /* For corruption detection */
     unsigned int alloc_seq;      /* Allocation sequence number */
 #endif
 };
@@ -149,8 +147,8 @@ mempool_add_slab(mempool_t *pool, unsigned int count)
         struct pool_obj_header *hdr = (struct pool_obj_header *)ptr;
         hdr->pool = pool;
         hdr->next_free = pool->free_list;
-#ifndef NDEBUG
         hdr->magic = MEMPOOL_FREE_MAGIC;
+#ifndef NDEBUG
         hdr->alloc_seq = 0;
 #endif
         pool->free_list = hdr;
@@ -286,13 +284,14 @@ mempool_alloc(mempool_t *pool)
     pool->free_count--;
     pool->alloc_count++;
 
-#ifndef NDEBUG
+    /* Verify magic (always enabled for pool_strfree safety) */
     if (hdr->magic != MEMPOOL_FREE_MAGIC) {
         log_module(MP_LOG, LOG_ERROR,
                    "mempool_alloc: object corruption detected (double alloc?)");
         return NULL;
     }
     hdr->magic = MEMPOOL_ALLOC_MAGIC;
+#ifndef NDEBUG
     hdr->alloc_seq = pool->next_alloc_seq++;
 #endif
 
@@ -336,7 +335,7 @@ mempool_free(mempool_t *pool, void *obj)
     header_offset = align_up(sizeof(struct pool_obj_header), pool->alignment);
     hdr = (struct pool_obj_header *)((char *)obj - header_offset);
 
-#ifndef NDEBUG
+    /* Verify magic (always enabled for pool_strfree safety) */
     if (hdr->magic != MEMPOOL_ALLOC_MAGIC) {
         log_module(MP_LOG, LOG_ERROR,
                    "mempool_free: object corruption or double free detected");
@@ -348,7 +347,6 @@ mempool_free(mempool_t *pool, void *obj)
         return;
     }
     hdr->magic = MEMPOOL_FREE_MAGIC;
-#endif
 
     /* Push to free list (LIFO for cache locality) */
     hdr->next_free = pool->free_list;
@@ -602,16 +600,20 @@ pool_strfree(char *str)
         return;
 
     /*
-     * Check string length first to determine if it COULD have come from a pool.
-     * Only pool-sized strings have headers we can safely read.
-     * Strings > 256 bytes are allocated via strdup(), no header exists.
+     * Determine if string COULD have come from a pool based on length.
+     * Strings > 256 bytes are always allocated via strdup(), no header exists.
+     *
+     * For pool-eligible strings, we check the magic number FIRST to verify
+     * the header is valid before reading the pool pointer. This prevents
+     * reading garbage when the string was allocated with regular strdup().
      */
     len = strlen(str) + 1;
 
     if (len <= 64 && mp_string64) {
         header_offset = align_up(sizeof(struct pool_obj_header), mp_string64->alignment);
         hdr = (struct pool_obj_header *)((char *)str - header_offset);
-        if (hdr->pool == mp_string64) {
+        /* Check magic FIRST to verify this is a valid pool header */
+        if (hdr->magic == MEMPOOL_ALLOC_MAGIC && hdr->pool == mp_string64) {
             mempool_free(mp_string64, str);
             return;
         }
@@ -620,13 +622,14 @@ pool_strfree(char *str)
     if (len <= 256 && mp_string256) {
         header_offset = align_up(sizeof(struct pool_obj_header), mp_string256->alignment);
         hdr = (struct pool_obj_header *)((char *)str - header_offset);
-        if (hdr->pool == mp_string256) {
+        /* Check magic FIRST to verify this is a valid pool header */
+        if (hdr->magic == MEMPOOL_ALLOC_MAGIC && hdr->pool == mp_string256) {
             mempool_free(mp_string256, str);
             return;
         }
     }
 
-    /* Not from a pool (too large or header doesn't match), use regular free */
+    /* Not from a pool (too large, no magic match, or pool doesn't match) */
     free(str);
 }
 

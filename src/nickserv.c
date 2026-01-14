@@ -12315,20 +12315,21 @@ sasl_delete_session(struct SASLSession *session)
         free(session->buf);
     session->buf = NULL;
 
+    /* These fields are allocated via pool_strdup(), must use pool_strfree() */
     if (session->sslclifp)
-        free(session->sslclifp);
+        pool_strfree(session->sslclifp);
     session->sslclifp = NULL;
 
     if (session->hostmask)
-        free(session->hostmask);
+        pool_strfree(session->hostmask);
     session->hostmask = NULL;
 
     if (session->authcid)
-        free(session->authcid);
+        pool_strfree(session->authcid);
     session->authcid = NULL;
 
     if (session->authzid)
-        free(session->authzid);
+        pool_strfree(session->authzid);
     session->authzid = NULL;
 
 #ifdef WITH_LMDB
@@ -13032,7 +13033,7 @@ sasl_packet(struct SASLSession *session)
                 log_module(NS_LOG, LOG_ERROR, "SASL EXTERNAL: Out of memory for async context");
                 session->state = SASL_STATE_INIT;
                 if (session->authzid) {
-                    free(session->authzid);
+                    pool_strfree(session->authzid);
                     session->authzid = NULL;
                 }
                 hi = loc_auth_external(session->sslclifp, authzid, session->hostmask);
@@ -13052,7 +13053,7 @@ sasl_packet(struct SASLSession *session)
                 free(async_ctx);
                 session->state = SASL_STATE_INIT;
                 if (session->authzid) {
-                    free(session->authzid);
+                    pool_strfree(session->authzid);
                     session->authzid = NULL;
                 }
                 hi = loc_auth_external(session->sslclifp, authzid, session->hostmask);
@@ -13250,7 +13251,7 @@ sasl_packet(struct SASLSession *session)
             log_module(NS_LOG, LOG_WARNING, "SASL OAUTHBEARER: Async introspect failed, using sync");
             session->state = SASL_STATE_INIT;
             if (session->authzid) {
-                free(session->authzid);
+                pool_strfree(session->authzid);
                 session->authzid = NULL;
             }
         }
@@ -13777,10 +13778,10 @@ sasl_packet(struct SASLSession *session)
             /* Async start failed - fall through to sync path */
             log_module(NS_LOG, LOG_WARNING, "SASL: Async auth start failed, falling back to sync");
             session->state = SASL_STATE_INIT;
-            free(session->authcid);
+            pool_strfree(session->authcid);
             session->authcid = NULL;
             if (session->authzid) {
-                free(session->authzid);
+                pool_strfree(session->authzid);
                 session->authzid = NULL;
             }
 
