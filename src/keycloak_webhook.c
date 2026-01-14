@@ -57,6 +57,26 @@ static struct webhook_event *event_queue_tail = NULL;
 static unsigned int event_queue_size = 0;
 static int process_scheduled = 0;
 
+/* Access update queue - decouples webhook receipt from chanserv processing */
+#define ACCESS_QUEUE_MAX 5000       /* Max queued access updates */
+#define ACCESS_QUEUE_BATCH 20       /* Process this many per timer tick */
+#define ACCESS_QUEUE_INTERVAL 1     /* Timer interval in seconds */
+
+struct access_update_entry {
+    char channel[CHANNELLEN+1];
+    char username[NICKSERV_HANDLE_LEN+1];
+    unsigned short level;
+    struct access_update_entry *next;
+};
+
+static struct access_update_entry *access_queue_head = NULL;
+static struct access_update_entry *access_queue_tail = NULL;
+static unsigned int access_queue_size = 0;
+static int access_queue_scheduled = 0;
+
+/* Forward declaration for access queue processing */
+static void access_queue_process(void *data);
+
 /* HTTP connection state */
 struct webhook_conn {
     struct io_fd *fd;
@@ -468,6 +488,122 @@ webhook_process_queue(UNUSED_ARG(void *data))
 }
 
 /*
+ * Queue an access update for deferred processing.
+ * Deduplicates by channel+username - if already queued, updates level.
+ */
+static int
+queue_access_update(const char *channel, const char *username, unsigned short level)
+{
+    struct access_update_entry *entry;
+
+    /* Check for existing entry (deduplication) */
+    for (entry = access_queue_head; entry; entry = entry->next) {
+        if (strcasecmp(entry->channel, channel) == 0 &&
+            strcasecmp(entry->username, username) == 0) {
+            /* Update existing entry's level */
+            if (entry->level != level) {
+                log_module(webhook_log, LOG_DEBUG,
+                           "access_queue: Updating queued entry %s/%s: %u -> %u",
+                           channel, username, entry->level, level);
+                entry->level = level;
+            }
+            return 0;  /* Deduplicated */
+        }
+    }
+
+    /* Check queue limit */
+    if (access_queue_size >= ACCESS_QUEUE_MAX) {
+        log_module(webhook_log, LOG_WARNING,
+                   "access_queue: Queue full (%u), dropping update for %s/%s",
+                   access_queue_size, channel, username);
+        stats.access_updates_dropped++;
+        return -1;
+    }
+
+    /* Create new entry */
+    entry = malloc(sizeof(*entry));
+    if (!entry) {
+        log_module(webhook_log, LOG_ERROR, "access_queue: malloc failed");
+        return -1;
+    }
+
+    strncpy(entry->channel, channel, CHANNELLEN);
+    entry->channel[CHANNELLEN] = '\0';
+    strncpy(entry->username, username, NICKSERV_HANDLE_LEN);
+    entry->username[NICKSERV_HANDLE_LEN] = '\0';
+    entry->level = level;
+    entry->next = NULL;
+
+    /* Append to queue */
+    if (access_queue_tail) {
+        access_queue_tail->next = entry;
+    } else {
+        access_queue_head = entry;
+    }
+    access_queue_tail = entry;
+    access_queue_size++;
+    stats.access_updates_queued++;
+
+    /* Schedule processing if not already scheduled */
+    if (!access_queue_scheduled) {
+        access_queue_scheduled = 1;
+        timeq_add(now + ACCESS_QUEUE_INTERVAL, access_queue_process, NULL);
+    }
+
+    log_module(webhook_log, LOG_DEBUG,
+               "access_queue: Queued %s/%s level %u (queue size: %u)",
+               channel, username, level, access_queue_size);
+
+    return 0;
+}
+
+/*
+ * Process queued access updates - called via timeq timer.
+ * Processes up to ACCESS_QUEUE_BATCH entries per invocation.
+ */
+static void
+access_queue_process(UNUSED_ARG(void *data))
+{
+    struct access_update_entry *entry;
+    int batch = 0;
+
+    access_queue_scheduled = 0;
+
+    while (access_queue_head && batch < ACCESS_QUEUE_BATCH) {
+        entry = access_queue_head;
+        access_queue_head = entry->next;
+        if (!access_queue_head)
+            access_queue_tail = NULL;
+        access_queue_size--;
+
+        /* Apply the access update */
+        log_module(webhook_log, LOG_DEBUG,
+                   "access_queue: Processing %s/%s level %u",
+                   entry->channel, entry->username, entry->level);
+
+        chanserv_keycloak_access_update(entry->channel, entry->username, entry->level);
+        stats.access_updates_processed++;
+
+        free(entry);
+        batch++;
+    }
+
+    stats.access_queue_depth = access_queue_size;
+
+    /* If more entries remain, schedule another processing round */
+    if (access_queue_head && !access_queue_scheduled) {
+        access_queue_scheduled = 1;
+        timeq_add(now + ACCESS_QUEUE_INTERVAL, access_queue_process, NULL);
+    }
+
+    if (batch > 0) {
+        log_module(webhook_log, LOG_DEBUG,
+                   "access_queue: Processed %d entries, %u remaining",
+                   batch, access_queue_size);
+    }
+}
+
+/*
  * Process a complete webhook request
  */
 static int
@@ -705,12 +841,12 @@ handle_keycloak_event(const char *body, size_t body_len)
                                         }
                                     }
 
-                                    log_module(webhook_log, LOG_INFO,
-                                               "Channel access changed for %s via Keycloak: %s = %u",
+                                    log_module(webhook_log, LOG_DEBUG,
+                                               "Queueing access update for %s via Keycloak: %s = %u",
                                                username, channel, level);
 
-                                    /* Apply to X3's internal access list */
-                                    chanserv_keycloak_access_update(channel, username, level);
+                                    /* Queue for deferred processing to avoid blocking event loop */
+                                    queue_access_update(channel, username, level);
                                     stats.cache_invalidations++;
                                     invalidated = 1;
                                 }
