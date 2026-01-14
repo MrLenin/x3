@@ -2641,7 +2641,7 @@ kc_curl_check_completed(void)
                     if (root) {
                         const char *id = json_string_value(json_object_get(root, "id"));
                         if (id) {
-                            group_id = strdup(id);
+                            group_id = pool_strdup(id);
                             result = KC_SUCCESS;
                             log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async get_group_path: Found group %s", req_id, group_id);
                         }
@@ -2657,7 +2657,7 @@ kc_curl_check_completed(void)
                     req->cb.get_group_path(req->session, result, group_id);
                     /* Note: group_id ownership transferred to callback */
                 } else if (group_id) {
-                    free(group_id);
+                    pool_strfree(group_id);
                 }
                 break;
             }
@@ -2671,7 +2671,7 @@ kc_curl_check_completed(void)
                         /* Location header format: .../groups/{id} */
                         const char *last_slash = strrchr(req->location_header, '/');
                         if (last_slash && last_slash[1]) {
-                            group_id = strdup(last_slash + 1);
+                            group_id = pool_strdup(last_slash + 1);
                             result = KC_SUCCESS;
                             log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async create_subgroup: Created group %s", req_id, group_id);
                         }
@@ -2693,7 +2693,7 @@ kc_curl_check_completed(void)
                     req->cb.create_subgroup(req->session, result, group_id);
                     /* Note: group_id ownership transferred to callback */
                 } else if (group_id) {
-                    free(group_id);
+                    pool_strfree(group_id);
                 }
                 break;
             }
@@ -2726,7 +2726,7 @@ kc_curl_check_completed(void)
                             json_t *first_group = json_array_get(root, 0);
                             json_t *id_val = json_object_get(first_group, "id");
                             if (id_val && json_is_string(id_val)) {
-                                group_id = strdup(json_string_value(id_val));
+                                group_id = pool_strdup(json_string_value(id_val));
                                 if (group_id) {
                                     result = KC_SUCCESS;
                                     log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async get_group_name: Found group ID %s", req_id, group_id);
@@ -2750,7 +2750,7 @@ kc_curl_check_completed(void)
                     req->cb.get_group_name(req->session, result, group_id);
                     /* Note: group_id ownership transferred to callback */
                 } else if (group_id) {
-                    free(group_id);
+                    pool_strfree(group_id);
                 }
                 break;
             }
@@ -6786,7 +6786,7 @@ int keycloak_get_group_by_name(struct kc_realm realm, struct kc_client client,
             json_t* first_group = json_array_get(root, 0);
             json_t* id_val = json_object_get(first_group, "id");
             if (id_val && json_is_string(id_val)) {
-                *group_id_out = strdup(json_string_value(id_val));
+                *group_id_out = pool_strdup(json_string_value(id_val));
                 if (*group_id_out) {
                     result = KC_SUCCESS;
                     log_module(KC_LOG, LOG_DEBUG, "keycloak_get_group_by_name: Found group '%s' with ID '%s'",
@@ -6864,7 +6864,7 @@ int keycloak_get_group_by_path(struct kc_realm realm, struct kc_client client,
         if (json_is_object(root)) {
             json_t* id_val = json_object_get(root, "id");
             if (id_val && json_is_string(id_val)) {
-                *group_id_out = strdup(json_string_value(id_val));
+                *group_id_out = pool_strdup(json_string_value(id_val));
                 if (*group_id_out) {
                     result = KC_SUCCESS;
                     log_module(KC_LOG, LOG_DEBUG, "keycloak_get_group_by_path: Found group at '%s' with ID '%s'",
