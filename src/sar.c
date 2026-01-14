@@ -22,6 +22,7 @@
 #include "conf.h"
 #include "ioset.h"
 #include "log.h"
+#include "mempool.h"
 #include "timeq.h"
 
 #if defined(HAVE_NETINET_IN_H)
@@ -342,7 +343,7 @@ sar_dns_init(const char *resolv_conf_path)
                 while (ch == ' ') {
                     ch = arg[len = strcspn(arg, " \t\r\n")];
                     arg[len] = '\0';
-                    string_list_append(ns_sv, strdup(arg));
+                    string_list_append(ns_sv, pool_strdup(arg));
                     arg += len + 1;
                 }
             } else if (!strcmp(linebuf, "domain")) {
@@ -353,7 +354,7 @@ sar_dns_init(const char *resolv_conf_path)
                 while (ch == ' ') {
                     ch = arg[len = strcspn(arg, " \t\r\n")];
                     arg[len] = '\0';
-                    string_list_append(ds_sv, strdup(arg));
+                    string_list_append(ds_sv, pool_strdup(arg));
                     arg += len + 1;
                 }
             } else if (!strcmp(linebuf, "options")) {
@@ -387,7 +388,7 @@ sar_dns_init(const char *resolv_conf_path)
 
     /* Set default search path if domain is set. */
     if (conf.sar_localdomain[0] != '\0' && ds_sv->used == 0)
-        string_list_append(ds_sv, strdup(conf.sar_localdomain));
+        string_list_append(ds_sv, pool_strdup(conf.sar_localdomain));
 
     /* Check configuration entries that might override resolv.conf. */
     node = conf_get_data("modules/sar", RECDB_OBJECT);

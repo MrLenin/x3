@@ -1113,7 +1113,8 @@ _GetChannelUser(struct chanData *channel, struct handle_info *handle, int overri
 
     if(!uData)
     {
-        uData = calloc(1, sizeof(struct userData));
+        uData = mempool_zalloc(mp_userdata);
+        if (!uData) return NULL;  /* Pool exhausted */
         uData->handle = handle;
 
         uData->access = UL_HELPER;
@@ -1640,7 +1641,8 @@ add_channel_user(struct chanData *channel, struct handle_info *handle, unsigned 
     if(access_level > UL_OWNER)
     return NULL;
 
-    ud = calloc(1, sizeof(*ud));
+    ud = mempool_zalloc(mp_userdata);
+    if (!ud) return NULL;  /* Pool exhausted */
     ud->channel = channel;
     ud->handle = handle;
     ud->seen = seen;
@@ -1801,7 +1803,7 @@ del_channel_user(struct userData *user, int do_gc)
         user->u_next->u_prev = user->u_prev;
 
     pool_strfree(user->info);
-    free(user);
+    mempool_free(mp_userdata, user);
     if(do_gc && !channel->users && !IsProtected(channel)) {
         spamserv_cs_unregister(NULL, channel->channel, lost_all_users, NULL);
         unregister_channel(channel, "lost all users.");
@@ -1932,7 +1934,8 @@ add_channel_ban(struct chanData *channel, const char *mask, char *owner, time_t 
     if(!mask)
         return NULL;
 
-    bd = malloc(sizeof(struct banData));
+    bd = mempool_zalloc(mp_bandata);
+    if (!bd) return NULL;  /* Pool exhausted */
 
     bd->channel = channel;
     bd->set = set;
@@ -1994,7 +1997,7 @@ del_channel_ban(struct banData *ban)
     if(ban->reason)
         pool_strfree(ban->reason);
 
-    free(ban);
+    mempool_free(mp_bandata, ban);
 }
 
 static void

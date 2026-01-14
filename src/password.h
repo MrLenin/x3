@@ -153,4 +153,62 @@ int pw_export_ldap(const char *hash, char *ldap_hash, size_t ldap_hash_len);
  */
 const char *pw_cryptpass(const char *pass, char *buffer);
 
+/*
+ * ============= Async password operations (threadpool) =============
+ *
+ * These functions offload CPU-intensive password hashing to the threadpool
+ * to avoid blocking the main event loop. The callback runs in the main
+ * thread after the operation completes.
+ */
+
+/* Callback type for async password operations */
+typedef void (*pw_async_callback)(void *ctx, int result, const char *hash);
+
+/* Async work context - allocated by caller, freed by library after callback */
+struct pw_async_ctx {
+    char password[256];              /* Copy of password (cleared after use) */
+    char stored_hash[PW_MAX_HASH_LEN]; /* For verify: stored hash to check against */
+    char output_hash[PW_MAX_HASH_LEN]; /* For hash: result goes here */
+    enum pw_algorithm algorithm;      /* For hash_with: algorithm to use */
+    int result;                       /* 0=success, -1=error, 1=verified */
+    pw_async_callback callback;       /* User callback */
+    void *user_ctx;                   /* User context passed to callback */
+};
+
+/*
+ * Hash password asynchronously using default algorithm.
+ * Callback receives: result (0=success, -1=error), hash string.
+ *
+ * @param password  Plaintext password (copied internally)
+ * @param callback  Called in main thread when done
+ * @param ctx       Passed to callback
+ * @return 0 if submitted, -1 on error (callback not called)
+ */
+int pw_hash_async(const char *password, pw_async_callback callback, void *ctx);
+
+/*
+ * Hash password asynchronously using specific algorithm.
+ *
+ * @param password  Plaintext password (copied internally)
+ * @param algorithm Algorithm to use
+ * @param callback  Called in main thread when done
+ * @param ctx       Passed to callback
+ * @return 0 if submitted, -1 on error (callback not called)
+ */
+int pw_hash_with_async(const char *password, enum pw_algorithm algorithm,
+                       pw_async_callback callback, void *ctx);
+
+/*
+ * Verify password asynchronously.
+ * Callback receives: result (1=match, 0=no match, -1=error), NULL for hash.
+ *
+ * @param password  Plaintext password (copied internally)
+ * @param hash      Stored hash to verify against (copied internally)
+ * @param callback  Called in main thread when done
+ * @param ctx       Passed to callback
+ * @return 0 if submitted, -1 on error (callback not called)
+ */
+int pw_verify_async(const char *password, const char *hash,
+                    pw_async_callback callback, void *ctx);
+
 #endif /* PASSWORD_H */

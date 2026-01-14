@@ -6700,7 +6700,7 @@ static MODCMD_FUNC(cmd_trace)
     else if (action == trace_domains_func) {
         das.dict = dict_new();
         dict_set_free_data(das.dict, free);
-        dict_set_free_keys(das.dict, free);
+        dict_set_free_keys(das.dict, pool_strfree_v);
         das.disp_limit = das.discrim->limit;
         das.discrim->limit = INT_MAX;
     }
@@ -7682,7 +7682,7 @@ opserv_db_init(void) {
     opserv_account_based_alerts = dict_new();
     dict_delete(opserv_user_alerts);
     opserv_user_alerts = dict_new();
-    dict_set_free_keys(opserv_user_alerts, free);
+    dict_set_free_keys(opserv_user_alerts, pool_strfree_v);
     dict_set_free_data(opserv_user_alerts, opserv_free_user_alert);
     /* set up opserv_bad_words */
     free_string_list(opserv_bad_words);
@@ -7690,7 +7690,7 @@ opserv_db_init(void) {
     /* and opserv_exempt_channels */
     dict_delete(opserv_exempt_channels);
     opserv_exempt_channels = dict_new();
-    dict_set_free_keys(opserv_exempt_channels, free);
+    dict_set_free_keys(opserv_exempt_channels, pool_strfree_v);
 }
 
 static void
@@ -7889,7 +7889,7 @@ init_opserv(const char *nick)
     opserv_reserved_nick_dict = dict_new();
     opserv_hostinfo_dict = dict_new();
 
-    dict_set_free_keys(opserv_hostinfo_dict, free);
+    dict_set_free_keys(opserv_hostinfo_dict, pool_strfree_v);
     dict_set_free_data(opserv_hostinfo_dict, opserv_free_hostinfo);
 
     opserv_waiting_connections = dict_new();

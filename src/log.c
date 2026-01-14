@@ -21,6 +21,7 @@
 #include "conf.h"
 #include "log.h"
 #include "helpfile.h" /* send_message, message_register, etc */
+#include "mempool.h"
 #include "modcmd.h"
 #include "nickserv.h"
 
@@ -274,7 +275,7 @@ log_parse_logset(char *buffer, struct string_list *slist)
         char *cont = strchr(buffer, ',');
         if (cont)
             *cont++ = 0;
-        string_list_append(slist, strdup(buffer));
+        string_list_append(slist, pool_strdup(buffer));
         buffer = cont;
     }
 }

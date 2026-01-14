@@ -10,6 +10,7 @@
 
 #include "common.h"
 #include "password.h"
+#include "threadpool.h"
 #include "log.h"
 
 #include <string.h>
@@ -762,4 +763,228 @@ const char *pw_cryptpass(const char *pass, char *buffer)
         return buffer;
     return NULL;
 }
+
+/* ============= Async password operations (threadpool) ============= */
+
+#ifdef HAVE_PTHREAD_H
+
+/* Internal work types */
+enum pw_work_type {
+    PW_WORK_HASH,
+    PW_WORK_HASH_WITH,
+    PW_WORK_VERIFY
+};
+
+/* Internal work structure */
+struct pw_work {
+    enum pw_work_type type;
+    struct pw_async_ctx *ctx;
+};
+
+/* Worker function - runs in threadpool thread */
+static void *pw_worker(void *arg)
+{
+    struct pw_work *work = arg;
+    struct pw_async_ctx *ctx = work->ctx;
+
+    switch (work->type) {
+    case PW_WORK_HASH:
+        ctx->result = pw_hash(ctx->password, ctx->output_hash, sizeof(ctx->output_hash));
+        break;
+
+    case PW_WORK_HASH_WITH:
+        ctx->result = pw_hash_with(ctx->password, ctx->algorithm,
+                                    ctx->output_hash, sizeof(ctx->output_hash));
+        break;
+
+    case PW_WORK_VERIFY:
+        ctx->result = pw_verify(ctx->password, ctx->stored_hash);
+        break;
+    }
+
+    /* Clear password from memory immediately */
+    memset(ctx->password, 0, sizeof(ctx->password));
+
+    return work;
+}
+
+/* Callback wrapper - runs in main thread */
+static void pw_callback_wrapper(void *result, void *user_data, tp_state_t state)
+{
+    struct pw_work *work = result;
+    struct pw_async_ctx *ctx = work->ctx;
+    const char *hash_out = NULL;
+
+    (void)user_data;  /* Unused */
+
+    if (state == TP_STATE_COMPLETED) {
+        /* For hash operations, provide the output hash */
+        if (work->type == PW_WORK_HASH || work->type == PW_WORK_HASH_WITH) {
+            if (ctx->result == 0)
+                hash_out = ctx->output_hash;
+        }
+
+        /* Invoke user callback */
+        if (ctx->callback) {
+            ctx->callback(ctx->user_ctx, ctx->result, hash_out);
+        }
+    } else {
+        /* Task was cancelled or failed */
+        if (ctx->callback) {
+            ctx->callback(ctx->user_ctx, -1, NULL);
+        }
+    }
+
+    /* Cleanup - clear any sensitive data */
+    memset(ctx->password, 0, sizeof(ctx->password));
+    memset(ctx->stored_hash, 0, sizeof(ctx->stored_hash));
+    free(ctx);
+    free(work);
+}
+
+int pw_hash_async(const char *password, pw_async_callback callback, void *ctx)
+{
+    return pw_hash_with_async(password, pw_config.default_algorithm, callback, ctx);
+}
+
+int pw_hash_with_async(const char *password, enum pw_algorithm algorithm,
+                       pw_async_callback callback, void *ctx)
+{
+    struct pw_work *work;
+    struct pw_async_ctx *async_ctx;
+
+    if (!password || !callback)
+        return -1;
+
+    if (!threadpool_is_initialized()) {
+        /* Fallback to sync - call callback directly */
+        char hash[PW_MAX_HASH_LEN];
+        int result = pw_hash_with(password, algorithm, hash, sizeof(hash));
+        callback(ctx, result, result == 0 ? hash : NULL);
+        return 0;
+    }
+
+    /* Allocate work structures */
+    work = malloc(sizeof(*work));
+    async_ctx = malloc(sizeof(*async_ctx));
+    if (!work || !async_ctx) {
+        free(work);
+        free(async_ctx);
+        return -1;
+    }
+
+    /* Initialize context */
+    memset(async_ctx, 0, sizeof(*async_ctx));
+    strncpy(async_ctx->password, password, sizeof(async_ctx->password) - 1);
+    async_ctx->algorithm = algorithm;
+    async_ctx->callback = callback;
+    async_ctx->user_ctx = ctx;
+
+    /* Initialize work */
+    work->type = PW_WORK_HASH_WITH;
+    work->ctx = async_ctx;
+
+    /* Submit to threadpool */
+    if (!threadpool_submit(pw_worker, work, pw_callback_wrapper, NULL, TP_PRIORITY_HIGH)) {
+        memset(async_ctx->password, 0, sizeof(async_ctx->password));
+        free(async_ctx);
+        free(work);
+        return -1;
+    }
+
+    return 0;
+}
+
+int pw_verify_async(const char *password, const char *hash,
+                    pw_async_callback callback, void *ctx)
+{
+    struct pw_work *work;
+    struct pw_async_ctx *async_ctx;
+
+    if (!password || !hash || !callback)
+        return -1;
+
+    if (!threadpool_is_initialized()) {
+        /* Fallback to sync - call callback directly */
+        int result = pw_verify(password, hash);
+        callback(ctx, result, NULL);
+        return 0;
+    }
+
+    /* Allocate work structures */
+    work = malloc(sizeof(*work));
+    async_ctx = malloc(sizeof(*async_ctx));
+    if (!work || !async_ctx) {
+        free(work);
+        free(async_ctx);
+        return -1;
+    }
+
+    /* Initialize context */
+    memset(async_ctx, 0, sizeof(*async_ctx));
+    strncpy(async_ctx->password, password, sizeof(async_ctx->password) - 1);
+    strncpy(async_ctx->stored_hash, hash, sizeof(async_ctx->stored_hash) - 1);
+    async_ctx->callback = callback;
+    async_ctx->user_ctx = ctx;
+
+    /* Initialize work */
+    work->type = PW_WORK_VERIFY;
+    work->ctx = async_ctx;
+
+    /* Submit to threadpool - password verification is high priority */
+    if (!threadpool_submit(pw_worker, work, pw_callback_wrapper, NULL, TP_PRIORITY_HIGH)) {
+        memset(async_ctx->password, 0, sizeof(async_ctx->password));
+        free(async_ctx);
+        free(work);
+        return -1;
+    }
+
+    return 0;
+}
+
+#else /* !HAVE_PTHREAD_H */
+
+/* Stub implementations without pthreads - just call sync versions */
+
+int pw_hash_async(const char *password, pw_async_callback callback, void *ctx)
+{
+    char hash[PW_MAX_HASH_LEN];
+    int result;
+
+    if (!password || !callback)
+        return -1;
+
+    result = pw_hash(password, hash, sizeof(hash));
+    callback(ctx, result, result == 0 ? hash : NULL);
+    return 0;
+}
+
+int pw_hash_with_async(const char *password, enum pw_algorithm algorithm,
+                       pw_async_callback callback, void *ctx)
+{
+    char hash[PW_MAX_HASH_LEN];
+    int result;
+
+    if (!password || !callback)
+        return -1;
+
+    result = pw_hash_with(password, algorithm, hash, sizeof(hash));
+    callback(ctx, result, result == 0 ? hash : NULL);
+    return 0;
+}
+
+int pw_verify_async(const char *password, const char *hash,
+                    pw_async_callback callback, void *ctx)
+{
+    int result;
+
+    if (!password || !hash || !callback)
+        return -1;
+
+    result = pw_verify(password, hash);
+    callback(ctx, result, NULL);
+    return 0;
+}
+
+#endif /* HAVE_PTHREAD_H */
 

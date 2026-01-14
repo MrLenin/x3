@@ -360,6 +360,28 @@ static int mdq_single_attr_cb(void *session, int result, char *value);
 #endif
 
 /*
+ * Local async password verification context (Phase 3 - threadpool integration)
+ * Used when Keycloak is disabled to offload PBKDF2/bcrypt to threadpool.
+ */
+struct local_auth_ctx {
+    char handle[NICKSERV_HANDLE_LEN + 1];  /* Account handle */
+    char nick[NICKLEN + 1];                 /* User's nick (for replies) */
+    char numeric[COMBO_NUMERIC_LEN + 1];   /* User numeric for validation */
+    char password[128];                     /* Plaintext password (cleared after use) */
+    struct userNode *user;                  /* User pointer (validated before use) */
+    struct svccmd *cmd;                     /* Command context */
+    time_t started;                         /* When request started */
+    int verified;                           /* 1=password matched, 0=no match */
+    int needs_rehash;                       /* 1=hash needs upgrade */
+};
+
+/* Forward declarations for local async password verification */
+static void local_auth_ctx_free(struct local_auth_ctx *ctx);
+static void local_auth_verify_callback(void *ctx, int result, const char *hash);
+static void local_auth_rehash_callback(void *ctx, int result, const char *hash);
+static void local_auth_complete(struct local_auth_ctx *ctx);
+
+/*
  * Password verification with lazy migration.
  * Verifies password and upgrades hash format if needed.
  * Returns 1 on success (password matches), 0 on failure.
@@ -723,7 +745,8 @@ static void
 register_nick(const char *nick, struct handle_info *owner)
 {
     struct nick_info *ni;
-    ni = malloc(sizeof(struct nick_info));
+    ni = mempool_zalloc(mp_nickinfo);
+    if (!ni) return;  /* Pool exhausted */
     safestrncpy(ni->nick, nick, sizeof(ni->nick));
     ni->registered = now;
     ni->lastseen = now;
@@ -756,6 +779,7 @@ delete_nick(struct nick_info *ni)
 	last->next = next->next;
     }
     dict_remove(nickserv_nick_dict, ni->nick);
+    mempool_free(mp_nickinfo, ni);
 }
 
 static unreg_func_t *unreg_func_list;
@@ -803,7 +827,7 @@ free_handle_info(void *vhi)
         delete_nick(hi->nicks);
     pool_strfree(hi->infoline);
     pool_strfree(hi->epithet);
-    pool_strfree(hi->note);
+    free(hi->note);  /* struct handle_note *, not a string */
     pool_strfree(hi->fakehost);
     if (hi->cookie) {
         timeq_del(hi->cookie->expires, nickserv_free_cookie, hi->cookie, 0);
@@ -2933,7 +2957,7 @@ static NICKSERV_FUNC(cmd_auth)
     if (nickserv_conf.keycloak_enable) {
         /* Try async auth first (Phase 2) - only for registered users with numerics */
         if (user->numeric[0] != '\0') {
-            struct auth_async_ctx *auth_ctx = calloc(1, sizeof(*auth_ctx));
+            struct auth_async_ctx *auth_ctx = mempool_zalloc(mp_auth_ctx);
             if (auth_ctx) {
                 safestrncpy(auth_ctx->handle, handle, sizeof(auth_ctx->handle));
                 safestrncpy(auth_ctx->nick, user->nick, sizeof(auth_ctx->nick));
@@ -2954,7 +2978,7 @@ static NICKSERV_FUNC(cmd_auth)
 
                 /* Async failed to start - fall through to sync */
                 log_module(NS_LOG, LOG_WARNING, "AUTH async: Failed to start, falling back to sync for %s", handle);
-                free(auth_ctx);
+                mempool_free(mp_auth_ctx, auth_ctx);
             }
         }
 
@@ -3069,20 +3093,54 @@ static NICKSERV_FUNC(cmd_auth)
     /* Check for invalid password - handle Keycloak, LDAP, and local cases */
     {
         int password_invalid = 0;
+        int local_check_needed = 0;
+
 #ifdef WITH_KEYCLOAK
         if (nickserv_conf.keycloak_enable && kc_result == KC_FORBIDDEN)
             password_invalid = 1;
-        else
-#endif
-#ifdef WITH_LDAP
-        if (nickserv_conf.ldap_enable && ldap_result == LDAP_INVALID_CREDENTIALS)
-            password_invalid = 1;
-        else if (!nickserv_conf.ldap_enable && !checkpass_migrate(passwd, hi))
-            password_invalid = 1;
+        else if (!nickserv_conf.keycloak_enable)
+            local_check_needed = 1;
+        /* If keycloak_enable && kc_result == KC_SUCCESS, sslfpauth is set above */
 #else
-        if (!checkpass_migrate(passwd, hi))
-            password_invalid = 1;
+        local_check_needed = 1;
 #endif
+
+#ifdef WITH_LDAP
+        if (nickserv_conf.ldap_enable) {
+            if (ldap_result == LDAP_INVALID_CREDENTIALS)
+                password_invalid = 1;
+            local_check_needed = 0;  /* LDAP handles auth */
+        }
+#endif
+
+        /* Try async local password verification if needed (Phase 3 - threadpool) */
+        if (local_check_needed && !sslfpauth && hi && user->numeric[0] != '\0') {
+            struct local_auth_ctx *local_ctx = calloc(1, sizeof(*local_ctx));
+            if (local_ctx) {
+                safestrncpy(local_ctx->handle, handle, sizeof(local_ctx->handle));
+                safestrncpy(local_ctx->nick, user->nick, sizeof(local_ctx->nick));
+                safestrncpy(local_ctx->numeric, user->numeric, sizeof(local_ctx->numeric));
+                safestrncpy(local_ctx->password, passwd, sizeof(local_ctx->password));
+                local_ctx->user = user;
+                local_ctx->cmd = cmd;
+                local_ctx->started = now;
+
+                if (pw_verify_async(passwd, hi->passwd, local_auth_verify_callback, local_ctx) == 0) {
+                    /* Async started - mask password in logs and return pending */
+                    argv[pw_arg] = "****";
+                    log_module(NS_LOG, LOG_DEBUG, "Local AUTH async: Started for %s", handle);
+                    return 1;
+                }
+
+                /* Async failed to start - fall through to sync */
+                log_module(NS_LOG, LOG_WARNING, "Local AUTH async: Failed to start, falling back to sync for %s", handle);
+                local_auth_ctx_free(local_ctx);
+            }
+        }
+
+        /* Sync fallback for local password check */
+        if (local_check_needed && !password_invalid && !checkpass_migrate(passwd, hi))
+            password_invalid = 1;
 
         if (password_invalid && !sslfpauth) {
         unsigned int n;
@@ -3454,7 +3512,7 @@ static NICKSERV_FUNC(cmd_cookie)
         if (nickserv_conf.keycloak_enable) {
             /* Phase 3+5: Try async path for users with numerics (registered users) */
             if (user->numeric[0] != '\0') {
-                struct cookie_async_ctx *cookie_ctx = calloc(1, sizeof(*cookie_ctx));
+                struct cookie_async_ctx *cookie_ctx = mempool_zalloc(mp_cookie_ctx);
                 if (cookie_ctx) {
                     int token_rc;
                     safestrncpy(cookie_ctx->handle, hi->handle, sizeof(cookie_ctx->handle));
@@ -3522,7 +3580,7 @@ static NICKSERV_FUNC(cmd_cookie)
         if (nickserv_conf.keycloak_enable) {
             /* Phase 5 integration: Try async path with token-first for users with numerics */
             if (user->numeric[0] != '\0') {
-                struct cookie_async_ctx *cookie_ctx = calloc(1, sizeof(*cookie_ctx));
+                struct cookie_async_ctx *cookie_ctx = mempool_zalloc(mp_cookie_ctx);
                 if (cookie_ctx) {
                     int token_rc;
                     safestrncpy(cookie_ctx->handle, hi->handle, sizeof(cookie_ctx->handle));
@@ -4936,7 +4994,7 @@ static OPTION_FUNC(opt_note)
         char *text = unsplit_string(argv + 1, argc - 1, NULL);
 
         if (hi->note)
-            pool_strfree(hi->note);
+            free(hi->note);  /* struct handle_note *, not a string */
 
         if ((text[0] == '*') && !text[1])
             hi->note = NULL;
@@ -6107,9 +6165,9 @@ nickserv_saxdb_read(dict_t db) {
 
     for (it=dict_first(db); it; it=iter_next(it)) {
         rd = iter_data(it);
-        handle = pool_strdup(iter_key(it));
+        handle = strdup(iter_key(it));
         nickserv_db_read_handle(handle, rd->d.object);
-        free(handle);
+        free(handle);  /* Short-lived temp copy, use regular strdup/free */
     }
     return 0;
 }
@@ -6323,8 +6381,8 @@ static void
 auth_async_ctx_free(struct auth_async_ctx *ctx)
 {
     if (!ctx) return;
-    if (ctx->kc_email) free(ctx->kc_email);
-    free(ctx);
+    if (ctx->kc_email) pool_strfree(ctx->kc_email);
+    mempool_free(mp_auth_ctx, ctx);
 }
 
 /* Complete AUTH flow after password check and optional email lookup */
@@ -6552,7 +6610,234 @@ auth_async_callback(void *ctx_ptr, int result)
         return 0;
     }
 }
+#endif /* WITH_KEYCLOAK */
 
+/*
+ * ============================================================================
+ * Local async password verification (Phase 3 - threadpool integration)
+ * Used when Keycloak is disabled to avoid blocking the event loop on PBKDF2.
+ * ============================================================================
+ */
+
+/* Validate user is still connected by checking numeric matches */
+static struct userNode *
+local_auth_validate_user(struct local_auth_ctx *ctx)
+{
+    struct userNode *user;
+
+    if (!ctx) return NULL;
+
+    /* Look up user by numeric */
+    user = GetUserN(ctx->numeric);
+    if (!user) {
+        log_module(NS_LOG, LOG_DEBUG, "Local AUTH async: User %s disconnected (numeric %s not found)",
+                   ctx->nick, ctx->numeric);
+        return NULL;
+    }
+
+    /* Verify it's the same user pointer */
+    if (user != ctx->user) {
+        log_module(NS_LOG, LOG_DEBUG, "Local AUTH async: User pointer mismatch for %s (numeric %s)",
+                   ctx->nick, ctx->numeric);
+        return NULL;
+    }
+
+    return user;
+}
+
+/* Free local auth context - securely clears password */
+static void
+local_auth_ctx_free(struct local_auth_ctx *ctx)
+{
+    if (!ctx) return;
+    /* Securely clear the password before freeing */
+    memset(ctx->password, 0, sizeof(ctx->password));
+    free(ctx);
+}
+
+/* Complete local AUTH flow after password verification (and optional rehash) */
+static void
+local_auth_complete(struct local_auth_ctx *ctx)
+{
+    struct userNode *user;
+    struct handle_info *hi;
+    int maxlogins, used;
+    struct userNode *other;
+
+    /* Validate user is still connected */
+    user = local_auth_validate_user(ctx);
+    if (!user) {
+        log_module(NS_LOG, LOG_DEBUG, "Local AUTH complete: User no longer valid");
+        local_auth_ctx_free(ctx);
+        return;
+    }
+
+    /* Look up handle info */
+    hi = dict_find(nickserv_handle_dict, ctx->handle, NULL);
+    if (!hi) {
+        send_message(user, nickserv, "NSMSG_HANDLE_NOT_FOUND");
+        local_auth_ctx_free(ctx);
+        return;
+    }
+
+    /* Check password result */
+    if (!ctx->verified) {
+        unsigned int n;
+        send_message_type(4, user, nickserv,
+                          handle_find_message(hi, "NSMSG_PASSWORD_INVALID"));
+        for (n = 0; n < failpw_func_used; n++)
+            failpw_func_list[n](user, hi, failpw_func_list_extra[n]);
+        if (nickserv_conf.autogag_enabled) {
+            if (!user->auth_policer.params) {
+                user->auth_policer.last_req = now;
+                user->auth_policer.params = nickserv_conf.auth_policer_params;
+            }
+            if (!policer_conforms(&user->auth_policer, now, 1.0)) {
+                char *hostmask;
+                hostmask = generate_hostmask(user, GENMASK_STRICT_HOST|GENMASK_BYIP|GENMASK_NO_HIDING);
+                log_module(NS_LOG, LOG_INFO, "%s auto-gagged for repeated password guessing.", hostmask);
+                gag_create(hostmask, nickserv->nick, "Repeated password guessing.", now + nickserv_conf.autogag_duration);
+                free(hostmask);
+            }
+        }
+        local_auth_ctx_free(ctx);
+        return;
+    }
+
+    /* Hostmask validation */
+    if (!valid_user_for(user, hi)) {
+        if (hi->email_addr && nickserv_conf.email_enabled)
+            send_message_type(4, user, nickserv,
+                              handle_find_message(hi, "NSMSG_USE_AUTHCOOKIE"),
+                              hi->handle);
+        else
+            send_message_type(4, user, nickserv,
+                              handle_find_message(hi, "NSMSG_HOSTMASK_INVALID"),
+                              hi->handle);
+        local_auth_ctx_free(ctx);
+        return;
+    }
+
+    /* Check if suspended */
+    if (HANDLE_FLAGGED(hi, SUSPENDED)) {
+        send_message_type(4, user, nickserv,
+                          handle_find_message(hi, "NSMSG_HANDLE_SUSPENDED"));
+        local_auth_ctx_free(ctx);
+        return;
+    }
+
+    /* Check for pending activation */
+    if (hi->cookie && hi->cookie->type == ACTIVATION) {
+        send_message_type(4, user, nickserv,
+                          handle_find_message(hi, "NSMSG_USE_COOKIE_REGISTER"));
+        local_auth_ctx_free(ctx);
+        return;
+    }
+
+    /* Check max logins */
+    maxlogins = hi->maxlogins ? hi->maxlogins : nickserv_conf.default_maxlogins;
+    for (used = 0, other = hi->users; other; other = other->next_authed) {
+        if (++used >= maxlogins) {
+            send_message_type(4, user, nickserv,
+                              handle_find_message(hi, "NSMSG_MAX_LOGINS"),
+                              maxlogins);
+            local_auth_ctx_free(ctx);
+            return;
+        }
+    }
+
+    /* Success! Set user as authenticated */
+    set_user_handle_info(user, hi, 1);
+    if (nickserv_conf.email_required && !hi->email_addr)
+        send_message(user, nickserv, "NSMSG_PLEASE_SET_EMAIL");
+    if (!is_secure_password(hi->handle, ctx->password, NULL))
+        send_message(user, nickserv, "NSMSG_WEAK_PASSWORD");
+
+    /* If a channel was waiting for this user to auth, finish adding them */
+    process_adduser_pending(user);
+
+    send_message_type(4, user, nickserv, handle_find_message(hi, "NSMSG_AUTH_SUCCESS"));
+
+    /* Set +x if autohide is on */
+    if (HANDLE_FLAGGED(hi, AUTOHIDE))
+        irc_umode(user, "+x");
+
+    if (!hi->masks->used) {
+        irc_in_addr_t ip;
+        string_list_append(hi->masks, generate_hostmask(user, GENMASK_OMITNICK|GENMASK_NO_HIDING|GENMASK_ANY_IDENT));
+        if (irc_in_addr_is_valid(user->ip) && irc_pton(&ip, NULL, user->hostname))
+            string_list_append(hi->masks, generate_hostmask(user, GENMASK_OMITNICK|GENMASK_BYIP|GENMASK_NO_HIDING|GENMASK_ANY_IDENT));
+    }
+
+    log_module(NS_LOG, LOG_DEBUG, "Local AUTH async complete: %s authenticated as %s in %ldms",
+               ctx->nick, ctx->handle, (long)(now - ctx->started) * 1000);
+
+    local_auth_ctx_free(ctx);
+}
+
+/* Callback for async password rehash (lazy migration) */
+static void
+local_auth_rehash_callback(void *ctx_ptr, int result, const char *hash)
+{
+    struct local_auth_ctx *ctx = (struct local_auth_ctx *)ctx_ptr;
+    struct handle_info *hi;
+
+    if (!ctx) return;
+
+    /* Look up handle to update password */
+    hi = dict_find(nickserv_handle_dict, ctx->handle, NULL);
+    if (hi && result == 0 && hash) {
+        /* Successfully created new hash, update the account */
+        safestrncpy(hi->passwd, hash, sizeof(hi->passwd));
+        log_module(NS_LOG, LOG_INFO, "Upgraded password hash for account %s (async)", ctx->handle);
+    }
+
+    /* Password was already verified, just needed rehash - complete the auth */
+    local_auth_complete(ctx);
+}
+
+/* Callback for async password verification */
+static void
+local_auth_verify_callback(void *ctx_ptr, int result, const char *hash)
+{
+    struct local_auth_ctx *ctx = (struct local_auth_ctx *)ctx_ptr;
+    struct handle_info *hi;
+
+    (void)hash;  /* Not used for verify */
+
+    if (!ctx) return;
+
+    /* Validate user is still connected */
+    if (!local_auth_validate_user(ctx)) {
+        local_auth_ctx_free(ctx);
+        return;
+    }
+
+    /* result: 1=match, 0=no match, -1=error */
+    if (result == 1) {
+        ctx->verified = 1;
+
+        /* Check if we need to upgrade the hash (lazy migration) */
+        hi = dict_find(nickserv_handle_dict, ctx->handle, NULL);
+        if (hi && pw_config.enable_lazy_migration && pw_needs_rehash(hi->passwd)) {
+            ctx->needs_rehash = 1;
+            /* Start async rehash - callback will complete the auth */
+            if (pw_hash_async(ctx->password, local_auth_rehash_callback, ctx) == 0) {
+                log_module(NS_LOG, LOG_DEBUG, "Local AUTH async: Starting rehash for %s", ctx->handle);
+                return;  /* Rehash in progress */
+            }
+            /* Rehash failed to start - continue without upgrading */
+            log_module(NS_LOG, LOG_WARNING, "Local AUTH async: Rehash failed to start for %s", ctx->handle);
+        }
+    } else {
+        ctx->verified = 0;
+    }
+
+    /* Complete the authentication */
+    local_auth_complete(ctx);
+}
+
+#ifdef WITH_KEYCLOAK
 /* Forward declarations for cookie async callbacks (token callback declared earlier) */
 static int cookie_async_lookup_callback(void *session, int result, struct kc_user *user);
 static int cookie_async_update_callback(void *session, int result);
@@ -6588,13 +6873,13 @@ static void
 cookie_async_ctx_free(struct cookie_async_ctx *ctx)
 {
     if (!ctx) return;
-    if (ctx->user_id) free(ctx->user_id);
+    if (ctx->user_id) pool_strfree(ctx->user_id);
     if (ctx->password_hash) pool_strfree(ctx->password_hash);
     if (ctx->plaintext_password) {
         memset(ctx->plaintext_password, 0, strlen(ctx->plaintext_password));
         pool_strfree(ctx->plaintext_password);
     }
-    free(ctx);
+    mempool_free(mp_cookie_ctx, ctx);
 }
 
 /* Phase 0 callback: Token ready, now start user lookup */
@@ -7013,7 +7298,7 @@ static void kc_modify_ctx_free(struct kc_modify_ctx *ctx) {
             memset(ctx->secret_data, 0, strlen(ctx->secret_data));
             free(ctx->secret_data);
         }
-        if (ctx->user_id) free(ctx->user_id);
+        if (ctx->user_id) pool_strfree(ctx->user_id);
         free(ctx);
     }
 }
@@ -7236,7 +7521,7 @@ struct kc_scram_sync_ctx {
 
 static void kc_scram_sync_ctx_free(struct kc_scram_sync_ctx *ctx) {
     if (ctx) {
-        free(ctx->user_id);
+        pool_strfree(ctx->user_id);
         free(ctx);
     }
 }
@@ -7836,7 +8121,7 @@ struct kc_fingerprints_ctx {
 
 static void kc_fingerprints_ctx_free(struct kc_fingerprints_ctx *ctx) {
     if (ctx) {
-        if (ctx->user_id) free(ctx->user_id);
+        if (ctx->user_id) pool_strfree(ctx->user_id);
         free(ctx);
     }
 }
@@ -8186,7 +8471,7 @@ kc_group_ctx_free(struct kc_group_ctx *ctx)
 {
     if (ctx) {
         if (ctx->group_name) free(ctx->group_name);
-        if (ctx->user_id) free(ctx->user_id);
+        if (ctx->user_id) pool_strfree(ctx->user_id);
         free(ctx);
     }
 }
@@ -9306,7 +9591,7 @@ mdq_single_user_cb(void *session, int result, struct kc_user *user)
                                            mdq_single_attr_cb) < 0) {
         log_module(NS_LOG, LOG_DEBUG, "mdq_single_async: Failed to start attribute lookup for %s.%s",
                    ctx->handle, ctx->key);
-        free(ctx->user_id);
+        pool_strfree(ctx->user_id);
         free(ctx);
         return 1;
     }
@@ -9353,7 +9638,7 @@ mdq_single_attr_cb(void *session, int result, char *value)
     }
 
     /* Cleanup context */
-    if (ctx->user_id) free(ctx->user_id);
+    if (ctx->user_id) pool_strfree(ctx->user_id);
     free(ctx);
     return 1;  /* Terminal callback */
 }
@@ -9659,7 +9944,7 @@ metadata_sync_user_cb(void *session, int result, struct kc_user *user)
                                              ctx->user_id, "metadata.", ctx,
                                              metadata_sync_list_cb) < 0) {
         log_module(NS_LOG, LOG_DEBUG, "metadata_sync_async: Failed to start attribute listing for %s", ctx->handle);
-        free(ctx->user_id);
+        pool_strfree(ctx->user_id);
         free(ctx);
         return 1;
     }
@@ -9681,7 +9966,7 @@ metadata_sync_list_cb(void *session, int result, struct kc_metadata_entry *entri
     if (result != KC_SUCCESS || !entries) {
         log_module(NS_LOG, LOG_DEBUG, "metadata_sync_async: No attributes for %s (%d)", ctx->handle, result);
         if (entries) keycloak_free_metadata_entries(entries);
-        if (ctx->user_id) free(ctx->user_id);
+        if (ctx->user_id) pool_strfree(ctx->user_id);
         free(ctx);
         return 1;
     }
@@ -9722,7 +10007,7 @@ metadata_sync_list_cb(void *session, int result, struct kc_metadata_entry *entri
     keycloak_free_metadata_entries(entries);
 
     /* Cleanup context */
-    if (ctx->user_id) free(ctx->user_id);
+    if (ctx->user_id) pool_strfree(ctx->user_id);
     free(ctx);
     return 1;  /* Terminal callback */
 }
@@ -9801,7 +10086,7 @@ nickserv_get_webpush_subscriptions(const char *account_name,
         /* Fetch all webpush.* attributes */
         rc = keycloak_list_user_attributes(keycloak_get_realm(), keycloak_get_authed_client(),
                                            user_id, "webpush.", entries_out);
-        free(user_id);
+        pool_strfree(user_id);
 
         if (rc != KC_SUCCESS) {
             log_module(NS_LOG, LOG_DEBUG, "nickserv_get_webpush_subscriptions: Failed to list attributes for %s",
@@ -9886,7 +10171,7 @@ webpush_subs_user_cb(void *session, int result, struct kc_user *user)
         if (ctx->callback) {
             ctx->callback(ctx->caller_session, KC_ERROR, NULL);
         }
-        free(ctx->user_id);
+        pool_strfree(ctx->user_id);
         free(ctx);
         return 1;
     }
@@ -9911,7 +10196,7 @@ webpush_subs_list_cb(void *session, int result, struct kc_metadata_entry *entrie
     }
 
     /* Cleanup context */
-    if (ctx->user_id) free(ctx->user_id);
+    if (ctx->user_id) pool_strfree(ctx->user_id);
     free(ctx);
     return 1;  /* Terminal callback */
 }
@@ -10153,7 +10438,7 @@ nickserv_conf_read(void)
     if (nickserv_conf.weak_password_dict)
         dict_delete(nickserv_conf.weak_password_dict);
     nickserv_conf.weak_password_dict = dict_new();
-    dict_set_free_keys(nickserv_conf.weak_password_dict, free);
+    dict_set_free_keys(nickserv_conf.weak_password_dict, pool_strfree_v);
     dict_insert(nickserv_conf.weak_password_dict, pool_strdup("password"), NULL);
     dict_insert(nickserv_conf.weak_password_dict, pool_strdup("<password>"), NULL);
     str = database_get_data(conf_node, KEY_DICT_FILE, RECDB_QSTRING);
@@ -11385,7 +11670,7 @@ static void
 scram_fetch_ctx_free(struct scram_fetch_ctx *ctx)
 {
     if (!ctx) return;
-    if (ctx->user_id) free(ctx->user_id);
+    if (ctx->user_id) pool_strfree(ctx->user_id);
     free(ctx);
 }
 
@@ -14129,7 +14414,7 @@ init_nickserv(const char *nick)
     nickserv_opt_dict = dict_new();
     nickserv_email_dict = dict_new();
 
-    dict_set_free_keys(nickserv_email_dict, free);
+    dict_set_free_keys(nickserv_email_dict, pool_strfree_v);
     dict_set_free_data(nickserv_email_dict, nickserv_free_email_addr);
 
     nickserv_module = module_register("NickServ", NS_LOG, "nickserv.help", NULL);
@@ -14220,7 +14505,7 @@ init_nickserv(const char *nick)
     dict_insert(nickserv_opt_dict, "KARMA", opt_karma);
 
     nickserv_handle_dict = dict_new();
-    dict_set_free_keys(nickserv_handle_dict, free);
+    dict_set_free_keys(nickserv_handle_dict, pool_strfree_v);
     dict_set_free_data(nickserv_handle_dict, free_handle_info);
 
     nickserv_id_dict = dict_new();

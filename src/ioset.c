@@ -25,6 +25,7 @@
 #include "saxdb.h"
 #include "conf.h"
 #include "x3_ssl.h"
+#include "mempool.h"
 
 #ifdef HAVE_FCNTL_H
 #include <fcntl.h>
@@ -111,9 +112,41 @@ static struct deferred_free_entry deferred_frees[MAX_DEFERRED_FREES];
 static int deferred_free_count = 0;
 int ioset_in_event_loop = 0;  /* Non-static so epoll/kevent loops can set it */
 
+/* I/O buffer pool allocation helpers.
+ * Uses memory pools for common sizes: 1KB, 4KB, 16KB.
+ * Falls back to malloc for non-standard sizes.
+ */
+static void *
+ioq_buf_alloc(unsigned int size) {
+    if (size == 1024 && mp_ioq_1k)
+        return mempool_alloc(mp_ioq_1k);
+    if (size == 4096 && mp_ioq_4k)
+        return mempool_alloc(mp_ioq_4k);
+    if (size == 16384 && mp_ioq_16k)
+        return mempool_alloc(mp_ioq_16k);
+    return malloc(size);
+}
+
+static void
+ioq_buf_free(void *buf, unsigned int size) {
+    if (size == 1024 && mp_ioq_1k) {
+        mempool_free(mp_ioq_1k, buf);
+        return;
+    }
+    if (size == 4096 && mp_ioq_4k) {
+        mempool_free(mp_ioq_4k, buf);
+        return;
+    }
+    if (size == 16384 && mp_ioq_16k) {
+        mempool_free(mp_ioq_16k, buf);
+        return;
+    }
+    free(buf);
+}
+
 static void
 ioq_init(struct ioq *ioq, int size) {
-    ioq->buf = malloc(size);
+    ioq->buf = ioq_buf_alloc(size);
     ioq->get = ioq->put = 0;
     ioq->size = size;
 }
@@ -142,13 +175,14 @@ ioq_used(const struct ioq *ioq) {
 
 static unsigned int
 ioq_grow(struct ioq *ioq) {
+    int old_size = ioq->size;
     int new_size = ioq->size << 1;
-    char *new_buf = malloc(new_size);
+    char *new_buf = ioq_buf_alloc(new_size);
     int get_avail = ioq_get_avail(ioq);
     memcpy(new_buf, ioq->buf + ioq->get, get_avail);
     if (ioq->put < ioq->get)
         memcpy(new_buf + get_avail, ioq->buf, ioq->put);
-    free(ioq->buf);
+    ioq_buf_free(ioq->buf, old_size);
     ioq->put = ioq_used(ioq);
     ioq->get = 0;
     ioq->buf = new_buf;
@@ -435,8 +469,8 @@ ioset_close(struct io_fd *fdp, int os_close) {
         if (fdp->send.get != fdp->send.put)
             ioset_try_write(fdp);
     }
-    free(fdp->send.buf);
-    free(fdp->recv.buf);
+    ioq_buf_free(fdp->send.buf, fdp->send.size);
+    ioq_buf_free(fdp->recv.buf, fdp->recv.size);
     if (os_close & 1)
         closesocket(fdp->fd);
 #else
@@ -450,8 +484,8 @@ ioset_close(struct io_fd *fdp, int os_close) {
         if (fdp->send.get != fdp->send.put)
             ioset_try_write(fdp);
     }
-    free(fdp->send.buf);
-    free(fdp->recv.buf);
+    ioq_buf_free(fdp->send.buf, fdp->send.size);
+    ioq_buf_free(fdp->recv.buf, fdp->recv.size);
     if (os_close & 1)
         close(fdp->fd);
     engine->remove(fdp, os_close & 1);

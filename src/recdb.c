@@ -465,7 +465,12 @@ parse_qstring(RECDB *recdb)
         ABORT(recdb, UNTERMINATED_STRING, EOF);
     }
     buff[used] = 0;
-    return buff;
+    /* Convert to pool-allocated string for compatibility with pool_strfree */
+    {
+        char *result = pool_strdup(buff);
+        free(buff);
+        return result;
+    }
 }
 
 dict_t
@@ -478,7 +483,7 @@ parse_object(RECDB *recdb)
     if ((c = parse_skip_ws(recdb)) == EOF) return NULL;
     if (c != '{') ABORT(recdb, EXPECTED_OPEN_BRACE, c);
     obj = alloc_object();
-    dict_set_free_keys(obj, free);
+    dict_set_free_keys(obj, pool_strfree_v);
     while (!dbeof(recdb)) {
         if ((c = parse_skip_ws(recdb)) == '}') break;
         if (c == EOF) break;
@@ -542,7 +547,7 @@ parse_database_int(RECDB *recdb)
     char *name;
     struct record_data *rd;
     dict_t db = alloc_database();
-    dict_set_free_keys(db, free);
+    dict_set_free_keys(db, pool_strfree_v);
     while (!dbeof(recdb)) {
         parse_record_int(recdb, &name, &rd);
         if (name) dict_insert(db, name, rd);

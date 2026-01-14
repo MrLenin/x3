@@ -95,6 +95,18 @@ mempool_t *mp_string256 = NULL;
 mempool_t *mp_curl_ctx = NULL;
 mempool_t *mp_timeq = NULL;
 
+/* Structure pools */
+mempool_t *mp_auth_ctx = NULL;
+mempool_t *mp_cookie_ctx = NULL;
+mempool_t *mp_userdata = NULL;
+mempool_t *mp_nickinfo = NULL;
+mempool_t *mp_bandata = NULL;
+
+/* I/O queue buffer pools */
+mempool_t *mp_ioq_1k = NULL;
+mempool_t *mp_ioq_4k = NULL;
+mempool_t *mp_ioq_16k = NULL;
+
 /* Helper: round up to alignment */
 static size_t
 align_up(size_t size, size_t alignment)
@@ -437,6 +449,49 @@ mempool_init_global(void)
     if (!mp_timeq)
         goto fail;
 
+    /* Structure pools for frequently allocated objects */
+
+    /* auth_async_ctx: ~200 bytes, high frequency during SASL auth */
+    mp_auth_ctx = mempool_create("auth_ctx", 200, 8, 50, 0, 25);
+    if (!mp_auth_ctx)
+        goto fail;
+
+    /* cookie_async_ctx: ~260 bytes, account activation flows */
+    mp_cookie_ctx = mempool_create("cookie_ctx", 264, 8, 20, 0, 10);
+    if (!mp_cookie_ctx)
+        goto fail;
+
+    /* userData: ~120 bytes, very high frequency on channel joins */
+    mp_userdata = mempool_create("userdata", 128, 8, 200, 0, 100);
+    if (!mp_userdata)
+        goto fail;
+
+    /* nick_info: ~64 bytes, nick registration */
+    mp_nickinfo = mempool_create("nickinfo", 64, 8, 100, 0, 50);
+    if (!mp_nickinfo)
+        goto fail;
+
+    /* banData: ~216 bytes (118 mask + 31 owner + 8 channel + 24 times + 8 reason + 16 prev/next + padding) */
+    mp_bandata = mempool_create("bandata", 232, 8, 50, 0, 25);
+    if (!mp_bandata)
+        goto fail;
+
+    /* I/O queue buffer pools - tiered sizes for ioset.c */
+    /* 1KB: initial ioq allocation, very high frequency */
+    mp_ioq_1k = mempool_create("ioq_1k", 1024, 8, 50, 0, 25);
+    if (!mp_ioq_1k)
+        goto fail;
+
+    /* 4KB: common grow size (1024 -> 2048 -> 4096) */
+    mp_ioq_4k = mempool_create("ioq_4k", 4096, 8, 20, 0, 10);
+    if (!mp_ioq_4k)
+        goto fail;
+
+    /* 16KB: large transfers */
+    mp_ioq_16k = mempool_create("ioq_16k", 16384, 8, 10, 0, 5);
+    if (!mp_ioq_16k)
+        goto fail;
+
     log_module(MP_LOG, LOG_INFO, "Global memory pools initialized");
     return 0;
 
@@ -467,6 +522,42 @@ mempool_cleanup_global(void)
     if (mp_timeq) {
         mempool_destroy(mp_timeq, 1);
         mp_timeq = NULL;
+    }
+
+    /* Structure pools */
+    if (mp_auth_ctx) {
+        mempool_destroy(mp_auth_ctx, 1);
+        mp_auth_ctx = NULL;
+    }
+    if (mp_cookie_ctx) {
+        mempool_destroy(mp_cookie_ctx, 1);
+        mp_cookie_ctx = NULL;
+    }
+    if (mp_userdata) {
+        mempool_destroy(mp_userdata, 1);
+        mp_userdata = NULL;
+    }
+    if (mp_nickinfo) {
+        mempool_destroy(mp_nickinfo, 1);
+        mp_nickinfo = NULL;
+    }
+    if (mp_bandata) {
+        mempool_destroy(mp_bandata, 1);
+        mp_bandata = NULL;
+    }
+
+    /* I/O queue buffer pools */
+    if (mp_ioq_1k) {
+        mempool_destroy(mp_ioq_1k, 1);
+        mp_ioq_1k = NULL;
+    }
+    if (mp_ioq_4k) {
+        mempool_destroy(mp_ioq_4k, 1);
+        mp_ioq_4k = NULL;
+    }
+    if (mp_ioq_16k) {
+        mempool_destroy(mp_ioq_16k, 1);
+        mp_ioq_16k = NULL;
     }
 
     log_module(MP_LOG, LOG_INFO, "Global memory pools cleaned up");
@@ -505,16 +596,19 @@ pool_strfree(char *str)
 {
     struct pool_obj_header *hdr;
     size_t header_offset;
+    size_t len;
 
     if (!str)
         return;
 
     /*
-     * Check if this string came from a pool by examining the header.
-     * This is a heuristic - we check if the header's pool pointer
-     * points to one of our known string pools.
+     * Check string length first to determine if it COULD have come from a pool.
+     * Only pool-sized strings have headers we can safely read.
+     * Strings > 256 bytes are allocated via strdup(), no header exists.
      */
-    if (mp_string64) {
+    len = strlen(str) + 1;
+
+    if (len <= 64 && mp_string64) {
         header_offset = align_up(sizeof(struct pool_obj_header), mp_string64->alignment);
         hdr = (struct pool_obj_header *)((char *)str - header_offset);
         if (hdr->pool == mp_string64) {
@@ -523,7 +617,7 @@ pool_strfree(char *str)
         }
     }
 
-    if (mp_string256) {
+    if (len <= 256 && mp_string256) {
         header_offset = align_up(sizeof(struct pool_obj_header), mp_string256->alignment);
         hdr = (struct pool_obj_header *)((char *)str - header_offset);
         if (hdr->pool == mp_string256) {
@@ -532,6 +626,12 @@ pool_strfree(char *str)
         }
     }
 
-    /* Not from a pool, use regular free */
+    /* Not from a pool (too large or header doesn't match), use regular free */
     free(str);
+}
+
+void
+pool_strfree_v(void *str)
+{
+    pool_strfree((char *)str);
 }

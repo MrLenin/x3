@@ -102,6 +102,18 @@ extern mempool_t *mp_string256;  /* 256-byte strings */
 extern mempool_t *mp_curl_ctx;   /* CURL request contexts */
 extern mempool_t *mp_timeq;      /* Timer queue entries (~16 bytes) */
 
+/* Structure pools for frequently allocated fixed-size objects */
+extern mempool_t *mp_auth_ctx;   /* auth_async_ctx (~200 bytes) - SASL auth */
+extern mempool_t *mp_cookie_ctx; /* cookie_async_ctx (~260 bytes) - account activation */
+extern mempool_t *mp_userdata;   /* userData (~120 bytes) - channel user records */
+extern mempool_t *mp_nickinfo;   /* nick_info (~64 bytes) - nick registrations */
+extern mempool_t *mp_bandata;    /* banData (~200 bytes) - channel bans */
+
+/* I/O queue buffer pools (ioset.c) */
+extern mempool_t *mp_ioq_1k;     /* 1KB buffers - initial ioq allocation */
+extern mempool_t *mp_ioq_4k;     /* 4KB buffers - common grow size */
+extern mempool_t *mp_ioq_16k;    /* 16KB buffers - large transfers */
+
 /**
  * Initialize global memory pools
  * Call once at startup before any allocations
@@ -130,5 +142,10 @@ char *pool_strdup(const char *str);
  * Detects pool-allocated strings and returns them to the correct pool
  */
 void pool_strfree(char *str);
+
+/**
+ * Wrapper for pool_strfree with void* signature for dict free functions
+ */
+void pool_strfree_v(void *str);
 
 #endif /* MEMPOOL_H */
