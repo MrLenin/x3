@@ -988,6 +988,11 @@ static void
 modcmd_privmsg(struct userNode *user, struct userNode *bot, const char *text, int server_qualified) {
     struct service *service;
 
+    /* DIAGNOSTIC: Track service message receipt */
+    log_module(MAIN_LOG, LOG_DEBUG, "modcmd_privmsg: from=%s to=%s text=%.*s",
+               user ? user->nick : "(null)", bot ? bot->nick : "(null)",
+               50, text ? text : "(null)");
+
     if (!(service = dict_find(services, bot->nick, NULL))) {
         log_module(MAIN_LOG, LOG_ERROR, "modcmd_privmsg got privmsg for unhandled service %s, unregistering.", bot->nick);
         reg_privmsg_func(bot, NULL);

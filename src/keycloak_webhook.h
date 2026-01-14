@@ -59,6 +59,7 @@ struct kc_webhook_stats {
     unsigned long scram_invalidations;    /* SCRAM caches invalidated */
     unsigned long opserv_invalidations;   /* OpServ level cache invalidations */
     unsigned long metadata_invalidations; /* Metadata cache invalidations */
+    unsigned long access_updates_skipped; /* No-op access updates skipped */
     time_t last_event_time;
 };
 

@@ -2745,8 +2745,17 @@ static CMD_FUNC(cmd_privmsg)
     if (argc < 3)
         return 0;
     pd.user = GetUserH(origin);
-    if (!pd.user || (IsGagged(pd.user) && !IsOper(pd.user)))
+
+    /* DIAGNOSTIC: Track PRIVMSG reception for debugging test timeouts */
+    if (!pd.user) {
+        log_module(MAIN_LOG, LOG_WARNING, "cmd_privmsg: origin=%s resolved to NULL user (argc=%d, target=%s)",
+                   origin ? origin : "(null)", argc, argc > 1 ? argv[1] : "(none)");
         return 1;
+    }
+    if (IsGagged(pd.user) && !IsOper(pd.user)) {
+        log_module(MAIN_LOG, LOG_DEBUG, "cmd_privmsg: user %s is gagged, ignoring", pd.user->nick);
+        return 1;
+    }
 
     if (checkDefCon(DEFCON_OPER_ONLY) && !IsOper(pd.user)) {
         const char *str;
@@ -4071,6 +4080,11 @@ parse_line(char *line, int recursive)
             } else {
                 struct userNode *uNode = GetUserN(argv[0]);
                 origin = uNode ? uNode->nick : 0;
+                /* DIAGNOSTIC: Log when user numeric lookup fails */
+                if (!uNode && argc > cmd) {
+                    log_module(MAIN_LOG, LOG_WARNING, "parse_line: User numeric %s not found (cmd=%s)",
+                               argv[0], argv[cmd]);
+                }
             }
         } else
             origin = 0;

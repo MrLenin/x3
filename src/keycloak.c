@@ -1457,7 +1457,12 @@ kc_build_group_by_path_endpoint(struct kc_realm realm, const char *path)
 
     /* URL-encode the path - especially important for # which is a URL fragment delimiter */
     char *encoded_path = curl_easy_escape(NULL, path, 0);
-    if (!encoded_path) return NULL;
+    if (!encoded_path) {
+        log_module(KC_LOG, LOG_ERROR, "kc_build_group_by_path_endpoint: curl_easy_escape returned NULL for '%s'", path);
+        return NULL;
+    }
+
+    log_module(KC_LOG, LOG_DEBUG, "kc_build_group_by_path_endpoint: BEFORE %2F fix: raw='%s'", encoded_path);
 
     /* curl_easy_escape encodes / as %2F, but we need literal slashes in the path */
     /* Replace %2F back to / for path separators */
@@ -1473,9 +1478,14 @@ kc_build_group_by_path_endpoint(struct kc_realm realm, const char *path)
     }
     *w = '\0';
 
+    log_module(KC_LOG, LOG_DEBUG, "kc_build_group_by_path_endpoint: AFTER %2F fix: encoded='%s'", encoded_path);
+
     int len = snprintf(NULL, 0, tmpl, realm.base_uri, realm.realm, encoded_path) + 1;
     char *uri = malloc(len);
     if (uri) snprintf(uri, len, tmpl, realm.base_uri, realm.realm, encoded_path);
+
+    log_module(KC_LOG, LOG_DEBUG, "kc_build_group_by_path_endpoint: FINAL uri='%s'", uri ? uri : "(null)");
+
     curl_free(encoded_path);
     return uri;
 }
@@ -5547,6 +5557,7 @@ static char* json_build_user_with_hash(const char *username, const char *email,
 }
 
 
+/* Still needed: called by keycloak_ensure_token() */
 int keycloak_get_client_token(struct kc_realm realm, struct kc_client client, struct access_token** access_token)
 {
     /* Input validation */
@@ -5692,6 +5703,7 @@ cleanup:
     return result;
 }
 
+/* Still needed: called by keycloak_get_user() */
 int keycloak_get_users(struct kc_realm realm, struct kc_client client, const char* user, const char* filter, bool exact, struct kc_user** user_out)
 {
     (void)filter; /* TODO: implement additional filtering */
@@ -5753,6 +5765,8 @@ cleanup:
     return result;
 }
 
+/* DISABLED: Use keycloak_create_user_async instead */
+#if 0
 int keycloak_create_user(struct kc_realm realm, struct kc_client client, const char* username, const char* email, const char* passwd)
 {
     /* Only require realm config, token, and username. Email and passwd can be NULL. */
@@ -5804,6 +5818,7 @@ cleanup:
 
     return result;
 }
+#endif /* keycloak_create_user - DISABLED */
 
 /**
  * Create a user in Keycloak with a pre-hashed PBKDF2 password.
@@ -5817,6 +5832,8 @@ cleanup:
  * @param secret_data secretData JSON string from pw_export_keycloak()
  * @return KC_SUCCESS, KC_USER_EXISTS, or KC_ERROR
  */
+/* DISABLED: Use keycloak_create_user_with_hash_async instead */
+#if 0
 int keycloak_create_user_with_hash(struct kc_realm realm, struct kc_client client,
                                    const char* username, const char* email,
                                    const char* cred_data, const char* secret_data)
@@ -5873,6 +5890,7 @@ cleanup:
 
     return result;
 }
+#endif /* keycloak_create_user_with_hash - DISABLED */
 
 int keycloak_get_user(struct kc_realm realm, struct kc_client client,
                              const char *user, struct kc_user *kc_user_out)
@@ -5957,6 +5975,8 @@ void keycloak_free_access_token(struct access_token* token)
     free(token);
 }
 
+/* DISABLED: Use keycloak_update_user_async instead */
+#if 0
 int keycloak_update_user(struct kc_realm realm, struct kc_client client,
                          const char* user_id, const char* new_password,
                          const char* new_email)
@@ -6085,10 +6105,13 @@ cleanup:
 
     return result;
 }
+#endif /* keycloak_update_user - DISABLED */
 
 /* NOTE: keycloak_update_user_credentials() removed - was dead code (never called).
  * Use keycloak_update_user_representation() with kc_user_update.cred_data instead. */
 
+/* DISABLED: Use keycloak_update_user_representation_async instead */
+#if 0
 int keycloak_update_user_representation(struct kc_realm realm, struct kc_client client,
                                         const char* user_id,
                                         const struct kc_user_update* update)
@@ -6183,7 +6206,10 @@ cleanup:
 
     return result;
 }
+#endif /* keycloak_update_user_representation - DISABLED */
 
+/* DISABLED: Use keycloak_delete_user_async instead */
+#if 0
 int keycloak_delete_user(struct kc_realm realm, struct kc_client client,
                          const char* user_id)
 {
@@ -6228,6 +6254,7 @@ cleanup:
 
     return result;
 }
+#endif /* keycloak_delete_user - DISABLED */
 
 /**
  * Set a user attribute synchronously.
@@ -6236,6 +6263,8 @@ cleanup:
  * attribute without clobbering other fields (email, firstName, etc.).
  * If cache miss, performs GET first to fetch the full representation.
  */
+/* DISABLED: Use keycloak_set_user_attribute_async instead */
+#if 0
 int keycloak_set_user_attribute(struct kc_realm realm, struct kc_client client,
                                 const char* user_id, const char* attr_name,
                                 const char* attr_value)
@@ -6374,7 +6403,10 @@ cleanup:
 
     return result;
 }
+#endif /* keycloak_set_user_attribute - DISABLED */
 
+/* DISABLED: Use keycloak_set_user_attribute_array_async instead */
+#if 0
 int keycloak_set_user_attribute_array(struct kc_realm realm, struct kc_client client,
                                       const char* user_id, const char* attr_name,
                                       const char** values, size_t value_count)
@@ -6452,7 +6484,10 @@ cleanup:
 
     return result;
 }
+#endif /* keycloak_set_user_attribute_array - DISABLED */
 
+/* DISABLED: Use keycloak_get_user_attribute_async instead */
+#if 0
 int keycloak_get_user_attribute(struct kc_realm realm, struct kc_client client,
                                 const char* user_id, const char* attr_name,
                                 char** value_out)
@@ -6530,6 +6565,7 @@ cleanup:
 
     return result;
 }
+#endif /* keycloak_get_user_attribute - DISABLED */
 
 void keycloak_free_metadata_entries(struct kc_metadata_entry* entries)
 {
@@ -6662,6 +6698,8 @@ cleanup:
     return result;
 }
 
+/* DISABLED: Use keycloak_add_user_to_group_async instead */
+#if 0
 int keycloak_add_user_to_group(struct kc_realm realm, struct kc_client client,
                                const char* user_id, const char* group_id)
 {
@@ -6708,7 +6746,10 @@ cleanup:
 
     return result;
 }
+#endif /* keycloak_add_user_to_group - DISABLED */
 
+/* DISABLED: Use keycloak_remove_user_from_group_async instead */
+#if 0
 int keycloak_remove_user_from_group(struct kc_realm realm, struct kc_client client,
                                     const char* user_id, const char* group_id)
 {
@@ -6757,6 +6798,7 @@ cleanup:
 
     return result;
 }
+#endif /* keycloak_remove_user_from_group - DISABLED */
 
 int keycloak_get_group_by_name(struct kc_realm realm, struct kc_client client,
                                const char* group_name, char** group_id_out)
@@ -6838,6 +6880,8 @@ cleanup:
     return result;
 }
 
+/* DISABLED: Use keycloak_get_group_by_path_async instead */
+#if 0
 int keycloak_get_group_by_path(struct kc_realm realm, struct kc_client client,
                                const char* group_path, char** group_id_out)
 {
@@ -6907,6 +6951,7 @@ cleanup:
 
     return result;
 }
+#endif /* keycloak_get_group_by_path - DISABLED */
 
 static int json_read_token_info(const char* response, struct kc_token_info** info_out)
 {
@@ -7082,6 +7127,8 @@ void keycloak_free_token_info(struct kc_token_info* info)
     free(info);
 }
 
+/* DISABLED: Use keycloak_get_group_members_async instead */
+#if 0
 int keycloak_get_group_members(struct kc_realm realm, struct kc_client client,
                                const char* group_id, struct kc_group_member** members_out)
 {
@@ -7189,6 +7236,7 @@ cleanup:
 
     return result;
 }
+#endif /* keycloak_get_group_members - DISABLED */
 
 void keycloak_free_group_members(struct kc_group_member* members)
 {
@@ -7222,6 +7270,8 @@ void keycloak_free_group_info(struct kc_group_info* info)
     free(info);
 }
 
+/* DISABLED: Use keycloak_get_group_info_async instead */
+#if 0
 int keycloak_get_group_info(struct kc_realm realm, struct kc_client client,
                             const char* group_id, struct kc_group_info** info_out)
 {
@@ -7349,7 +7399,10 @@ cleanup:
 
     return result;
 }
+#endif /* keycloak_get_group_info - DISABLED */
 
+/* DISABLED: Use keycloak_get_group_attribute_async instead */
+#if 0
 int keycloak_get_group_attribute(struct kc_realm realm, struct kc_client client,
                                  const char* group_id, const char* attr_name,
                                  char** value_out)
@@ -7386,7 +7439,10 @@ int keycloak_get_group_attribute(struct kc_realm realm, struct kc_client client,
     keycloak_free_group_info(info);
     return result;
 }
+#endif /* keycloak_get_group_attribute - DISABLED */
 
+/* DISABLED: Use keycloak_get_group_members_with_level_async instead */
+#if 0
 int keycloak_get_group_members_with_level(struct kc_realm realm, struct kc_client client,
                                           const char* group_id, struct kc_group_member** members_out)
 {
@@ -7423,6 +7479,7 @@ int keycloak_get_group_members_with_level(struct kc_realm realm, struct kc_clien
     *members_out = members;
     return rc; /* Returns count of members */
 }
+#endif /* keycloak_get_group_members_with_level - DISABLED */
 
 int keycloak_find_user_by_fingerprint(struct kc_realm realm, struct kc_client client,
                                        const char* fingerprint, char** username_out)
@@ -7613,6 +7670,8 @@ cleanup:
     return result;
 }
 
+/* DISABLED: Use keycloak_create_subgroup_async instead */
+#if 0
 int keycloak_create_subgroup(struct kc_realm realm, struct kc_client client,
                              const char* parent_id, const char* group_name,
                              char** group_id_out)
@@ -7706,7 +7765,10 @@ cleanup:
 
     return result;
 }
+#endif /* keycloak_create_subgroup - DISABLED */
 
+/* DISABLED: Use keycloak_set_group_attribute_async instead */
+#if 0
 int keycloak_set_group_attribute(struct kc_realm realm, struct kc_client client,
                                  const char* group_id, const char* attr_name,
                                  const char* attr_value)
@@ -7804,7 +7866,10 @@ cleanup:
 
     return result;
 }
+#endif /* keycloak_set_group_attribute - DISABLED */
 
+/* DISABLED: Use keycloak_delete_group_async instead */
+#if 0
 int keycloak_delete_group(struct kc_realm realm, struct kc_client client,
                           const char* group_id)
 {
@@ -7853,6 +7918,7 @@ cleanup:
 
     return result;
 }
+#endif /* keycloak_delete_group - DISABLED */
 
 int keycloak_ensure_channels_parent(struct kc_realm realm, struct kc_client client,
                                     char** group_id_out)
@@ -7885,6 +7951,10 @@ int keycloak_ensure_channels_parent(struct kc_realm realm, struct kc_client clie
     return KC_ERROR;
 }
 
+/* DISABLED: Unused sync function - use async workflow via chanserv_push_keycloak_access_async
+ * This function chains multiple sync HTTP calls and would block the event loop.
+ */
+#if 0
 int keycloak_create_channel_group(struct kc_realm realm, struct kc_client client,
                                   const char* channel_name, unsigned short access_level,
                                   char** group_id_out)
@@ -7963,6 +8033,7 @@ cleanup:
 
     return result;
 }
+#endif /* keycloak_create_channel_group - DISABLED */
 
 /*
  * Start async group info lookup against Keycloak

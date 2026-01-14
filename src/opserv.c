@@ -491,6 +491,9 @@ static const struct message_entry msgtab[] = {
     { "OSMSG_KC_STATS_NONE", "  No Keycloak requests recorded." },
     { "OSMSG_KC_NOT_AVAILABLE", "Keycloak is not available." },
 
+    { "OSMSG_POOLS_HEADER", "Memory Pool Statistics:" },
+    { "OSMSG_NO_POOLS", "No memory pools registered." },
+
     { NULL, NULL }
 };
 
@@ -3014,6 +3017,46 @@ static MODCMD_FUNC(cmd_stats_keycloak)
     reply("OSMSG_KC_NOT_AVAILABLE");
     return 0;
 #endif
+}
+
+static MODCMD_FUNC(cmd_stats_pools)
+{
+    struct mempool_stats stats;
+    unsigned int i, count;
+    size_t total_memory = 0;
+    unsigned long total_alloc = 0, total_free = 0;
+    mempool_t *pool;
+
+    /* Get registered pool count */
+    count = mempool_count();
+    if (count == 0) {
+        reply("OSMSG_NO_POOLS");
+        return 1;
+    }
+
+    reply("OSMSG_POOLS_HEADER");
+    send_message_type(MSG_TYPE_NOXLATE, user, cmd->parent->bot,
+                      "%-16s %8s %8s %8s %8s %10s",
+                      "Pool", "ObjSize", "Total", "Free", "Peak", "Memory");
+
+    for (i = 0; i < count; i++) {
+        pool = mempool_get_by_index(i);
+        if (!pool) continue;
+        mempool_get_stats(pool, &stats);
+        send_message_type(MSG_TYPE_NOXLATE, user, cmd->parent->bot,
+                          "%-16s %8zu %8lu %8lu %8lu %10zu",
+                          stats.name, stats.object_size, stats.total_objects,
+                          stats.free_objects, stats.peak_usage, stats.memory_used);
+        total_memory += stats.memory_used;
+        total_alloc += stats.alloc_count;
+        total_free += stats.free_count;
+    }
+
+    send_message_type(MSG_TYPE_NOXLATE, user, cmd->parent->bot,
+                      "--- Total: %u pools, %zu bytes, %lu allocs, %lu frees ---",
+                      count, total_memory, total_alloc, total_free);
+
+    return 1;
 }
 
 static MODCMD_FUNC(cmd_dump)
@@ -7858,6 +7901,7 @@ init_opserv(const char *nick)
     opserv_define_func("LMDB STATS", cmd_lmdb_stats, 100, 0, 0);
     /* Keycloak stats */
     opserv_define_func("STATS KEYCLOAK", cmd_stats_keycloak, 100, 0, 0);
+    opserv_define_func("STATS POOLS", cmd_stats_pools, 100, 0, 0);
     opserv_define_func("TRACE", cmd_trace, 100, 0, 3);
     opserv_define_func("TRACE PRINT", NULL, 0, 0, 0);
     opserv_define_func("TRACE COUNT", NULL, 0, 0, 0);

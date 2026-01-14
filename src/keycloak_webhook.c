@@ -687,6 +687,24 @@ handle_keycloak_event(const char *body, size_t body_len)
                                         }
                                     }
 
+                                    /* Skip no-op updates to avoid blocking event loop */
+                                    {
+                                        struct chanNode *cn = GetChannel(channel);
+                                        if (cn && cn->channel_info) {
+                                            struct handle_info *hi = get_handle_info(username);
+                                            if (hi) {
+                                                struct userData *uData = GetChannelUser(cn->channel_info, hi);
+                                                if (uData && uData->access == level) {
+                                                    log_module(webhook_log, LOG_DEBUG,
+                                                               "Skipping no-op access update for %s in %s: %u",
+                                                               username, channel, level);
+                                                    stats.access_updates_skipped++;
+                                                    continue;  /* Skip to next attribute */
+                                                }
+                                            }
+                                        }
+                                    }
+
                                     log_module(webhook_log, LOG_INFO,
                                                "Channel access changed for %s via Keycloak: %s = %u",
                                                username, channel, level);

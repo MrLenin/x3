@@ -417,6 +417,14 @@ mempool_count(void)
     return pool_count;
 }
 
+mempool_t *
+mempool_get_by_index(unsigned int index)
+{
+    if (index < pool_count)
+        return pool_registry[index];
+    return NULL;
+}
+
 int
 mempool_init_global(void)
 {

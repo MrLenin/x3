@@ -88,6 +88,7 @@ struct kc_client {
  * @param access_token  Output pointer for access token
  * @return KC_SUCCESS on success, KC_ERROR on failure
  */
+/* Still needed: called by keycloak_ensure_token() */
 int keycloak_get_client_token(struct kc_realm realm, struct kc_client client, struct access_token** access_token);
 
 /**
@@ -108,6 +109,7 @@ int keycloak_get_user_token(struct kc_realm realm, struct kc_client client, cons
  * @param user_out  Output pointer for user array (caller must free)
  * @return Number of users found (>= 0), KC_ERROR on failure, KC_FORBIDDEN on permission denied
  */
+/* Still needed: called by keycloak_get_user() */
 int keycloak_get_users(struct kc_realm realm, struct kc_client client, const char* user, const char* filter, bool exact, struct kc_user** user_out);
 
 /**
@@ -127,7 +129,10 @@ int keycloak_get_user(struct kc_realm realm, struct kc_client client, const char
  * @param passwd    New user's password (must not be NULL)
  * @return KC_SUCCESS on creation, KC_USER_EXISTS if user already exists, KC_ERROR on other failures
  */
+/* DISABLED - use keycloak_create_user_async instead */
+#if 0
 int keycloak_create_user(struct kc_realm realm, struct kc_client client, const char* username, const char* email, const char* passwd);
+#endif
 
 /**
  * Creates a new user in Keycloak with a pre-hashed PBKDF2 password.
@@ -142,9 +147,12 @@ int keycloak_create_user(struct kc_realm realm, struct kc_client client, const c
  * @param secret_data secretData JSON from pw_export_keycloak()
  * @return KC_SUCCESS on creation, KC_USER_EXISTS if user already exists, KC_ERROR on other failures
  */
+/* DISABLED - use keycloak_create_user_with_hash_async instead */
+#if 0
 int keycloak_create_user_with_hash(struct kc_realm realm, struct kc_client client,
                                    const char* username, const char* email,
                                    const char* cred_data, const char* secret_data);
+#endif
 
 /**
  * Frees only the internal fields of a kc_user structure (not the struct itself)
@@ -217,9 +225,12 @@ void kc_user_repr_cache_remove(const char *user_id);
  * @param new_email     New email (can be NULL to skip)
  * @return KC_SUCCESS on success, KC_NOT_FOUND if user doesn't exist, KC_ERROR on failure
  */
+/* DISABLED - use keycloak_update_user_async instead */
+#if 0
 int keycloak_update_user(struct kc_realm realm, struct kc_client client,
                          const char* user_id, const char* new_password,
                          const char* new_email);
+#endif
 
 /* NOTE: keycloak_update_user_credentials() removed - was dead code.
  * Use keycloak_update_user_representation() with kc_user_update.cred_data instead. */
@@ -242,9 +253,12 @@ struct kc_user_update {
  * @param update      Fields to update (NULL fields are skipped)
  * @return KC_SUCCESS on success, KC_NOT_FOUND if user doesn't exist, KC_ERROR on failure
  */
+/* DISABLED - use keycloak_update_user_representation_async instead */
+#if 0
 int keycloak_update_user_representation(struct kc_realm realm, struct kc_client client,
                                         const char* user_id,
                                         const struct kc_user_update* update);
+#endif
 
 /**
  * Deletes a user from Keycloak
@@ -253,8 +267,11 @@ int keycloak_update_user_representation(struct kc_realm realm, struct kc_client 
  * @param user_id   User's Keycloak ID (UUID)
  * @return KC_SUCCESS on success, KC_NOT_FOUND if user doesn't exist, KC_ERROR on failure
  */
+/* DISABLED - use keycloak_delete_user_async instead */
+#if 0
 int keycloak_delete_user(struct kc_realm realm, struct kc_client client,
                          const char* user_id);
+#endif
 
 /**
  * Sets a custom attribute on a Keycloak user
@@ -265,9 +282,12 @@ int keycloak_delete_user(struct kc_realm realm, struct kc_client client,
  * @param attr_value Attribute value as string
  * @return KC_SUCCESS on success, KC_NOT_FOUND if user doesn't exist, KC_ERROR on failure
  */
+/* DISABLED - use keycloak_set_user_attribute_async instead */
+#if 0
 int keycloak_set_user_attribute(struct kc_realm realm, struct kc_client client,
                                 const char* user_id, const char* attr_name,
                                 const char* attr_value);
+#endif
 
 /**
  * Sets a custom attribute on a Keycloak user with multiple values (array)
@@ -279,9 +299,12 @@ int keycloak_set_user_attribute(struct kc_realm realm, struct kc_client client,
  * @param value_count Number of values in the array
  * @return KC_SUCCESS on success, KC_NOT_FOUND if user doesn't exist, KC_ERROR on failure
  */
+/* DISABLED - use keycloak_set_user_attribute_array_async instead */
+#if 0
 int keycloak_set_user_attribute_array(struct kc_realm realm, struct kc_client client,
                                       const char* user_id, const char* attr_name,
                                       const char** values, size_t value_count);
+#endif
 
 /**
  * Gets a custom attribute from a Keycloak user
@@ -292,9 +315,12 @@ int keycloak_set_user_attribute_array(struct kc_realm realm, struct kc_client cl
  * @param value_out  Output pointer for attribute value (caller must free)
  * @return KC_SUCCESS on success, KC_NOT_FOUND if user or attr doesn't exist, KC_ERROR on failure
  */
+/* DISABLED - use keycloak_get_user_attribute_async instead */
+#if 0
 int keycloak_get_user_attribute(struct kc_realm realm, struct kc_client client,
                                 const char* user_id, const char* attr_name,
                                 char** value_out);
+#endif
 
 /**
  * Metadata key-value pair for listing attributes
@@ -332,8 +358,11 @@ void keycloak_free_metadata_entries(struct kc_metadata_entry* entries);
  * @param group_id  Group's Keycloak ID (UUID)
  * @return KC_SUCCESS on success, KC_NOT_FOUND if user/group doesn't exist, KC_ERROR on failure
  */
+/* DISABLED - use keycloak_add_user_to_group_async instead */
+#if 0
 int keycloak_add_user_to_group(struct kc_realm realm, struct kc_client client,
                                const char* user_id, const char* group_id);
+#endif
 
 /**
  * Removes a user from a Keycloak group
@@ -343,8 +372,11 @@ int keycloak_add_user_to_group(struct kc_realm realm, struct kc_client client,
  * @param group_id  Group's Keycloak ID (UUID)
  * @return KC_SUCCESS on success, KC_NOT_FOUND if user/group doesn't exist, KC_ERROR on failure
  */
+/* DISABLED - use keycloak_remove_user_from_group_async instead */
+#if 0
 int keycloak_remove_user_from_group(struct kc_realm realm, struct kc_client client,
                                     const char* user_id, const char* group_id);
+#endif
 
 /**
  * Gets a Keycloak group by name
@@ -366,8 +398,11 @@ int keycloak_get_group_by_name(struct kc_realm realm, struct kc_client client,
  * @param group_id_out Output pointer for group ID (caller must free)
  * @return KC_SUCCESS on success, KC_NOT_FOUND if group doesn't exist, KC_ERROR on failure
  */
+/* DISABLED - use keycloak_get_group_by_path_async instead */
+#if 0
 int keycloak_get_group_by_path(struct kc_realm realm, struct kc_client client,
                                const char* group_path, char** group_id_out);
+#endif
 
 /**
  * Group member entry for iteration
@@ -398,8 +433,11 @@ struct kc_group_info {
  * @param members_out  Output pointer for linked list of members (caller must free with keycloak_free_group_members)
  * @return Number of members found (>= 0), KC_NOT_FOUND if group doesn't exist, KC_ERROR on failure
  */
+/* DISABLED - use keycloak_get_group_members_async instead */
+#if 0
 int keycloak_get_group_members(struct kc_realm realm, struct kc_client client,
                                const char* group_id, struct kc_group_member** members_out);
+#endif
 
 /**
  * Frees a linked list of group member entries
@@ -415,8 +453,11 @@ void keycloak_free_group_members(struct kc_group_member* members);
  * @param info_out     Output pointer for group info (caller must free with keycloak_free_group_info)
  * @return KC_SUCCESS on success, KC_NOT_FOUND if group doesn't exist, KC_ERROR on failure
  */
+/* DISABLED - use keycloak_get_group_info_async instead */
+#if 0
 int keycloak_get_group_info(struct kc_realm realm, struct kc_client client,
                             const char* group_id, struct kc_group_info** info_out);
+#endif
 
 /**
  * Gets a custom attribute from a Keycloak group
@@ -427,9 +468,12 @@ int keycloak_get_group_info(struct kc_realm realm, struct kc_client client,
  * @param value_out    Output pointer for attribute value (caller must free)
  * @return KC_SUCCESS on success, KC_NOT_FOUND if group or attr doesn't exist, KC_ERROR on failure
  */
+/* DISABLED - use keycloak_get_group_attribute_async instead */
+#if 0
 int keycloak_get_group_attribute(struct kc_realm realm, struct kc_client client,
                                  const char* group_id, const char* attr_name,
                                  char** value_out);
+#endif
 
 /**
  * Gets group members with access level from group attribute
@@ -441,8 +485,11 @@ int keycloak_get_group_attribute(struct kc_realm realm, struct kc_client client,
  * @param members_out  Output pointer for linked list of members with access_level populated
  * @return Number of members found (>= 0), KC_NOT_FOUND if group doesn't exist, KC_ERROR on failure
  */
+/* DISABLED - use keycloak_get_group_members_with_level_async instead */
+#if 0
 int keycloak_get_group_members_with_level(struct kc_realm realm, struct kc_client client,
                                           const char* group_id, struct kc_group_member** members_out);
+#endif
 
 /**
  * Frees memory allocated for a kc_group_info structure
@@ -520,9 +567,12 @@ int keycloak_create_group(struct kc_realm realm, struct kc_client client,
  * @return KC_SUCCESS on success, KC_USER_EXISTS if group already exists,
  *         KC_NOT_FOUND if parent doesn't exist, KC_ERROR on failure
  */
+/* DISABLED - use keycloak_create_subgroup_async instead */
+#if 0
 int keycloak_create_subgroup(struct kc_realm realm, struct kc_client client,
                              const char* parent_id, const char* group_name,
                              char** group_id_out);
+#endif
 
 /**
  * Sets a custom attribute on a Keycloak group
@@ -533,9 +583,12 @@ int keycloak_create_subgroup(struct kc_realm realm, struct kc_client client,
  * @param attr_value   Attribute value as string
  * @return KC_SUCCESS on success, KC_NOT_FOUND if group doesn't exist, KC_ERROR on failure
  */
+/* DISABLED - use keycloak_set_group_attribute_async instead */
+#if 0
 int keycloak_set_group_attribute(struct kc_realm realm, struct kc_client client,
                                  const char* group_id, const char* attr_name,
                                  const char* attr_value);
+#endif
 
 /**
  * Deletes a Keycloak group
@@ -544,8 +597,11 @@ int keycloak_set_group_attribute(struct kc_realm realm, struct kc_client client,
  * @param group_id  Group's Keycloak ID (UUID)
  * @return KC_SUCCESS on success, KC_NOT_FOUND if group doesn't exist, KC_ERROR on failure
  */
+/* DISABLED - use keycloak_delete_group_async instead */
+#if 0
 int keycloak_delete_group(struct kc_realm realm, struct kc_client client,
                           const char* group_id);
+#endif
 
 /**
  * Creates a group hierarchy for a channel with a specific access level
@@ -557,9 +613,12 @@ int keycloak_delete_group(struct kc_realm realm, struct kc_client client,
  * @param group_id_out   Output pointer for created channel group's ID (caller must free, can be NULL)
  * @return KC_SUCCESS on success, KC_ERROR on failure
  */
+/* DISABLED - use keycloak_create_channel_group_async instead */
+#if 0
 int keycloak_create_channel_group(struct kc_realm realm, struct kc_client client,
                                   const char* channel_name, unsigned short access_level,
                                   char** group_id_out);
+#endif
 
 /**
  * Ensures the parent "irc-channels" group exists, creating it if needed

@@ -95,6 +95,13 @@ void mempool_dump_all(void);
  */
 unsigned int mempool_count(void);
 
+/**
+ * Get pool by index (for iteration)
+ * @param index Pool index (0 to mempool_count()-1)
+ * @return Pool handle, or NULL if index out of range
+ */
+mempool_t *mempool_get_by_index(unsigned int index);
+
 /* Global pools (initialized at startup) */
 extern mempool_t *mp_msgbuf;     /* IRC message buffers (512 bytes) */
 extern mempool_t *mp_string64;   /* 64-byte strings */
