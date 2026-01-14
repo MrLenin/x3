@@ -278,6 +278,10 @@ int main(int argc, char *argv[])
     }
 
     ioset_init();
+    /* Hook threadpool notifications into the event loop for immediate callback processing */
+    if (ioset_register_threadpool() < 0) {
+        log_module(MAIN_LOG, LOG_DEBUG, "Threadpool ioset integration not available");
+    }
     init_structs();
     init_parse();
     modcmd_init();

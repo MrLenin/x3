@@ -25,6 +25,7 @@
 #include "gline.h"
 #include "global.h"
 #include "nickserv.h"
+#include "mempool.h"
 #include "modcmd.h"
 #include "modules.h"
 #include "proto.h"
@@ -7851,7 +7852,7 @@ init_opserv(const char *nick)
 #if defined(WITH_MALLOC_X3) || defined(WITH_MALLOC_SLAB)
     opserv_define_func("STATS MEMORY", cmd_stats_memory, 0, 0, 0);
 #endif
-    /* LMDB commands */
+    /* LMDB commands - standalone like STATS subcommands */
     opserv_define_func("LMDB SNAPSHOT", cmd_lmdb_snapshot, 600, 0, 0);
     opserv_define_func("LMDB EXPORT", cmd_lmdb_export, 600, 0, 0);
     opserv_define_func("LMDB STATS", cmd_lmdb_stats, 100, 0, 0);

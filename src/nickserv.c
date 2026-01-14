@@ -23,6 +23,7 @@
 #include "conf.h"
 #include "config.h"
 #include "global.h"
+#include "mempool.h"
 #include "modcmd.h"
 #include "opserv.h" /* for gag_create(), opserv_bad_channel() */
 #include "password.h"

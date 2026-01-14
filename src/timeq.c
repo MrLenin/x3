@@ -20,6 +20,7 @@
 
 #include "common.h"
 #include "heap.h"
+#include "mempool.h"
 #include "timeq.h"
 
 heap_t timeq;
@@ -59,7 +60,9 @@ timeq_add(unsigned long when, timeq_func func, void *data)
 {
     struct timeq_entry *ent;
     void *w;
-    ent = malloc(sizeof(struct timeq_entry));
+    ent = mempool_alloc(mp_timeq);
+    if (!ent)
+        return; /* Out of memory */
     ent->func = func;
     ent->data = data;
     w = (void*)when;
@@ -83,7 +86,7 @@ timeq_del_matching(void *key, void *data, void *extra)
     if (((b->mask & TIMEQ_IGNORE_WHEN) || ((unsigned long)key == b->when))
         && ((b->mask & TIMEQ_IGNORE_FUNC) || (a->func == b->func))
         && ((b->mask & TIMEQ_IGNORE_DATA) || (a->data == b->data))) {
-        free(data);
+        mempool_free(mp_timeq, data);
         return 1;
     } else {
         return 0;
@@ -120,6 +123,6 @@ timeq_run(void)
         ent = d;
         heap_pop(timeq);
         ent->func(ent->data);
-        free(ent);
+        mempool_free(mp_timeq, ent);
     }
 }

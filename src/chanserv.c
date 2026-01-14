@@ -24,6 +24,7 @@
 #include "gline.h"
 #include "ioset.h"
 #include "keycloak.h"
+#include "mempool.h"
 #include "modcmd.h"
 #include "opserv.h" /* for opserv_bad_channel() */
 #include "nickserv.h" /* for oper_outranks() */

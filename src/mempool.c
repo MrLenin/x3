@@ -93,6 +93,7 @@ mempool_t *mp_msgbuf = NULL;
 mempool_t *mp_string64 = NULL;
 mempool_t *mp_string256 = NULL;
 mempool_t *mp_curl_ctx = NULL;
+mempool_t *mp_timeq = NULL;
 
 /* Helper: round up to alignment */
 static size_t
@@ -431,6 +432,11 @@ mempool_init_global(void)
     if (!mp_curl_ctx)
         goto fail;
 
+    /* Create timer queue entry pool (struct timeq_entry ~16 bytes) */
+    mp_timeq = mempool_create("timeq", 24, 8, 100, 0, 50);
+    if (!mp_timeq)
+        goto fail;
+
     log_module(MP_LOG, LOG_INFO, "Global memory pools initialized");
     return 0;
 
@@ -457,6 +463,10 @@ mempool_cleanup_global(void)
     if (mp_curl_ctx) {
         mempool_destroy(mp_curl_ctx, 1);
         mp_curl_ctx = NULL;
+    }
+    if (mp_timeq) {
+        mempool_destroy(mp_timeq, 1);
+        mp_timeq = NULL;
     }
 
     log_module(MP_LOG, LOG_INFO, "Global memory pools cleaned up");

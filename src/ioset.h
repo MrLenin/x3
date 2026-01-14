@@ -79,4 +79,10 @@ void ioset_set_time(unsigned long new_now);
 void ioset_set_poll_hint_ms(long timeout_ms);
 long ioset_get_poll_hint_ms(void);
 
+/* Threadpool integration - register notify fd with ioset for immediate callback processing.
+ * Call after both threadpool_init() and ioset_init() complete.
+ * Returns 0 on success, -1 if threadpool not initialized or registration failed.
+ */
+int ioset_register_threadpool(void);
+
 #endif /* !defined(IOSET_H) */

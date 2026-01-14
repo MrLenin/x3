@@ -119,7 +119,7 @@ ioset_epoll_cleanup(void)
 static int
 ioset_epoll_loop(struct timeval *timeout)
 {
-    struct epoll_event evts[32];
+    struct epoll_event evts[128];  /* Increased from 32 for high-volume event batching */
     int events;
     int msec;
     int res;

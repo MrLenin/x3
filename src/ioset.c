@@ -21,6 +21,7 @@
 #include "ioset-impl.h"
 #include "log.h"
 #include "timeq.h"
+#include "threadpool.h"
 #include "saxdb.h"
 #include "conf.h"
 #include "x3_ssl.h"
@@ -101,7 +102,7 @@ static long poll_hint_ms = 0;
  * actual free() until after the event loop iteration completes.
  * This prevents use-after-free bugs in the epoll loop.
  */
-#define MAX_DEFERRED_FREES 64
+#define MAX_DEFERRED_FREES 256  /* Increased from 64 for high-volume connection handling */
 struct deferred_free_entry {
     struct io_fd *fd;
     int os_close;
@@ -722,6 +723,11 @@ ioset_run(void) {
 
         /* Call any timeq events we need to call. */
         timeq_run();
+
+        /* Process completed threadpool tasks (callbacks run in main thread) */
+        if (threadpool_is_initialized())
+            threadpool_process_callbacks(0);
+
         if (do_write_dbs) {
             saxdb_write_all(NULL);
             do_write_dbs = 0;
@@ -743,6 +749,40 @@ ioset_set_poll_hint_ms(long timeout_ms) {
 long
 ioset_get_poll_hint_ms(void) {
     return poll_hint_ms;
+}
+
+/* Threadpool notification integration */
+static struct io_fd *threadpool_io_fd = NULL;
+
+static void
+threadpool_notify_readable(struct io_fd *fd) {
+    (void)fd;
+    /* Process all pending callbacks - the read will happen via
+     * threadpool_process_callbacks() which clears the notification */
+    threadpool_process_callbacks(0);
+}
+
+int
+ioset_register_threadpool(void) {
+    int notify_fd;
+
+    if (!threadpool_is_initialized())
+        return -1;
+
+    notify_fd = threadpool_get_notify_fd();
+    if (notify_fd < 0)
+        return -1;
+
+    threadpool_io_fd = ioset_add(notify_fd);
+    if (!threadpool_io_fd)
+        return -1;
+
+    threadpool_io_fd->state = IO_CONNECTED;
+    threadpool_io_fd->line_reads = 0;  /* Raw read mode */
+    threadpool_io_fd->readable_cb = threadpool_notify_readable;
+
+    log_module(MAIN_LOG, LOG_DEBUG, "Registered threadpool notify fd %d with ioset", notify_fd);
+    return 0;
 }
 
 void

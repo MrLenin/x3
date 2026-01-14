@@ -100,6 +100,7 @@ extern mempool_t *mp_msgbuf;     /* IRC message buffers (512 bytes) */
 extern mempool_t *mp_string64;   /* 64-byte strings */
 extern mempool_t *mp_string256;  /* 256-byte strings */
 extern mempool_t *mp_curl_ctx;   /* CURL request contexts */
+extern mempool_t *mp_timeq;      /* Timer queue entries (~16 bytes) */
 
 /**
  * Initialize global memory pools

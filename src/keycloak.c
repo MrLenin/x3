@@ -11,6 +11,7 @@
 #include "ioset.h"
 #include "timeq.h"
 #include "base64.h"
+#include "mempool.h"
 #include <curl/multi.h>
 #include <openssl/evp.h>
 #include <openssl/rsa.h>
@@ -2166,24 +2167,24 @@ kc_async_request_cleanup(struct kc_async_request *req)
         free(req->response.response);
     }
 
-    /* Free allocated strings */
-    if (req->uri) free(req->uri);
+    /* Free allocated strings - use pool_strfree for strings that may be pooled */
+    if (req->uri) free(req->uri);  /* URIs are typically long, not pooled */
     if (req->post_fields) {
-        memset(req->post_fields, 0, strlen(req->post_fields));
+        memset(req->post_fields, 0, strlen(req->post_fields));  /* Zero sensitive data */
         free(req->post_fields);
     }
-    if (req->post_data_copy) free(req->post_data_copy);
+    if (req->post_data_copy) free(req->post_data_copy);  /* Binary data, not pooled */
     if (req->header_list) curl_slist_free_all(req->header_list);
-    if (req->request_id) free(req->request_id);
-    if (req->create_username) free(req->create_username);
-    if (req->attr_prefix) free(req->attr_prefix);
-    if (req->attr_name) free(req->attr_name);
-    if (req->user_attr_name) free(req->user_attr_name);
-    if (req->user_attr_value) free(req->user_attr_value);
-    if (req->user_id_copy) free(req->user_id_copy);
-    if (req->bearer_token_copy) free(req->bearer_token_copy);
-    if (req->group_attr_value) free(req->group_attr_value);
-    if (req->group_id) free(req->group_id);
+    pool_strfree(req->request_id);
+    pool_strfree(req->create_username);
+    pool_strfree(req->attr_prefix);
+    pool_strfree(req->attr_name);
+    pool_strfree(req->user_attr_name);
+    pool_strfree(req->user_attr_value);
+    pool_strfree(req->user_id_copy);
+    if (req->bearer_token_copy) free(req->bearer_token_copy);  /* JWT tokens are long */
+    pool_strfree(req->group_attr_value);
+    pool_strfree(req->group_id);
 
     free(req);
 }
@@ -3204,7 +3205,7 @@ curl_perform_async(struct kc_async_request *req, struct curl_opts opts)
 
     /* Store request_id for completion logging */
     if (opts.request_id) {
-        req->request_id = strdup(opts.request_id);
+        req->request_id = pool_strdup(opts.request_id);
     }
 
     /* Record start time for timeout tracking */
@@ -4389,7 +4390,7 @@ keycloak_create_user_async(struct kc_realm realm, struct kc_client client,
     req->cb.generic = callback;
 
     /* Store username for user ID caching */
-    req->create_username = strdup(username);
+    req->create_username = pool_strdup(username);
     if (!req->create_username) {
         log_module(KC_LOG, LOG_ERROR, "create_user_async: Failed to copy username");
         free(req);
@@ -4500,7 +4501,7 @@ keycloak_create_user_with_hash_async(struct kc_realm realm, struct kc_client cli
     req->cb.generic = callback;
 
     /* Store username for user ID caching */
-    req->create_username = strdup(username);
+    req->create_username = pool_strdup(username);
     if (!req->create_username) {
         log_module(KC_LOG, LOG_ERROR, "create_user_with_hash_async: Failed to copy username");
         free(req);
@@ -4619,7 +4620,7 @@ keycloak_list_user_attributes_async(struct kc_realm realm, struct kc_client clie
 
     /* Store prefix for completion handler */
     if (prefix) {
-        req->attr_prefix = strdup(prefix);
+        req->attr_prefix = pool_strdup(prefix);
         if (!req->attr_prefix) {
             log_module(KC_LOG, LOG_ERROR, "list_user_attrs_async: Failed to copy prefix");
             goto error;
@@ -4706,7 +4707,7 @@ keycloak_get_user_attribute_async(struct kc_realm realm, struct kc_client client
     req->cb.get_attr = callback;
 
     /* Store attribute name for completion handler */
-    req->attr_name = strdup(attr_name);
+    req->attr_name = pool_strdup(attr_name);
     if (!req->attr_name) {
         log_module(KC_LOG, LOG_ERROR, "get_user_attr_async: Failed to copy attr_name");
         goto error;
