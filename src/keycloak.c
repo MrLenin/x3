@@ -1455,9 +1455,28 @@ kc_build_group_by_path_endpoint(struct kc_realm realm, const char *path)
     static const char tmpl[] = "%s/admin/realms/%s/group-by-path%s";
     if (!realm.base_uri || !realm.realm || !path) return NULL;
 
-    int len = snprintf(NULL, 0, tmpl, realm.base_uri, realm.realm, path) + 1;
+    /* URL-encode the path - especially important for # which is a URL fragment delimiter */
+    char *encoded_path = curl_easy_escape(NULL, path, 0);
+    if (!encoded_path) return NULL;
+
+    /* curl_easy_escape encodes / as %2F, but we need literal slashes in the path */
+    /* Replace %2F back to / for path separators */
+    char *p = encoded_path;
+    char *w = encoded_path;
+    while (*p) {
+        if (p[0] == '%' && p[1] == '2' && (p[2] == 'F' || p[2] == 'f')) {
+            *w++ = '/';
+            p += 3;
+        } else {
+            *w++ = *p++;
+        }
+    }
+    *w = '\0';
+
+    int len = snprintf(NULL, 0, tmpl, realm.base_uri, realm.realm, encoded_path) + 1;
     char *uri = malloc(len);
-    if (uri) snprintf(uri, len, tmpl, realm.base_uri, realm.realm, path);
+    if (uri) snprintf(uri, len, tmpl, realm.base_uri, realm.realm, encoded_path);
+    curl_free(encoded_path);
     return uri;
 }
 
