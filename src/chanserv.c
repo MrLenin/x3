@@ -1606,7 +1606,7 @@ register_channel(struct chanNode *cNode, char *registrar)
     channel->notes = dict_new();
     dict_set_free_data(channel->notes, chanserv_free_note);
 
-    channel->registrar = strdup(registrar);
+    channel->registrar = pool_strdup(registrar);
     channel->registered = now;
     channel->visited = now;
     channel->limitAdjusted = now;
@@ -1645,7 +1645,7 @@ add_channel_user(struct chanData *channel, struct handle_info *handle, unsigned 
     ud->handle = handle;
     ud->seen = seen;
     ud->access = access_level;
-    ud->info = info ? strdup(info) : NULL;
+    ud->info = info ? pool_strdup(info) : NULL;
     ud->accessexpiry = accessexpiry ? accessexpiry : 0;
     ud->clvlexpiry = 0;
     ud->lastaccess = 0;
@@ -1678,7 +1678,7 @@ chanserv_expire_tempuser(void *data)
     char *handle;
 
     if (data) {
-        handle = strdup(uData->handle->handle);
+        handle = pool_strdup(uData->handle->handle);
         if (uData->accessexpiry > 0) {
             if (uData->present) {
                 struct userNode *user, *next_un = NULL;
@@ -1720,7 +1720,7 @@ chanserv_expire_tempclvl(void *data)
     char *handle;
 
     if (data) {
-        handle = strdup(uData->handle->handle);
+        handle = pool_strdup(uData->handle->handle);
         if (uData->clvlexpiry > 0) {
             int changemodes = 0;
             unsigned int mode = 0;
@@ -1800,7 +1800,7 @@ del_channel_user(struct userData *user, int do_gc)
     if(user->u_next)
         user->u_next->u_prev = user->u_prev;
 
-    free(user->info);
+    pool_strfree(user->info);
     free(user);
     if(do_gc && !channel->users && !IsProtected(channel)) {
         spamserv_cs_unregister(NULL, channel->channel, lost_all_users, NULL);
@@ -1958,7 +1958,7 @@ add_channel_ban(struct chanData *channel, const char *mask, char *owner, time_t 
     safestrncpy(bd->mask, mask, sizeof(bd->mask));
     if(owner)
         safestrncpy(bd->owner, owner, sizeof(bd->owner));
-    bd->reason = strdup(reason);
+    bd->reason = pool_strdup(reason);
 
     if(expires)
     timeq_add(expires, expire_ban, bd);
@@ -1992,7 +1992,7 @@ del_channel_ban(struct banData *ban)
     timeq_del(0, expire_ban, ban, TIMEQ_IGNORE_WHEN);
 
     if(ban->reason)
-        free(ban->reason);
+        pool_strfree(ban->reason);
 
     free(ban);
 }
@@ -2077,11 +2077,11 @@ unregister_channel(struct chanData *channel, const char *reason)
     while(channel->bans)
     del_channel_ban(channel->bans);
 
-    free(channel->topic);
-    free(channel->registrar);
-    free(channel->greeting);
-    free(channel->user_greeting);
-    free(channel->topic_mask);
+    pool_strfree(channel->topic);
+    pool_strfree(channel->registrar);
+    pool_strfree(channel->greeting);
+    pool_strfree(channel->user_greeting);
+    pool_strfree(channel->topic_mask);
 
     if(channel->prev)
         channel->prev->next = channel->next;
@@ -2099,8 +2099,8 @@ unregister_channel(struct chanData *channel, const char *reason)
         for(suspended = channel->suspended; suspended; suspended = next_suspended)
         {
             next_suspended = suspended->previous;
-            free(suspended->suspender);
-            free(suspended->reason);
+            pool_strfree(suspended->suspender);
+            pool_strfree(suspended->reason);
             if(suspended->expires)
                 timeq_del(suspended->expires, chanserv_expire_suspension, suspended, 0);
             free(suspended);
@@ -3049,11 +3049,11 @@ static CHANSERV_FUNC(cmd_unregister)
     }
 
     sprintf(reason, "unregistered by %s.", user->handle_info->handle);
-    name = strdup(channel->name);
+    name = pool_strdup(channel->name);  /* pool_strfree'd below */
     unregister_channel(cData, reason);
     spamserv_cs_unregister(user, channel, manually, "unregistered");
     reply("CSMSG_UNREG_SUCCESS", name);
-    free(name);
+    pool_strfree(name);
     return 1;
 }
 
@@ -3752,7 +3752,7 @@ static CHANSERV_FUNC(cmd_deluser)
     if(!real_actor || (real_actor->access <= victim->access && real_actor != victim))
         override = CMD_LOG_OVERRIDE;
 
-    chan_name = strdup(channel->name);
+    chan_name = pool_strdup(channel->name);
 
 #ifdef WITH_KEYCLOAK
     /* Remove user from Keycloak group if bidirectional sync enabled */
@@ -3761,7 +3761,7 @@ static CHANSERV_FUNC(cmd_deluser)
 
     del_channel_user(victim, 1);
     reply("CSMSG_DELETED_USER", handle->handle, access_level, chan_name);
-    free(chan_name);
+    pool_strfree(chan_name);
     return 1 | override;
 }
 
@@ -3856,37 +3856,37 @@ static CHANSERV_FUNC(cmd_levels)
     tbl.contents[0][3] = "To";
 
     tbl.contents[++ii] = calloc(tbl.width, sizeof(tbl.contents[0][0]));
-    tbl.contents[ii][0] = strdup(user_level_name_from_level(UL_OWNER));
+    tbl.contents[ii][0] = pool_strdup(user_level_name_from_level(UL_OWNER));
     tbl.contents[ii][1] = msnprintf(4, "%d", UL_OWNER);
     tbl.contents[ii][2] = msnprintf(2, " ");
     tbl.contents[ii][3] = msnprintf(1, "");
 
     tbl.contents[++ii] = calloc(tbl.width, sizeof(tbl.contents[0][0]));
-    tbl.contents[ii][0] = strdup(user_level_name_from_level(UL_COOWNER));
+    tbl.contents[ii][0] = pool_strdup(user_level_name_from_level(UL_COOWNER));
     tbl.contents[ii][1] = msnprintf(4, "%d", UL_COOWNER);
     tbl.contents[ii][2] = msnprintf(2, "-");
     tbl.contents[ii][3] = msnprintf(4, "%d", UL_OWNER-1);
 
     tbl.contents[++ii] = calloc(tbl.width, sizeof(tbl.contents[0][0]));
-    tbl.contents[ii][0] = strdup(user_level_name_from_level(UL_MANAGER));
+    tbl.contents[ii][0] = pool_strdup(user_level_name_from_level(UL_MANAGER));
     tbl.contents[ii][1] = msnprintf(4, "%d", UL_MANAGER);
     tbl.contents[ii][2] = msnprintf(2, "-");
     tbl.contents[ii][3] = msnprintf(4, "%d", UL_COOWNER-1);
 
     tbl.contents[++ii] = calloc(tbl.width, sizeof(tbl.contents[0][0]));
-    tbl.contents[ii][0] = strdup(user_level_name_from_level(UL_OP));
+    tbl.contents[ii][0] = pool_strdup(user_level_name_from_level(UL_OP));
     tbl.contents[ii][1] = msnprintf(4, "%d", UL_OP);
     tbl.contents[ii][2] = msnprintf(2, "-");
     tbl.contents[ii][3] = msnprintf(4, "%d", UL_MANAGER-1);
 
     tbl.contents[++ii] = calloc(tbl.width, sizeof(tbl.contents[0][0]));
-    tbl.contents[ii][0] = strdup(user_level_name_from_level(UL_HALFOP));
+    tbl.contents[ii][0] = pool_strdup(user_level_name_from_level(UL_HALFOP));
     tbl.contents[ii][1] = msnprintf(4, "%d", UL_HALFOP);
     tbl.contents[ii][2] = msnprintf(2, "-");
     tbl.contents[ii][3] = msnprintf(4, "%d", UL_OP-1);
 
     tbl.contents[++ii] = calloc(tbl.width, sizeof(tbl.contents[0][0]));
-    tbl.contents[ii][0] = strdup(user_level_name_from_level(UL_PEON));
+    tbl.contents[ii][0] = pool_strdup(user_level_name_from_level(UL_PEON));
     tbl.contents[ii][1] = msnprintf(4, "%d", UL_PEON);
     tbl.contents[ii][2] = msnprintf(2, "-");
     tbl.contents[ii][3] = msnprintf(4, "%d", UL_HALFOP-1);
@@ -4333,7 +4333,7 @@ eject_user(struct userNode *user, struct chanNode *channel, unsigned int argc, c
             return 0;
         }
 
-        name = ban = strdup(banmask);
+        name = ban = pool_strdup(banmask);
     }
     else
     {
@@ -4382,7 +4382,7 @@ eject_user(struct userNode *user, struct chanNode *channel, unsigned int argc, c
             return 0;
         }
 
-        name = ban = strdup(argv[1]);
+        name = ban = pool_strdup(argv[1]);
     }
 
     /* Truncate the ban in place if necessary; we must ensure
@@ -4398,7 +4398,7 @@ eject_user(struct userNode *user, struct chanNode *channel, unsigned int argc, c
         {
             if(cmd)
                 reply("CSMSG_MAXIMUM_LAMERS", chanserv_conf.max_chan_bans); /* ..lamers.. */
-            free(ban);
+            pool_strfree(ban);
             return 0;
         }
 
@@ -4410,14 +4410,14 @@ eject_user(struct userNode *user, struct chanNode *channel, unsigned int argc, c
             {
                 if(cmd)
                     reply("CSMSG_DURATION_TOO_LOW");
-                free(ban);
+                pool_strfree(ban);
                 return 0;
             }
             else if(duration > (86400 * 365 * 2))
             {
                 if(cmd)
                     reply("CSMSG_DURATION_TOO_HIGH");
-                free(ban);
+                pool_strfree(ban);
                 return 0;
             }
         }
@@ -4434,8 +4434,8 @@ eject_user(struct userNode *user, struct chanNode *channel, unsigned int argc, c
                 if(exact)
                 {
                     if(bData->reason)
-                        free(bData->reason);
-                    bData->reason = strdup(reason);
+                        pool_strfree(bData->reason);
+                    bData->reason = pool_strdup(reason);
                     safestrncpy(bData->owner, (user->handle_info ? user->handle_info->handle : user->nick), sizeof(bData->owner));
                     if(cmd)
                         reply("CSMSG_REASON_CHANGE", ban);
@@ -4484,7 +4484,7 @@ eject_user(struct userNode *user, struct chanNode *channel, unsigned int argc, c
                 if(cmd)
                     reply("CSMSG_REDUNDANT_LAMER", name, channel->name);
 
-                free(ban);
+                pool_strfree(ban);
                 return 0;
             }
 
@@ -4498,8 +4498,8 @@ eject_user(struct userNode *user, struct chanNode *channel, unsigned int argc, c
         }
 
         bData = add_channel_ban(channel->channel_info, ban, (user->handle_info ? user->handle_info->handle : user->nick), now, (victimCount ? now : 0), (duration ? now + duration : 0), reason);
-        free(ban);
-        name = ban = strdup(bData->mask);
+        pool_strfree(ban);
+        name = ban = pool_strdup(bData->mask);
     }
     else if(ban)
     {
@@ -4519,7 +4519,7 @@ eject_user(struct userNode *user, struct chanNode *channel, unsigned int argc, c
                 continue;
             new_mask = malloc(MAXLEN);
             sprintf(new_mask, "%.*s%s", (int)(l1-l2), ban, hidden_host_suffix);
-            free(ban);
+            pool_strfree(ban);
             name = ban = new_mask;
         }
     }
@@ -4534,7 +4534,7 @@ eject_user(struct userNode *user, struct chanNode *channel, unsigned int argc, c
         {
             if(cmd)
                 reply("CSMSG_BANLIST_FULL", channel->name);
-            free(ban);
+            pool_strfree(ban);
             return 0;
         }
 
@@ -4561,7 +4561,7 @@ eject_user(struct userNode *user, struct chanNode *channel, unsigned int argc, c
         {
             if(cmd)
                 reply("CSMSG_REDUNDANT_BAN", name, channel->name);
-            free(ban);
+            pool_strfree(ban);
             return 0;
         }
     }
@@ -4608,7 +4608,7 @@ eject_user(struct userNode *user, struct chanNode *channel, unsigned int argc, c
     else if(action & ACTION_KICK && victimCount)
         reply("CSMSG_KICK_DONE", name, channel->name);
 
-    free(ban);
+    pool_strfree(ban);
     return 1;
 }
 
@@ -4672,7 +4672,7 @@ find_matching_bans(struct banList *bans, struct userNode *actee, const char *mas
         if(!match[ii])
             continue;
         change->args[count].mode = MODE_REMOVE | MODE_BAN;
-        change->args[count++].u.hostmask = strdup(bans->list[ii]->ban);
+        change->args[count++].u.hostmask = pool_strdup(bans->list[ii]->ban);
     }
     assert(count == change->argc);
     return change;
@@ -4718,7 +4718,7 @@ static void expire_bans(UNUSED_ARG(void* data)) /* Real bans, not lamers */
 
                     /* Add this ban to the mode change */
                     change->args[ii].mode = MODE_REMOVE | MODE_BAN;
-                    change->args[ii].u.hostmask = strdup(bn->ban);
+                    change->args[ii].u.hostmask = pool_strdup(bn->ban);
                     ii++;
                     /* Pull this ban out of the list */
                     banList_remove(&(channel->channel->banlist), bn);
@@ -4729,9 +4729,9 @@ static void expire_bans(UNUSED_ARG(void* data)) /* Real bans, not lamers */
             /* Send the modes to IRC */
             mod_chanmode_announce(chanserv, channel->channel, change);
 
-            /* free memory from strdup above */
+            /* free memory from pool_strdup above */
             for(ii = 0; ii < count; ++ii)
-                free((char*)change->args[ii].u.hostmask);
+                pool_strfree((char*)change->args[ii].u.hostmask);
 
             mod_chanmode_free(change);
         }
@@ -4760,7 +4760,7 @@ unban_user(struct userNode *user, struct chanNode *channel, unsigned int argc, c
             const char *accountname = argv[1] + 1;
 
             snprintf(banmask, sizeof(banmask), "*!*@%s.*", accountname);
-            mask = strdup(banmask);
+            mask = pool_strdup(banmask);
         }
         else if(!is_ircmask(argv[1]))
         {
@@ -4769,7 +4769,7 @@ unban_user(struct userNode *user, struct chanNode *channel, unsigned int argc, c
         }
         else
         {
-            mask = strdup(argv[1]);
+            mask = pool_strdup(argv[1]);
         }
     }
 
@@ -4785,7 +4785,7 @@ unban_user(struct userNode *user, struct chanNode *channel, unsigned int argc, c
 
             modcmd_chanmode_announce(change);
             for(ii = 0; ii < change->argc; ++ii)
-                free((char*)change->args[ii].u.hostmask);
+                pool_strfree((char*)change->args[ii].u.hostmask);
             mod_chanmode_free(change);
             acted = 1;
         }
@@ -4818,7 +4818,7 @@ unban_user(struct userNode *user, struct chanNode *channel, unsigned int argc, c
     else
         reply("CSMSG_BAN_REMOVED", actee ? actee->nick : mask);
     if(mask)
-        free(mask);
+        pool_strfree(mask);
     return 1;
 }
 
@@ -4863,11 +4863,11 @@ static CHANSERV_FUNC(cmd_unbanall)
     for(ii=0; ii<channel->banlist.used; ii++)
     {
         change->args[ii].mode = MODE_REMOVE | MODE_BAN;
-        change->args[ii].u.hostmask = strdup(channel->banlist.list[ii]->ban);
+        change->args[ii].u.hostmask = pool_strdup(channel->banlist.list[ii]->ban);
     }
     modcmd_chanmode_announce(change);
     for(ii = 0; ii < change->argc; ++ii)
-        free((char*)change->args[ii].u.hostmask);
+        pool_strfree((char*)change->args[ii].u.hostmask);
     mod_chanmode_free(change);
     reply("CSMSG_BANS_REMOVED", channel->name);
     return 1;
@@ -4888,7 +4888,7 @@ static CHANSERV_FUNC(cmd_open)
     modcmd_chanmode_announce(change);
     reply("CSMSG_CHANNEL_OPENED", channel->name);
     for(ii = 0; ii < change->argc; ++ii)
-        free((char*)change->args[ii].u.hostmask);
+        pool_strfree((char*)change->args[ii].u.hostmask);
     mod_chanmode_free(change);
     return 1;
 }
@@ -5345,7 +5345,7 @@ cmd_list_users(struct userNode *user, struct chanNode *channel, unsigned int arg
             ary[i] = "Never";
         else
             ary[i] = intervalString(seen, now - uData->seen, user->handle_info);
-        ary[i] = strdup(ary[i]);
+        ary[i] = pool_strdup(ary[i]);
         i++;
         if(IsUserSuspended(uData))
             ary[i++] = "Suspended";
@@ -5374,8 +5374,8 @@ cmd_list_users(struct userNode *user, struct chanNode *channel, unsigned int arg
     send_list(&lData);
     for(matches = 1; matches < lData.table.length; ++matches)
     {
-        /* Free strdup above */
-        free((char*)lData.table.contents[matches][seen_index]);
+        /* Free pool_strdup above */
+        pool_strfree((char*)lData.table.contents[matches][seen_index]);
         free(lData.table.contents[matches]);
     }
     free(lData.table.contents[0]);
@@ -5517,10 +5517,10 @@ static CHANSERV_FUNC(cmd_lamers)
         tbl.contents[++ii] = malloc(tbl.width * sizeof(tbl.contents[0][0]));
         tbl.contents[ii][0] = ban->mask;
         tbl.contents[ii][1] = ban->owner;
-        tbl.contents[ii][2] = strdup(triggered);
+        tbl.contents[ii][2] = pool_strdup(triggered);
         if(timed)
         {
-            tbl.contents[ii][3] = strdup(expires);
+            tbl.contents[ii][3] = pool_strdup(expires);
             tbl.contents[ii][4] = ban->reason;
         }
         else
@@ -5530,9 +5530,9 @@ static CHANSERV_FUNC(cmd_lamers)
     /* reply("MSG_MATCH_COUNT", matches); */
     for(ii = 1; ii < tbl.length; ++ii)
     {
-        free((char*)tbl.contents[ii][2]);
+        pool_strfree((char*)tbl.contents[ii][2]);
         if(timed)
-            free((char*)tbl.contents[ii][3]);
+            pool_strfree((char*)tbl.contents[ii][3]);
         free(tbl.contents[ii]);
     }
     free(tbl.contents[0]);
@@ -5666,8 +5666,8 @@ static CHANSERV_FUNC(cmd_topic)
     if(check_user_level(channel, user, lvlTopicSnarf, 1, 0))
     {
         /* Grab the topic and save it as the default topic. */
-        free(cData->topic);
-        cData->topic = strdup(channel->topic);
+        pool_strfree(cData->topic);
+        cData->topic = pool_strdup(channel->topic);
     }
 
     return 1;
@@ -6092,7 +6092,7 @@ static MODCMD_FUNC(cmd_wipeinfo)
     if((ud != real_actor) && (!real_actor || (ud->access >= real_actor->access)))
         override = CMD_LOG_OVERRIDE;
     if(ud->info)
-        free(ud->info);
+        pool_strfree(ud->info);
     ud->info = NULL;
     reply("CSMSG_WIPED_INFO_LINE", argv[1], channel->name);
     return 1 | override;
@@ -6681,9 +6681,9 @@ static CHANSERV_FUNC(cmd_csuspend)
     suspended = calloc(1, sizeof(*suspended));
     suspended->revoked = 0;
     suspended->issued = now;
-    suspended->suspender = strdup(user->handle_info->handle);
+    suspended->suspender = pool_strdup(user->handle_info->handle);
     suspended->expires = expiry;
-    suspended->reason = strdup(reason);
+    suspended->reason = pool_strdup(reason);
     suspended->cData = channel->channel_info;
     suspended->previous = suspended->cData->suspended;
     suspended->cData->suspended = suspended;
@@ -6975,8 +6975,8 @@ static MODCMD_FUNC(chan_opt_unreviewed)
                 cData->flags |= CHANNEL_UNREVIEWED;
             else
             {
-                free(cData->registrar);
-                cData->registrar = strdup(user->handle_info->handle);
+                pool_strfree(cData->registrar);
+                cData->registrar = pool_strdup(user->handle_info->handle);
                 cData->flags &= ~CHANNEL_UNREVIEWED;
             }
             value = new_value;
@@ -7004,14 +7004,14 @@ static MODCMD_FUNC(chan_opt_defaulttopic)
 
         topic = unsplit_string(argv+1, argc-1, NULL);
 
-        free(channel->channel_info->topic);
+        pool_strfree(channel->channel_info->topic);
         if(topic[0] == '*' && topic[1] == 0)
         {
             topic = channel->channel_info->topic = NULL;
         }
         else
         {
-            topic = channel->channel_info->topic = strdup(topic);
+            topic = channel->channel_info->topic = pool_strdup(topic);
             if(channel->channel_info->topic_mask
                && !match_ircglob(channel->channel_info->topic, channel->channel_info->topic_mask))
                 reply("CSMSG_TOPIC_MISMATCH", channel->name);
@@ -7042,14 +7042,14 @@ static MODCMD_FUNC(chan_opt_topicmask)
         mask = unsplit_string(argv+1, argc-1, NULL);
 
         if(cData->topic_mask)
-            free(cData->topic_mask);
+            pool_strfree(cData->topic_mask);
         if(mask[0] == '*' && mask[1] == 0)
         {
             cData->topic_mask = 0;
         }
         else
         {
-            cData->topic_mask = strdup(mask);
+            cData->topic_mask = pool_strdup(mask);
             if(!cData->topic)
                 reply("CSMSG_MASK_BUT_NO_TOPIC", channel->name);
             else if(!match_ircglob(cData->topic, cData->topic_mask))
@@ -7086,10 +7086,10 @@ static int opt_greeting_common(struct userNode *user, struct svccmd *cmd, int ar
                 reply("CSMSG_GREETING_TOO_LONG", length, chanserv_conf.greeting_length);
                 return 0;
             }
-            *data = strdup(greeting);
+            *data = pool_strdup(greeting);
         }
         if(previous)
-            free(previous);
+            pool_strfree(previous);
     }
 
     if(*data)
@@ -7683,11 +7683,11 @@ static MODCMD_FUNC(user_opt_info)
             return 0;
         }
         if(uData->info)
-            free(uData->info);
+            pool_strfree(uData->info);
         if(infoline[0] == '*' && infoline[1] == 0)
             uData->info = NULL;
         else
-            uData->info = strdup(infoline);
+            uData->info = pool_strdup(infoline);
     }
     if(uData->info)
         reply("CSMSG_USET_INFO", uData->info);
@@ -7861,17 +7861,17 @@ static CHANSERV_FUNC(cmd_giveownership)
 
     giveownership = calloc(1, sizeof(*giveownership));
     giveownership->issued = now;
-    giveownership->old_owner = strdup(curr_user->handle->handle);
-    giveownership->target = strdup(new_owner_hi->handle);
+    giveownership->old_owner = pool_strdup(curr_user->handle->handle);
+    giveownership->target = pool_strdup(new_owner_hi->handle);
     giveownership->target_access = new_owner_old_access;
     if(override)
     {
         if(argc > (2 + force))
         {
             unsplit_string(argv + 2 + force, argc - 2 - force, transfer_reason);
-            giveownership->reason = strdup(transfer_reason);
+            giveownership->reason = pool_strdup(transfer_reason);
         }
-        giveownership->staff_issuer = strdup(user->handle_info->handle);
+        giveownership->staff_issuer = pool_strdup(user->handle_info->handle);
     }
 
     giveownership->previous = channel->channel_info->giveownership;
@@ -8009,10 +8009,10 @@ static MODCMD_FUNC(cmd_deleteme)
         return 0;
     }
     access = target->access;
-    channel_name = strdup(channel->name);
+    channel_name = pool_strdup(channel->name);
     del_channel_user(target, 1);
     reply("CSMSG_DELETED_YOU", access, channel_name);
-    free(channel_name);
+    pool_strfree(channel_name);
     return 1;
 }
 
@@ -8326,8 +8326,8 @@ static CHANSERV_FUNC(cmd_spin)
          int abusednum = 1 + (int) (10000.0 * (rand() / (RAND_MAX + 1.0)));
          struct userNode *clone;
 
-         oldnick = strdup(user->nick);
-         oldident = strdup(user->ident);
+         oldnick = pool_strdup(user->nick);
+         oldident = pool_strdup(user->ident);
 
          //snprintf(abusednick, NICKLEN, "Abused%d", abusednum+(1 + rand() % 120));
          while (1) 
@@ -9329,8 +9329,8 @@ handle_topic(struct userNode *user, struct chanNode *channel, const char *old_to
     /* With topicsnarf, grab the topic and save it as the default topic. */
     if(check_user_level(channel, user, lvlTopicSnarf, 0, 0))
     {
-        free(cData->topic);
-        cData->topic = strdup(channel->topic);
+        pool_strfree(cData->topic);
+        cData->topic = pool_strdup(channel->topic);
     }
     return 0;
 }
@@ -9394,7 +9394,7 @@ handle_mode(struct chanNode *channel, struct userNode *user, const struct mod_ch
             if(!bounce)
                 bounce = mod_chanmode_alloc(change->argc + 1 - ii);
             bounce->args[bnc].mode = MODE_REMOVE | MODE_BAN;
-            bounce->args[bnc].u.hostmask = strdup(ban);
+            bounce->args[bnc].u.hostmask = pool_strdup(ban);
             bnc++;
             send_message(user, chanserv, "CSMSG_MASK_PROTECTED", ban);
         }
@@ -9405,7 +9405,7 @@ handle_mode(struct chanNode *channel, struct userNode *user, const struct mod_ch
             mod_chanmode_announce(chanserv, channel, bounce);
         for(ii = 0; ii < change->argc; ++ii)
             if(bounce->args[ii].mode == (MODE_REMOVE | MODE_BAN))
-                free((char*)bounce->args[ii].u.hostmask);
+                pool_strfree((char*)bounce->args[ii].u.hostmask);
         mod_chanmode_free(bounce);
     }
 }
@@ -9700,7 +9700,7 @@ chanserv_conf_read(void)
        unsigned int ii;
        strlist = alloc_string_list(ArrayLength(list)-1);
        for(ii=0; list[ii]; ii++)
-          string_list_append(strlist, strdup(list[ii]));
+          string_list_append(strlist, pool_strdup(list[ii]));
     }
     chanserv_conf.wheel = strlist;
 
@@ -9725,7 +9725,7 @@ chanserv_conf_read(void)
         };
         strlist = alloc_string_list(ArrayLength(list)-1);
         for(ii=0; list[ii]; ii++)
-            string_list_append(strlist, strdup(list[ii]));
+            string_list_append(strlist, pool_strdup(list[ii]));
     }
     chanserv_conf.set_shows = strlist;
     /* We don't look things up now, in case the list refers to options
@@ -9743,9 +9743,9 @@ chanserv_conf_read(void)
     else
     {
         strlist = alloc_string_list(4);
-        string_list_append(strlist, strdup("Yes."));
-        string_list_append(strlist, strdup("No."));
-        string_list_append(strlist, strdup("Maybe so."));
+        string_list_append(strlist, pool_strdup("Yes."));
+        string_list_append(strlist, pool_strdup("No."));
+        string_list_append(strlist, pool_strdup("Maybe so."));
     }
     chanserv_conf.eightball = strlist;
 
@@ -9940,8 +9940,8 @@ chanserv_read_suspended(dict_t obj)
     suspended->revoked = str ? (time_t)strtoul(str, NULL, 0) : 0;
     str = database_get_data(obj, KEY_ISSUED, RECDB_QSTRING);
     suspended->issued = str ? (time_t)strtoul(str, NULL, 0) : 0;
-    suspended->suspender = strdup(database_get_data(obj, KEY_SUSPENDER, RECDB_QSTRING));
-    suspended->reason = strdup(database_get_data(obj, KEY_REASON, RECDB_QSTRING));
+    suspended->suspender = pool_strdup(database_get_data(obj, KEY_SUSPENDER, RECDB_QSTRING));
+    suspended->reason = pool_strdup(database_get_data(obj, KEY_REASON, RECDB_QSTRING));
     previous = database_get_data(obj, KEY_PREVIOUS, RECDB_OBJECT);
     suspended->previous = previous ? chanserv_read_suspended(previous) : NULL;
     return suspended;
@@ -9955,15 +9955,15 @@ chanserv_read_giveownership(dict_t obj)
     dict_t previous;
 
     str = database_get_data(obj, KEY_STAFF_ISSUER, RECDB_QSTRING);
-    giveownership->staff_issuer = str ? strdup(str) : NULL;
+    giveownership->staff_issuer = str ? pool_strdup(str) : NULL;
 
-    giveownership->old_owner = strdup(database_get_data(obj, KEY_OLD_OWNER, RECDB_QSTRING));
+    giveownership->old_owner = pool_strdup(database_get_data(obj, KEY_OLD_OWNER, RECDB_QSTRING));
 
-    giveownership->target = strdup(database_get_data(obj, KEY_TARGET, RECDB_QSTRING));
+    giveownership->target = pool_strdup(database_get_data(obj, KEY_TARGET, RECDB_QSTRING));
     giveownership->target_access = atoi(database_get_data(obj, KEY_TARGET_ACCESS, RECDB_QSTRING));
 
     str = database_get_data(obj, KEY_REASON, RECDB_QSTRING);
-    giveownership->reason = str ? strdup(str) : NULL;
+    giveownership->reason = str ? pool_strdup(str) : NULL;
     str = database_get_data(obj, KEY_ISSUED, RECDB_QSTRING);
     giveownership->issued = str ? (time_t)strtoul(str, NULL, 0) : 0;
 
@@ -10080,11 +10080,11 @@ chanserv_channel_read(const char *key, struct record_data *hir)
         suspended = calloc(1, sizeof(*suspended));
         suspended->issued = 0;
         suspended->revoked = 0;
-        suspended->suspender = strdup(str);
+        suspended->suspender = pool_strdup(str);
         str = database_get_data(hir->d.object, KEY_SUSPEND_EXPIRES, RECDB_QSTRING);
         suspended->expires = str ? atoi(str) : 0;
         str = database_get_data(hir->d.object, KEY_SUSPEND_REASON, RECDB_QSTRING);
-        suspended->reason = strdup(str ? str : "No reason");
+        suspended->reason = pool_strdup(str ? str : "No reason");
         suspended->previous = NULL;
         cData->suspended = suspended;
         suspended->cData = cData;
@@ -10126,13 +10126,13 @@ chanserv_channel_read(const char *key, struct record_data *hir)
     str = database_get_data(channel, KEY_MAX, RECDB_QSTRING);
     cData->max = str ? atoi(str) : 0;
     str = database_get_data(channel, KEY_GREETING, RECDB_QSTRING);
-    cData->greeting = str ? strdup(str) : NULL;
+    cData->greeting = str ? pool_strdup(str) : NULL;
     str = database_get_data(channel, KEY_USER_GREETING, RECDB_QSTRING);
-    cData->user_greeting = str ? strdup(str) : NULL;
+    cData->user_greeting = str ? pool_strdup(str) : NULL;
     str = database_get_data(channel, KEY_TOPIC_MASK, RECDB_QSTRING);
-    cData->topic_mask = str ? strdup(str) : NULL;
+    cData->topic_mask = str ? pool_strdup(str) : NULL;
     str = database_get_data(channel, KEY_TOPIC, RECDB_QSTRING);
-    cData->topic = str ? strdup(str) : NULL;
+    cData->topic = str ? pool_strdup(str) : NULL;
 
     str = database_get_data(channel, KEY_MAXSETINFO, RECDB_QSTRING);
     cData->maxsetinfo = str ? strtoul(str, NULL, 0) : chanserv_conf.max_userinfo_length;
@@ -11400,11 +11400,11 @@ static void
 adduser_async_ctx_free(struct adduser_async_ctx *ctx)
 {
     if (!ctx) return;
-    if (ctx->channel) free(ctx->channel);
-    if (ctx->username) free(ctx->username);
-    if (ctx->user_id) free(ctx->user_id);
-    if (ctx->group_id) free(ctx->group_id);
-    if (ctx->parent_id) free(ctx->parent_id);
+    if (ctx->channel) pool_strfree(ctx->channel);
+    if (ctx->username) pool_strfree(ctx->username);
+    if (ctx->user_id) pool_strfree(ctx->user_id);
+    if (ctx->group_id) pool_strfree(ctx->group_id);
+    if (ctx->parent_id) pool_strfree(ctx->parent_id);
     /* Note: realm and client are borrowed pointers, don't free */
     free(ctx);
 }
@@ -11473,7 +11473,7 @@ adduser_lookup_user_cb(void *session, int result, struct kc_user *user)
     }
 
     /* Save user ID */
-    ctx->user_id = strdup(user->id);
+    ctx->user_id = pool_strdup(user->id);
     keycloak_user_free_fields(user);
 
     if (!ctx->user_id) {
@@ -11818,8 +11818,8 @@ chanserv_push_keycloak_access_async(const char *channel, const char *username,
         return -1;
     }
 
-    ctx->channel = strdup(channel);
-    ctx->username = strdup(username);
+    ctx->channel = pool_strdup(channel);
+    ctx->username = pool_strdup(username);
     ctx->access = access;
     ctx->state = ADDUSER_TOKEN_WAIT;
     ctx->started = now;

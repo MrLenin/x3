@@ -711,7 +711,7 @@ register_handle(const char *handle, const char *passwd, UNUSED_ARG(unsigned long
     hi = calloc(1, sizeof(*hi));
     hi->userlist_style = nickserv_conf.default_style ? nickserv_conf.default_style : HI_DEFAULT_STYLE;
     hi->announcements = '?';
-    hi->handle = strdup(handle);
+    hi->handle = pool_strdup(handle);
     safestrncpy(hi->passwd, passwd, sizeof(hi->passwd));
     hi->infoline = NULL;
     dict_insert(nickserv_handle_dict, hi->handle, hi);
@@ -785,7 +785,7 @@ nickserv_free_cookie(void *data)
 {
     struct handle_cookie *cookie = data;
     if (cookie->hi) cookie->hi->cookie = NULL;
-    if (cookie->data) free(cookie->data);
+    if (cookie->data) pool_strfree(cookie->data);
     free(cookie);
 }
 
@@ -801,10 +801,10 @@ free_handle_info(void *vhi)
 
     while (hi->nicks)
         delete_nick(hi->nicks);
-    free(hi->infoline);
-    free(hi->epithet);
-    free(hi->note);
-    free(hi->fakehost);
+    pool_strfree(hi->infoline);
+    pool_strfree(hi->epithet);
+    pool_strfree(hi->note);
+    pool_strfree(hi->fakehost);
     if (hi->cookie) {
         timeq_del(hi->cookie->expires, nickserv_free_cookie, hi->cookie, 0);
         nickserv_free_cookie(hi->cookie);
@@ -1556,7 +1556,7 @@ nickserv_make_cookie(struct userNode *user, struct handle_info *hi, enum cookie_
     cookie = calloc(1, sizeof(*cookie));
     cookie->hi = hi;
     cookie->type = type;
-    cookie->data = cookie_data ? strdup(cookie_data) : NULL;
+    cookie->data = cookie_data ? pool_strdup(cookie_data) : NULL;
 
     cookie->expires = now + nickserv_conf.cookie_timeout;
     /* Adding dedicated password gen function for more control -Rubin */
@@ -1668,7 +1668,7 @@ nickserv_set_email_addr(struct handle_info *hi, const char *new_email_addr)
     if (new_email_addr) {
         if (!(hil = dict_find(nickserv_email_dict, new_email_addr, 0))) {
             hil = calloc(1, sizeof(*hil));
-            hil->tag = strdup(new_email_addr);
+            hil->tag = pool_strdup(new_email_addr);
             handle_info_list_init(hil);
             dict_insert(nickserv_email_dict, hil->tag, hil);
         }
@@ -1777,7 +1777,7 @@ static NICKSERV_FUNC(cmd_register)
         return 0;
     /* Add any masks they should get. */
     if (nickserv_conf.default_hostmask) {
-        string_list_append(hi->masks, strdup("*@*"));
+        string_list_append(hi->masks, pool_strdup("*@*"));
     } else {
         string_list_append(hi->masks, generate_hostmask(user, GENMASK_OMITNICK|GENMASK_NO_HIDING|GENMASK_ANY_IDENT));
         if (irc_in_addr_is_valid(user->ip) && !irc_pton(&ip, NULL, user->hostname))
@@ -1932,7 +1932,7 @@ static NICKSERV_FUNC(cmd_oregister)
 #endif
     }
     if (mask) {
-        char* mask_canonicalized = canonicalize_hostmask(strdup(mask));
+        char* mask_canonicalized = canonicalize_hostmask(pool_strdup(mask));
         if (mask_canonicalized)
             string_list_append(hi->masks, mask_canonicalized);
     }
@@ -1949,11 +1949,11 @@ nickserv_ignore(struct svccmd *cmd, struct userNode *user, struct handle_info *h
 {
     unsigned int i;
     struct userNode *target;
-    char *new_mask = strdup(pretty_mask(mask));
+    char *new_mask = pool_strdup(pretty_mask(mask));
     for (i=0; i<hi->ignores->used; i++) {
         if (!irccasecmp(new_mask, hi->ignores->list[i])) {
             reply("NSMSG_ADDIGNORE_ALREADY", new_mask);
-            free(new_mask);
+            pool_strfree(new_mask);
             return 0;
         }
     }
@@ -1989,7 +1989,7 @@ nickserv_delignore(struct svccmd *cmd, struct userNode *user, struct handle_info
 {
     unsigned int i;
     struct userNode *target;
-    char *pmask = strdup(pretty_mask(del_mask));
+    char *pmask = pool_strdup(pretty_mask(del_mask));
     for (i=0; i<hi->ignores->used; i++) {
 	if (!strcmp(pmask, hi->ignores->list[i]) || !strcmp(del_mask, hi->ignores->list[i])) {
 	    char *old_mask = hi->ignores->list[i];
@@ -1998,8 +1998,8 @@ nickserv_delignore(struct svccmd *cmd, struct userNode *user, struct handle_info
             for (target = hi->users; target; target = target->next_authed) {
                 irc_silence(target, old_mask, 0);
             }
-	    free(old_mask);
-            free(pmask);
+	    pool_strfree(old_mask);
+            pool_strfree(pmask);
 	    return 1;
 	}
     }
@@ -2393,7 +2393,7 @@ static NICKSERV_FUNC(cmd_rename_handle)
 #endif
 
     dict_remove2(nickserv_handle_dict, old_handle = hi->handle, 1);
-    hi->handle = strdup(argv[2]);
+    hi->handle = pool_strdup(argv[2]);
     dict_insert(nickserv_handle_dict, hi->handle, hi);
     for (nn=0; nn<rf_list_used; nn++)
         rf_list[nn](hi, old_handle, rf_list_extra[nn]);
@@ -2409,7 +2409,7 @@ static NICKSERV_FUNC(cmd_rename_handle)
     global_message_args(MESSAGE_RECIPIENT_OPERS, "NSMSG_ACCOUNT_RENAMED",
                         user->handle_info->handle, old_handle, hi->handle);
 
-    free(old_handle);
+    pool_strfree(old_handle);
     return 1;
 }
 
@@ -2529,7 +2529,7 @@ struct handle_info *loc_auth(char *sslfp, char *handle, char *password, char *us
                free(email);
             }
             if(mask) {
-               char* mask_canonicalized = canonicalize_hostmask(strdup(mask));
+               char* mask_canonicalized = canonicalize_hostmask(pool_strdup(mask));
                string_list_append(hi->masks, mask_canonicalized);
             }
             if(nickserv_conf.sync_log)
@@ -2574,7 +2574,7 @@ struct handle_info *loc_auth(char *sslfp, char *handle, char *password, char *us
                 free(kc_email);
             }
             if (mask) {
-                char *mask_canonicalized = canonicalize_hostmask(strdup(mask));
+                char *mask_canonicalized = canonicalize_hostmask(pool_strdup(mask));
                 string_list_append(hi->masks, mask_canonicalized);
             }
             if (nickserv_conf.sync_log)
@@ -2626,7 +2626,7 @@ struct handle_info *loc_auth(char *sslfp, char *handle, char *password, char *us
         char *c;
         int bracket = 0;
 
-        buf = strdup(userhost);
+        buf = pool_strdup(userhost);
 
         ident = buf;
         for (c = buf; *c; c++) {
@@ -2650,7 +2650,7 @@ struct handle_info *loc_auth(char *sslfp, char *handle, char *password, char *us
         if(!ip || !realhost || !ident) {
             log_module(NS_LOG, LOG_DEBUG, "LOC: Invalid AC request (ident=%s host=%s ip=%s)",
                        ident ? ident : "(null)", realhost ? realhost : "(null)", ip ? ip : "(null)");
-            free(buf);
+            pool_strfree(buf);
             return NULL; /* Invalid AC request, just quit */
         }
         log_module(NS_LOG, LOG_DEBUG, "LOC: ident=%s host=%s ip=%s", ident, realhost, ip);
@@ -2667,7 +2667,7 @@ struct handle_info *loc_auth(char *sslfp, char *handle, char *password, char *us
                 break;
             }
         }
-        free(buf);
+        pool_strfree(buf);
         free(uh);
         free(ui);
     }
@@ -2996,7 +2996,7 @@ static NICKSERV_FUNC(cmd_auth)
                 mask = generate_hostmask(user, GENMASK_OMITNICK|GENMASK_NO_HIDING|GENMASK_ANY_IDENT);
 
              if(mask) {
-                char* mask_canonicalized = canonicalize_hostmask(strdup(mask));
+                char* mask_canonicalized = canonicalize_hostmask(pool_strdup(mask));
                 string_list_append(hi->masks, mask_canonicalized);
              }
              if(email) {
@@ -3025,7 +3025,7 @@ static NICKSERV_FUNC(cmd_auth)
                 mask = generate_hostmask(user, GENMASK_OMITNICK|GENMASK_NO_HIDING|GENMASK_ANY_IDENT);
 
             if (mask) {
-                char *mask_canonicalized = canonicalize_hostmask(strdup(mask));
+                char *mask_canonicalized = canonicalize_hostmask(pool_strdup(mask));
                 string_list_append(hi->masks, mask_canonicalized);
             }
             if (kc_email) {
@@ -3462,8 +3462,8 @@ static NICKSERV_FUNC(cmd_cookie)
                     safestrncpy(cookie_ctx->numeric, user->numeric, sizeof(cookie_ctx->numeric));
                     cookie_ctx->user = user;
                     cookie_ctx->hi = hi;
-                    cookie_ctx->password_hash = strdup(hi->cookie->data);
-                    cookie_ctx->plaintext_password = strdup(password);
+                    cookie_ctx->password_hash = pool_strdup(hi->cookie->data);
+                    cookie_ctx->plaintext_password = pool_strdup(password);
                     cookie_ctx->state = COOKIE_STATE_TOKEN_WAIT;
                     cookie_ctx->cookie_type = ACTIVATION;
                     cookie_ctx->started = now;
@@ -3530,8 +3530,8 @@ static NICKSERV_FUNC(cmd_cookie)
                     safestrncpy(cookie_ctx->numeric, user->numeric, sizeof(cookie_ctx->numeric));
                     cookie_ctx->user = user;
                     cookie_ctx->hi = hi;
-                    cookie_ctx->password_hash = strdup(hi->cookie->data);
-                    cookie_ctx->plaintext_password = pw_for_scram ? strdup(pw_for_scram) : NULL;
+                    cookie_ctx->password_hash = pool_strdup(hi->cookie->data);
+                    cookie_ctx->plaintext_password = pw_for_scram ? pool_strdup(pw_for_scram) : NULL;
                     cookie_ctx->state = COOKIE_STATE_TOKEN_WAIT;
                     cookie_ctx->cookie_type = PASSWORD_CHANGE;
                     cookie_ctx->started = now;
@@ -3760,11 +3760,11 @@ static int
 nickserv_addmask(struct userNode *user, struct handle_info *hi, const char *mask)
 {
     unsigned int i;
-    char *new_mask = canonicalize_hostmask(strdup(mask));
+    char *new_mask = canonicalize_hostmask(pool_strdup(mask));
     for (i=0; i<hi->masks->used; i++) {
         if (!irccasecmp(new_mask, hi->masks->list[i])) {
             send_message(user, nickserv, "NSMSG_ADDMASK_ALREADY", new_mask);
-            free(new_mask);
+            pool_strfree(new_mask);
             return 0;
         }
     }
@@ -3812,7 +3812,7 @@ nickserv_delmask(struct svccmd *cmd, struct userNode *user, struct handle_info *
 	    }
 	    hi->masks->list[i] = hi->masks->list[--hi->masks->used];
 	    reply("NSMSG_DELMASK_SUCCESS", old_mask);
-	    free(old_mask);
+	    pool_strfree(old_mask);
 	    return 1;
 	}
     }
@@ -3848,10 +3848,10 @@ nickserv_addsslfp_silent(struct handle_info *hi, const char *sslfp)
     if (!hi || !sslfp || !sslfp[0])
         return 0;
 
-    char *new_sslfp = strdup(sslfp);
+    char *new_sslfp = pool_strdup(sslfp);
     for (i = 0; i < hi->sslfps->used; i++) {
         if (!irccasecmp(new_sslfp, hi->sslfps->list[i])) {
-            free(new_sslfp);
+            pool_strfree(new_sslfp);
             return 0;  /* Already exists */
         }
     }
@@ -3876,11 +3876,11 @@ static int
 nickserv_addsslfp(struct userNode *user, struct handle_info *hi, const char *sslfp)
 {
     unsigned int i;
-    char *new_sslfp = strdup(sslfp);
+    char *new_sslfp = pool_strdup(sslfp);
     for (i=0; i<hi->sslfps->used; i++) {
         if (!irccasecmp(new_sslfp, hi->sslfps->list[i])) {
             send_message(user, nickserv, "NSMSG_ADDSSLFP_ALREADY", new_sslfp);
-            free(new_sslfp);
+            pool_strfree(new_sslfp);
             return 0;
         }
     }
@@ -3941,7 +3941,7 @@ nickserv_delsslfp(struct svccmd *cmd, struct userNode *user, struct handle_info 
 #endif
 
             reply("NSMSG_DELSSLFP_SUCCESS", old_sslfp);
-            free(old_sslfp);
+            pool_strfree(old_sslfp);
             return 1;
         }
     }
@@ -4220,10 +4220,10 @@ static OPTION_FUNC(opt_info)
     const char *info;
     if (argc > 1) {
 	if ((argv[1][0] == '*') && (argv[1][1] == 0)) {
-            free(hi->infoline);
+            pool_strfree(hi->infoline);
             hi->infoline = NULL;
 	} else {
-	    hi->infoline = strdup(unsplit_string(argv+1, argc-1, NULL));
+	    hi->infoline = pool_strdup(unsplit_string(argv+1, argc-1, NULL));
 	}
     }
 
@@ -4711,11 +4711,11 @@ static OPTION_FUNC(opt_epithet)
         epithet = unsplit_string(argv+1, argc-1, NULL);
 
         if (hi->epithet)
-            free(hi->epithet);
+            pool_strfree(hi->epithet);
         if ((epithet[0] == '*') && !epithet[1])
             hi->epithet = NULL;
         else
-            hi->epithet = strdup(epithet);
+            hi->epithet = pool_strdup(epithet);
 
         for (target = hi->users; target; target = next_un) {
           irc_swhois(nickserv, target, hi->epithet);
@@ -4748,7 +4748,7 @@ static OPTION_FUNC(opt_title)
 
         title = argv[1];
         if(!strcmp(title, "*")) {
-            free(hi->fakehost);
+            pool_strfree(hi->fakehost);
             hi->fakehost = NULL;
         }
         else {
@@ -4771,7 +4771,7 @@ static OPTION_FUNC(opt_title)
                     reply("NSMSG_TITLE_TRUNCATED");
                 return 0;
             }
-            free(hi->fakehost);
+            pool_strfree(hi->fakehost);
             hi->fakehost = malloc(strlen(title)+2);
             if (!hi->fakehost) {
                 log_module(NS_LOG, LOG_ERROR, "malloc failed in SET TITLE");
@@ -4791,7 +4791,7 @@ static OPTION_FUNC(opt_title)
         char *hs, *hidden_suffix, *rest;
 
         hs = conf_get_data("server/hidden_host", RECDB_QSTRING);
-        hidden_suffix = strdup(hs);
+        hidden_suffix = pool_strdup(hs);
 
         /* Yes we do this twice */
         if((rest = strchr(hidden_suffix, '.')))
@@ -4802,8 +4802,8 @@ static OPTION_FUNC(opt_title)
         else
         {
             /* A lame default if someone configured hidden_host to something lame */
-            title = strdup("users");
-            free(hidden_suffix);
+            title = pool_strdup("users");
+            pool_strfree(hidden_suffix);
         }
 
     }
@@ -4898,7 +4898,7 @@ static OPTION_FUNC(opt_fakehost)
         }
         if (!strcmp(fake, "*")) {
             if(hi->fakehost) {
-                free(hi->fakehost);
+                pool_strfree(hi->fakehost);
                 hi->fakehost = NULL;
             }
         } 
@@ -4908,8 +4908,8 @@ static OPTION_FUNC(opt_fakehost)
         }
         else {
             if(hi->fakehost)
-                free(hi->fakehost);
-            hi->fakehost = strdup(fake);
+                pool_strfree(hi->fakehost);
+            hi->fakehost = pool_strdup(fake);
         }
         apply_fakehost(hi);
         fake = hi->fakehost;
@@ -4936,7 +4936,7 @@ static OPTION_FUNC(opt_note)
         char *text = unsplit_string(argv + 1, argc - 1, NULL);
 
         if (hi->note)
-            free(hi->note);
+            pool_strfree(hi->note);
 
         if ((text[0] == '*') && !text[1])
             hi->note = NULL;
@@ -5294,7 +5294,7 @@ static NICKSERV_FUNC(cmd_merge)
             if (match_ircglobs(hi_to->masks->list[jj], mask))
                 break;
         if (jj==hi_to->masks->used) /* Nothing from the "to" handle covered this mask, so add it. */
-            string_list_append(hi_to->masks, strdup(mask));
+            string_list_append(hi_to->masks, pool_strdup(mask));
     }
 
     /* Merge the SSL fingerprints. */
@@ -5304,7 +5304,7 @@ static NICKSERV_FUNC(cmd_merge)
             if (!irccasecmp(hi_to->sslfps->list[jj], sslfp))
                 break;
         if (jj==hi_to->sslfps->used) /* Nothing from the "to" handle covered this sslfp, so add it. */
-            string_list_append(hi_to->sslfps, strdup(sslfp));
+            string_list_append(hi_to->sslfps, pool_strdup(sslfp));
     }
 
     /* Merge the ignores. */
@@ -5314,7 +5314,7 @@ static NICKSERV_FUNC(cmd_merge)
             if (match_ircglobs(hi_to->ignores->list[jj], ignore))
                 break;
         if (jj==hi_to->ignores->used) /* Nothing from the "to" handle covered this mask, so add it. */
-            string_list_append(hi_to->ignores, strdup(ignore));
+            string_list_append(hi_to->ignores, pool_strdup(ignore));
     }
 
     /* Merge the lists of authed users. */
@@ -5381,7 +5381,7 @@ static NICKSERV_FUNC(cmd_merge)
      * reconnect.)
      */
     if (hi_from->fakehost && !hi_to->fakehost)
-        hi_to->fakehost = strdup(hi_from->fakehost);
+        hi_to->fakehost = pool_strdup(hi_from->fakehost);
 
     /* Notify of success. */
     reply("NSMSG_HANDLES_MERGED", hi_from->handle, hi_to->handle);
@@ -5921,7 +5921,7 @@ nickserv_db_read_handle(char *handle, dict_t obj)
     hi->opserv_level = str ? strtoul(str, NULL, 0) : 0;
     str = database_get_data(obj, KEY_INFO, RECDB_QSTRING);
     if (str)
-        hi->infoline = strdup(str);
+        hi->infoline = pool_strdup(str);
     str = database_get_data(obj, KEY_REGISTER_ON, RECDB_QSTRING);
     hi->registered = str ? (time_t)strtoul(str, NULL, 0) : now;
     str = database_get_data(obj, KEY_LAST_SEEN, RECDB_QSTRING);
@@ -5989,7 +5989,7 @@ nickserv_db_read_handle(char *handle, dict_t obj)
         nickserv_set_email_addr(hi, str);
     str = database_get_data(obj, KEY_EPITHET, RECDB_QSTRING);
     if (str)
-        hi->epithet = strdup(str);
+        hi->epithet = pool_strdup(str);
     subdb = database_get_data(obj, KEY_NOTE_NOTE, RECDB_OBJECT);
     if (subdb) {
         setter = database_get_data(subdb, KEY_NOTE_SETTER, RECDB_QSTRING);
@@ -6005,7 +6005,7 @@ nickserv_db_read_handle(char *handle, dict_t obj)
 
     str = database_get_data(obj, KEY_FAKEHOST, RECDB_QSTRING);
     if (str)
-        hi->fakehost = strdup(str);
+        hi->fakehost = pool_strdup(str);
 
     subdb = database_get_data(obj, KEY_COOKIE, RECDB_OBJECT);
     if (subdb) {
@@ -6037,7 +6037,7 @@ nickserv_db_read_handle(char *handle, dict_t obj)
         if (cookie->expires < now)
             goto cookie_out;
         if (data)
-            cookie->data = strdup(data);
+            cookie->data = pool_strdup(data);
         safestrncpy(cookie->cookie, cookie_str, sizeof(cookie->cookie));
         cookie->hi = hi;
       cookie_out:
@@ -6107,7 +6107,7 @@ nickserv_saxdb_read(dict_t db) {
 
     for (it=dict_first(db); it; it=iter_next(it)) {
         rd = iter_data(it);
-        handle = strdup(iter_key(it));
+        handle = pool_strdup(iter_key(it));
         nickserv_db_read_handle(handle, rd->d.object);
         free(handle);
     }
@@ -6231,7 +6231,7 @@ nickserv_load_dict(const char *fname)
             continue;
         if (line[strlen(line)-1] == '\n')
             line[strlen(line)-1] = 0;
-        dict_insert(nickserv_conf.weak_password_dict, strdup(line), NULL);
+        dict_insert(nickserv_conf.weak_password_dict, pool_strdup(line), NULL);
     }
     fclose(file);
     log_module(NS_LOG, LOG_INFO, "Loaded %d words into weak password dictionary.", dict_size(nickserv_conf.weak_password_dict));
@@ -6362,7 +6362,7 @@ auth_async_complete(struct auth_async_ctx *ctx)
         else
             mask = generate_hostmask(user, GENMASK_OMITNICK|GENMASK_NO_HIDING|GENMASK_ANY_IDENT);
         if (mask) {
-            char *mask_canonicalized = canonicalize_hostmask(strdup(mask));
+            char *mask_canonicalized = canonicalize_hostmask(pool_strdup(mask));
             string_list_append(hi->masks, mask_canonicalized);
         }
         if (ctx->kc_email) {
@@ -6476,7 +6476,7 @@ auth_async_email_cb(void *session, int result, struct kc_user *user)
     }
 
     if (result == KC_SUCCESS && user && user->email) {
-        ctx->kc_email = strdup(user->email);
+        ctx->kc_email = pool_strdup(user->email);
         log_module(NS_LOG, LOG_DEBUG, "AUTH async email_cb: Got email for %s", ctx->handle);
     } else {
         log_module(NS_LOG, LOG_DEBUG, "AUTH async email_cb: No email for %s (result=%d)", ctx->handle, result);
@@ -6589,10 +6589,10 @@ cookie_async_ctx_free(struct cookie_async_ctx *ctx)
 {
     if (!ctx) return;
     if (ctx->user_id) free(ctx->user_id);
-    if (ctx->password_hash) free(ctx->password_hash);
+    if (ctx->password_hash) pool_strfree(ctx->password_hash);
     if (ctx->plaintext_password) {
         memset(ctx->plaintext_password, 0, strlen(ctx->plaintext_password));
-        free(ctx->plaintext_password);
+        pool_strfree(ctx->plaintext_password);
     }
     free(ctx);
 }
@@ -6684,7 +6684,7 @@ cookie_async_lookup_callback(void *session, int result, struct kc_user *kc_user)
         cookie_async_ctx_free(ctx);
         return 0;
     }
-    ctx->user_id = strdup(kc_user->id);
+    ctx->user_id = pool_strdup(kc_user->id);
 
     /* Free the user struct fields (we only needed the ID) */
     keycloak_user_free_fields(kc_user);
@@ -6831,7 +6831,7 @@ kc_get_user_info(const char *handle, char **email_out)
     int rc = keycloak_get_user(keycloak_get_realm(), keycloak_get_authed_client(), handle, &user);
     if (rc == KC_SUCCESS) {
         if (user.email) {
-            *email_out = strdup(user.email);
+            *email_out = pool_strdup(user.email);
         }
         keycloak_user_free_fields(&user);
         return KC_SUCCESS;
@@ -6957,15 +6957,15 @@ kc_do_add(const char *handle, const char *hash, const char *email)
     safestrncpy(ctx->handle, handle, sizeof(ctx->handle));
 
     if (email) {
-        ctx->email = strdup(email);
+        ctx->email = pool_strdup(email);
     }
 
     /* Convert hash to Keycloak format if provided */
     if (hash) {
         if (pw_export_keycloak(hash, cred_data, sizeof(cred_data),
                                secret_data, sizeof(secret_data)) == 0) {
-            ctx->cred_data = strdup(cred_data);
-            ctx->secret_data = strdup(secret_data);
+            ctx->cred_data = pool_strdup(cred_data);
+            ctx->secret_data = pool_strdup(secret_data);
             /* Clear stack buffers */
             memset(cred_data, 0, sizeof(cred_data));
             memset(secret_data, 0, sizeof(secret_data));
@@ -7093,7 +7093,7 @@ kc_modify_user_cb(void *session, int result, struct kc_user *user)
     }
 
     /* Store user_id */
-    ctx->user_id = strdup(user->id);
+    ctx->user_id = pool_strdup(user->id);
     keycloak_user_free_fields(user);
 
     /* Build update struct */
@@ -7188,15 +7188,15 @@ kc_do_modify(const char *handle, const char *hash, const char *email)
     safestrncpy(ctx->handle, handle, sizeof(ctx->handle));
 
     if (email) {
-        ctx->email = strdup(email);
+        ctx->email = pool_strdup(email);
     }
 
     /* Convert hash to Keycloak format if provided */
     if (hash) {
         if (pw_export_keycloak(hash, cred_data, sizeof(cred_data),
                                secret_data, sizeof(secret_data)) == 0) {
-            ctx->cred_data = strdup(cred_data);
-            ctx->secret_data = strdup(secret_data);
+            ctx->cred_data = pool_strdup(cred_data);
+            ctx->secret_data = pool_strdup(secret_data);
             /* Clear stack buffers */
             memset(cred_data, 0, sizeof(cred_data));
             memset(secret_data, 0, sizeof(secret_data));
@@ -7316,7 +7316,7 @@ static int kc_scram_sync_user_cb(void *session, int result, struct kc_user *user
         return 0;
     }
 
-    ctx->user_id = strdup(user->id);
+    ctx->user_id = pool_strdup(user->id);
     keycloak_user_free_fields(user);
 
     /* Start setting attributes */
@@ -7882,7 +7882,7 @@ kc_fingerprints_user_cb(void *session, int result, struct kc_user *user)
     }
 
     /* Store user_id for logging */
-    ctx->user_id = strdup(user->id);
+    ctx->user_id = pool_strdup(user->id);
 
     /* Look up current handle_info to get latest fingerprints */
     hi = get_handle_info(ctx->handle);
@@ -8278,7 +8278,7 @@ kc_group_user_cb(void *session, int result, struct kc_user *user)
     }
 
     /* Save user_id for next callback */
-    ctx->user_id = strdup(user->id);
+    ctx->user_id = pool_strdup(user->id);
     keycloak_user_free_fields(user);
 
     if (!ctx->user_id) {
@@ -8357,7 +8357,7 @@ kc_add2group(const char *handle, const char *group_name)
         return;
     }
     safestrncpy(ctx->handle, handle, sizeof(ctx->handle));
-    ctx->group_name = strdup(group_name);
+    ctx->group_name = pool_strdup(group_name);
     ctx->is_add = 1;
 
     if (!ctx->group_name) {
@@ -8398,7 +8398,7 @@ kc_delfromgroup(const char *handle, const char *group_name)
         return;
     }
     safestrncpy(ctx->handle, handle, sizeof(ctx->handle));
-    ctx->group_name = strdup(group_name);
+    ctx->group_name = pool_strdup(group_name);
     ctx->is_add = 0;
 
     if (!ctx->group_name) {
@@ -8607,7 +8607,7 @@ loc_auth_oauth(const char *bearer_token, const char *username_hint, const char *
 
         /* Get email from token or Keycloak */
         if (token_info->email && *token_info->email) {
-            email = strdup(token_info->email);
+            email = pool_strdup(token_info->email);
         } else {
             kc_get_user_info(username, &email);
         }
@@ -8643,7 +8643,7 @@ loc_auth_oauth(const char *bearer_token, const char *username_hint, const char *
             mask = NULL;
 
         if (mask) {
-            char *mask_canonicalized = canonicalize_hostmask(strdup(mask));
+            char *mask_canonicalized = canonicalize_hostmask(pool_strdup(mask));
             string_list_append(hi->masks, mask_canonicalized);
         }
 
@@ -8863,12 +8863,12 @@ loc_auth_external(const char *fingerprint, const char *authzid, const char *host
                     mask = NULL;
 
                 if (mask) {
-                    char *mask_canonicalized = canonicalize_hostmask(strdup(mask));
+                    char *mask_canonicalized = canonicalize_hostmask(pool_strdup(mask));
                     string_list_append(hi->masks, mask_canonicalized);
                 }
 
                 /* Store the fingerprint locally too */
-                string_list_append(hi->sslfps, strdup(fingerprint));
+                string_list_append(hi->sslfps, pool_strdup(fingerprint));
 
                 if (email) {
                     nickserv_set_email_addr(hi, email);
@@ -9162,7 +9162,7 @@ nickserv_set_user_metadata(struct handle_info *hi, const char *key, const char *
             kc_ctx->attr_name = malloc(128);
             if (kc_ctx->attr_name) {
                 snprintf(kc_ctx->attr_name, 128, "metadata.%s", key);
-                kc_ctx->attr_value = strdup((value && *value) ? stored_value : "");
+                kc_ctx->attr_value = pool_strdup((value && *value) ? stored_value : "");
                 if (kc_ctx->attr_value) {
                     int kc_rc = keycloak_ensure_token_async(kc_metadata_token_cb, kc_ctx);
                     if (kc_rc >= 0) {
@@ -9290,7 +9290,7 @@ mdq_single_user_cb(void *session, int result, struct kc_user *user)
     }
 
     /* Store user ID for stage 3 */
-    ctx->user_id = strdup(user->id);
+    ctx->user_id = pool_strdup(user->id);
     keycloak_user_free_fields(user);
 
     if (!ctx->user_id) {
@@ -9645,7 +9645,7 @@ metadata_sync_user_cb(void *session, int result, struct kc_user *user)
     }
 
     /* Store user ID for stage 3 */
-    ctx->user_id = strdup(user->id);
+    ctx->user_id = pool_strdup(user->id);
     keycloak_user_free_fields(user);
 
     if (!ctx->user_id) {
@@ -9795,7 +9795,7 @@ nickserv_get_webpush_subscriptions(const char *account_name,
             return -1;
         }
 
-        char *user_id = strdup(kc_user.id);
+        char *user_id = pool_strdup(kc_user.id);
         keycloak_user_free_fields(&kc_user);
 
         /* Fetch all webpush.* attributes */
@@ -9866,7 +9866,7 @@ webpush_subs_user_cb(void *session, int result, struct kc_user *user)
     }
 
     /* Store user ID for stage 3 */
-    ctx->user_id = strdup(user->id);
+    ctx->user_id = pool_strdup(user->id);
     keycloak_user_free_fields(user);
 
     if (!ctx->user_id) {
@@ -10154,8 +10154,8 @@ nickserv_conf_read(void)
         dict_delete(nickserv_conf.weak_password_dict);
     nickserv_conf.weak_password_dict = dict_new();
     dict_set_free_keys(nickserv_conf.weak_password_dict, free);
-    dict_insert(nickserv_conf.weak_password_dict, strdup("password"), NULL);
-    dict_insert(nickserv_conf.weak_password_dict, strdup("<password>"), NULL);
+    dict_insert(nickserv_conf.weak_password_dict, pool_strdup("password"), NULL);
+    dict_insert(nickserv_conf.weak_password_dict, pool_strdup("<password>"), NULL);
     str = database_get_data(conf_node, KEY_DICT_FILE, RECDB_QSTRING);
     if (str)
         nickserv_load_dict(str);
@@ -10189,8 +10189,8 @@ nickserv_conf_read(void)
         strlist = string_list_copy(strlist);
     else {
         strlist = alloc_string_list(4);
-        string_list_append(strlist, strdup("sex"));
-        string_list_append(strlist, strdup("fuck"));
+        string_list_append(strlist, pool_strdup("sex"));
+        string_list_append(strlist, pool_strdup("fuck"));
     }
     nickserv_conf.denied_fakehost_words = strlist;
 
@@ -10299,7 +10299,7 @@ nickserv_conf_read(void)
         strlist = string_list_copy(strlist);
     else {
         strlist = alloc_string_list(4);
-        string_list_append(strlist, strdup("top"));
+        string_list_append(strlist, pool_strdup("top"));
     }
     nickserv_conf.ldap_object_classes = strlist;
 
@@ -10592,7 +10592,7 @@ ctime(&hi->registered));
                 mask = generate_hostmask(user, GENMASK_OMITNICK|GENMASK_NO_HIDING|GENMASK_ANY_IDENT);
 
             if(mask) {
-                char* mask_canonicalized = canonicalize_hostmask(strdup(mask));
+                char* mask_canonicalized = canonicalize_hostmask(pool_strdup(mask));
                 string_list_append(hi->masks, mask_canonicalized);
             }
 
@@ -10738,7 +10738,7 @@ static void pending_scram_store(const char *account, const char *password) {
     if (entry) {
         safestrncpy(entry->password, password, sizeof(entry->password));
         entry->created = now;
-        dict_insert(pending_scram_dict, strdup(account_lower), entry);
+        dict_insert(pending_scram_dict, pool_strdup(account_lower), entry);
     }
 }
 
@@ -11681,7 +11681,7 @@ scram_fetch_user_cb(void *session, int result, struct kc_user *user)
     }
 
     /* Store user ID for attributes fetch */
-    ctx->user_id = strdup(user->id);
+    ctx->user_id = pool_strdup(user->id);
     keycloak_user_free_fields(user);
 
     if (!ctx->user_id) {
@@ -12499,7 +12499,7 @@ sasl_async_fingerprint_callback(void *ctx_ptr, int result, char *username)
                     hi->ignores = alloc_string_list(1);
                     /* Add fingerprint */
                     if (session->sslclifp)
-                        string_list_append(hi->sslfps, strdup(session->sslclifp));
+                        string_list_append(hi->sslfps, pool_strdup(session->sslclifp));
                 } else {
                     log_module(NS_LOG, LOG_ERROR, "SASL EXTERNAL: Failed to auto-create account for %s (register_handle returned NULL)", username);
                 }
@@ -12738,7 +12738,7 @@ sasl_packet(struct SASLSession *session)
 
             /* Store authzid for callback */
             if (authzid && *authzid)
-                session->authzid = strdup(authzid);
+                session->authzid = pool_strdup(authzid);
             session->state = SASL_STATE_AUTHENTICATING;
 
             /* Create async context before the call so we can free it on error */
@@ -12950,7 +12950,7 @@ sasl_packet(struct SASLSession *session)
 
             /* Store authzid as username hint for callback */
             if (authzid && *authzid)
-                session->authzid = strdup(authzid);
+                session->authzid = pool_strdup(authzid);
             session->state = SASL_STATE_AUTHENTICATING;
 
             if (keycloak_introspect_token_async(keycloak_get_realm(), keycloak_get_authed_client(),
@@ -13475,9 +13475,9 @@ sasl_packet(struct SASLSession *session)
 #endif
 
             /* Store credentials for callback */
-            session->authcid = strdup(authcid);
+            session->authcid = pool_strdup(authcid);
             if (authzid && *authzid)
-                session->authzid = strdup(authzid);
+                session->authzid = pool_strdup(authzid);
             session->state = SASL_STATE_AUTHENTICATING;
 
             /* Start async auth - returns immediately */
@@ -13627,7 +13627,7 @@ handle_sasl_input(struct server* source ,const char *uid, const char *subcmd, co
 
     if (!strcmp(subcmd, "H")) {
        log_module(NS_LOG, LOG_DEBUG, "SASL: Storing host mask %s", data);
-       sess->hostmask = strdup(data);
+       sess->hostmask = pool_strdup(data);
        return ;
     }
 
@@ -13727,7 +13727,7 @@ handle_sasl_input(struct server* source ,const char *uid, const char *subcmd, co
     sess->buf[sess->buflen] = '\0';
 
     if (ext != NULL)
-        sess->sslclifp = strdup(ext);
+        sess->sslclifp = pool_strdup(ext);
 
     /* Messages not exactly 400 bytes are the end of a packet. */
     if(len < 400)
@@ -13787,7 +13787,7 @@ static void handle_loc_auth_oper(struct userNode *user, UNUSED_ARG(struct handle
         if (*nickserv_conf.auto_admin && user->handle_info->opserv_level >= opserv_conf_admin_level()) {
             if (nickserv_conf.auto_admin_privs[0]) {
                 irc_raw_privs(user, nickserv_conf.auto_admin_privs);
-                privc = split_line(strdup(nickserv_conf.auto_admin_privs), false, MAXNUMPARAMS, privv);
+                privc = split_line(pool_strdup(nickserv_conf.auto_admin_privs), false, MAXNUMPARAMS, privv);
                 for (i = 0; i < privc; i++) {
                     client_modify_priv_by_name(user, privv[i], 1);
                 }
@@ -13799,7 +13799,7 @@ static void handle_loc_auth_oper(struct userNode *user, UNUSED_ARG(struct handle
         } else if (*nickserv_conf.auto_oper && user->handle_info->opserv_level) {
             if (nickserv_conf.auto_oper_privs[0]) {
                 irc_raw_privs(user, nickserv_conf.auto_oper_privs);
-                privc = split_line(strdup(nickserv_conf.auto_oper_privs), false, MAXNUMPARAMS, privv);
+                privc = split_line(pool_strdup(nickserv_conf.auto_oper_privs), false, MAXNUMPARAMS, privv);
                 for (i = 0; i < privc; i++) {
                     client_modify_priv_by_name(user, privv[i], 1);
                 }

@@ -23,6 +23,7 @@
 
 #include "common.h"
 #include "dict.h"
+#include "mempool.h"
 
 enum recdb_type {
     RECDB_INVALID,
@@ -41,7 +42,7 @@ struct record_data {
     } d;
 };
 
-#define SET_RECORD_QSTRING(rec, qs) do { const char *s = (qs); (rec)->type = RECDB_QSTRING; (rec)->d.qstring = (s) ? strdup(s) : NULL; } while (0)
+#define SET_RECORD_QSTRING(rec, qs) do { const char *s = (qs); (rec)->type = RECDB_QSTRING; (rec)->d.qstring = (s) ? pool_strdup(s) : NULL; } while (0)
 #define GET_RECORD_QSTRING(rec) (((rec)->type == RECDB_QSTRING) ? (rec)->d.qstring : 0)
 #define SET_RECORD_OBJECT(rec, obj) do { (rec)->type = RECDB_OBJECT; (rec)->d.object = (obj); } while (0)
 #define GET_RECORD_OBJECT(rec) (((rec)->type == RECDB_OBJECT) ? (rec)->d.object : 0)
@@ -55,7 +56,7 @@ struct string_list {
 void string_list_append(struct string_list *slist, char *string);
 struct string_list *string_list_copy(struct string_list *orig);
 void string_list_sort(struct string_list *slist);
-#define string_list_delete(slist, n) (free((slist)->list[n]), (slist)->list[n] = (slist)->list[--(slist)->used])
+#define string_list_delete(slist, n) (pool_strfree((slist)->list[n]), (slist)->list[n] = (slist)->list[--(slist)->used])
 
 /* allocation functions */
 struct string_list *alloc_string_list(int size);

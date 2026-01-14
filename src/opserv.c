@@ -588,8 +588,8 @@ static void
 opserv_free_waiting_connection(void *data)
 {
     struct waitingConnection *wc = data;
-    free(wc->server);
-    free(wc->target);
+    pool_strfree(wc->server);
+    pool_strfree(wc->target);
     free(wc);
 }
 
@@ -661,9 +661,9 @@ opserv_free_user_alert(void *data)
     unsigned int i;
     for(i = 0; i < alert->discrim->channel_count; i++)
         UnlockChannel(alert->discrim->channels[i]);
-    free(alert->owner);
-    free(alert->text_discrim);
-    free(alert->split_discrim);
+    pool_strfree(alert->owner);
+    pool_strfree(alert->text_discrim);
+    pool_strfree(alert->split_discrim);
     if(alert->discrim->has_regex_nick)
       regfree(&alert->discrim->regex_nick);
     if(alert->discrim->has_regex_ident)
@@ -674,7 +674,7 @@ opserv_free_user_alert(void *data)
       regfree(&alert->discrim->regex_info);
     if(alert->discrim->has_regex_version)
       regfree(&alert->discrim->regex_version);
-    free(alert->discrim->reason);
+    pool_strfree(alert->discrim->reason);
     free(alert->discrim);
     free(alert);
 }
@@ -926,7 +926,7 @@ static MODCMD_FUNC(cmd_ban)
     change.argc = 1;
     change.args[0].mode = MODE_BAN;
     if (is_ircmask(argv[1]))
-        change.args[0].u.hostmask = strdup(argv[1]);
+        change.args[0].u.hostmask = pool_strdup(argv[1]);
     else if ((victim = GetUserH(argv[1])))
         change.args[0].u.hostmask = generate_hostmask(victim, 0);
     else {
@@ -935,7 +935,7 @@ static MODCMD_FUNC(cmd_ban)
     }
     modcmd_chanmode_announce(&change);
     reply("OSMSG_ADDED_BAN", change.args[0].u.hostmask, channel->name);
-    free((char*)change.args[0].u.hostmask);
+    pool_strfree((char*)change.args[0].u.hostmask);
     return 1;
 }
 
@@ -1032,10 +1032,10 @@ static MODCMD_FUNC(cmd_warn)
         return 0;
     }
     if (argv[2])
-        reason = strdup(unsplit_string(argv+2, argc-2, NULL));
+        reason = pool_strdup(unsplit_string(argv+2, argc-2, NULL));
     else
-        reason = strdup("No reason");
-    dict_insert(opserv_chan_warn, strdup(argv[1]), reason);
+        reason = pool_strdup("No reason");
+    dict_insert(opserv_chan_warn, pool_strdup(argv[1]), reason);
     reply("OSMSG_WARN_ADDED", argv[1], reason);
     if (dict_find(channels, argv[1], NULL)) {
         global_message_args(MESSAGE_RECIPIENT_OPERS, "OSMSG_CHANNEL_ACTIVITY_WARN" argv[1], reason);
@@ -1066,11 +1066,11 @@ static MODCMD_FUNC(cmd_clearbans)
     change = mod_chanmode_alloc(channel->banlist.used);
     for (ii=0; ii<channel->banlist.used; ii++) {
         change->args[ii].mode = MODE_REMOVE | MODE_BAN;
-        change->args[ii].u.hostmask = strdup(channel->banlist.list[ii]->ban);
+        change->args[ii].u.hostmask = pool_strdup(channel->banlist.list[ii]->ban);
     }
     modcmd_chanmode_announce(change);
     for (ii=0; ii<change->argc; ++ii)
-        free((char*)change->args[ii].u.hostmask);
+        pool_strfree((char*)change->args[ii].u.hostmask);
     mod_chanmode_free(change);
     reply("OSMSG_CLEARBANS_DONE", channel->name);
     return 1;
@@ -2820,7 +2820,7 @@ static MODCMD_FUNC(cmd_stats_gags) {
         table.contents[nn] = calloc(table.width, sizeof(char*));
         table.contents[nn][0] = gag->mask;
         table.contents[nn][1] = gag->owner;
-        table.contents[nn][2] = strdup(expstr);
+        table.contents[nn][2] = pool_strdup(expstr);
         table.contents[nn][3] = gag->reason;
     }
     table_send(cmd->parent->bot, user->nick, 0, NULL, table);
@@ -3158,7 +3158,7 @@ opserv_new_user_check(struct userNode *user, UNUSED_ARG(void *extra))
     irc_ntop(addr, sizeof(addr), &user->ip);
     if (!(ohi = dict_find(opserv_hostinfo_dict, addr, NULL))) {
         ohi = calloc(1, sizeof(*ohi));
-        dict_insert(opserv_hostinfo_dict, strdup(addr), ohi);
+        dict_insert(opserv_hostinfo_dict, pool_strdup(addr), ohi);
         userList_init(&ohi->clients);
     }
     userList_append(&ohi->clients, user);
@@ -3313,7 +3313,7 @@ opserv_notice_handler(struct userNode *user, struct userNode *bot, const char *t
     char *cmd; 
     char *textb;
 
-    textb = strdup(text);
+    textb = pool_strdup(text);
 
     /* if its a version reply, do an alert check (only alerts with version=something) */
     if(bot == opserv) {
@@ -3325,7 +3325,7 @@ opserv_notice_handler(struct userNode *user, struct userNode *bot, const char *t
                 if(!version)
                     version = "";
                 /* opserv_debug("Opserv got CTCP VERSION Notice from %s: %s", user->nick, version); */
-                /* user->version_reply = strdup(version); done in parse-p10.c now */
+                /* user->version_reply = pool_strdup(version); done in parse-p10.c now */
                 dict_foreach(opserv_user_alerts, alert_check_user, user);
             }
         }
@@ -3407,7 +3407,7 @@ opserv_add_bad_word(struct svccmd *cmd, struct userNode *user, const char *new_b
             if (user)
                 reply("OSMSG_BAD_GROWING", orig_bad, new_bad);
             free(orig_bad);
-            opserv_bad_words->list[bad_idx] = strdup(new_bad);
+            opserv_bad_words->list[bad_idx] = pool_strdup(new_bad);
             for (bad_idx++; bad_idx < opserv_bad_words->used; bad_idx++) {
                 orig_bad = opserv_bad_words->list[bad_idx];
                 if (!irccasestr(orig_bad, new_bad))
@@ -3420,7 +3420,7 @@ opserv_add_bad_word(struct svccmd *cmd, struct userNode *user, const char *new_b
             return 1;
         }
     }
-    string_list_append(opserv_bad_words, strdup(new_bad));
+    string_list_append(opserv_bad_words, pool_strdup(new_bad));
     if (user)
         reply("OSMSG_ADDED_BAD", new_bad);
     return 1;
@@ -3434,15 +3434,15 @@ opserv_routing_plan_add_server(struct routingPlan *rp, const char *name, const c
     if(!rps)
         return 0;
     /* duplicate servers replace */
-    rps->uplink = strdup(uplink);
+    rps->uplink = pool_strdup(uplink);
     if(second)
-        rps->secondaryuplink = strdup(second);
+        rps->secondaryuplink = pool_strdup(second);
     else
         rps->secondaryuplink = NULL;
     rps->port = port ? port : 4400; /* lame hardcodede default port. maybe get from config file somewhere? */
     rps->karma = karma;
     rps->offline = offline; /* 1 = yes, 0 = no */
-    dict_insert(rp->servers, strdup(name), rps);
+    dict_insert(rp->servers, pool_strdup(name), rps);
     log_module(OS_LOG, LOG_DEBUG, "Adding rp server %s with uplink %s", name, uplink);
     return 1;
 }
@@ -3451,9 +3451,9 @@ static void
 free_routing_plan_server(void *data)
 {
     struct routingPlanServer *rps = data;
-    free(rps->uplink);
+    pool_strfree(rps->uplink);
     if(rps->secondaryuplink)
-        free(rps->secondaryuplink);
+        pool_strfree(rps->secondaryuplink);
     free(rps);
 }
  
@@ -3469,7 +3469,7 @@ opserv_add_routing_plan(const char *name)
     rp->servers = dict_new();
     dict_set_free_data(rp->servers, free_routing_plan_server);
 
-    dict_insert(opserv_routing_plans, strdup(name), rp);
+    dict_insert(opserv_routing_plans, pool_strdup(name), rp);
     /* TODO: check for duplicate */
     return rp;
 }
@@ -3510,11 +3510,11 @@ wipe_route_list(struct route *route) {
     for(rptr = opserv_route->servers; rptr; rptr=nextptr)
     {
         nextptr = rptr->next;
-        free(rptr->server);
+        pool_strfree(rptr->server);
         if(rptr->uplink)
-            free(rptr->uplink);
+            pool_strfree(rptr->uplink);
         if(rptr->secondaryuplink)
-            free(rptr->secondaryuplink);
+            pool_strfree(rptr->secondaryuplink);
         free(rptr);
     }
     route->centered = true;
@@ -3580,15 +3580,15 @@ add_routestruct_server(struct route *route, const char *server, unsigned int por
         return;
     }
     rptr = calloc(1, sizeof(*rptr));
-    rptr->server = strdup(server);
+    rptr->server = pool_strdup(server);
     rptr->port = port;
     if(!uplink) {
         hname = conf_get_data("server/hostname", RECDB_QSTRING);
         uplink = hname;
     }
-    rptr->uplink = strdup(uplink);
+    rptr->uplink = pool_strdup(uplink);
     if(secondary)
-        rptr->secondaryuplink = strdup(secondary);
+        rptr->secondaryuplink = pool_strdup(secondary);
     /* tack this server on the front of the list */
     rptr->next = route->servers;
     route->servers = rptr;
@@ -3633,8 +3633,8 @@ change_route_uplinks(struct route *route)
         while(rptr) {
             strcpy(nextserver, rptr->uplink);
             log_module(MAIN_LOG, LOG_DEBUG, "change_route_uplinks() changing %s uplink to %s.", rptr->server, lastserver);
-            free(rptr->uplink);
-            rptr->uplink = strdup(lastserver);
+            pool_strfree(rptr->uplink);
+            rptr->uplink = pool_strdup(lastserver);
             strcpy(lastserver, rptr->server);
             rptr = find_routeList_server(route, nextserver);
         }
@@ -3815,13 +3815,13 @@ routing_connect_server(char *server, int port, struct server *to)
 {
     struct waitingConnection *wc = calloc(1, sizeof(*wc));
 
-    wc->server = strdup(server);
-    wc->target = strdup(to->name);
+    wc->server = pool_strdup(server);
+    wc->target = pool_strdup(to->name);
     /* Just to make sure there isn't one left hanging
      * if 2 connections are attempted at once.. 
      * */
     routing_delete_connect_timer(server);
-    dict_insert(opserv_waiting_connections, strdup(server), wc);
+    dict_insert(opserv_waiting_connections, pool_strdup(server), wc);
     timeq_add(now + ROUTING_CONNECT_TIMEOUT, routing_connect_timeout, wc);
 
     irc_connect(opserv, server, port, to);
@@ -4060,7 +4060,7 @@ void routing_karma_timer(void *data) {
     /* Save when karma_timer should run again in case we restart before then */
     log_module(MAIN_LOG, LOG_DEBUG, "routing_karma_timer() scheduling self to run again at %d", (unsigned int) next);
     sprintf(buf, "%u", (unsigned int) next);
-    dict_insert(opserv_routing_plan_options, "KARMA_TIMER", strdup(buf));
+    dict_insert(opserv_routing_plan_options, "KARMA_TIMER", pool_strdup(buf));
     /* add a timer to run this again .. */
     timeq_add(next, routing_karma_timer, NULL);
 }
@@ -4274,7 +4274,7 @@ static MODCMD_FUNC(cmd_routing_set)
             }
             /* set the value here */
             dict_remove(opserv_routing_plan_options, found_option);
-            dict_insert(opserv_routing_plan_options, strdup(found_option), strdup(value));
+            dict_insert(opserv_routing_plan_options, pool_strdup(found_option), pool_strdup(value));
             route_show_option(cmd, user, found_option);
         }
         else {
@@ -4373,7 +4373,7 @@ static MODCMD_FUNC(cmd_routing_addserver)
     struct routingPlan *rp;
 
     plan   = argv[1];
-    server = strdup(argv[2]);
+    server = pool_strdup(argv[2]);
     server = strtok(server, ":");
     portstr = strtok(NULL, ":"); 
     if(portstr)
@@ -4559,7 +4559,7 @@ static MODCMD_FUNC(cmd_addbad)
             for (count = 0; (arg < argc) && IsChannelName(argv[arg]); arg++) {
                 dict_find(opserv_exempt_channels, argv[arg], &exempt_found);
                 if (!exempt_found) {
-                    dict_insert(opserv_exempt_channels, strdup(argv[arg]), NULL);
+                    dict_insert(opserv_exempt_channels, pool_strdup(argv[arg]), NULL);
                     count++;
                 }
             }
@@ -4629,7 +4629,7 @@ static MODCMD_FUNC(cmd_addexempt)
         OPSERV_SYNTAX();
         return 0;
     }
-    dict_insert(opserv_exempt_channels, strdup(chanName), NULL);
+    dict_insert(opserv_exempt_channels, pool_strdup(chanName), NULL);
     channel = GetChannel(chanName);
     if (channel) {
         if (channel->bad_channel) {
@@ -4675,9 +4675,9 @@ opserv_add_trusted_host(const char *ipaddr, unsigned int limit, const char *issu
     th = calloc(1, sizeof(*th));
     if (!th)
         return;
-    th->ipaddr = strdup(ipaddr);
-    th->reason = reason ? strdup(reason) : NULL;
-    th->issuer = issuer ? strdup(issuer) : NULL;
+    th->ipaddr = pool_strdup(ipaddr);
+    th->reason = reason ? pool_strdup(reason) : NULL;
+    th->issuer = issuer ? pool_strdup(issuer) : NULL;
     th->issued = issued;
     th->limit = limit;
     th->expires = expires;
@@ -4690,9 +4690,9 @@ static void
 free_trusted_host(void *data)
 {
     struct trusted_host *th = data;
-    free(th->ipaddr);
-    free(th->reason);
-    free(th->issuer);
+    pool_strfree(th->ipaddr);
+    pool_strfree(th->reason);
+    pool_strfree(th->issuer);
     free(th);
 }
 
@@ -4757,10 +4757,10 @@ static MODCMD_FUNC(cmd_edittrust)
     if (th->expires)
         timeq_del(th->expires, opserv_expire_trusted_host, th, 0);
 
-    free(th->reason);
-    th->reason = strdup(reason);
-    free(th->issuer);
-    th->issuer = strdup(user->handle_info->handle);
+    pool_strfree(th->reason);
+    th->reason = pool_strdup(reason);
+    pool_strfree(th->issuer);
+    th->issuer = pool_strdup(user->handle_info->handle);
     th->issued = now;
     th->limit = count;
     if (interval) {
@@ -5058,7 +5058,7 @@ foreach_matching_user(const char *hostmask, discrim_search_func func, void *extr
     discrim->intra_dcmp = 0;
     discrim->use_regex = 0;
     discrim->silent = 0;
-    dupmask = strdup(hostmask);
+    dupmask = pool_strdup(hostmask);
     if (split_ircmask(dupmask, &discrim->mask_nick, &discrim->mask_ident, &discrim->mask_host)) {
         if (!irc_pton(&discrim->ip_mask, &discrim->ip_mask_bits, discrim->mask_host))
             discrim->ip_mask_bits = 0;
@@ -5068,7 +5068,7 @@ foreach_matching_user(const char *hostmask, discrim_search_func func, void *extr
         matched = 0;
     }
     free(discrim);
-    free(dupmask);
+    pool_strfree(dupmask);
     return matched;
 }
 
@@ -5089,9 +5089,9 @@ gag_free(struct gag_entry *gag)
     ungagged = foreach_matching_user(gag->mask, ungag_helper_func, NULL);
 
     /* Deallocate storage */
-    free(gag->reason);
-    free(gag->owner);
-    free(gag->mask);
+    pool_strfree(gag->reason);
+    pool_strfree(gag->owner);
+    pool_strfree(gag->mask);
     free(gag);
 
     return ungagged;
@@ -5110,9 +5110,9 @@ gag_create(const char *mask, const char *owner, const char *reason, time_t expir
 
     /* Create gag and put it into linked list */
     gag = calloc(1, sizeof(*gag));
-    gag->mask = strdup(mask);
-    gag->owner = strdup(owner ? owner : "<unknown>");
-    gag->reason = strdup(reason ? reason : "<unknown>");
+    gag->mask = pool_strdup(mask);
+    gag->owner = pool_strdup(owner ? owner : "<unknown>");
+    gag->reason = pool_strdup(reason ? reason : "<unknown>");
     gag->expires = expires;
     if (gag->expires)
         timeq_add(gag->expires, gag_expire, gag);
@@ -5152,10 +5152,10 @@ opserv_add_user_alert(struct userNode *req, const char *name, opserv_alert_react
         return NULL;
     }
     alert = malloc(sizeof(*alert));
-    alert->owner = strdup(req->handle_info ? req->handle_info->handle : req->nick);
-    alert->text_discrim = strdup(text_discrim);
+    alert->owner = pool_strdup(req->handle_info ? req->handle_info->handle : req->nick);
+    alert->text_discrim = pool_strdup(text_discrim);
     alert->last = last;
-    discrim_copy = strdup(text_discrim); /* save a copy of the discrim */
+    discrim_copy = pool_strdup(text_discrim); /* save a copy of the discrim */
     wordc = split_line(discrim_copy, false, ArrayLength(wordv), wordv);
     alert->discrim = opserv_discrim_create(req, opserv, wordc, wordv, 0, action);
     alert->expire = expire;
@@ -5163,15 +5163,15 @@ opserv_add_user_alert(struct userNode *req, const char *name, opserv_alert_react
     if (!alert->discrim || (reaction==REACT_SVSJOIN && !alert->discrim->chantarget) ||
        (reaction==REACT_SVSPART && !alert->discrim->chantarget) ||
        (reaction==REACT_MARK && !alert->discrim->mark)) {
-        free(alert->text_discrim);
-        free(discrim_copy);
+        pool_strfree(alert->text_discrim);
+        pool_strfree(discrim_copy);
         free(alert);
         return NULL;
     }
     alert->split_discrim = discrim_copy;
-    name_dup = strdup(name);
+    name_dup = pool_strdup(name);
     if (!alert->discrim->reason)
-        alert->discrim->reason = strdup(name);
+        alert->discrim->reason = pool_strdup(name);
     alert->reaction = reaction;
     dict_insert(opserv_user_alerts, name_dup, alert);
     /* Stick the alert into the appropriate additional alert dict(s).
@@ -5202,7 +5202,7 @@ add_chan_warn(const char *key, void *data, UNUSED_ARG(void *extra))
     if (!reason)
         reason = "No Reason";
 
-    dict_insert(opserv_chan_warn, strdup(key), strdup(reason));
+    dict_insert(opserv_chan_warn, pool_strdup(key), pool_strdup(reason));
     return 0;
 }
 */
@@ -5269,8 +5269,8 @@ add_user_alert(const char *key, void *data, UNUSED_ARG(void *extra))
         return 0;
     }
     owner = database_get_data(alert_dict, KEY_OWNER, RECDB_QSTRING);
-    free(alert->owner);
-    alert->owner = strdup(owner ? owner : "<unknown>");
+    pool_strfree(alert->owner);
+    alert->owner = pool_strdup(owner ? owner : "<unknown>");
     return 0;
 }
 
@@ -5336,7 +5336,7 @@ routing_plan_set_option(const char *name, void *data, UNUSED_ARG(void *extra))
     if(rd->type == RECDB_QSTRING)
     {
         char *value = GET_RECORD_QSTRING(rd);
-        dict_insert(opserv_routing_plan_options, strdup(name), strdup(value));
+        dict_insert(opserv_routing_plan_options, pool_strdup(name), pool_strdup(value));
     }
     return 0;
 }
@@ -5378,7 +5378,7 @@ opserv_saxdb_read(struct dict *conf_db)
                 rd = iter_data(it);
                 if (rd->type == RECDB_STRING_LIST)
                     for (nn=0; nn<rd->d.slist->used; nn++)
-                        dict_insert(opserv_exempt_channels, strdup(rd->d.slist->list[nn]), NULL);
+                        dict_insert(opserv_exempt_channels, pool_strdup(rd->d.slist->list[nn]), NULL);
             }
             break;
         default:
@@ -5388,7 +5388,7 @@ opserv_saxdb_read(struct dict *conf_db)
     if ((rd = database_get_path(conf_db, KEY_EXEMPT_CHANNELS))
         && (rd->type == RECDB_STRING_LIST)) {
         for (nn=0; nn<rd->d.slist->used; ++nn)
-            dict_insert(opserv_exempt_channels, strdup(rd->d.slist->list[nn]), NULL);
+            dict_insert(opserv_exempt_channels, pool_strdup(rd->d.slist->list[nn]), NULL);
     }
     if ((object = database_get_data(conf_db, KEY_MAX_CLIENTS, RECDB_OBJECT))) {
         char *str;
@@ -5481,7 +5481,7 @@ opserv_saxdb_write(struct saxdb_context *ctx)
     if (dict_size(opserv_exempt_channels)) {
         slist = alloc_string_list(dict_size(opserv_exempt_channels));
         for (it=dict_first(opserv_exempt_channels); it; it=iter_next(it)) {
-            string_list_append(slist, strdup(iter_key(it)));
+            string_list_append(slist, pool_strdup(iter_key(it)));
         }
         saxdb_write_string_list(ctx, KEY_EXEMPT_CHANNELS, slist);
         free_string_list(slist);
@@ -5629,7 +5629,7 @@ static MODCMD_FUNC(cmd_set)
     }
 
     free(rd->d.qstring);
-    rd->d.qstring = strdup(argv[2]);
+    rd->d.qstring = pool_strdup(argv[2]);
     conf_call_reload_funcs();
     reply("OSMSG_SET_SUCCESS", argv[1], argv[2]);
     return 1;
@@ -5868,7 +5868,7 @@ opserv_discrim_create(struct userNode *user, struct userNode *bot, unsigned int 
     } else if (irccasecmp(argv[i], "limit") == 0) {
         discrim->limit = strtoul(argv[++i], NULL, 10);
         } else if (irccasecmp(argv[i], "reason") == 0) {
-            discrim->reason = strdup(unsplit_string(argv+i+1, argc-i-1, NULL));
+            discrim->reason = pool_strdup(unsplit_string(argv+i+1, argc-i-1, NULL));
             i = argc;
         } else if (irccasecmp(argv[i], "notice_target") == 0 || irccasecmp(argv[i], "target") == 0) {
             if (!IsChannelName(argv[i + 1])) {
@@ -6607,7 +6607,7 @@ trace_domains_func(struct userNode *match, void *extra)
     }
     if (!(count = dict_find(das->dict, hostname, NULL))) {
         count = calloc(1, sizeof(*count));
-        dict_insert(das->dict, strdup(hostname), count);
+        dict_insert(das->dict, pool_strdup(hostname), count);
     }
     (*count)++;
     return 0;
@@ -6736,7 +6736,7 @@ static MODCMD_FUNC(cmd_trace)
 
     for (i = 0; i < das.discrim->channel_count; i++)
         UnlockChannel(das.discrim->channels[i]);
-    free(das.discrim->reason);
+    pool_strfree(das.discrim->reason);
 
     if(das.discrim->has_regex_nick)
       regfree(&das.discrim->regex_nick);
@@ -7020,7 +7020,7 @@ static void
 gtrace_ungline_func(struct gline *gline, void *extra)
 {
     struct gline_extra *xtra = extra;
-    string_list_append(xtra->glines, strdup(gline->target));
+    string_list_append(xtra->glines, pool_strdup(gline->target));
 }
 
 static MODCMD_FUNC(cmd_gtrace)
@@ -7124,7 +7124,7 @@ static void
 strace_unshun_func(struct shun *shun, void *extra)
 {
     struct shun_extra *xtra = extra;
-    string_list_append(xtra->shuns, strdup(shun->target));
+    string_list_append(xtra->shuns, pool_strdup(shun->target));
 }
 
 static MODCMD_FUNC(cmd_strace)
@@ -7620,7 +7620,7 @@ opserv_conf_read(void)
     DefConLevel = str ? atoi(str) : 5;
 
     str = database_get_data(conf_node, KEY_DEFCON_CHANMODES, RECDB_QSTRING);
-    DefConChanModes = str ? strdup(str) : "+r";
+    DefConChanModes = str ? pool_strdup(str) : "+r";
 
     str = database_get_data(conf_node, KEY_DEFCON_SESSION_LIMIT, RECDB_QSTRING);
     DefConSessionLimit = str ? atoi(str) : 2;
@@ -7638,13 +7638,13 @@ opserv_conf_read(void)
     GlobalOnDefconMore = str ? atoi(str) : 0;
 
     str = database_get_data(conf_node, KEY_DEFCON_MESSAGE, RECDB_QSTRING);
-    DefConMessage = str ? strdup(str) : "Put your message to send your users here. Dont forget to uncomment GlobalOnDefconMore";
+    DefConMessage = str ? pool_strdup(str) : "Put your message to send your users here. Dont forget to uncomment GlobalOnDefconMore";
 
     str = database_get_data(conf_node, KEY_DEFCON_OFF_MESSAGE, RECDB_QSTRING);
-    DefConOffMessage = str? strdup(str) : "Services are now back to normal, sorry for any inconvenience";
+    DefConOffMessage = str? pool_strdup(str) : "Services are now back to normal, sorry for any inconvenience";
 
     str = database_get_data(conf_node, KEY_DEFCON_GLINE_REASON, RECDB_QSTRING);
-    DefConGlineReason = str ? strdup(str) : "This network is currently not accepting connections, please try again later";
+    DefConGlineReason = str ? pool_strdup(str) : "This network is currently not accepting connections, please try again later";
 }
 
 /* lame way to export opserv_conf value to nickserv.c ... */

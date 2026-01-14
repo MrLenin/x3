@@ -195,7 +195,7 @@ string_list_copy(struct string_list *slist)
     new_list = alloc_string_list(slist->size);
     new_list->used = slist->used;
     for (i=0; i<new_list->used; i++) {
-        new_list->list[i] = strdup(slist->list[i]);
+        new_list->list[i] = pool_strdup(slist->list[i]);
     }
     return new_list;
 }
@@ -214,7 +214,7 @@ string_list_sort(struct string_list *slist)
 struct record_data*
 database_get_path(dict_t db, const char *path)
 {
-    char *new_path = strdup(path), *orig_path = new_path;
+    char *new_path = pool_strdup(path), *orig_path = new_path;
     char *part;
     struct record_data *rd;
 
@@ -224,7 +224,7 @@ database_get_path(dict_t db, const char *path)
 
         rd = dict_find(db, part, NULL);
         if (!rd || rd->type != RECDB_OBJECT) {
-            free(orig_path);
+            pool_strfree(orig_path);
             return NULL;
         }
 
@@ -233,7 +233,7 @@ database_get_path(dict_t db, const char *path)
     }
 
     rd = dict_find(db, part, NULL);
-    free(orig_path);
+    pool_strfree(orig_path);
     return rd;
 }
 
@@ -257,7 +257,7 @@ free_string_list(struct string_list *slist)
     if (!slist)
         return;
     for (i=0; i<slist->used; i++)
-        free(slist->list[i]);
+        pool_strfree(slist->list[i]);
     free(slist->list);
     free(slist);
 }
@@ -268,7 +268,7 @@ free_record_data(void *rdata)
     struct record_data *r = rdata;
     switch (r->type) {
     case RECDB_INVALID: break;
-    case RECDB_QSTRING: free(r->d.qstring); break;
+    case RECDB_QSTRING: pool_strfree(r->d.qstring); break;
     case RECDB_OBJECT: dict_delete(r->d.object); break;
     case RECDB_STRING_LIST: free_string_list(r->d.slist); break;
     }
@@ -593,17 +593,19 @@ parse_record(const char *text, char **pname, struct record_data **prd)
     *prd = NULL;
     recdb.source = "<user-supplied text>";
     recdb.f = NULL;
-    recdb.s = strdup(text);
+    recdb.s = pool_strdup(text);
     recdb.length = strlen(text);
     recdb.pos = 0;
     recdb.type = RECDB_STRING;
     recdb.ctx.line = recdb.ctx.col = 1;
     if ((res = setjmp(recdb.env)) == 0) {
         parse_record_int(&recdb, pname, prd);
+        pool_strfree(recdb.s);
         return 0;
     } else {
         free(*pname);
         free(*prd);
+        pool_strfree(recdb.s);
         return failure_reason(res);
     }
 }
