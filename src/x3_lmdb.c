@@ -5119,22 +5119,22 @@ int x3_lmdb_scram_acct_get(const char *account, enum scram_hash_type hash_type,
         return LMDB_ERROR;
     }
 
-    /* Parse salt from hex */
-    if (hex_to_bytes(fields[3], cred_out->salt, SCRAM_SALT_LEN) != SCRAM_SALT_LEN) {
+    /* Parse salt from hex (hex_to_bytes returns 0 on success, -1 on failure) */
+    if (hex_to_bytes(fields[3], cred_out->salt, SCRAM_SALT_LEN) != 0) {
         free(value_copy);
         log_module(MAIN_LOG, LOG_WARNING, "x3_lmdb: Invalid SCRAM salt for %s", account);
         return LMDB_ERROR;
     }
 
     /* Parse stored_key from hex */
-    if ((i = hex_to_bytes(fields[4], cred_out->stored_key, hash_len)) != (int)hash_len) {
+    if (hex_to_bytes(fields[4], cred_out->stored_key, hash_len) != 0) {
         free(value_copy);
         log_module(MAIN_LOG, LOG_WARNING, "x3_lmdb: Invalid SCRAM stored_key for %s", account);
         return LMDB_ERROR;
     }
 
     /* Parse server_key from hex */
-    if ((i = hex_to_bytes(fields[5], cred_out->server_key, hash_len)) != (int)hash_len) {
+    if (hex_to_bytes(fields[5], cred_out->server_key, hash_len) != 0) {
         free(value_copy);
         log_module(MAIN_LOG, LOG_WARNING, "x3_lmdb: Invalid SCRAM server_key for %s", account);
         return LMDB_ERROR;
