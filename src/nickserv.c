@@ -491,7 +491,7 @@ struct register_async_ctx {
     char nick[NICKLEN + 1];
     char numeric[COMBO_NUMERIC_LEN + 1];
     char settee_numeric[COMBO_NUMERIC_LEN + 1];  /* Target user's numeric (for oregister) */
-    char email[MAX_EMAIL_LEN + 1];
+    char email[256];  /* Email addresses up to 255 chars */
     char mask[USERLEN + HOSTLEN + 2];  /* For oregister mask */
     char plaintext_password[256];  /* For SCRAM creation (cleared after use) */
     struct userNode *user;         /* Validated via numeric before use */
@@ -535,6 +535,96 @@ register_async_validate_user(struct register_async_ctx *ctx)
 
 /* Forward declaration for callback */
 static void cmd_register_hash_callback(void *ctx_ptr, int result, const char *hash);
+
+/* Context for async password change operations */
+#define PASS_ASYNC_TIMEOUT 30  /* seconds */
+
+struct pass_async_ctx {
+    char handle[NICKSERV_HANDLE_LEN + 1];
+    char nick[NICKLEN + 1];
+    char numeric[COMBO_NUMERIC_LEN + 1];
+    char plaintext_password[256];  /* For SCRAM creation (cleared after use) */
+    struct userNode *user;         /* Validated via numeric before use */
+    time_t started;
+};
+
+static void pass_ctx_free(struct pass_async_ctx *ctx)
+{
+    if (!ctx) return;
+    /* Securely clear plaintext password */
+    memset(ctx->plaintext_password, 0, sizeof(ctx->plaintext_password));
+    free(ctx);
+}
+
+static struct userNode *
+pass_async_validate_user(struct pass_async_ctx *ctx)
+{
+    struct userNode *user;
+
+    if (!ctx) return NULL;
+
+    /* Look up user by numeric */
+    user = GetUserN(ctx->numeric);
+    if (!user) {
+        log_module(NS_LOG, LOG_DEBUG, "PASS async: User %s disconnected", ctx->nick);
+        return NULL;
+    }
+
+    /* Verify same user pointer (numeric could be reused) */
+    if (user != ctx->user) {
+        log_module(NS_LOG, LOG_DEBUG, "PASS async: User pointer mismatch for %s", ctx->nick);
+        return NULL;
+    }
+
+    return user;
+}
+
+/* Forward declaration for pass callback */
+static void cmd_pass_hash_callback(void *ctx_ptr, int result, const char *hash);
+
+/* Context for async resetpass operations */
+#define RESETPASS_ASYNC_TIMEOUT 30  /* seconds */
+
+struct resetpass_async_ctx {
+    char handle[NICKSERV_HANDLE_LEN + 1];
+    char nick[NICKLEN + 1];
+    char numeric[COMBO_NUMERIC_LEN + 1];
+    struct userNode *user;         /* Validated via numeric before use */
+    int weblink;
+    time_t started;
+};
+
+static void resetpass_ctx_free(struct resetpass_async_ctx *ctx)
+{
+    if (!ctx) return;
+    free(ctx);
+}
+
+static struct userNode *
+resetpass_async_validate_user(struct resetpass_async_ctx *ctx)
+{
+    struct userNode *user;
+
+    if (!ctx) return NULL;
+
+    /* Look up user by numeric */
+    user = GetUserN(ctx->numeric);
+    if (!user) {
+        log_module(NS_LOG, LOG_DEBUG, "RESETPASS async: User %s disconnected", ctx->nick);
+        return NULL;
+    }
+
+    /* Verify same user pointer (numeric could be reused) */
+    if (user != ctx->user) {
+        log_module(NS_LOG, LOG_DEBUG, "RESETPASS async: User pointer mismatch for %s", ctx->nick);
+        return NULL;
+    }
+
+    return user;
+}
+
+/* Forward declaration for resetpass callback */
+static void cmd_resetpass_hash_callback(void *ctx_ptr, int result, const char *hash);
 
 /*
  * Password verification with lazy migration.
@@ -699,6 +789,10 @@ static const struct message_entry msgtab[] = {
     { "NSMSG_SCRAM_FAILED", "Warning: SCRAM credential creation failed. SCRAM authentication will not be available for this account." },
     { "NSMSG_REGISTER_TIMEOUT", "Registration timed out. Please try again." },
     { "NSMSG_REGISTER_FAILED", "Registration failed due to an internal error. Please try again." },
+    { "NSMSG_PASS_TIMEOUT", "Password change timed out. Please try again." },
+    { "NSMSG_PASS_FAILED", "Password change failed due to an internal error. Please try again." },
+    { "NSMSG_RESETPASS_TIMEOUT", "Password reset timed out. Please try again." },
+    { "NSMSG_RESETPASS_FAILED", "Password reset failed due to an internal error. Please try again." },
     { "NSMSG_MASK_INVALID", "$b%s$b is an invalid hostmask." },
     { "NSMSG_ADDMASK_ALREADY", "$b%s$b is already a hostmask in your account." },
     { "NSMSG_ADDMASK_SUCCESS", "Hostmask %s added." },
@@ -1611,7 +1705,7 @@ nickserv_register(struct userNode *user, struct userNode *settee, const char *ha
     if (passwd)
     {
         /* Check if passwd is already hashed (pre-hash async pattern) or plaintext */
-        if (pw_identify(passwd) != PW_ALG_UNKNOWN) {
+        if (pw_detect_algorithm(passwd) != PW_ALG_UNKNOWN) {
             /* Already hashed - use directly */
             if (strlen(passwd) < sizeof(crypted)) {
                 safestrncpy(crypted, passwd, sizeof(crypted));
@@ -2051,7 +2145,6 @@ static NICKSERV_FUNC(cmd_register)
     irc_in_addr_t ip;
     struct handle_info *hi;
     const char *email_addr, *password;
-    char syncpass[PASSWD_LEN];
     int no_auth, weblink;
 
     if (checkDefCon(DEFCON_NO_NEW_NICKS) && !IsOper(user)) {
@@ -2226,13 +2319,8 @@ static NICKSERV_FUNC(cmd_register)
     user->modes |= FLAGS_REGISTERING;
 
     if (nickserv_conf.sync_log) {
-      pw_cryptpass(password, syncpass);
-      /*
-      * An 0 is only sent if theres no email address. Thios should only happen if email functions are
-       * disabled which they wont be for us. Email Required MUST be set on if you are using this.
-       * -SiRVulcaN
-       */
-      SyncLog("REGISTER %s %s %s %s", hi->handle, syncpass, email_addr ? email_addr : "0", user->info);
+      /* Use hi->passwd directly - already contains the hash from nickserv_register() */
+      SyncLog("REGISTER %s %s %s %s", hi->handle, hi->passwd, email_addr ? email_addr : "0", user->info);
     }
 
     /* this wont work if email is required .. */
@@ -3815,10 +3903,59 @@ static NICKSERV_FUNC(cmd_odelcookie)
     return 1;
 }
 
+/* Callback for async password hashing in RESETPASS command */
+static void cmd_resetpass_hash_callback(void *ctx_ptr, int result, const char *hash)
+{
+    struct resetpass_async_ctx *ctx = ctx_ptr;
+    struct userNode *user;
+    struct handle_info *hi;
+
+    if (!ctx) return;
+
+    /* Validate user still connected */
+    user = resetpass_async_validate_user(ctx);
+    if (!user) {
+        resetpass_ctx_free(ctx);
+        return;
+    }
+
+    /* Check timeout */
+    if (now - ctx->started > RESETPASS_ASYNC_TIMEOUT) {
+        send_message(user, nickserv, "NSMSG_RESETPASS_TIMEOUT");
+        resetpass_ctx_free(ctx);
+        return;
+    }
+
+    /* Check hash result */
+    if (result != 0 || !hash) {
+        send_message(user, nickserv, "NSMSG_RESETPASS_FAILED");
+        resetpass_ctx_free(ctx);
+        return;
+    }
+
+    /* Re-check user is still not authenticated (race condition) */
+    if (user->handle_info) {
+        send_message(user, nickserv, "NSMSG_ALREADY_AUTHED", user->handle_info->handle);
+        resetpass_ctx_free(ctx);
+        return;
+    }
+
+    /* Re-check handle still exists */
+    hi = get_handle_info(ctx->handle);
+    if (!hi) {
+        send_message(user, nickserv, "MSG_HANDLE_UNKNOWN", ctx->handle);
+        resetpass_ctx_free(ctx);
+        return;
+    }
+
+    /* Create the password change cookie with the hashed password */
+    nickserv_make_cookie(user, hi, PASSWORD_CHANGE, hash, ctx->weblink);
+    resetpass_ctx_free(ctx);
+}
+
 static NICKSERV_FUNC(cmd_resetpass)
 {
     struct handle_info *hi;
-    char crypted[PASSWD_LEN];
     int weblink;
 
     NICKSERV_MIN_PARMS(3);
@@ -3845,9 +3982,36 @@ static NICKSERV_FUNC(cmd_resetpass)
         reply("MSG_SET_EMAIL_ADDR");
         return 0;
     }
-    pw_cryptpass(argv[2], crypted);
-    argv[2] = "****";
-    nickserv_make_cookie(user, hi, PASSWORD_CHANGE, crypted, weblink);
+
+    /* Try async password hashing */
+    {
+        struct resetpass_async_ctx *ctx = calloc(1, sizeof(*ctx));
+        if (ctx) {
+            safestrncpy(ctx->handle, hi->handle, sizeof(ctx->handle));
+            safestrncpy(ctx->nick, user->nick, sizeof(ctx->nick));
+            safestrncpy(ctx->numeric, user->numeric, sizeof(ctx->numeric));
+            ctx->user = user;
+            ctx->weblink = weblink;
+            ctx->started = now;
+
+            if (pw_hash_async(argv[2], cmd_resetpass_hash_callback, ctx) == 0) {
+                log_module(NS_LOG, LOG_DEBUG, "RESETPASS async: Started hash for %s", hi->handle);
+                argv[2] = "****";
+                return 1;  /* Async started */
+            }
+
+            log_module(NS_LOG, LOG_WARNING, "RESETPASS async: pw_hash_async failed, falling back to sync");
+            resetpass_ctx_free(ctx);
+        }
+    }
+
+    /* Sync fallback */
+    {
+        char crypted[PASSWD_LEN];
+        pw_cryptpass(argv[2], crypted);
+        argv[2] = "****";
+        nickserv_make_cookie(user, hi, PASSWORD_CHANGE, crypted, weblink);
+    }
     return 1;
 }
 
@@ -4154,11 +4318,88 @@ static NICKSERV_FUNC(cmd_regnick) {
     return 1;
 }
 
+/* Callback for async password hashing in PASS command */
+static void cmd_pass_hash_callback(void *ctx_ptr, int result, const char *hash)
+{
+    struct pass_async_ctx *ctx = ctx_ptr;
+    struct userNode *user;
+    struct handle_info *hi;
+
+    if (!ctx) return;
+
+    /* Validate user still connected */
+    user = pass_async_validate_user(ctx);
+    if (!user) {
+        pass_ctx_free(ctx);
+        return;
+    }
+
+    /* Check timeout */
+    if (now - ctx->started > PASS_ASYNC_TIMEOUT) {
+        send_message(user, nickserv, "NSMSG_PASS_TIMEOUT");
+        pass_ctx_free(ctx);
+        return;
+    }
+
+    /* Check hash result */
+    if (result != 0 || !hash) {
+        send_message(user, nickserv, "NSMSG_PASS_FAILED");
+        pass_ctx_free(ctx);
+        return;
+    }
+
+    /* Check user is still authenticated to the same handle */
+    hi = user->handle_info;
+    if (!hi || irccasecmp(hi->handle, ctx->handle) != 0) {
+        log_module(NS_LOG, LOG_DEBUG, "PASS async: User %s no longer authenticated to %s",
+            ctx->nick, ctx->handle);
+        pass_ctx_free(ctx);
+        return;
+    }
+
+#ifdef WITH_LDAP
+    if (nickserv_conf.ldap_enable && nickserv_conf.ldap_admin_dn) {
+        int rc;
+        if ((rc = ldap_do_modify(hi->handle, hash, NULL)) != LDAP_SUCCESS) {
+            send_message(user, nickserv, "NSMSG_LDAP_FAIL", ldap_err2string(rc));
+            pass_ctx_free(ctx);
+            return;
+        }
+    }
+#endif
+#ifdef WITH_KEYCLOAK
+    /* Fire-and-forget async password sync to Keycloak */
+    kc_do_modify(hi->handle, hash, NULL);
+#endif
+
+    /* Update local password */
+    safestrncpy(hi->passwd, hash, sizeof(hi->passwd));
+
+    if (nickserv_conf.sync_log)
+        SyncLog("PASSCHANGE %s %s", hi->handle, hi->passwd);
+
+#ifdef WITH_LMDB
+    /* Revoke all session tokens on password change */
+    x3_lmdb_session_revoke_all(hi->handle);
+#ifdef WITH_SSL
+    /* Revoke old SCRAM session tokens and create new SCRAM credentials (async) */
+    x3_lmdb_scram_revoke_all(hi->handle);
+#ifdef WITH_KEYCLOAK
+    scram_create_async(hi->handle, ctx->plaintext_password, user, 1);
+#else
+    scram_create_async(hi->handle, ctx->plaintext_password, user, 0);
+#endif
+#endif
+#endif
+
+    send_message(user, nickserv, "NSMSG_PASS_SUCCESS");
+    pass_ctx_free(ctx);
+}
+
 static NICKSERV_FUNC(cmd_pass)
 {
     struct handle_info *hi;
     char *old_pass, *new_pass;
-    char crypted[MD5_CRYPT_LENGTH+1];
 #ifdef WITH_LDAP
     int ldap_result;
 #endif
@@ -4202,38 +4443,64 @@ static NICKSERV_FUNC(cmd_pass)
 	reply("NSMSG_PASSWORD_INVALID");
 	return 0;
     }
-    pw_cryptpass(new_pass, crypted);
-#ifdef WITH_LDAP
-    if(nickserv_conf.ldap_enable && nickserv_conf.ldap_admin_dn) {
-        int rc;
-        if((rc = ldap_do_modify(hi->handle, crypted, NULL)) != LDAP_SUCCESS) {
-             reply("NSMSG_LDAP_FAIL", ldap_err2string(rc));
-             return 0;
+
+    /* Try async password hashing */
+    {
+        struct pass_async_ctx *ctx = calloc(1, sizeof(*ctx));
+        if (ctx) {
+            safestrncpy(ctx->handle, hi->handle, sizeof(ctx->handle));
+            safestrncpy(ctx->nick, user->nick, sizeof(ctx->nick));
+            safestrncpy(ctx->numeric, user->numeric, sizeof(ctx->numeric));
+            safestrncpy(ctx->plaintext_password, new_pass, sizeof(ctx->plaintext_password));
+            ctx->user = user;
+            ctx->started = now;
+
+            if (pw_hash_async(new_pass, cmd_pass_hash_callback, ctx) == 0) {
+                log_module(NS_LOG, LOG_DEBUG, "PASS async: Started hash for %s", hi->handle);
+                argv[1] = "****";
+                return 1;  /* Async started */
+            }
+
+            log_module(NS_LOG, LOG_WARNING, "PASS async: pw_hash_async failed, falling back to sync");
+            pass_ctx_free(ctx);
         }
     }
+
+    /* Sync fallback */
+    {
+        char crypted[MD5_CRYPT_LENGTH+1];
+        pw_cryptpass(new_pass, crypted);
+#ifdef WITH_LDAP
+        if(nickserv_conf.ldap_enable && nickserv_conf.ldap_admin_dn) {
+            int rc;
+            if((rc = ldap_do_modify(hi->handle, crypted, NULL)) != LDAP_SUCCESS) {
+                 reply("NSMSG_LDAP_FAIL", ldap_err2string(rc));
+                 return 0;
+            }
+        }
 #endif
 #ifdef WITH_KEYCLOAK
-    /* Fire-and-forget async password sync to Keycloak */
-    kc_do_modify(hi->handle, crypted, NULL);
+        /* Fire-and-forget async password sync to Keycloak */
+        kc_do_modify(hi->handle, crypted, NULL);
 #endif
-    //cryptpass(new_pass, hi->passwd);
-    strcpy(hi->passwd, crypted);
-    if (nickserv_conf.sync_log)
-      SyncLog("PASSCHANGE %s %s", hi->handle, hi->passwd);
+        strcpy(hi->passwd, crypted);
+        if (nickserv_conf.sync_log)
+          SyncLog("PASSCHANGE %s %s", hi->handle, hi->passwd);
 
 #ifdef WITH_LMDB
-    /* Revoke all session tokens on password change */
-    x3_lmdb_session_revoke_all(hi->handle);
+        /* Revoke all session tokens on password change */
+        x3_lmdb_session_revoke_all(hi->handle);
 #ifdef WITH_SSL
-    /* Revoke old SCRAM session tokens and create new password SCRAM credentials (async) */
-    x3_lmdb_scram_revoke_all(hi->handle);
+        /* Revoke old SCRAM session tokens and create new password SCRAM credentials (async) */
+        x3_lmdb_scram_revoke_all(hi->handle);
 #ifdef WITH_KEYCLOAK
-    scram_create_async(hi->handle, new_pass, user, 1);
+        scram_create_async(hi->handle, new_pass, user, 1);
 #else
-    scram_create_async(hi->handle, new_pass, user, 0);
+        scram_create_async(hi->handle, new_pass, user, 0);
 #endif
 #endif
 #endif
+    }
 
     argv[1] = "****";
     reply("NSMSG_PASS_SUCCESS");
