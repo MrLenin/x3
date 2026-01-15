@@ -16,6 +16,7 @@
 #include "log.h"
 #include "proto.h"
 #include "timeq.h"
+#include "threadpool.h"
 
 #include <lmdb.h>
 #include <stdlib.h>
@@ -4813,6 +4814,114 @@ int x3_lmdb_scram_acct_create_all(const char *account, const char *password)
 
     return count;
 }
+
+/* ========== Async SCRAM Creation (Threadpool) ========== */
+
+#ifdef HAVE_PTHREAD_H
+
+/* Work context for async SCRAM creation */
+struct scram_async_work {
+    char account[128];           /* Account name */
+    char password[256];          /* Plaintext password (cleared after use) */
+    scram_async_callback callback;
+    void *user_ctx;
+    int result;                  /* Number of credentials created */
+};
+
+/* Worker function - runs in threadpool thread */
+static void *scram_async_worker(void *arg)
+{
+    struct scram_async_work *work = arg;
+
+    /* Do the actual SCRAM creation (blocking PBKDF2) */
+    work->result = x3_lmdb_scram_acct_create_all(work->account, work->password);
+
+    /* Clear password from memory immediately */
+    memset(work->password, 0, sizeof(work->password));
+
+    return work;
+}
+
+/* Callback wrapper - runs in main thread */
+static void scram_async_done(void *result, void *user_data, tp_state_t state)
+{
+    struct scram_async_work *work = result;
+
+    (void)user_data;  /* Unused */
+
+    if (state == TP_STATE_COMPLETED) {
+        if (work->callback) {
+            work->callback(work->user_ctx, work->result);
+        }
+    } else {
+        /* Task was cancelled or failed */
+        if (work->callback) {
+            work->callback(work->user_ctx, -1);
+        }
+    }
+
+    /* Final cleanup - ensure password is cleared */
+    memset(work->password, 0, sizeof(work->password));
+    free(work);
+}
+
+int x3_lmdb_scram_acct_create_all_async(const char *account, const char *password,
+                                         scram_async_callback callback, void *ctx)
+{
+    struct scram_async_work *work;
+
+    if (!account || !password || !callback) {
+        return -1;
+    }
+
+    if (!threadpool_is_initialized()) {
+        /* Fallback to sync - call callback directly */
+        int result = x3_lmdb_scram_acct_create_all(account, password);
+        callback(ctx, result);
+        return 0;
+    }
+
+    /* Allocate work structure */
+    work = calloc(1, sizeof(*work));
+    if (!work) {
+        return -1;
+    }
+
+    /* Initialize work */
+    strncpy(work->account, account, sizeof(work->account) - 1);
+    strncpy(work->password, password, sizeof(work->password) - 1);
+    work->callback = callback;
+    work->user_ctx = ctx;
+
+    /* Submit to threadpool - SCRAM creation is lower priority than password verify */
+    if (!threadpool_submit(scram_async_worker, work, scram_async_done, NULL, TP_PRIORITY_NORMAL)) {
+        log_module(MAIN_LOG, LOG_WARNING, "x3_lmdb: Failed to submit async SCRAM creation");
+        memset(work->password, 0, sizeof(work->password));
+        free(work);
+        return -1;
+    }
+
+    log_module(MAIN_LOG, LOG_DEBUG, "x3_lmdb: Async SCRAM creation started for account %s", account);
+    return 0;
+}
+
+#else /* !HAVE_PTHREAD_H */
+
+/* Stub implementation without pthreads - just call sync version */
+int x3_lmdb_scram_acct_create_all_async(const char *account, const char *password,
+                                         scram_async_callback callback, void *ctx)
+{
+    int result;
+
+    if (!account || !password || !callback)
+        return -1;
+
+    result = x3_lmdb_scram_acct_create_all(account, password);
+    callback(ctx, result);
+    return 0;
+}
+
+#endif /* HAVE_PTHREAD_H */
 
 /**
  * Get SCRAM credential for an account with specified hash type.

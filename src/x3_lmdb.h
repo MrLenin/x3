@@ -916,6 +916,26 @@ int x3_lmdb_is_scram_token(const char *password);
 int x3_lmdb_scram_acct_create_all(const char *account, const char *password);
 
 /**
+ * Callback for async SCRAM credential creation.
+ * @param ctx User-provided context pointer
+ * @param result Number of credentials created (0-3), -1 on error
+ */
+typedef void (*scram_async_callback)(void *ctx, int result);
+
+/**
+ * Create SCRAM credentials asynchronously using threadpool.
+ * This offloads the PBKDF2 key derivation to a worker thread to avoid
+ * blocking the event loop (~1 second for 3 variants × 4096 iterations).
+ * @param account Account name
+ * @param password The plaintext password
+ * @param callback Function to call when complete
+ * @param ctx User context passed to callback
+ * @return 0 on successful submission, -1 on error (callback invoked synchronously on fallback)
+ */
+int x3_lmdb_scram_acct_create_all_async(const char *account, const char *password,
+                                         scram_async_callback callback, void *ctx);
+
+/**
  * Create SCRAM credential for an account password with specified hash type
  * @param account Account name
  * @param password The plaintext password
@@ -1165,6 +1185,7 @@ void init_x3_lmdb(void);
 #define x3_lmdb_scram_revoke_all(u)     (-1)
 #define x3_lmdb_is_scram_token(p)       (0)
 #define x3_lmdb_scram_acct_create_all(a, p) (-1)
+#define x3_lmdb_scram_acct_create_all_async(a, p, cb, ctx) ((cb) ? ((cb)((ctx), -1), 0) : -1)
 #define x3_lmdb_scram_acct_create(a, p, h) (-1)
 #define x3_lmdb_scram_acct_get(a, h, c) (-2)
 #define x3_lmdb_scram_acct_delete_all(a) (-1)

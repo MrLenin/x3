@@ -283,6 +283,7 @@ static void auth_async_complete(struct auth_async_ctx *ctx);
 
 /* Structure for async COOKIE command (Phase 4/5) */
 enum cookie_async_state {
+    COOKIE_STATE_PW_VERIFY,   /* Waiting for async password verification */
     COOKIE_STATE_TOKEN_WAIT,  /* Waiting for token refresh (Phase 5 integration) */
     COOKIE_STATE_LOOKUP,
     COOKIE_STATE_UPDATE,
@@ -303,6 +304,7 @@ struct cookie_async_ctx {
     time_t started;                          /* When request started */
 };
 static void cookie_async_token_callback(void *ctx, int result, struct access_token *token);
+static void cookie_pw_verify_callback(void *ctx, int result, const char *hash);
 static void cookie_async_ctx_free(struct cookie_async_ctx *ctx);
 
 /* Forward declarations for Keycloak wrapper functions */
@@ -380,6 +382,104 @@ static void local_auth_ctx_free(struct local_auth_ctx *ctx);
 static void local_auth_verify_callback(void *ctx, int result, const char *hash);
 static void local_auth_rehash_callback(void *ctx, int result, const char *hash);
 static void local_auth_complete(struct local_auth_ctx *ctx);
+
+/* Fire-and-forget SCRAM creation callback - just logs result */
+static void scram_create_log_callback(void *ctx, int result)
+{
+    const char *account = (const char *)ctx;
+    if (result > 0) {
+        log_module(NS_LOG, LOG_DEBUG, "Async SCRAM creation completed for %s: %d credentials",
+                   account ? account : "(unknown)", result);
+    } else {
+        log_module(NS_LOG, LOG_WARNING, "Async SCRAM creation failed for %s",
+                   account ? account : "(unknown)");
+    }
+    /* Note: account string must remain valid or be NULL - caller manages lifetime */
+}
+
+#if defined(WITH_LMDB) && defined(WITH_SSL)
+/* Context for async SCRAM creation with user notification */
+struct scram_async_ctx {
+    char handle[NICKSERV_HANDLE_LEN + 1];
+    char numeric[COMBO_NUMERIC_LEN + 1];  /* For finding user to notify on failure */
+    int sync_to_keycloak;                  /* Whether to call kc_sync_scram on success */
+};
+
+/* Callback for async SCRAM creation - notifies user on failure, syncs to KC on success */
+static void scram_create_async_callback(void *ctx_ptr, int result)
+{
+    struct scram_async_ctx *ctx = ctx_ptr;
+    struct userNode *user = NULL;
+
+    /* Try to find user if they're still connected */
+    if (ctx->numeric[0]) {
+        user = GetUserN(ctx->numeric);
+    }
+
+    if (result > 0) {
+        log_module(NS_LOG, LOG_DEBUG, "Async SCRAM creation completed for %s: %d credentials",
+                   ctx->handle, result);
+#ifdef WITH_KEYCLOAK
+        if (ctx->sync_to_keycloak) {
+            kc_sync_scram(ctx->handle);
+        }
+#endif
+    } else {
+        log_module(NS_LOG, LOG_WARNING, "Async SCRAM creation failed for %s", ctx->handle);
+        /* Notify user if still connected */
+        if (user) {
+            send_message(user, nickserv, "NSMSG_SCRAM_FAILED");
+        }
+    }
+    free(ctx);
+}
+
+/* Helper: Fire-and-forget async SCRAM creation with optional Keycloak sync */
+static void scram_create_async(const char *handle, const char *password,
+                                struct userNode *user, int sync_to_keycloak)
+{
+    struct scram_async_ctx *ctx;
+
+    if (!handle || !password)
+        return;
+
+    ctx = calloc(1, sizeof(*ctx));
+    if (!ctx) {
+        /* Fallback to sync */
+        int result = x3_lmdb_scram_acct_create_all(handle, password);
+        if (result <= 0 && user) {
+            send_message(user, nickserv, "NSMSG_SCRAM_FAILED");
+        }
+#ifdef WITH_KEYCLOAK
+        if (result > 0 && sync_to_keycloak) {
+            kc_sync_scram(handle);
+        }
+#endif
+        return;
+    }
+
+    safestrncpy(ctx->handle, handle, sizeof(ctx->handle));
+    if (user && user->numeric[0]) {
+        safestrncpy(ctx->numeric, user->numeric, sizeof(ctx->numeric));
+    }
+    ctx->sync_to_keycloak = sync_to_keycloak;
+
+    if (x3_lmdb_scram_acct_create_all_async(handle, password,
+                                             scram_create_async_callback, ctx) != 0) {
+        /* Async failed - fallback to sync */
+        int result = x3_lmdb_scram_acct_create_all(handle, password);
+        if (result <= 0 && user) {
+            send_message(user, nickserv, "NSMSG_SCRAM_FAILED");
+        }
+#ifdef WITH_KEYCLOAK
+        if (result > 0 && sync_to_keycloak) {
+            kc_sync_scram(handle);
+        }
+#endif
+        free(ctx);
+    }
+}
+#endif /* WITH_LMDB && WITH_SSL */
 
 /*
  * Password verification with lazy migration.
@@ -541,6 +641,7 @@ static const struct message_entry msgtab[] = {
     { "NSMSG_REGNICK_SUCCESS", "Nick $b%s$b has been registered to you." },
     { "NSMSG_OREGNICK_SUCCESS", "Nick $b%s$b has been registered to account $b%s$b." },
     { "NSMSG_PASS_SUCCESS", "Password changed." },
+    { "NSMSG_SCRAM_FAILED", "Warning: SCRAM credential creation failed. SCRAM authentication will not be available for this account." },
     { "NSMSG_MASK_INVALID", "$b%s$b is an invalid hostmask." },
     { "NSMSG_ADDMASK_ALREADY", "$b%s$b is already a hostmask in your account." },
     { "NSMSG_ADDMASK_SUCCESS", "Hostmask %s added." },
@@ -1486,14 +1587,15 @@ nickserv_register(struct userNode *user, struct userNode *settee, const char *ha
     hi->flags = HI_DEFAULT_FLAGS;
 
 #if defined(WITH_LMDB) && defined(WITH_SSL)
-    /* Create SCRAM credentials for password-based registration.
+    /* Create SCRAM credentials for password-based registration (async to avoid blocking).
      * Only create if no_auth is false - if email verification is required,
      * the password is invalidated until cookie verification, so we should
      * not create SCRAM credentials until after activation. */
     if (passwd && *passwd && !no_auth) {
-        x3_lmdb_scram_acct_create_all(handle, passwd);
 #ifdef WITH_KEYCLOAK
-        kc_sync_scram(handle);
+        scram_create_async(handle, passwd, settee, 1);
+#else
+        scram_create_async(handle, passwd, settee, 0);
 #endif
     }
 #endif
@@ -3491,8 +3593,41 @@ static NICKSERV_FUNC(cmd_cookie)
             return 0;
         }
 
-        /* Verify the password matches what was registered (cookie->data has the hash) */
-        if (!hi->cookie->data || pw_verify(password, hi->cookie->data) != 1) {
+        if (!hi->cookie->data) {
+            reply("NSMSG_PASSWORD_MISMATCH");
+            return 0;
+        }
+
+#ifdef WITH_KEYCLOAK
+        /* Use async password verification to avoid blocking the event loop.
+         * pw_verify with 100k PBKDF2 iterations takes ~9 seconds synchronously. */
+        if (nickserv_conf.keycloak_enable && user->numeric[0] != '\0') {
+            struct cookie_async_ctx *cookie_ctx = mempool_zalloc(mp_cookie_ctx);
+            if (cookie_ctx) {
+                safestrncpy(cookie_ctx->handle, hi->handle, sizeof(cookie_ctx->handle));
+                safestrncpy(cookie_ctx->nick, user->nick, sizeof(cookie_ctx->nick));
+                safestrncpy(cookie_ctx->numeric, user->numeric, sizeof(cookie_ctx->numeric));
+                cookie_ctx->user = user;
+                cookie_ctx->hi = hi;
+                cookie_ctx->password_hash = pool_strdup(hi->cookie->data);
+                cookie_ctx->plaintext_password = pool_strdup(password);
+                cookie_ctx->state = COOKIE_STATE_PW_VERIFY;
+                cookie_ctx->cookie_type = ACTIVATION;
+                cookie_ctx->started = now;
+
+                /* Start async password verification - callback will continue with keycloak flow */
+                if (pw_verify_async(password, hi->cookie->data, cookie_pw_verify_callback, cookie_ctx) == 0) {
+                    log_module(NS_LOG, LOG_DEBUG, "COOKIE async: Started pw_verify for %s", hi->handle);
+                    return 1;  /* Async started - response will come via callback */
+                }
+                log_module(NS_LOG, LOG_WARNING, "COOKIE async: pw_verify_async failed, falling back to sync for %s", hi->handle);
+                cookie_async_ctx_free(cookie_ctx);
+            }
+        }
+#endif
+
+        /* Fallback: Synchronous password verification */
+        if (pw_verify(password, hi->cookie->data) != 1) {
             reply("NSMSG_PASSWORD_MISMATCH");
             return 0;
         }
@@ -3510,34 +3645,7 @@ static NICKSERV_FUNC(cmd_cookie)
 #ifdef WITH_KEYCLOAK
         /* Set password hash in Keycloak (user was created at registration without password). */
         if (nickserv_conf.keycloak_enable) {
-            /* Phase 3+5: Try async path for users with numerics (registered users) */
-            if (user->numeric[0] != '\0') {
-                struct cookie_async_ctx *cookie_ctx = mempool_zalloc(mp_cookie_ctx);
-                if (cookie_ctx) {
-                    int token_rc;
-                    safestrncpy(cookie_ctx->handle, hi->handle, sizeof(cookie_ctx->handle));
-                    safestrncpy(cookie_ctx->nick, user->nick, sizeof(cookie_ctx->nick));
-                    safestrncpy(cookie_ctx->numeric, user->numeric, sizeof(cookie_ctx->numeric));
-                    cookie_ctx->user = user;
-                    cookie_ctx->hi = hi;
-                    cookie_ctx->password_hash = pool_strdup(hi->cookie->data);
-                    cookie_ctx->plaintext_password = pool_strdup(password);
-                    cookie_ctx->state = COOKIE_STATE_TOKEN_WAIT;
-                    cookie_ctx->cookie_type = ACTIVATION;
-                    cookie_ctx->started = now;
-
-                    /* Phase 5 integration: Ensure token is valid before proceeding */
-                    token_rc = keycloak_ensure_token_async(cookie_async_token_callback, cookie_ctx);
-                    if (token_rc >= 0) {
-                        log_module(NS_LOG, LOG_DEBUG, "COOKIE async: Started (token %s) for %s",
-                                   token_rc == 1 ? "valid" : "refreshing", hi->handle);
-                        return 1;  /* Async started - response will come via callback */
-                    }
-                    log_module(NS_LOG, LOG_WARNING, "COOKIE async: Token check failed, falling back to sync for %s", hi->handle);
-                    cookie_async_ctx_free(cookie_ctx);
-                }
-            }
-            /* Fallback: fire-and-forget async (pre-registration users or async failed) */
+            /* fire-and-forget async (pre-registration users or async path failed) */
             kc_do_modify(hi->handle, hi->cookie->data, NULL);
         }
 #endif
@@ -3545,10 +3653,11 @@ static NICKSERV_FUNC(cmd_cookie)
         safestrncpy(hi->passwd, hi->cookie->data, sizeof(hi->passwd));
 
 #if defined(WITH_LMDB) && defined(WITH_SSL)
-        /* Create SCRAM credentials - we have plaintext password here */
-        x3_lmdb_scram_acct_create_all(hi->handle, password);
+        /* Create SCRAM credentials (async) - we have plaintext password here */
 #ifdef WITH_KEYCLOAK
-        kc_sync_scram(hi->handle);
+        scram_create_async(hi->handle, password, user, 1);
+#else
+        scram_create_async(hi->handle, password, user, 0);
 #endif
 #endif
 
@@ -3560,7 +3669,35 @@ static NICKSERV_FUNC(cmd_cookie)
         break;
     }
     case PASSWORD_CHANGE: {
-        /* Optional: If password provided, verify it matches cookie->data for SCRAM creation */
+#ifdef WITH_KEYCLOAK
+        /* Use async password verification to avoid blocking the event loop.
+         * The password is optional here - just used for SCRAM creation. */
+        if (nickserv_conf.keycloak_enable && user->numeric[0] != '\0' && password && hi->cookie->data) {
+            struct cookie_async_ctx *cookie_ctx = mempool_zalloc(mp_cookie_ctx);
+            if (cookie_ctx) {
+                safestrncpy(cookie_ctx->handle, hi->handle, sizeof(cookie_ctx->handle));
+                safestrncpy(cookie_ctx->nick, user->nick, sizeof(cookie_ctx->nick));
+                safestrncpy(cookie_ctx->numeric, user->numeric, sizeof(cookie_ctx->numeric));
+                cookie_ctx->user = user;
+                cookie_ctx->hi = hi;
+                cookie_ctx->password_hash = pool_strdup(hi->cookie->data);
+                cookie_ctx->plaintext_password = pool_strdup(password);  /* Will be used for SCRAM if verify succeeds */
+                cookie_ctx->state = COOKIE_STATE_PW_VERIFY;
+                cookie_ctx->cookie_type = PASSWORD_CHANGE;
+                cookie_ctx->started = now;
+
+                /* Start async password verification - callback will continue with keycloak flow */
+                if (pw_verify_async(password, hi->cookie->data, cookie_pw_verify_callback, cookie_ctx) == 0) {
+                    log_module(NS_LOG, LOG_DEBUG, "COOKIE async: Started PASSWORD_CHANGE pw_verify for %s", hi->handle);
+                    return 1;  /* Async started - response will come via callback */
+                }
+                log_module(NS_LOG, LOG_WARNING, "COOKIE async: pw_verify_async failed for PASSWORD_CHANGE, falling back to sync for %s", hi->handle);
+                cookie_async_ctx_free(cookie_ctx);
+            }
+        }
+#endif
+
+        /* Fallback: Synchronous path (optional password verification for SCRAM) */
         const char *pw_for_scram = NULL;
         if (password && hi->cookie->data && pw_verify(password, hi->cookie->data) == 1) {
             pw_for_scram = password;
@@ -3578,34 +3715,7 @@ static NICKSERV_FUNC(cmd_cookie)
 #ifdef WITH_KEYCLOAK
         /* Sync password hash to Keycloak */
         if (nickserv_conf.keycloak_enable) {
-            /* Phase 5 integration: Try async path with token-first for users with numerics */
-            if (user->numeric[0] != '\0') {
-                struct cookie_async_ctx *cookie_ctx = mempool_zalloc(mp_cookie_ctx);
-                if (cookie_ctx) {
-                    int token_rc;
-                    safestrncpy(cookie_ctx->handle, hi->handle, sizeof(cookie_ctx->handle));
-                    safestrncpy(cookie_ctx->nick, user->nick, sizeof(cookie_ctx->nick));
-                    safestrncpy(cookie_ctx->numeric, user->numeric, sizeof(cookie_ctx->numeric));
-                    cookie_ctx->user = user;
-                    cookie_ctx->hi = hi;
-                    cookie_ctx->password_hash = pool_strdup(hi->cookie->data);
-                    cookie_ctx->plaintext_password = pw_for_scram ? pool_strdup(pw_for_scram) : NULL;
-                    cookie_ctx->state = COOKIE_STATE_TOKEN_WAIT;
-                    cookie_ctx->cookie_type = PASSWORD_CHANGE;
-                    cookie_ctx->started = now;
-
-                    /* Phase 5 integration: Ensure token is valid before proceeding */
-                    token_rc = keycloak_ensure_token_async(cookie_async_token_callback, cookie_ctx);
-                    if (token_rc >= 0) {
-                        log_module(NS_LOG, LOG_DEBUG, "COOKIE async: Started PASSWORD_CHANGE (token %s) for %s",
-                                   token_rc == 1 ? "valid" : "refreshing", hi->handle);
-                        return 1;  /* Async started - response will come via callback */
-                    }
-                    log_module(NS_LOG, LOG_WARNING, "COOKIE async: Token check failed, falling back to sync for %s", hi->handle);
-                    cookie_async_ctx_free(cookie_ctx);
-                }
-            }
-            /* Fallback: fire-and-forget async */
+            /* fire-and-forget async (pre-registration users or async path failed) */
             kc_do_modify(hi->handle, hi->cookie->data, NULL);
         }
 #endif
@@ -3616,11 +3726,12 @@ static NICKSERV_FUNC(cmd_cookie)
         x3_lmdb_session_revoke_all(hi->handle);
 #ifdef WITH_SSL
         x3_lmdb_scram_revoke_all(hi->handle);
-        /* Create new SCRAM credentials if we have plaintext password */
+        /* Create new SCRAM credentials if we have plaintext password (async) */
         if (pw_for_scram) {
-            x3_lmdb_scram_acct_create_all(hi->handle, pw_for_scram);
 #ifdef WITH_KEYCLOAK
-            kc_sync_scram(hi->handle);
+            scram_create_async(hi->handle, pw_for_scram, user, 1);
+#else
+            scram_create_async(hi->handle, pw_for_scram, user, 0);
 #endif
         }
 #endif
@@ -3800,11 +3911,12 @@ static NICKSERV_FUNC(cmd_pass)
     /* Revoke all session tokens on password change */
     x3_lmdb_session_revoke_all(hi->handle);
 #ifdef WITH_SSL
-    /* Revoke old SCRAM session tokens and create new password SCRAM credentials */
+    /* Revoke old SCRAM session tokens and create new password SCRAM credentials (async) */
     x3_lmdb_scram_revoke_all(hi->handle);
-    x3_lmdb_scram_acct_create_all(hi->handle, new_pass);
 #ifdef WITH_KEYCLOAK
-    kc_sync_scram(hi->handle);
+    scram_create_async(hi->handle, new_pass, user, 1);
+#else
+    scram_create_async(hi->handle, new_pass, user, 0);
 #endif
 #endif
 #endif
@@ -4503,10 +4615,11 @@ static OPTION_FUNC(opt_password)
         SyncLog("PASSCHANGE %s %s", hi->handle, hi->passwd);
 
 #if defined(WITH_LMDB) && defined(WITH_SSL)
-    /* Create SCRAM credentials for the new password */
-    x3_lmdb_scram_acct_create_all(hi->handle, argv[1]);
+    /* Create SCRAM credentials for the new password (async) */
 #ifdef WITH_KEYCLOAK
-    kc_sync_scram(hi->handle);
+    scram_create_async(hi->handle, argv[1], user, 1);
+#else
+    scram_create_async(hi->handle, argv[1], user, 0);
 #endif
 #endif
 
@@ -6882,6 +6995,127 @@ cookie_async_ctx_free(struct cookie_async_ctx *ctx)
     mempool_free(mp_cookie_ctx, ctx);
 }
 
+/* Phase -1 callback: Password verification completed (threadpool), now continue with keycloak */
+static void
+cookie_pw_verify_callback(void *context, int result, const char *hash)
+{
+    struct cookie_async_ctx *ctx = (struct cookie_async_ctx *)context;
+    struct userNode *user;
+    int token_rc;
+
+    (void)hash;  /* Not used for verify operations */
+
+    if (!ctx) {
+        log_module(NS_LOG, LOG_ERROR, "COOKIE pw_verify callback: NULL context");
+        return;
+    }
+
+    /* Validate user is still connected */
+    user = cookie_async_validate_user(ctx);
+    if (!user) {
+        log_module(NS_LOG, LOG_DEBUG, "COOKIE pw_verify: User no longer valid");
+        cookie_async_ctx_free(ctx);
+        return;
+    }
+
+    /* Check password verification result */
+    if (result != 1) {
+        if (ctx->cookie_type == ACTIVATION) {
+            /* For ACTIVATION, password is required - fail the operation */
+            log_module(NS_LOG, LOG_DEBUG, "COOKIE pw_verify: Password mismatch for %s", ctx->handle);
+            send_message(user, nickserv, "NSMSG_PASSWORD_MISMATCH");
+            cookie_async_ctx_free(ctx);
+            return;
+        }
+        /* For PASSWORD_CHANGE, password is optional - continue without SCRAM */
+        log_module(NS_LOG, LOG_DEBUG, "COOKIE pw_verify: Password mismatch for %s (optional, continuing without SCRAM)", ctx->handle);
+        if (ctx->plaintext_password) {
+            memset(ctx->plaintext_password, 0, strlen(ctx->plaintext_password));
+            pool_strfree(ctx->plaintext_password);
+            ctx->plaintext_password = NULL;
+        }
+    } else {
+        log_module(NS_LOG, LOG_DEBUG, "COOKIE pw_verify: Password verified for %s", ctx->handle);
+    }
+
+    log_module(NS_LOG, LOG_DEBUG, "COOKIE pw_verify: Continuing with token check for %s", ctx->handle);
+
+    /* Password verified, transition to token wait state */
+    ctx->state = COOKIE_STATE_TOKEN_WAIT;
+
+    /* Start async token check */
+    token_rc = keycloak_ensure_token_async(cookie_async_token_callback, ctx);
+    if (token_rc >= 0) {
+        log_module(NS_LOG, LOG_DEBUG, "COOKIE async: Token %s for %s after pw_verify",
+                   token_rc == 1 ? "valid" : "refreshing", ctx->handle);
+        return;  /* Async continues via token callback */
+    }
+
+    /* Token check failed - fall through to synchronous completion */
+    log_module(NS_LOG, LOG_WARNING, "COOKIE async: Token check failed after pw_verify for %s, completing sync", ctx->handle);
+
+    /* Complete the activation/password change synchronously */
+    if (ctx->cookie_type == ACTIVATION) {
+        struct handle_info *hi = ctx->hi;
+        if (hi && hi->cookie && hi->cookie->data) {
+#ifdef WITH_LDAP
+            if (nickserv_conf.ldap_enable && nickserv_conf.ldap_admin_dn) {
+                int rc = ldap_do_modify(ctx->handle, ctx->password_hash, NULL);
+                if (rc != LDAP_SUCCESS) {
+                    send_message(user, nickserv, "NSMSG_LDAP_FAIL", ldap_err2string(rc));
+                    cookie_async_ctx_free(ctx);
+                    return;
+                }
+            }
+#endif
+            kc_do_modify(ctx->handle, ctx->password_hash, NULL);
+            safestrncpy(hi->passwd, ctx->password_hash, sizeof(hi->passwd));
+#if defined(WITH_LMDB) && defined(WITH_SSL)
+            if (ctx->plaintext_password) {
+                scram_create_async(ctx->handle, ctx->plaintext_password, user, 1);
+            }
+#endif
+            set_user_handle_info(user, hi, 1);
+            nickserv_eat_cookie(hi->cookie);
+            send_message(user, nickserv, "NSMSG_HANDLE_ACTIVATED");
+            if (nickserv_conf.sync_log)
+                SyncLog("ACCOUNTACC %s", ctx->handle);
+        }
+    } else if (ctx->cookie_type == PASSWORD_CHANGE) {
+        struct handle_info *hi = ctx->hi;
+        if (hi && hi->cookie && hi->cookie->data) {
+#ifdef WITH_LDAP
+            if (nickserv_conf.ldap_enable && nickserv_conf.ldap_admin_dn) {
+                int rc = ldap_do_modify(ctx->handle, ctx->password_hash, NULL);
+                if (rc != LDAP_SUCCESS) {
+                    send_message(user, nickserv, "NSMSG_LDAP_FAIL", ldap_err2string(rc));
+                    cookie_async_ctx_free(ctx);
+                    return;
+                }
+            }
+#endif
+            kc_do_modify(ctx->handle, ctx->password_hash, NULL);
+            set_user_handle_info(user, hi, 1);
+            safestrncpy(hi->passwd, ctx->password_hash, sizeof(hi->passwd));
+#ifdef WITH_LMDB
+            x3_lmdb_session_revoke_all(ctx->handle);
+#ifdef WITH_SSL
+            x3_lmdb_scram_revoke_all(ctx->handle);
+            if (ctx->plaintext_password) {
+                scram_create_async(ctx->handle, ctx->plaintext_password, user, 1);
+            }
+#endif
+#endif
+            nickserv_eat_cookie(hi->cookie);
+            send_message(user, nickserv, "NSMSG_PASSWORD_CHANGED");
+            if (nickserv_conf.sync_log)
+                SyncLog("PASSCHANGE %s", ctx->handle);
+        }
+    }
+
+    cookie_async_ctx_free(ctx);
+}
+
 /* Phase 0 callback: Token ready, now start user lookup */
 static void
 cookie_async_token_callback(void *context, int result, struct access_token *token)
@@ -7058,11 +7292,12 @@ cookie_async_update_callback(void *session, int result)
         safestrncpy(hi->passwd, hi->cookie->data, sizeof(hi->passwd));
 
 #if defined(WITH_LMDB) && defined(WITH_SSL)
-        /* Create SCRAM credentials if we have plaintext password */
+        /* Create SCRAM credentials if we have plaintext password (async) */
         if (ctx->plaintext_password) {
-            x3_lmdb_scram_acct_create_all(hi->handle, ctx->plaintext_password);
 #ifdef WITH_KEYCLOAK
-            kc_sync_scram(hi->handle);
+            scram_create_async(hi->handle, ctx->plaintext_password, user, 1);
+#else
+            scram_create_async(hi->handle, ctx->plaintext_password, user, 0);
 #endif
         }
 #endif
@@ -7086,11 +7321,12 @@ cookie_async_update_callback(void *session, int result)
         x3_lmdb_session_revoke_all(hi->handle);
 #ifdef WITH_SSL
         x3_lmdb_scram_revoke_all(hi->handle);
-        /* Create new SCRAM credentials if we have plaintext password */
+        /* Create new SCRAM credentials if we have plaintext password (async) */
         if (ctx->plaintext_password) {
-            x3_lmdb_scram_acct_create_all(hi->handle, ctx->plaintext_password);
 #ifdef WITH_KEYCLOAK
-            kc_sync_scram(hi->handle);
+            scram_create_async(hi->handle, ctx->plaintext_password, user, 1);
+#else
+            scram_create_async(hi->handle, ctx->plaintext_password, user, 0);
 #endif
         }
 #endif
@@ -11342,11 +11578,13 @@ reg_complete_registration(struct RegSession *session)
             nickserv_set_email_addr(hi, session->email);
 
 #if defined(WITH_LMDB) && defined(WITH_SSL)
-        /* Create SCRAM credentials - we have plaintext password in session */
+        /* Create SCRAM credentials - we have plaintext password in session (async).
+         * Note: User is pre-registration (no userNode), so pass NULL - failure logged only */
         if (session->password_plain[0]) {
-            x3_lmdb_scram_acct_create_all(session->account, session->password_plain);
 #ifdef WITH_KEYCLOAK
-            kc_sync_scram(session->account);
+            scram_create_async(session->account, session->password_plain, NULL, 1);
+#else
+            scram_create_async(session->account, session->password_plain, NULL, 0);
 #endif
         }
 #endif
@@ -14346,15 +14584,16 @@ nickserv_ircv3_verify(struct userNode *user, const char *handle,
     safestrncpy(hi->passwd, hi->cookie->data, sizeof(hi->passwd));
 
 #if defined(WITH_LMDB) && defined(WITH_SSL)
-    /* Create SCRAM credentials if we have the pending plaintext password */
+    /* Create SCRAM credentials if we have the pending plaintext password (async) */
     {
         const char *pending_password = pending_scram_get(handle);
         if (pending_password) {
-            x3_lmdb_scram_acct_create_all(hi->handle, pending_password);
 #ifdef WITH_KEYCLOAK
-            kc_sync_scram(hi->handle);
+            scram_create_async(hi->handle, pending_password, user, 1);
+#else
+            scram_create_async(hi->handle, pending_password, user, 0);
 #endif
-            pending_scram_remove(handle);
+            pending_scram_remove(handle);  /* Safe - password copied into async work struct */
         }
     }
 #endif
