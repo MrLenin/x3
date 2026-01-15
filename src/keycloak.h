@@ -240,6 +240,7 @@ int keycloak_update_user(struct kc_realm realm, struct kc_client client,
  * Set fields to NULL to skip updating them.
  */
 struct kc_user_update {
+    const char* username;       /* Username - REQUIRED for credential updates (Keycloak bug workaround) */
     const char* email;          /* New email address (NULL to skip) */
     const char* cred_data;      /* credentialData JSON from pw_export_keycloak() (NULL to skip) */
     const char* secret_data;    /* secretData JSON - required if cred_data is set */

@@ -8325,8 +8325,8 @@ keycloak_update_user_representation_async(struct kc_realm realm, struct kc_clien
         goto error;
     }
 
-    /* Build JSON body - utility function handles NULL username for updates */
-    json_body = json_build_user_with_hash(NULL, update->email,
+    /* Build JSON body - username required for credential updates (Keycloak bug workaround) */
+    json_body = json_build_user_with_hash(update->username, update->email,
                                           update->cred_data, update->secret_data);
     if (!json_body) {
         log_module(KC_LOG, LOG_ERROR, "update_user_async: Failed to build JSON body");

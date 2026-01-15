@@ -6987,6 +6987,7 @@ cookie_async_lookup_callback(void *session, int result, struct kc_user *kc_user)
 
     /* Build update struct and start phase 2 */
     struct kc_user_update update = {0};
+    update.username = ctx->handle;  /* Required for Keycloak credential import */
     update.cred_data = cred_data;
     update.secret_data = secret_data;
 
@@ -7382,6 +7383,7 @@ kc_modify_user_cb(void *session, int result, struct kc_user *user)
     keycloak_user_free_fields(user);
 
     /* Build update struct */
+    update.username = ctx->handle;  /* Required for Keycloak credential import */
     if (ctx->cred_data && ctx->secret_data) {
         update.cred_data = ctx->cred_data;
         update.secret_data = ctx->secret_data;
