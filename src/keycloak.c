@@ -8334,6 +8334,9 @@ keycloak_update_user_representation_async(struct kc_realm realm, struct kc_clien
     }
     req->post_fields = json_body;
 
+    /* DEBUG: Log the JSON body being sent */
+    log_module(KC_LOG, LOG_DEBUG, "update_user_async: JSON body = %s", json_body);
+
     /* Copy bearer token from global manager (avoids use-after-free if ctx has stale pointer) */
     if (!kc_token_mgr.token || !kc_token_mgr.token->access_token) {
         log_module(KC_LOG, LOG_ERROR, "update_user_async: No valid token available (token refresh in progress?)");

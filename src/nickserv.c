@@ -6985,6 +6985,10 @@ cookie_async_lookup_callback(void *session, int result, struct kc_user *kc_user)
         return 0;
     }
 
+    /* DEBUG: Log the credential data being sent to Keycloak */
+    log_module(NS_LOG, LOG_DEBUG, "COOKIE async: cred_data = %s", cred_data);
+    log_module(NS_LOG, LOG_DEBUG, "COOKIE async: secret_data = %s", secret_data);
+
     /* Build update struct and start phase 2 */
     struct kc_user_update update = {0};
     update.username = ctx->handle;  /* Required for Keycloak credential import */
