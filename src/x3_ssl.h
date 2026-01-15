@@ -124,6 +124,15 @@ enum x3_ssl_state x3_ssl_get_state(struct x3_ssl_conn *conn);
 ssize_t x3_ssl_read(struct x3_ssl_conn *conn, void *buf, size_t len);
 
 /**
+ * Check if SSL layer has buffered data ready to read
+ * IMPORTANT: Must check this after SSL_read to avoid missing data.
+ * SSL can buffer decrypted data internally that won't wake up epoll.
+ * @param conn SSL connection
+ * @return Number of bytes available, 0 if none
+ */
+int x3_ssl_pending(struct x3_ssl_conn *conn);
+
+/**
  * SSL-aware write (replaces send())
  * @param conn SSL connection
  * @param buf Buffer to write from
@@ -206,6 +215,7 @@ struct x3_ssl_conn;
 #define x3_ssl_want_write(c)                    (0)
 #define x3_ssl_get_state(c)                     (0)
 #define x3_ssl_read(c,b,l)                      (-1)
+#define x3_ssl_pending(c)                       (0)
 #define x3_ssl_write(c,b,l)                     (-1)
 #define x3_ssl_get_fingerprint(c,b,l)           (-1)
 #define x3_ssl_verify_fingerprint(c,e)          (-1)

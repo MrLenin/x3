@@ -549,6 +549,7 @@ static void
 ioset_buffered_read(struct io_fd *fd) {
     int put_avail, nbr;
 
+ssl_read_again:
     if (!(put_avail = ioq_put_avail(&fd->recv)))
         put_avail = ioq_grow(&fd->recv);
 #ifdef WITH_SSL
@@ -608,8 +609,16 @@ ioset_buffered_read(struct io_fd *fd) {
             if (old_active != fd)
                 active_fd = old_active;
             if (died)
-                break;
+                return;  /* fd was closed, don't check ssl_pending */
         }
+#ifdef WITH_SSL
+        /* SSL can buffer decrypted data internally. If there's more data
+         * waiting in the SSL layer, we must read it now - epoll won't
+         * wake us since the underlying socket shows empty. This fixes
+         * hangs when multiple IRC messages arrive in one TLS record. */
+        if (fd->ssl && fd->state != IO_CLOSED && x3_ssl_pending(fd->ssl) > 0)
+            goto ssl_read_again;
+#endif
     }
 }
 

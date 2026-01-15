@@ -321,6 +321,15 @@ ssize_t x3_ssl_read(struct x3_ssl_conn *conn, void *buf, size_t len)
     }
 }
 
+int x3_ssl_pending(struct x3_ssl_conn *conn)
+{
+    if (!conn || !conn->ssl)
+        return 0;
+    if (conn->state != X3_SSL_CONNECTED)
+        return 0;
+    return SSL_pending(conn->ssl);
+}
+
 ssize_t x3_ssl_write(struct x3_ssl_conn *conn, const void *buf, size_t len)
 {
     int ret, err;
