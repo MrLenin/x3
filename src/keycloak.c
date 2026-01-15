@@ -1462,7 +1462,7 @@ kc_build_group_by_path_endpoint(struct kc_realm realm, const char *path)
         return NULL;
     }
 
-    log_module(KC_LOG, LOG_DEBUG, "kc_build_group_by_path_endpoint: BEFORE %2F fix: raw='%s'", encoded_path);
+    log_module(KC_LOG, LOG_DEBUG, "kc_build_group_by_path_endpoint: BEFORE %%2F fix: raw='%s'", encoded_path);
 
     /* curl_easy_escape encodes / as %2F, but we need literal slashes in the path */
     /* Replace %2F back to / for path separators */
@@ -1478,7 +1478,7 @@ kc_build_group_by_path_endpoint(struct kc_realm realm, const char *path)
     }
     *w = '\0';
 
-    log_module(KC_LOG, LOG_DEBUG, "kc_build_group_by_path_endpoint: AFTER %2F fix: encoded='%s'", encoded_path);
+    log_module(KC_LOG, LOG_DEBUG, "kc_build_group_by_path_endpoint: AFTER %%2F fix: encoded='%s'", encoded_path);
 
     int len = snprintf(NULL, 0, tmpl, realm.base_uri, realm.realm, encoded_path) + 1;
     char *uri = malloc(len);
@@ -2981,8 +2981,9 @@ kc_curl_check_completed(void)
                             json_array_append_new(attr_array, json_string(req->user_attr_value));
                             json_object_set_new(attrs, req->user_attr_name, attr_array);
                         } else {
-                            /* NULL value = delete attribute */
-                            json_object_del(attrs, req->user_attr_name);
+                            /* NULL value = delete attribute by setting to empty array */
+                            json_t *empty_array = json_array();
+                            json_object_set_new(attrs, req->user_attr_name, empty_array);
                         }
 
                         /* Now issue the PUT with full representation */
@@ -3104,8 +3105,9 @@ kc_curl_check_completed(void)
                                 json_array_append_new(attr_array, json_string(pending->attrs[i].value));
                                 json_object_set_new(attrs, pending->attrs[i].name, attr_array);
                             } else {
-                                /* NULL value = delete attribute */
-                                json_object_del(attrs, pending->attrs[i].name);
+                                /* NULL value = delete attribute by setting to empty array */
+                                json_t *empty_array = json_array();
+                                json_object_set_new(attrs, pending->attrs[i].name, empty_array);
                             }
                         }
 
@@ -3752,8 +3754,12 @@ kc_coalesce_flush_cb(void *data)
                 json_array_append_new(attr_array, json_string(p->attrs[i].value));
                 json_object_set_new(attrs, p->attrs[i].name, attr_array);
             } else {
-                /* NULL value = delete attribute */
-                json_object_del(attrs, p->attrs[i].name);
+                /* NULL value = delete attribute by setting to empty array
+                 * NOTE: json_object_del doesn't work - Keycloak interprets missing
+                 * attributes as "don't change" not "delete". Must explicitly set
+                 * to empty array [] to delete. */
+                json_t *empty_array = json_array();
+                json_object_set_new(attrs, p->attrs[i].name, empty_array);
             }
         }
 

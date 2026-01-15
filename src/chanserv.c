@@ -2064,13 +2064,21 @@ unregister_channel(struct chanData *channel, const char *reason)
     /* Queue deletion of user access attributes before deleting local users */
     if (nickserv_conf.keycloak_enable && chanserv_conf.keycloak_access_sync) {
         struct userData *uData;
+        int user_count = 0;
         for (uData = channel->users; uData; uData = uData->next) {
+            user_count++;
             if (uData->handle && uData->handle->handle) {
                 /* Queue async deletion of user's channel access attribute */
+                log_module(CS_LOG, LOG_INFO,
+                           "unregister_channel[%s]: Queuing Keycloak attr delete for %s (access=%d)",
+                           channel->channel->name, uData->handle->handle, uData->access);
                 chanserv_push_keycloak_access(channel->channel->name,
                                                uData->handle->handle, 0);
             }
         }
+        log_module(CS_LOG, LOG_INFO,
+                   "unregister_channel[%s]: Queued %d Keycloak attr deletions",
+                   channel->channel->name, user_count);
     }
 #endif
 
@@ -11525,6 +11533,9 @@ adduser_lookup_group_cb(void *session, int result, char *group_id)
             char attr_name[256];
             snprintf(attr_name, sizeof(attr_name), "x3.channel.%s", ctx->channel);
 
+            log_module(CS_LOG, LOG_INFO, "adduser_async[%s/%s]: Deleting attr %s (group exists)",
+                       ctx->channel, ctx->username, attr_name);
+
             if (keycloak_set_user_attribute_async(ctx->realm, ctx->client, ctx->user_id,
                                                    attr_name, NULL, ctx,
                                                    adduser_remove_attr_cb) < 0) {
@@ -11540,6 +11551,9 @@ adduser_lookup_group_cb(void *session, int result, char *group_id)
             char attr_name[256];
             snprintf(attr_name, sizeof(attr_name), "x3.channel.%s", ctx->channel);
             ctx->state = ADDUSER_REMOVE_ATTR;
+
+            log_module(CS_LOG, LOG_INFO, "adduser_async[%s/%s]: Deleting attr %s (no group)",
+                       ctx->channel, ctx->username, attr_name);
 
             if (keycloak_set_user_attribute_async(ctx->realm, ctx->client, ctx->user_id,
                                                    attr_name, NULL, ctx,
