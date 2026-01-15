@@ -795,8 +795,14 @@ enum scram_hash_type {
     SCRAM_HASH_SHA512 = 3     /* SCRAM-SHA-512 - 64 byte output */
 };
 
-/* SCRAM iteration count (RFC 7677 recommends at least 4096) */
-#define SCRAM_ITERATION_COUNT 4096
+/* SCRAM iteration count - configurable via scram_iterations in x3.conf
+ * RFC 7677 recommends at least 4096. Default is 4096. */
+#define SCRAM_ITERATION_COUNT_MIN 4096
+#define SCRAM_ITERATION_COUNT_DEFAULT 4096
+
+/* Get/set the configured SCRAM iteration count */
+unsigned int x3_lmdb_get_scram_iterations(void);
+void x3_lmdb_set_scram_iterations(unsigned int iterations);
 
 /* SCRAM salt length in bytes */
 #define SCRAM_SALT_LEN 16

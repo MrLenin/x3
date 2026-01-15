@@ -40,6 +40,24 @@ static int lmdb_initialized = 0;
 /* Configuration */
 static char lmdb_path[MAXLEN];
 static size_t lmdb_mapsize = 100 * 1024 * 1024; /* 100MB default */
+static unsigned int scram_iterations = SCRAM_ITERATION_COUNT_DEFAULT;
+
+/* Get/set SCRAM iteration count */
+unsigned int x3_lmdb_get_scram_iterations(void)
+{
+    return scram_iterations;
+}
+
+void x3_lmdb_set_scram_iterations(unsigned int iterations)
+{
+    if (iterations < SCRAM_ITERATION_COUNT_MIN) {
+        log_module(MAIN_LOG, LOG_WARNING, "x3_lmdb: scram_iterations %u below minimum %u, using minimum",
+                   iterations, SCRAM_ITERATION_COUNT_MIN);
+        iterations = SCRAM_ITERATION_COUNT_MIN;
+    }
+    scram_iterations = iterations;
+    log_module(MAIN_LOG, LOG_DEBUG, "x3_lmdb: SCRAM iterations set to %u", scram_iterations);
+}
 
 /* Maximum value size (increased for compression support) */
 #define LMDB_MAX_VALUE_SIZE 8192
@@ -4289,7 +4307,7 @@ int x3_lmdb_scram_create_ex(const char *token_id, const char *username,
 
     /* Derive SCRAM keys using the generic function */
     if (scram_derive_keys(hash_type, password, salt, SCRAM_SALT_LEN,
-                          SCRAM_ITERATION_COUNT,
+                          x3_lmdb_get_scram_iterations(),
                           stored_key, server_key) != 0) {
         log_module(MAIN_LOG, LOG_ERROR, "x3_lmdb: Failed to derive SCRAM keys");
         return LMDB_ERROR;
@@ -4312,7 +4330,7 @@ int x3_lmdb_scram_create_ex(const char *token_id, const char *username,
     /* Build value: expiry:hashtype:iteration:salt:storedkey:serverkey:username */
     expiry = now + SESSION_TOKEN_TTL;
     snprintf(value_buf, sizeof(value_buf), "%lu:%d:%u:%s:%s:%s:%s",
-             (unsigned long)expiry, (int)hash_type, SCRAM_ITERATION_COUNT,
+             (unsigned long)expiry, (int)hash_type, x3_lmdb_get_scram_iterations(),
              salt_hex, stored_key_hex, server_key_hex, username);
 
     /* Start write transaction */
@@ -4726,7 +4744,7 @@ int x3_lmdb_scram_acct_create(const char *account, const char *password,
 
     /* Derive SCRAM keys */
     if (scram_derive_keys(hash_type, password, salt, SCRAM_SALT_LEN,
-                          SCRAM_ITERATION_COUNT,
+                          x3_lmdb_get_scram_iterations(),
                           stored_key, server_key) != 0) {
         log_module(MAIN_LOG, LOG_ERROR, "x3_lmdb: Failed to derive SCRAM keys for account");
         return LMDB_ERROR;
@@ -4749,7 +4767,7 @@ int x3_lmdb_scram_acct_create(const char *account, const char *password,
     /* Build value: 0:hashtype:iteration:salt:storedkey:serverkey:account
      * Note: expiry=0 means no expiry for password-based SCRAM */
     snprintf(value_buf, sizeof(value_buf), "0:%d:%u:%s:%s:%s:%s",
-             (int)hash_type, SCRAM_ITERATION_COUNT,
+             (int)hash_type, x3_lmdb_get_scram_iterations(),
              salt_hex, stored_key_hex, server_key_hex, account);
 
     /* Start write transaction */

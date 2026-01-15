@@ -39,7 +39,7 @@ extern int checkpass(const char *pass, const char *crypted);
 #define PBKDF2_SALT_LEN      16
 #define PBKDF2_SHA256_LEN    32   /* SHA256 output: 256 bits */
 #define PBKDF2_SHA512_LEN    64   /* SHA512 output: 512 bits */
-#define PBKDF2_ITERATIONS    100000
+#define PBKDF2_ITERATIONS    10000  /* Default: 10k iterations (~100ms sync, <10ms async) */
 
 /* bcrypt parameters (reused from Nefarious ircd_crypt_bcrypt.c) */
 #define BCRYPT_DEFAULT_COST 12

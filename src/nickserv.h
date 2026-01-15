@@ -240,9 +240,10 @@ struct nickserv_config {
     const char *metadata_immutable_keys;    // Space-separated keys that never expire
     /* Password hashing configuration */
     const char *password_algorithm;         // "pbkdf2-sha256", "pbkdf2-sha512", "bcrypt"
-    unsigned long password_pbkdf2_iterations; // PBKDF2 iterations (default: 100000)
+    unsigned long password_pbkdf2_iterations; // PBKDF2 iterations (default: 10000)
     unsigned int password_bcrypt_cost;      // bcrypt cost factor (default: 12)
     unsigned int password_lazy_migration;   // Rehash legacy passwords on login (default: 1)
+    unsigned int scram_iterations;          // SCRAM-SHA-256 iterations (default: 4096, RFC min)
     /* Certificate auto-registration */
     unsigned int cert_autoregister;         // Auto-register certs on SASL PLAIN auth (default: 0)
 };

@@ -2133,6 +2133,40 @@ unregister_channel(struct chanData *channel, const char *reason)
     chanserv_delete_keycloak_channel(channel->channel->name);
 #endif
 
+#ifdef WITH_LMDB
+    /* Clean up all LMDB data for this channel and notify IRCd */
+    if (x3_lmdb_is_available()) {
+        const char *chan_name = channel->channel->name;
+        struct lmdb_metadata_entry *entries = NULL;
+        struct lmdb_metadata_entry *entry;
+        int count, cleared;
+
+        /* First, list all channel metadata and notify IRCd to clear each key */
+        count = x3_lmdb_channel_list(chan_name, &entries);
+        if (count > 0) {
+            for (entry = entries; entry; entry = entry->next) {
+                /* Skip internal keys */
+                if (entry->key && entry->key[0] != '_') {
+                    irc_metadata(chan_name, entry->key, NULL, 0);
+                }
+            }
+            x3_lmdb_free_entries(entries);
+            log_module(CS_LOG, LOG_DEBUG, "unregister_channel[%s]: Sent %d metadata deletions to IRCd", chan_name, count);
+        }
+
+        /* Now clear LMDB */
+        cleared = x3_lmdb_channel_clear(chan_name);
+        if (cleared > 0)
+            log_module(CS_LOG, LOG_DEBUG, "unregister_channel[%s]: Cleared %d LMDB channel metadata entries", chan_name, cleared);
+
+        cleared = x3_lmdb_chanaccess_clear(chan_name);
+        if (cleared > 0)
+            log_module(CS_LOG, LOG_DEBUG, "unregister_channel[%s]: Cleared %d LMDB channel access entries", chan_name, cleared);
+
+        x3_lmdb_chansync_delete(chan_name);
+    }
+#endif
+
     UnlockChannel(channel->channel);
     free(channel);
     registered_channels--;

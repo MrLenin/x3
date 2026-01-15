@@ -212,6 +212,7 @@
 #define KEY_PASSWORD_PBKDF2_ITERATIONS "password_pbkdf2_iterations"
 #define KEY_PASSWORD_BCRYPT_COST     "password_bcrypt_cost"
 #define KEY_PASSWORD_LAZY_MIGRATION  "password_lazy_migration"
+#define KEY_SCRAM_ITERATIONS         "scram_iterations"
 
 /* Certificate auto-registration */
 #define KEY_CERT_AUTOREGISTER        "cert_autoregister"
@@ -954,6 +955,11 @@ struct nickserv_config nickserv_conf;
 /* We have 2^32 unique account IDs to use. */
 unsigned long int highest_id = 0;
 
+/* X3 startup time - used to detect stale LMDB metadata.
+ * If account's _metadata_sync_time < x3_metadata_startup_time,
+ * the LMDB data is from a previous X3 session and may be stale. */
+static time_t x3_metadata_startup_time = 0;
+
 static char *
 canonicalize_hostmask(char *mask)
 {
@@ -1122,6 +1128,41 @@ nickserv_unregister_handle(struct handle_info *hi, struct userNode *notify, stru
         kc_delete_account(hi->handle);
     }
 #endif
+
+#ifdef WITH_LMDB
+    /* Clean up all LMDB data for this account and notify IRCd */
+    if (x3_lmdb_is_available()) {
+        struct lmdb_metadata_entry *entries = NULL;
+        struct lmdb_metadata_entry *entry;
+        struct userNode *user;
+        int count, cleared;
+
+        /* First, list all account metadata */
+        count = x3_lmdb_account_list(hi->handle, &entries);
+        if (count > 0) {
+            /* Notify IRCd to clear metadata for each online user authed to this account */
+            for (user = hi->users; user; user = user->next_authed) {
+                for (entry = entries; entry; entry = entry->next) {
+                    /* Skip internal keys */
+                    if (entry->key && entry->key[0] != '_') {
+                        irc_metadata(user->nick, entry->key, NULL, 0);
+                    }
+                }
+            }
+            x3_lmdb_free_entries(entries);
+            log_module(NS_LOG, LOG_DEBUG, "nickserv_unregister_handle[%s]: Sent metadata deletions to IRCd for %d keys", hi->handle, count);
+        }
+
+        /* Now clear LMDB */
+        cleared = x3_lmdb_account_clear(hi->handle);
+        if (cleared > 0)
+            log_module(NS_LOG, LOG_DEBUG, "nickserv_unregister_handle[%s]: Cleared %d LMDB metadata entries", hi->handle, cleared);
+
+        x3_lmdb_activity_delete(hi->handle);
+        x3_lmdb_scram_acct_delete_all(hi->handle);
+    }
+#endif
+
     for (n=0; n<unreg_func_used; n++)
         unreg_func_list[n](notify, hi, unreg_func_list_extra[n]);
     while (hi->users) {
@@ -10451,6 +10492,10 @@ mdq_single_attr_cb(void *session, int result, char *value)
         /* Populate LMDB cache */
         if (x3_lmdb_is_available()) {
             x3_lmdb_account_set(ctx->handle, ctx->key, value);
+            /* Also update sync timestamp */
+            char ts_buf[32];
+            snprintf(ts_buf, sizeof(ts_buf), "%lu", (unsigned long)now);
+            x3_lmdb_account_set(ctx->handle, "_metadata_sync_time", ts_buf);
         }
 #endif
         free(value);
@@ -10592,6 +10637,7 @@ void
 nickserv_sync_metadata_to_ircd(struct userNode *user)
 {
     int found_entries = 0;
+    int lmdb_stale = 0;
 
     if (!user || !user->handle_info)
         return;
@@ -10599,11 +10645,33 @@ nickserv_sync_metadata_to_ircd(struct userNode *user)
     /*
      * Sync pattern: Try LMDB cache first, then Keycloak.
      * When loading from Keycloak, populate LMDB cache for next time.
+     *
+     * Staleness detection: If LMDB data was written before X3 started,
+     * it may be stale (Keycloak may have been updated while X3 was down).
+     * In that case, skip LMDB and refresh from Keycloak.
      */
 
 #ifdef WITH_LMDB
-    /* Step 1: Try LMDB cache first */
-    if (x3_lmdb_is_available()) {
+    /* Step 1: Check if LMDB data is stale (from a previous X3 session) */
+    if (x3_lmdb_is_available() && x3_metadata_startup_time > 0) {
+        char sync_time_buf[32];
+        if (x3_lmdb_account_get(user->handle_info->handle, "_metadata_sync_time", sync_time_buf) == LMDB_SUCCESS) {
+            time_t sync_time = (time_t)strtoul(sync_time_buf, NULL, 10);
+            if (sync_time < x3_metadata_startup_time) {
+                log_module(NS_LOG, LOG_DEBUG, "nickserv_sync_metadata_to_ircd: LMDB data for %s is stale (sync_time=%lu < startup=%lu), refreshing from Keycloak",
+                           user->handle_info->handle, (unsigned long)sync_time, (unsigned long)x3_metadata_startup_time);
+                lmdb_stale = 1;
+            }
+        } else {
+            /* No sync time found - data predates timestamp tracking, treat as stale */
+            log_module(NS_LOG, LOG_DEBUG, "nickserv_sync_metadata_to_ircd: No _metadata_sync_time for %s, treating as stale",
+                       user->handle_info->handle);
+            lmdb_stale = 1;
+        }
+    }
+
+    /* Step 2: Try LMDB cache if not stale */
+    if (x3_lmdb_is_available() && !lmdb_stale) {
         struct lmdb_metadata_entry *entries = NULL;
         struct lmdb_metadata_entry *entry;
         int count;
@@ -10618,6 +10686,10 @@ nickserv_sync_metadata_to_ircd(struct userNode *user)
                 const char *value = entry->value;
                 int visibility = METADATA_VIS_PUBLIC;
 
+                /* Skip internal keys (start with _) */
+                if (key && key[0] == '_')
+                    continue;
+
                 /* Parse visibility prefix from stored value (P:value for private) */
                 if (value && value[0] == 'P' && value[1] == ':') {
                     visibility = METADATA_VIS_PRIVATE;
@@ -10629,6 +10701,41 @@ nickserv_sync_metadata_to_ircd(struct userNode *user)
 
                 irc_metadata(user->nick, key, value, visibility);
                 found_entries++;
+
+#ifdef WITH_KEYCLOAK
+                /* Also sync LMDB entries to Keycloak to keep them in sync.
+                 * X3/LMDB is authoritative - this ensures Keycloak stays current
+                 * even if the Keycloak user was deleted and recreated. */
+                if (nickserv_conf.keycloak_enable) {
+                    struct kc_metadata_ctx *kc_ctx = calloc(1, sizeof(*kc_ctx));
+                    if (kc_ctx) {
+                        safestrncpy(kc_ctx->handle, user->handle_info->handle, sizeof(kc_ctx->handle));
+                        kc_ctx->attr_name = malloc(128);
+                        if (kc_ctx->attr_name) {
+                            snprintf(kc_ctx->attr_name, 128, "metadata.%s", key);
+                            /* Re-encode with visibility prefix for Keycloak storage */
+                            char stored_val[2048];
+                            if (visibility == METADATA_VIS_PRIVATE) {
+                                snprintf(stored_val, sizeof(stored_val), "P:%s", value);
+                            } else {
+                                snprintf(stored_val, sizeof(stored_val), "%s", value);
+                            }
+                            kc_ctx->attr_value = pool_strdup(stored_val);
+                            if (kc_ctx->attr_value) {
+                                if (keycloak_ensure_token_async(kc_metadata_token_cb, kc_ctx) < 0) {
+                                    kc_metadata_ctx_free(kc_ctx);
+                                }
+                                /* else: async chain owns context now */
+                            } else {
+                                free(kc_ctx->attr_name);
+                                free(kc_ctx);
+                            }
+                        } else {
+                            free(kc_ctx);
+                        }
+                    }
+                }
+#endif
             }
 
             x3_lmdb_free_entries(entries);
@@ -10636,7 +10743,7 @@ nickserv_sync_metadata_to_ircd(struct userNode *user)
     }
 #endif
 
-    /* If we found entries in LMDB cache, we're done */
+    /* If we found entries in LMDB cache, we're done (already synced to IRCd and Keycloak) */
     if (found_entries > 0)
         return;
 
@@ -10648,6 +10755,7 @@ void
 nickserv_sync_account_metadata_to_ircd(struct handle_info *hi)
 {
     int found_entries = 0;
+    int lmdb_stale = 0;
 
     if (!hi)
         return;
@@ -10657,11 +10765,32 @@ nickserv_sync_account_metadata_to_ircd(struct handle_info *hi)
      *
      * Uses compression passthrough: if data in LMDB is already compressed,
      * send it via irc_metadata_raw() with Z flag to avoid decompression/recompression.
+     *
+     * Staleness detection: If LMDB data was written before X3 started,
+     * skip LMDB and refresh from Keycloak.
      */
 
 #ifdef WITH_LMDB
-    /* Step 1: Try LMDB cache first with raw passthrough */
-    if (x3_lmdb_is_available()) {
+    /* Step 1: Check if LMDB data is stale (from a previous X3 session) */
+    if (x3_lmdb_is_available() && x3_metadata_startup_time > 0) {
+        char sync_time_buf[32];
+        if (x3_lmdb_account_get(hi->handle, "_metadata_sync_time", sync_time_buf) == LMDB_SUCCESS) {
+            time_t sync_time = (time_t)strtoul(sync_time_buf, NULL, 10);
+            if (sync_time < x3_metadata_startup_time) {
+                log_module(NS_LOG, LOG_DEBUG, "nickserv_sync_account_metadata_to_ircd: LMDB data for %s is stale (sync_time=%lu < startup=%lu), refreshing from Keycloak",
+                           hi->handle, (unsigned long)sync_time, (unsigned long)x3_metadata_startup_time);
+                lmdb_stale = 1;
+            }
+        } else {
+            /* No sync time found - data predates timestamp tracking, treat as stale */
+            log_module(NS_LOG, LOG_DEBUG, "nickserv_sync_account_metadata_to_ircd: No _metadata_sync_time for %s, treating as stale",
+                       hi->handle);
+            lmdb_stale = 1;
+        }
+    }
+
+    /* Step 2: Try LMDB cache first with raw passthrough (if not stale) */
+    if (x3_lmdb_is_available() && !lmdb_stale) {
         struct lmdb_raw_metadata_entry *entries = NULL;
         struct lmdb_raw_metadata_entry *entry;
         int count;
@@ -10674,6 +10803,10 @@ nickserv_sync_account_metadata_to_ircd(struct handle_info *hi)
             for (entry = entries; entry; entry = entry->next) {
                 const char *key = entry->key;
                 int visibility = METADATA_VIS_PUBLIC;
+
+                /* Skip internal keys (start with _) */
+                if (key && key[0] == '_')
+                    continue;
 
                 /* For compressed data, check visibility prefix in raw data */
                 if (entry->is_compressed) {
@@ -10696,6 +10829,39 @@ nickserv_sync_account_metadata_to_ircd(struct handle_info *hi)
                                hi->handle, key, value, visibility);
 
                     irc_metadata(hi->handle, key, value, visibility);
+
+#ifdef WITH_KEYCLOAK
+                    /* Also sync LMDB entries to Keycloak to keep them in sync.
+                     * X3/LMDB is authoritative - this ensures Keycloak stays current. */
+                    if (nickserv_conf.keycloak_enable) {
+                        struct kc_metadata_ctx *kc_ctx = calloc(1, sizeof(*kc_ctx));
+                        if (kc_ctx) {
+                            safestrncpy(kc_ctx->handle, hi->handle, sizeof(kc_ctx->handle));
+                            kc_ctx->attr_name = malloc(128);
+                            if (kc_ctx->attr_name) {
+                                snprintf(kc_ctx->attr_name, 128, "metadata.%s", key);
+                                /* Re-encode with visibility prefix for Keycloak storage */
+                                char stored_val[2048];
+                                if (visibility == METADATA_VIS_PRIVATE) {
+                                    snprintf(stored_val, sizeof(stored_val), "P:%s", value);
+                                } else {
+                                    snprintf(stored_val, sizeof(stored_val), "%s", value);
+                                }
+                                kc_ctx->attr_value = pool_strdup(stored_val);
+                                if (kc_ctx->attr_value) {
+                                    if (keycloak_ensure_token_async(kc_metadata_token_cb, kc_ctx) < 0) {
+                                        kc_metadata_ctx_free(kc_ctx);
+                                    }
+                                } else {
+                                    free(kc_ctx->attr_name);
+                                    free(kc_ctx);
+                                }
+                            } else {
+                                free(kc_ctx);
+                            }
+                        }
+                    }
+#endif
                 }
                 found_entries++;
             }
@@ -10705,7 +10871,7 @@ nickserv_sync_account_metadata_to_ircd(struct handle_info *hi)
     }
 #endif
 
-    /* If we found entries in LMDB cache, we're done */
+    /* If we found entries in LMDB cache, we're done (already synced to IRCd and Keycloak) */
     if (found_entries > 0)
         return;
 
@@ -10826,6 +10992,19 @@ metadata_sync_list_cb(void *session, int result, struct kc_metadata_entry *entri
         }
 #endif
     }
+
+#ifdef WITH_LMDB
+    /* Store sync timestamp to track when LMDB was last populated from Keycloak.
+     * On subsequent logins, if this timestamp < x3_metadata_startup_time,
+     * we know the LMDB data is from a previous X3 session and may be stale. */
+    if (x3_lmdb_is_available()) {
+        char ts_buf[32];
+        snprintf(ts_buf, sizeof(ts_buf), "%lu", (unsigned long)now);
+        x3_lmdb_account_set(ctx->handle, "_metadata_sync_time", ts_buf);
+        log_module(NS_LOG, LOG_DEBUG, "metadata_sync_async: Stored _metadata_sync_time=%s for %s",
+                   ts_buf, ctx->handle);
+    }
+#endif
 
     keycloak_free_metadata_entries(entries);
 
@@ -11515,13 +11694,16 @@ nickserv_conf_read(void)
     nickserv_conf.password_algorithm = str ? str : "pbkdf2-sha256";
 
     str = database_get_data(conf_node, KEY_PASSWORD_PBKDF2_ITERATIONS, RECDB_QSTRING);
-    nickserv_conf.password_pbkdf2_iterations = str ? strtoul(str, NULL, 0) : 100000;
+    nickserv_conf.password_pbkdf2_iterations = str ? strtoul(str, NULL, 0) : 10000;
 
     str = database_get_data(conf_node, KEY_PASSWORD_BCRYPT_COST, RECDB_QSTRING);
     nickserv_conf.password_bcrypt_cost = str ? strtoul(str, NULL, 0) : 12;
 
     str = database_get_data(conf_node, KEY_PASSWORD_LAZY_MIGRATION, RECDB_QSTRING);
     nickserv_conf.password_lazy_migration = str ? !disabled_string(str) : 1;  /* Enabled by default */
+
+    str = database_get_data(conf_node, KEY_SCRAM_ITERATIONS, RECDB_QSTRING);
+    nickserv_conf.scram_iterations = str ? strtoul(str, NULL, 0) : 4096;  /* RFC 7677 minimum */
 
     /* Certificate auto-registration */
     str = database_get_data(conf_node, KEY_CERT_AUTOREGISTER, RECDB_QSTRING);
@@ -11536,6 +11718,11 @@ nickserv_conf_read(void)
     pw_config.bcrypt_cost = nickserv_conf.password_bcrypt_cost;
     pw_config.enable_lazy_migration = nickserv_conf.password_lazy_migration;
 
+    /* Apply SCRAM config to LMDB module */
+#ifdef WITH_LMDB
+    x3_lmdb_set_scram_iterations(nickserv_conf.scram_iterations);
+#endif
+
     /* Set default algorithm based on config */
     if (strcasecmp(nickserv_conf.password_algorithm, "pbkdf2-sha512") == 0) {
         pw_config.default_algorithm = PW_ALG_PBKDF2_SHA512;
@@ -11545,9 +11732,10 @@ nickserv_conf_read(void)
         pw_config.default_algorithm = PW_ALG_PBKDF2_SHA256;  /* Default */
     }
 
-    log_module(NS_LOG, LOG_INFO, "Password hashing: algorithm=%s, iterations=%lu, bcrypt_cost=%u, lazy_migration=%s",
+    log_module(NS_LOG, LOG_INFO, "Password hashing: algorithm=%s, pbkdf2_iterations=%lu, bcrypt_cost=%u, scram_iterations=%u, lazy_migration=%s",
                nickserv_conf.password_algorithm, nickserv_conf.password_pbkdf2_iterations,
-               nickserv_conf.password_bcrypt_cost, nickserv_conf.password_lazy_migration ? "yes" : "no");
+               nickserv_conf.password_bcrypt_cost, nickserv_conf.scram_iterations,
+               nickserv_conf.password_lazy_migration ? "yes" : "no");
 
     /* Schedule timers after config is loaded (not at init time when values are 0).
      * These only run once - the timer callbacks reschedule themselves. */
@@ -15203,6 +15391,11 @@ init_nickserv(const char *nick)
 #ifdef WITH_KEYCLOAK
     init_keycloak();
 #endif
+
+    /* Record startup time for LMDB metadata staleness detection */
+    x3_metadata_startup_time = now;
+    log_module(NS_LOG, LOG_INFO, "Metadata startup time set to %lu", (unsigned long)x3_metadata_startup_time);
+
     reg_new_user_func(new_user_event, NULL);
     reg_nick_change_func(handle_nick_change, NULL);
     reg_del_user_func(nickserv_remove_user, NULL);
