@@ -481,6 +481,61 @@ static void scram_create_async(const char *handle, const char *password,
 }
 #endif /* WITH_LMDB && WITH_SSL */
 
+/* ========== Async Registration Context ========== */
+
+#define REGISTER_ASYNC_TIMEOUT 30  /* seconds */
+
+/* Context for async password hashing during REGISTER/OREGISTER */
+struct register_async_ctx {
+    char handle[NICKSERV_HANDLE_LEN + 1];
+    char nick[NICKLEN + 1];
+    char numeric[COMBO_NUMERIC_LEN + 1];
+    char settee_numeric[COMBO_NUMERIC_LEN + 1];  /* Target user's numeric (for oregister) */
+    char email[MAX_EMAIL_LEN + 1];
+    char mask[USERLEN + HOSTLEN + 2];  /* For oregister mask */
+    char plaintext_password[256];  /* For SCRAM creation (cleared after use) */
+    struct userNode *user;         /* Validated via numeric before use */
+    struct userNode *settee;       /* Target user (same as user for self-register) */
+    int no_auth;                   /* Email verification required */
+    int weblink;                   /* Web-based registration */
+    int is_oregister;              /* Admin registering for another user */
+    time_t started;
+};
+
+static void register_ctx_free(struct register_async_ctx *ctx)
+{
+    if (!ctx) return;
+    /* Securely clear plaintext password */
+    memset(ctx->plaintext_password, 0, sizeof(ctx->plaintext_password));
+    free(ctx);
+}
+
+static struct userNode *
+register_async_validate_user(struct register_async_ctx *ctx)
+{
+    struct userNode *user;
+
+    if (!ctx) return NULL;
+
+    /* Look up user by numeric */
+    user = GetUserN(ctx->numeric);
+    if (!user) {
+        log_module(NS_LOG, LOG_DEBUG, "REGISTER async: User %s disconnected", ctx->nick);
+        return NULL;
+    }
+
+    /* Verify same user pointer (numeric could be reused) */
+    if (user != ctx->user) {
+        log_module(NS_LOG, LOG_DEBUG, "REGISTER async: User pointer mismatch for %s", ctx->nick);
+        return NULL;
+    }
+
+    return user;
+}
+
+/* Forward declaration for callback */
+static void cmd_register_hash_callback(void *ctx_ptr, int result, const char *hash);
+
 /*
  * Password verification with lazy migration.
  * Verifies password and upgrades hash format if needed.
@@ -642,6 +697,8 @@ static const struct message_entry msgtab[] = {
     { "NSMSG_OREGNICK_SUCCESS", "Nick $b%s$b has been registered to account $b%s$b." },
     { "NSMSG_PASS_SUCCESS", "Password changed." },
     { "NSMSG_SCRAM_FAILED", "Warning: SCRAM credential creation failed. SCRAM authentication will not be available for this account." },
+    { "NSMSG_REGISTER_TIMEOUT", "Registration timed out. Please try again." },
+    { "NSMSG_REGISTER_FAILED", "Registration failed due to an internal error. Please try again." },
     { "NSMSG_MASK_INVALID", "$b%s$b is an invalid hostmask." },
     { "NSMSG_ADDMASK_ALREADY", "$b%s$b is already a hostmask in your account." },
     { "NSMSG_ADDMASK_SUCCESS", "Hostmask %s added." },
@@ -1531,7 +1588,8 @@ set_user_handle_info(struct userNode *user, struct handle_info *hi, int stamp)
 }
 
 static struct handle_info*
-nickserv_register(struct userNode *user, struct userNode *settee, const char *handle, const char *passwd, int no_auth)
+nickserv_register(struct userNode *user, struct userNode *settee, const char *handle,
+                  const char *passwd, const char *plaintext_for_scram, int no_auth)
 {
     struct handle_info *hi;
     struct nick_info *ni;
@@ -1544,7 +1602,7 @@ nickserv_register(struct userNode *user, struct userNode *settee, const char *ha
     }
 
     if(strlen(handle) > 30)
-    {  
+    {
         if(user)
           send_message(user, nickserv, "NSMSG_HANDLE_TOLONG", handle, 30);
         return 0;
@@ -1552,10 +1610,24 @@ nickserv_register(struct userNode *user, struct userNode *settee, const char *ha
 
     if (passwd)
     {
-        if (!is_secure_password(handle, passwd, user))
-            return 0;
-
-        pw_cryptpass(passwd, crypted);
+        /* Check if passwd is already hashed (pre-hash async pattern) or plaintext */
+        if (pw_identify(passwd) != PW_ALG_UNKNOWN) {
+            /* Already hashed - use directly */
+            if (strlen(passwd) < sizeof(crypted)) {
+                safestrncpy(crypted, passwd, sizeof(crypted));
+            } else {
+                log_module(NS_LOG, LOG_ERROR, "nickserv_register: pre-hashed password too long for %s", handle);
+                return 0;
+            }
+        } else {
+            /* Plaintext - validate and hash (sync fallback path) */
+            if (!is_secure_password(handle, passwd, user))
+                return 0;
+            pw_cryptpass(passwd, crypted);
+            /* If no explicit plaintext provided, use passwd for SCRAM */
+            if (!plaintext_for_scram)
+                plaintext_for_scram = passwd;
+        }
     }
 #ifdef WITH_LDAP
     if(nickserv_conf.ldap_enable && nickserv_conf.ldap_admin_dn) {
@@ -1590,12 +1662,13 @@ nickserv_register(struct userNode *user, struct userNode *settee, const char *ha
     /* Create SCRAM credentials for password-based registration (async to avoid blocking).
      * Only create if no_auth is false - if email verification is required,
      * the password is invalidated until cookie verification, so we should
-     * not create SCRAM credentials until after activation. */
-    if (passwd && *passwd && !no_auth) {
+     * not create SCRAM credentials until after activation.
+     * Use plaintext_for_scram if provided (async path), otherwise unavailable. */
+    if (plaintext_for_scram && *plaintext_for_scram && !no_auth) {
 #ifdef WITH_KEYCLOAK
-        scram_create_async(handle, passwd, settee, 1);
+        scram_create_async(handle, plaintext_for_scram, settee, 1);
 #else
-        scram_create_async(handle, passwd, settee, 0);
+        scram_create_async(handle, plaintext_for_scram, settee, 0);
 #endif
     }
 #endif
@@ -1803,6 +1876,176 @@ nickserv_set_email_addr(struct handle_info *hi, const char *new_email_addr)
     }
 }
 
+/* ========== Async Registration Callback ========== */
+
+static void
+cmd_register_hash_callback(void *ctx_ptr, int result, const char *hash)
+{
+    struct register_async_ctx *ctx = ctx_ptr;
+    struct userNode *user;
+    struct handle_info *hi;
+    irc_in_addr_t ip;
+
+    if (!ctx) return;
+
+    /* Validate user still connected */
+    user = register_async_validate_user(ctx);
+    if (!user) {
+        register_ctx_free(ctx);
+        return;
+    }
+
+    /* Check timeout */
+    if (now - ctx->started > REGISTER_ASYNC_TIMEOUT) {
+        send_message(user, nickserv, "NSMSG_REGISTER_TIMEOUT");
+        register_ctx_free(ctx);
+        return;
+    }
+
+    /* Check hash result */
+    if (result != 0 || !hash) {
+        send_message(user, nickserv, "NSMSG_REGISTER_FAILED");
+        register_ctx_free(ctx);
+        return;
+    }
+
+    /* Re-check eligibility (user state may have changed during async) */
+    if (!ctx->is_oregister && user->handle_info) {
+        send_message(user, nickserv, "NSMSG_USE_RENAME", user->handle_info->handle);
+        register_ctx_free(ctx);
+        return;
+    }
+
+    /* For oregister: validate settee is still connected and not authed */
+    if (ctx->is_oregister && ctx->settee_numeric[0]) {
+        struct userNode *settee = GetUserN(ctx->settee_numeric);
+        if (!settee || settee != ctx->settee) {
+            /* Settee disconnected - still proceed but with NULL settee */
+            ctx->settee = NULL;
+            log_module(NS_LOG, LOG_DEBUG, "OREGISTER async: Target user disconnected, proceeding without binding");
+        } else if (settee->handle_info) {
+            send_message(user, nickserv, "NSMSG_USER_PREV_AUTH", settee->nick);
+            register_ctx_free(ctx);
+            return;
+        }
+    }
+
+    /* Check handle wasn't registered during async hash (race condition) */
+    if (dict_find(nickserv_handle_dict, ctx->handle, NULL)) {
+        send_message(user, nickserv, "NSMSG_HANDLE_EXISTS", ctx->handle);
+        register_ctx_free(ctx);
+        return;
+    }
+
+    /* Call nickserv_register with pre-hashed password + plaintext for SCRAM */
+    hi = nickserv_register(user, ctx->settee, ctx->handle, hash, ctx->plaintext_password, ctx->no_auth);
+    if (!hi) {
+        register_ctx_free(ctx);
+        return;
+    }
+
+    /* --- Post-registration setup --- */
+
+    if (ctx->is_oregister) {
+        /* OREGISTER path: admin registering for another user */
+
+        /* Set email if provided */
+        if (ctx->email[0]) {
+#ifdef WITH_LDAP
+            if (nickserv_conf.ldap_enable && nickserv_conf.ldap_admin_dn) {
+                int rc;
+                if ((rc = ldap_do_modify(hi->handle, NULL, ctx->email)) != LDAP_SUCCESS) {
+                    send_message(user, nickserv, "NSMSG_LDAP_FAIL_EMAIL", ldap_err2string(rc));
+                } else {
+                    nickserv_set_email_addr(hi, ctx->email);
+                }
+            } else {
+                nickserv_set_email_addr(hi, ctx->email);
+            }
+#else
+            nickserv_set_email_addr(hi, ctx->email);
+#endif
+#ifdef WITH_KEYCLOAK
+            kc_do_modify(hi->handle, NULL, ctx->email);
+#endif
+        }
+
+        /* Add the pre-computed mask */
+        if (ctx->mask[0]) {
+            char *mask_canonicalized = canonicalize_hostmask(pool_strdup(ctx->mask));
+            if (mask_canonicalized)
+                string_list_append(hi->masks, mask_canonicalized);
+        }
+
+        /* Sync log for oregister */
+        if (nickserv_conf.sync_log) {
+            SyncLog("REGISTER %s %s %s %s", hi->handle, hi->passwd,
+                    ctx->email[0] ? ctx->email : "@", user->info);
+        }
+
+        log_module(NS_LOG, LOG_DEBUG, "OREGISTER async: Completed for %s", ctx->handle);
+
+    } else {
+        /* REGISTER path: self-registration */
+
+        /* Add any masks they should get. */
+        if (nickserv_conf.default_hostmask) {
+            string_list_append(hi->masks, pool_strdup("*@*"));
+        } else {
+            string_list_append(hi->masks, generate_hostmask(user, GENMASK_OMITNICK|GENMASK_NO_HIDING|GENMASK_ANY_IDENT));
+            if (irc_in_addr_is_valid(user->ip) && !irc_pton(&ip, NULL, user->hostname))
+                string_list_append(hi->masks, generate_hostmask(user, GENMASK_OMITNICK|GENMASK_BYIP|GENMASK_NO_HIDING|GENMASK_ANY_IDENT));
+        }
+
+        /* If they're the first to register, give them level 1000. */
+        if (dict_size(nickserv_handle_dict) == 1) {
+            hi->opserv_level = 1000;
+            send_message(user, nickserv, "NSMSG_ROOT_HANDLE", ctx->handle);
+        }
+
+        /* Set their email address. */
+        if (ctx->email[0]) {
+#ifdef WITH_LDAP
+            if (nickserv_conf.ldap_enable && nickserv_conf.ldap_admin_dn) {
+                int rc;
+                if ((rc = ldap_do_modify(hi->handle, NULL, ctx->email)) != LDAP_SUCCESS) {
+                    send_message(user, nickserv, "NSMSG_LDAP_FAIL_EMAIL", ldap_err2string(rc));
+                } else {
+                    nickserv_set_email_addr(hi, ctx->email);
+                }
+            } else {
+                nickserv_set_email_addr(hi, ctx->email);
+            }
+#else
+            nickserv_set_email_addr(hi, ctx->email);
+#endif
+#ifdef WITH_KEYCLOAK
+            kc_do_modify(hi->handle, NULL, ctx->email);
+#endif
+        }
+
+        /* If they need to do email verification, tell them. */
+        if (ctx->no_auth)
+            nickserv_make_cookie(user, hi, ACTIVATION, hi->passwd, ctx->weblink);
+
+        /* Set registering flag.. */
+        user->modes |= FLAGS_REGISTERING;
+
+        /* Sync log - use hi->passwd instead of re-hashing (was redundant) */
+        if (nickserv_conf.sync_log) {
+            SyncLog("REGISTER %s %s %s %s", hi->handle, hi->passwd,
+                    ctx->email[0] ? ctx->email : "0", user->info);
+        }
+
+        /* this wont work if email is required .. */
+        process_adduser_pending(user);
+
+        log_module(NS_LOG, LOG_DEBUG, "REGISTER async: Completed for %s", ctx->handle);
+    }
+
+    register_ctx_free(ctx);
+}
+
 static NICKSERV_FUNC(cmd_register)
 {
     irc_in_addr_t ip;
@@ -1892,14 +2135,48 @@ static NICKSERV_FUNC(cmd_register)
 
     password = argv[2];
     argv[2] = "****";
-    /* Webregister hack - send URL instead of IRC cookie 
+    /* Webregister hack - send URL instead of IRC cookie
      * commands in email
      */
     if((argc >= 5) && !strcmp(argv[4],"WEBLINK"))
         weblink = 1;
     else
         weblink = 0;
-    if (!(hi = nickserv_register(user, user, argv[1], password, no_auth)))
+
+    /* Validate password strength before hashing */
+    if (!is_secure_password(argv[1], password, user))
+        return 0;
+
+    /* Try async password hashing to avoid blocking the event loop.
+     * PBKDF2 with 100k iterations takes ~9 seconds synchronously. */
+    if (user->numeric[0] != '\0') {
+        struct register_async_ctx *ctx = calloc(1, sizeof(*ctx));
+        if (ctx) {
+            safestrncpy(ctx->handle, argv[1], sizeof(ctx->handle));
+            safestrncpy(ctx->nick, user->nick, sizeof(ctx->nick));
+            safestrncpy(ctx->numeric, user->numeric, sizeof(ctx->numeric));
+            safestrncpy(ctx->plaintext_password, password, sizeof(ctx->plaintext_password));
+            if (email_addr)
+                safestrncpy(ctx->email, email_addr, sizeof(ctx->email));
+            ctx->user = user;
+            ctx->settee = user;  /* Self-registration */
+            ctx->no_auth = no_auth;
+            ctx->weblink = weblink;
+            ctx->is_oregister = 0;
+            ctx->started = now;
+
+            if (pw_hash_async(password, cmd_register_hash_callback, ctx) == 0) {
+                log_module(NS_LOG, LOG_DEBUG, "REGISTER async: Started hash for %s", argv[1]);
+                return 1;  /* Async started - callback will complete registration */
+            }
+
+            log_module(NS_LOG, LOG_WARNING, "REGISTER async: pw_hash_async failed, falling back to sync for %s", argv[1]);
+            register_ctx_free(ctx);
+        }
+    }
+
+    /* Fallback: Synchronous registration (password already validated above) */
+    if (!(hi = nickserv_register(user, user, argv[1], password, password, no_auth)))
         return 0;
     /* Add any masks they should get. */
     if (nickserv_conf.default_hostmask) {
@@ -2018,7 +2295,7 @@ static NICKSERV_FUNC(cmd_oregister)
         reply("NSMSG_USER_PREV_AUTH", settee->nick);
         return 0;
     }
-    /* If there is no default mask in the conf, and they didn't pass a mask, 
+    /* If there is no default mask in the conf, and they didn't pass a mask,
      * but we did find a user by nick, generate the mask */
     if (!mask) {
         if (nickserv_conf.default_hostmask)
@@ -2031,7 +2308,44 @@ static NICKSERV_FUNC(cmd_oregister)
         }
     }
 
-    if (!(hi = nickserv_register(user, settee, account, pass, 0))) {
+    /* Validate password strength before hashing */
+    if (!is_secure_password(account, pass, user))
+        return 0;
+
+    /* Try async password hashing to avoid blocking the event loop */
+    if (user->numeric[0] != '\0') {
+        struct register_async_ctx *ctx = calloc(1, sizeof(*ctx));
+        if (ctx) {
+            safestrncpy(ctx->handle, account, sizeof(ctx->handle));
+            safestrncpy(ctx->nick, user->nick, sizeof(ctx->nick));
+            safestrncpy(ctx->numeric, user->numeric, sizeof(ctx->numeric));
+            safestrncpy(ctx->plaintext_password, pass, sizeof(ctx->plaintext_password));
+            if (email)
+                safestrncpy(ctx->email, email, sizeof(ctx->email));
+            if (mask)
+                safestrncpy(ctx->mask, mask, sizeof(ctx->mask));
+            if (settee && settee->numeric[0])
+                safestrncpy(ctx->settee_numeric, settee->numeric, sizeof(ctx->settee_numeric));
+            ctx->user = user;
+            ctx->settee = settee;
+            ctx->no_auth = 0;  /* No email verification for oregister */
+            ctx->weblink = 0;
+            ctx->is_oregister = 1;
+            ctx->started = now;
+
+            if (pw_hash_async(pass, cmd_register_hash_callback, ctx) == 0) {
+                log_module(NS_LOG, LOG_DEBUG, "OREGISTER async: Started hash for %s", account);
+                argv[2] = "****";
+                return 1;  /* Async started - callback will complete registration */
+            }
+
+            log_module(NS_LOG, LOG_WARNING, "OREGISTER async: pw_hash_async failed, falling back to sync for %s", account);
+            register_ctx_free(ctx);
+        }
+    }
+
+    /* Fallback: Synchronous registration */
+    if (!(hi = nickserv_register(user, settee, account, pass, pass, 0))) {
         return 0; /* error reply handled by above */
     }
     if (email) {
@@ -2039,7 +2353,7 @@ static NICKSERV_FUNC(cmd_oregister)
         if(nickserv_conf.ldap_enable && nickserv_conf.ldap_admin_dn) {
             int rc;
             if((rc = ldap_do_modify(hi->handle, NULL, email)) != LDAP_SUCCESS) {
-                /* Falied to update email in ldap, but still 
+                /* Failed to update email in ldap, but still
                  * updated it here.. what should we do? */
                reply("NSMSG_LDAP_FAIL_EMAIL", ldap_err2string(rc));
             } else {
@@ -2640,7 +2954,7 @@ struct handle_info *loc_auth(char *sslfp, char *handle, char *password, char *us
             else
                return NULL; /* They dont have a *@* mask so they can't loc */
     
-            if(!(hi = nickserv_register(NULL, NULL, handle, password, 0))) {
+            if(!(hi = nickserv_register(NULL, NULL, handle, password, password, 0))) {
                return 0; /* couldn't add the user for some reason */
             }
     
@@ -2686,7 +3000,7 @@ struct handle_info *loc_auth(char *sslfp, char *handle, char *password, char *us
             else
                 return NULL; /* They dont have a *@* mask so they can't loc */
 
-            if (!(hi = nickserv_register(NULL, NULL, handle, password, 0))) {
+            if (!(hi = nickserv_register(NULL, NULL, handle, password, password, 0))) {
                 return 0; /* couldn't add the user for some reason */
             }
 
@@ -3111,7 +3425,7 @@ static NICKSERV_FUNC(cmd_auth)
             * create the account.
             */
              char *mask;
-             if(!(hi = nickserv_register(user, user, handle, passwd, 0))) {
+             if(!(hi = nickserv_register(user, user, handle, passwd, passwd, 0))) {
                 reply("NSMSG_UNABLE_TO_ADD");
                 return 0; /* couldn't add the user for some reason */
              }
@@ -3140,7 +3454,7 @@ static NICKSERV_FUNC(cmd_auth)
              * create the account.
              */
             char *mask;
-            if (!(hi = nickserv_register(user, user, handle, passwd, 0))) {
+            if (!(hi = nickserv_register(user, user, handle, passwd, passwd, 0))) {
                 reply("NSMSG_UNABLE_TO_ADD");
                 return 0; /* couldn't add the user for some reason */
             }
@@ -6521,7 +6835,7 @@ auth_async_complete(struct auth_async_ctx *ctx)
     /* Handle autocreate if account doesn't exist (only on KC_SUCCESS) */
     if (!hi && nickserv_conf.keycloak_autocreate && ctx->state == AUTH_STATE_EMAIL_LOOKUP) {
         char *mask;
-        hi = nickserv_register(user, user, ctx->handle, "*", 0);
+        hi = nickserv_register(user, user, ctx->handle, "*", NULL, 0);
         if (!hi) {
             send_message(user, nickserv, "NSMSG_UNABLE_TO_ADD");
             auth_async_ctx_free(ctx);
@@ -11112,7 +11426,7 @@ ctime(&hi->registered));
                 cont = 0;
 
         /* Now try to register the handle */
-        if (cont && (hi = nickserv_register(user, user, stamp, NULL, 1))) {
+        if (cont && (hi = nickserv_register(user, user, stamp, NULL, NULL, 1))) {
             if(nickserv_conf.default_hostmask)
                 mask = "*@*";
             else
