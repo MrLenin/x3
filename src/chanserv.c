@@ -2029,6 +2029,9 @@ expire_ban(void *data) /* lamer.. */
 
 static void chanserv_expire_suspension(void *data);
 void chanserv_sync_x3_metadata(struct chanData *cData, int sync_immutable);
+#ifdef WITH_KEYCLOAK
+static void kc_sync_invalidate_channel(struct chanData *cData);
+#endif
 
 static void
 unregister_channel(struct chanData *channel, const char *reason)
@@ -2048,6 +2051,11 @@ unregister_channel(struct chanData *channel, const char *reason)
 
     if(!channel)
     return;
+
+#ifdef WITH_KEYCLOAK
+    /* Invalidate any pending sync queue entry before freeing this channel */
+    kc_sync_invalidate_channel(channel);
+#endif
 
     timeq_del(0, NULL, channel, TIMEQ_IGNORE_FUNC | TIMEQ_IGNORE_WHEN);
 
@@ -12225,6 +12233,28 @@ kc_sync_cleanup(void)
     kc_sync.queue_alloc = 0;
     kc_sync.current_index = 0;
     kc_sync.in_progress = 0;
+}
+
+/**
+ * Invalidate a channel in the sync queue (set to NULL)
+ * Called when a channel is unregistered to prevent use-after-free
+ */
+static void
+kc_sync_invalidate_channel(struct chanData *cData)
+{
+    int i;
+    if (!kc_sync.queue || !cData)
+        return;
+
+    for (i = kc_sync.current_index; i < kc_sync.queue_size; i++) {
+        if (kc_sync.queue[i] == cData) {
+            kc_sync.queue[i] = NULL;
+            log_module(CS_LOG, LOG_DEBUG,
+                       "kc_sync_invalidate_channel: Invalidated queue entry %d for %s",
+                       i, cData->channel ? cData->channel->name : "(unknown)");
+            break;
+        }
+    }
 }
 
 /**

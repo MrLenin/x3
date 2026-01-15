@@ -42,6 +42,10 @@ static char lmdb_path[MAXLEN];
 static size_t lmdb_mapsize = 100 * 1024 * 1024; /* 100MB default */
 static unsigned int scram_iterations = SCRAM_ITERATION_COUNT_DEFAULT;
 
+/* Sync configuration - MDB_NOSYNC mode for performance */
+static int lmdb_nosync = 0;                    /* 0 = sync on commit, 1 = periodic sync only */
+static unsigned int lmdb_sync_interval = 10;   /* seconds between syncs when nosync enabled */
+
 /* Get/set SCRAM iteration count */
 unsigned int x3_lmdb_get_scram_iterations(void)
 {
@@ -57,6 +61,47 @@ void x3_lmdb_set_scram_iterations(unsigned int iterations)
     }
     scram_iterations = iterations;
     log_module(MAIN_LOG, LOG_DEBUG, "x3_lmdb: SCRAM iterations set to %u", scram_iterations);
+}
+
+/* Get/set LMDB nosync mode */
+int x3_lmdb_get_nosync(void)
+{
+    return lmdb_nosync;
+}
+
+void x3_lmdb_set_nosync(int nosync)
+{
+    lmdb_nosync = nosync ? 1 : 0;
+    log_module(MAIN_LOG, LOG_DEBUG, "x3_lmdb: nosync mode %s",
+               lmdb_nosync ? "enabled (periodic sync)" : "disabled (sync on commit)");
+}
+
+/* Get/set LMDB sync interval (only used when nosync enabled) */
+unsigned int x3_lmdb_get_sync_interval(void)
+{
+    return lmdb_sync_interval;
+}
+
+void x3_lmdb_set_sync_interval(unsigned int interval)
+{
+    if (interval < 1) interval = 1;
+    if (interval > 300) interval = 300;  /* Max 5 minutes */
+    lmdb_sync_interval = interval;
+    log_module(MAIN_LOG, LOG_DEBUG, "x3_lmdb: sync interval set to %u seconds", lmdb_sync_interval);
+}
+
+/* Periodic sync timer callback */
+static void lmdb_periodic_sync_timer(UNUSED_ARG(void *data))
+{
+    if (lmdb_nosync && lmdb_initialized && lmdb_env) {
+        mdb_env_sync(lmdb_env, 0);  /* Non-forced sync */
+        log_module(MAIN_LOG, LOG_DEBUG, "x3_lmdb: periodic sync completed");
+    }
+
+    /* Reschedule if still in nosync mode */
+    if (lmdb_nosync && lmdb_initialized) {
+        timeq_add(now + lmdb_sync_interval, lmdb_periodic_sync_timer, NULL);
+    }
 }
 
 /* Maximum value size (increased for compression support) */
@@ -136,8 +181,19 @@ int x3_lmdb_init(const char *dbpath, size_t mapsize)
         return LMDB_ERROR;
     }
 
-    /* Open the environment */
-    rc = mdb_env_open(lmdb_env, lmdb_path, 0, 0644);
+    /* Open the environment
+     * MDB_NOSYNC: Don't sync on commit - use periodic sync instead for performance.
+     * This trades some durability for significantly reduced fdatasync overhead.
+     */
+    {
+        unsigned int env_flags = 0;
+        if (lmdb_nosync) {
+            env_flags |= MDB_NOSYNC;
+            log_module(MAIN_LOG, LOG_INFO, "x3_lmdb: Using MDB_NOSYNC mode with %u second sync interval",
+                       lmdb_sync_interval);
+        }
+        rc = mdb_env_open(lmdb_env, lmdb_path, env_flags, 0644);
+    }
     if (rc != 0) {
         log_module(MAIN_LOG, LOG_ERROR, "x3_lmdb: Failed to open environment at '%s': %s",
                    lmdb_path, mdb_strerror(rc));
@@ -178,6 +234,12 @@ int x3_lmdb_init(const char *dbpath, size_t mapsize)
     log_module(MAIN_LOG, LOG_INFO, "x3_lmdb: Initialized at '%s' with %luMB map",
                lmdb_path, (unsigned long)(lmdb_mapsize / (1024 * 1024)));
 
+    /* Start periodic sync timer if nosync mode enabled */
+    if (lmdb_nosync) {
+        timeq_add(now + lmdb_sync_interval, lmdb_periodic_sync_timer, NULL);
+        log_module(MAIN_LOG, LOG_DEBUG, "x3_lmdb: Started periodic sync timer");
+    }
+
     return LMDB_SUCCESS;
 }
 
@@ -185,6 +247,12 @@ void x3_lmdb_shutdown(void)
 {
     if (!lmdb_initialized || !lmdb_env) {
         return;
+    }
+
+    /* Sync before shutdown to ensure all data is persisted */
+    if (lmdb_nosync) {
+        log_module(MAIN_LOG, LOG_INFO, "x3_lmdb: Final sync before shutdown");
+        mdb_env_sync(lmdb_env, 1);  /* Force sync */
     }
 
     mdb_dbi_close(lmdb_env, dbi_accounts);
@@ -3806,11 +3874,27 @@ void init_x3_lmdb(void)
     const char *snapshot_str;
     const char *retention_str;
     const char *snapshot_path_str;
+    const char *nosync_str;
+    const char *sync_interval_str;
 
     /* Get database path from configuration */
     dbpath = conf_get_data("services/x3/lmdb_path", RECDB_QSTRING);
     if (!dbpath) {
         dbpath = "x3data/lmdb";
+    }
+
+    /* Configure sync settings BEFORE opening environment */
+    nosync_str = conf_get_data("services/x3/lmdb_nosync", RECDB_QSTRING);
+    if (nosync_str && (atoi(nosync_str) || !strcasecmp(nosync_str, "yes") || !strcasecmp(nosync_str, "true"))) {
+        lmdb_nosync = 1;
+    }
+
+    sync_interval_str = conf_get_data("services/x3/lmdb_sync_interval", RECDB_QSTRING);
+    if (sync_interval_str) {
+        unsigned int interval = (unsigned int)strtoul(sync_interval_str, NULL, 10);
+        if (interval >= 1 && interval <= 300) {
+            lmdb_sync_interval = interval;
+        }
     }
 
     if (x3_lmdb_init(dbpath, 0) == LMDB_SUCCESS) {

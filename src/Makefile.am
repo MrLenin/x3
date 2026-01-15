@@ -69,6 +69,7 @@ x3_SOURCES = \
 	helpfile.c helpfile.h \
 	ioset.c ioset.h ioset-impl.h \
 	log.c log.h \
+	log_async.c log_async.h \
 	mail.h \
 	main.c common.h \
 	math.c \

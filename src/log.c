@@ -20,10 +20,12 @@
 
 #include "conf.h"
 #include "log.h"
+#include "log_async.h"
 #include "helpfile.h" /* send_message, message_register, etc */
 #include "mempool.h"
 #include "modcmd.h"
 #include "nickserv.h"
+#include "timeq.h"
 
 #define Block  4096
 #define MAXLOGSEARCHLENGTH 10000
@@ -80,6 +82,64 @@ static struct dict *log_dests;
 static struct dict *log_types;
 static struct log_type *log_default;
 static int log_inited, log_debugged;
+
+/* Buffered logging: track file handles for periodic flush */
+#define LOG_MAX_FILE_DESTS 32
+static FILE *log_file_handles[LOG_MAX_FILE_DESTS];
+static unsigned int log_file_handle_count = 0;
+static unsigned int log_flush_interval = 5;  /* seconds between flushes */
+
+/* Async logging configuration */
+static int async_logging_enabled = 0;  /* 0 = disabled, 1 = enabled via config */
+
+/* Forward declarations */
+static void log_periodic_flush(void *data);
+static void log_register_file_handle(FILE *f);
+static void log_unregister_file_handle(FILE *f);
+
+/* Flush all open log file handles */
+static void log_flush_all(void)
+{
+    unsigned int i;
+    for (i = 0; i < log_file_handle_count; i++) {
+        if (log_file_handles[i]) {
+            fflush(log_file_handles[i]);
+        }
+    }
+}
+
+/* Register a file handle for periodic flushing */
+static void log_register_file_handle(FILE *f)
+{
+    if (f && log_file_handle_count < LOG_MAX_FILE_DESTS) {
+        log_file_handles[log_file_handle_count++] = f;
+    }
+}
+
+/* Unregister a file handle */
+static void log_unregister_file_handle(FILE *f)
+{
+    unsigned int i;
+    for (i = 0; i < log_file_handle_count; i++) {
+        if (log_file_handles[i] == f) {
+            /* Shift remaining entries down */
+            for (; i < log_file_handle_count - 1; i++) {
+                log_file_handles[i] = log_file_handles[i + 1];
+            }
+            log_file_handle_count--;
+            break;
+        }
+    }
+}
+
+/* Periodic flush timer callback */
+static void log_periodic_flush(UNUSED_ARG(void *data))
+{
+    log_flush_all();
+    if (log_inited && log_flush_interval > 0) {
+        timeq_add(now + log_flush_interval, log_periodic_flush, NULL);
+    }
+}
 
 DEFINE_LIST(logList, struct logDestination*)
 static void log_format_audit(struct logEntry *entry);
@@ -240,6 +300,13 @@ log_type_free(void *ptr)
 static void
 cleanup_logs(UNUSED_ARG(void *extra))
 {
+    /* Shutdown async logging first (flushes pending entries) */
+    if (async_logging_enabled && log_async_available()) {
+        log_async_shutdown();
+    }
+
+    /* Flush all pending log entries before shutdown */
+    log_flush_all();
 
     close_logs();
     dict_delete(log_types);
@@ -366,6 +433,27 @@ log_conf_read(void)
     struct log_type *type;
     enum log_severity sev;
     unsigned int ii;
+    const char *str;
+    int prev_async_enabled = async_logging_enabled;
+
+    /* Read async logging config from services/x3 section */
+    str = conf_get_data("services/x3/async_logging", RECDB_QSTRING);
+    async_logging_enabled = str ? enabled_string(str) : 0;
+
+    /* Handle async logging state changes */
+    if (async_logging_enabled && !prev_async_enabled) {
+        /* Newly enabled - initialize async logging */
+        if (log_async_init(0) == 0) {
+            log_module(MAIN_LOG, LOG_INFO, "Async logging enabled.");
+        } else {
+            log_module(MAIN_LOG, LOG_WARNING, "Failed to initialize async logging, falling back to sync.");
+            async_logging_enabled = 0;
+        }
+    } else if (!async_logging_enabled && prev_async_enabled && log_async_available()) {
+        /* Disabled - shutdown async logging */
+        log_async_shutdown();
+        log_module(MAIN_LOG, LOG_INFO, "Async logging disabled.");
+    }
 
     close_logs();
     dict_delete(log_dests);
@@ -843,19 +931,24 @@ ldFile_open(const char *args) {
     ld->base.vtbl = &ldFile_vtbl;
     ld->fname = strdup(args);
     ld->output = fopen(ld->fname, "a");
+    log_register_file_handle(ld->output);  /* Register for periodic flush */
     return &ld->base;
 }
 
 static void
 ldFile_reopen(struct logDestination *dest_) {
     struct logDest_file *dest = (struct logDest_file*)dest_;
+    log_unregister_file_handle(dest->output);  /* Unregister old handle */
     fclose(dest->output);
     dest->output = fopen(dest->fname, "a");
+    log_register_file_handle(dest->output);  /* Register new handle */
 }
 
 static void
 ldFile_close(struct logDestination *dest_) {
     struct logDest_file *dest = (struct logDest_file*)dest_;
+    log_unregister_file_handle(dest->output);  /* Unregister from periodic flush */
+    fflush(dest->output);  /* Flush before close */
     fclose(dest->output);
     free(dest->fname);
     free(dest);
@@ -864,9 +957,23 @@ ldFile_close(struct logDestination *dest_) {
 static void
 ldFile_audit(struct logDestination *dest_, UNUSED_ARG(struct log_type *type), struct logEntry *entry) {
     struct logDest_file *dest = (struct logDest_file*)dest_;
+
+    /* Try async logging if available and enabled */
+    if (async_logging_enabled && log_async_available()) {
+        char buf[LOG_ASYNC_MAX_ENTRY];
+        size_t len = strlen(entry->default_desc);
+        if (len < sizeof(buf) - 1) {
+            memcpy(buf, entry->default_desc, len);
+            buf[len++] = '\n';
+            if (log_async_write(fileno(dest->output), 0, buf, len) == 0) {
+                return;  /* Successfully queued */
+            }
+        }
+    }
+
+    /* Sync fallback */
     fputs(entry->default_desc, dest->output);
     fputc('\n', dest->output);
-    fflush(dest->output);
 }
 
 static void
@@ -877,21 +984,48 @@ ldFile_replay(struct logDestination *dest_, UNUSED_ARG(struct log_type *type), i
     log_format_timestamp(now, &sbuf);
     string_buffer_append_string(&sbuf, is_write ? "W: " : "   ");
     string_buffer_append_string(&sbuf, line);
+    string_buffer_append(&sbuf, '\n');
+
+    /* Try async logging if available and enabled */
+    if (async_logging_enabled && log_async_available()) {
+        if (sbuf.used <= LOG_ASYNC_MAX_ENTRY) {
+            if (log_async_write(fileno(dest->output), 0, sbuf.list, sbuf.used) == 0) {
+                free(sbuf.list);
+                return;  /* Successfully queued */
+            }
+        }
+    }
+
+    /* Sync fallback */
     fputs(sbuf.list, dest->output);
-    fputc('\n', dest->output);
     free(sbuf.list);
-    fflush(dest->output);
 }
 
 static void
 ldFile_module(struct logDestination *dest_, struct log_type *type, enum log_severity sev, const char *message) {
     struct logDest_file *dest = (struct logDest_file*)dest_;
     struct string_buffer sbuf;
+    char buf[LOG_ASYNC_MAX_ENTRY];
+    int len;
+
     memset(&sbuf, 0, sizeof(sbuf));
     log_format_timestamp(now, &sbuf);
+
+    /* Try async logging if available and enabled */
+    if (async_logging_enabled && log_async_available()) {
+        len = snprintf(buf, sizeof(buf), "%s (%s:%s) %s\n",
+                       sbuf.list, type->name, log_severity_names[sev], message);
+        if (len > 0 && (size_t)len < sizeof(buf)) {
+            if (log_async_write(fileno(dest->output), 0, buf, len) == 0) {
+                free(sbuf.list);
+                return;  /* Successfully queued */
+            }
+        }
+    }
+
+    /* Sync fallback */
     fprintf(dest->output, "%s (%s:%s) %s\n", sbuf.list, type->name, log_severity_names[sev], message);
     free(sbuf.list);
-    fflush(dest->output);
 }
 
 static struct logDest_vtable ldFile_vtbl = {
@@ -1024,6 +1158,11 @@ log_init(void)
     reg_exit_func(cleanup_logs, NULL);
     message_register_table(msgtab);
     log_inited = 1;
+
+    /* Start periodic log flush timer */
+    if (log_flush_interval > 0) {
+        timeq_add(now + log_flush_interval, log_periodic_flush, NULL);
+    }
 }
 
 void SyncLog(char *fmt,...)

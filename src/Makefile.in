@@ -122,7 +122,7 @@ am_x3_OBJECTS = base64.$(OBJEXT) chanserv.$(OBJEXT) compat.$(OBJEXT) \
 	getopt.$(OBJEXT) getopt1.$(OBJEXT) gline.$(OBJEXT) \
 	global.$(OBJEXT) hash.$(OBJEXT) heap.$(OBJEXT) \
 	helpfile.$(OBJEXT) ioset.$(OBJEXT) log.$(OBJEXT) \
-	main.$(OBJEXT) math.$(OBJEXT) md5.$(OBJEXT) modcmd.$(OBJEXT) \
+	log_async.$(OBJEXT) main.$(OBJEXT) math.$(OBJEXT) md5.$(OBJEXT) modcmd.$(OBJEXT) \
 	modules.$(OBJEXT) password.$(OBJEXT) keycloak.$(OBJEXT) \
 	keycloak_webhook.$(OBJEXT) nickserv.$(OBJEXT) opserv.$(OBJEXT) \
 	policer.$(OBJEXT) recdb.$(OBJEXT) sar.$(OBJEXT) \
@@ -402,6 +402,7 @@ x3_SOURCES = \
 	helpfile.c helpfile.h \
 	ioset.c ioset.h ioset-impl.h \
 	log.c log.h \
+	log_async.c log_async.h \
 	mail.h \
 	main.c common.h \
 	math.c \

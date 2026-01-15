@@ -22,6 +22,7 @@
 #include "global.h"
 #include "hash.h"
 #include "log.h"
+#include "mempool.h"
 
 #if defined(HAVE_LIBGEOIP)&&defined(HAVE_GEOIP_H)&&defined(HAVE_GEOIPCITY_H)
 #include <GeoIP.h>
@@ -40,6 +41,9 @@ time_t max_clients_time;
 struct userList curr_opers;
 unsigned int count_opers;
 
+/* Memory pool for modeNode (channel membership) - high churn on JOIN/PART */
+static struct mempool *mp_modenode;
+
 static void hash_cleanup(void *extra);
 
 void init_structs(void)
@@ -49,6 +53,10 @@ void init_structs(void)
     servers = dict_new();
     userList_init(&curr_opers);
     count_opers = 0;
+
+    /* Initialize modeNode pool: ~40 bytes each, high churn on JOIN/PART */
+    mp_modenode = mempool_create("modeNode", sizeof(struct modeNode), 0, 500, 0, 200);
+
     reg_exit_func(hash_cleanup, NULL);
 }
 
@@ -867,7 +875,7 @@ AddChannelUser(struct userNode *user, struct chanNode* channel)
 	if (mNode)
             return mNode;
 
-	mNode = malloc(sizeof(*mNode));
+	mNode = mempool_alloc(mp_modenode);
 
 	/* set up modeNode */
 	mNode->channel = channel;
@@ -973,8 +981,8 @@ DelChannelUser(struct userNode* user, struct chanNode* channel, const char *reas
     for (n=0; n<pf_used; n++)
 	pf_list[n](mNode, reason, pf_list_extra[n]);
 
-    /* free memory */
-    free(mNode);
+    /* free memory back to pool */
+    mempool_free(mp_modenode, mNode);
 
     /* A single check for APASS only should be enough here */
     if (!deleting && !channel->members.used && !channel->locks

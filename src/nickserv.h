@@ -244,6 +244,8 @@ struct nickserv_config {
     unsigned int password_bcrypt_cost;      // bcrypt cost factor (default: 12)
     unsigned int password_lazy_migration;   // Rehash legacy passwords on login (default: 1)
     unsigned int scram_iterations;          // SCRAM-SHA-256 iterations (default: 4096, RFC min)
+    unsigned int lmdb_nosync;               // LMDB nosync mode (default: 0, trades durability for speed)
+    unsigned int lmdb_sync_interval;        // LMDB sync interval in seconds when nosync enabled (default: 10)
     /* Certificate auto-registration */
     unsigned int cert_autoregister;         // Auto-register certs on SASL PLAIN auth (default: 0)
 };

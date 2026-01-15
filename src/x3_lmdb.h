@@ -804,6 +804,14 @@ enum scram_hash_type {
 unsigned int x3_lmdb_get_scram_iterations(void);
 void x3_lmdb_set_scram_iterations(unsigned int iterations);
 
+/* Get/set LMDB nosync mode (trades durability for performance) */
+int x3_lmdb_get_nosync(void);
+void x3_lmdb_set_nosync(int nosync);
+
+/* Get/set LMDB sync interval in seconds (only used when nosync enabled) */
+unsigned int x3_lmdb_get_sync_interval(void);
+void x3_lmdb_set_sync_interval(unsigned int interval);
+
 /* SCRAM salt length in bytes */
 #define SCRAM_SALT_LEN 16
 

@@ -213,6 +213,8 @@
 #define KEY_PASSWORD_BCRYPT_COST     "password_bcrypt_cost"
 #define KEY_PASSWORD_LAZY_MIGRATION  "password_lazy_migration"
 #define KEY_SCRAM_ITERATIONS         "scram_iterations"
+#define KEY_LMDB_NOSYNC              "lmdb_nosync"
+#define KEY_LMDB_SYNC_INTERVAL       "lmdb_sync_interval"
 
 /* Certificate auto-registration */
 #define KEY_CERT_AUTOREGISTER        "cert_autoregister"
@@ -11705,6 +11707,12 @@ nickserv_conf_read(void)
     str = database_get_data(conf_node, KEY_SCRAM_ITERATIONS, RECDB_QSTRING);
     nickserv_conf.scram_iterations = str ? strtoul(str, NULL, 0) : 4096;  /* RFC 7677 minimum */
 
+    str = database_get_data(conf_node, KEY_LMDB_NOSYNC, RECDB_QSTRING);
+    nickserv_conf.lmdb_nosync = str ? !disabled_string(str) : 0;  /* Disabled by default for safety */
+
+    str = database_get_data(conf_node, KEY_LMDB_SYNC_INTERVAL, RECDB_QSTRING);
+    nickserv_conf.lmdb_sync_interval = str ? strtoul(str, NULL, 0) : 10;  /* 10 seconds default */
+
     /* Certificate auto-registration */
     str = database_get_data(conf_node, KEY_CERT_AUTOREGISTER, RECDB_QSTRING);
     nickserv_conf.cert_autoregister = str ? !disabled_string(str) : 0;  /* Disabled by default */
@@ -11718,9 +11726,11 @@ nickserv_conf_read(void)
     pw_config.bcrypt_cost = nickserv_conf.password_bcrypt_cost;
     pw_config.enable_lazy_migration = nickserv_conf.password_lazy_migration;
 
-    /* Apply SCRAM config to LMDB module */
+    /* Apply SCRAM and sync config to LMDB module */
 #ifdef WITH_LMDB
     x3_lmdb_set_scram_iterations(nickserv_conf.scram_iterations);
+    x3_lmdb_set_nosync(nickserv_conf.lmdb_nosync);
+    x3_lmdb_set_sync_interval(nickserv_conf.lmdb_sync_interval);
 #endif
 
     /* Set default algorithm based on config */

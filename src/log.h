@@ -54,6 +54,16 @@ void log_audit(struct log_type *type, enum log_severity sev, struct userNode *us
 void log_module(struct log_type *type, enum log_severity sev, const char *format, ...) PRINTF_LIKE(3, 4);
 void log_replay(struct log_type *type, int is_write, const char *line);
 
+/* Conditional DEBUG logging macro - compiles to no-op in release builds.
+ * Use LOG_DEBUG_M() instead of log_module(type, LOG_DEBUG, ...) for
+ * high-frequency debug logging that should be eliminated in production.
+ */
+#ifdef NDEBUG
+#define LOG_DEBUG_M(type, fmt, ...) ((void)0)
+#else
+#define LOG_DEBUG_M(type, fmt, ...) log_module(type, LOG_DEBUG, fmt, ##__VA_ARGS__)
+#endif
+
 /* Log searching functions - ONLY searches log_audit'ed data */
 
 struct logEntry
