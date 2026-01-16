@@ -414,6 +414,8 @@ kc_user_repr_cache_cleanup(void)
 struct kc_pending_attr {
     char *name;                       /* Attribute name (heap allocated) */
     char *value;                      /* Attribute value (NULL = delete attr) */
+    kc_async_callback cb;             /* Callback for this attr's requester */
+    void *session;                    /* Session for this attr's requester */
 };
 
 /* Pending updates for one user - owns all memory */
@@ -422,8 +424,6 @@ struct kc_pending_user_update {
     struct kc_pending_attr attrs[KC_COALESCE_MAX_PENDING];
     int attr_count;
     time_t scheduled_flush;           /* When flush was scheduled */
-    kc_async_callback cb;             /* Last callback wins */
-    void *session;                    /* Last session wins */
     struct kc_pending_user_update *next;
 };
 
@@ -433,6 +433,18 @@ static struct kc_pending_user_update *kc_pending_updates = NULL;
 static void kc_coalesce_flush_cb(void *data);
 static void kc_pending_update_free(struct kc_pending_user_update *p);
 static void kc_coalesce_cleanup(void);
+
+/* Invoke all callbacks for a pending update with given result */
+static void
+kc_pending_invoke_all_callbacks(struct kc_pending_user_update *p, int result)
+{
+    if (!p) return;
+    for (int i = 0; i < p->attr_count; i++) {
+        if (p->attrs[i].cb) {
+            p->attrs[i].cb(p->attrs[i].session, result);
+        }
+    }
+}
 
 /* Free a pending update structure and all its contents */
 static void
@@ -457,6 +469,8 @@ kc_coalesce_cleanup(void)
         next = p->next;
         /* Cancel the scheduled timeq callback to prevent use-after-free */
         timeq_del(0, kc_coalesce_flush_cb, p, TIMEQ_IGNORE_WHEN);
+        /* Invoke all callbacks with error - shutdown aborts pending operations */
+        kc_pending_invoke_all_callbacks(p, KC_ERROR);
         kc_pending_update_free(p);
         count++;
     }
@@ -510,8 +524,9 @@ kc_coalesce_add_attr(struct kc_pending_user_update *p,
         if (strcmp(p->attrs[i].name, attr_name) == 0) {
             free(p->attrs[i].value);
             p->attrs[i].value = attr_value ? strdup(attr_value) : NULL;
-            p->cb = cb;       /* Last callback wins */
-            p->session = session;
+            /* Store callback for this attr - each requester gets notified */
+            p->attrs[i].cb = cb;
+            p->attrs[i].session = session;
             log_module(KC_LOG, LOG_DEBUG, "coalesce: Updated pending attr %s for %s",
                        attr_name, p->user_id);
             return 0;
@@ -527,13 +542,13 @@ kc_coalesce_add_attr(struct kc_pending_user_update *p,
 
     p->attrs[p->attr_count].name = strdup(attr_name);
     p->attrs[p->attr_count].value = attr_value ? strdup(attr_value) : NULL;
+    p->attrs[p->attr_count].cb = cb;
+    p->attrs[p->attr_count].session = session;
     if (!p->attrs[p->attr_count].name) {
         log_module(KC_LOG, LOG_ERROR, "coalesce: Out of memory for attr name");
         return -1;
     }
     p->attr_count++;
-    p->cb = cb;
-    p->session = session;
 
     log_module(KC_LOG, LOG_DEBUG, "coalesce: Added pending attr %s for %s (count=%d)",
                attr_name, p->user_id, p->attr_count);
@@ -2390,7 +2405,12 @@ kc_curl_check_completed(void)
                 } else {
                     log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async set_attr: Error (HTTP %ld)", req_id, http_code);
                 }
-                if (req->cb.generic) {
+                /* If this came from coalescing, invoke all pending callbacks */
+                if (req->coalesce_pending) {
+                    kc_pending_invoke_all_callbacks(req->coalesce_pending, result);
+                    kc_pending_update_free(req->coalesce_pending);
+                    req->coalesce_pending = NULL;
+                } else if (req->cb.generic) {
                     req->cb.generic(req->session, result);
                 }
                 break;
@@ -3120,9 +3140,8 @@ kc_curl_check_completed(void)
                             if (put_uri) {
                                 struct kc_async_request *put_req = calloc(1, sizeof(*put_req));
                                 if (put_req) {
-                                    put_req->session = pending->session;
                                     put_req->type = KC_ASYNC_SET_ATTR;
-                                    put_req->cb.generic = pending->cb;
+                                    put_req->coalesce_pending = pending;  /* Transfer ownership */
                                     put_req->uri = put_uri;
                                     put_req->post_fields = json_body;
 
@@ -3135,6 +3154,7 @@ kc_curl_check_completed(void)
                                         log_module(KC_LOG, LOG_ERROR,
                                                    "[%s] kc_async coalesce_get: Failed to get bearer token for PUT",
                                                    req_id);
+                                        put_req->coalesce_pending = NULL;  /* Return ownership */
                                         free(put_uri);
                                         free(json_body);
                                         free(put_req);
@@ -3153,10 +3173,13 @@ kc_curl_check_completed(void)
                                                        "issued PUT with %d merged attrs for %s",
                                                        req_id, pending->attr_count, pending->user_id);
                                             result = KC_SUCCESS;
+                                            /* Ownership transferred to put_req - don't free pending */
+                                            req->coalesce_pending = NULL;
                                         } else {
                                             log_module(KC_LOG, LOG_ERROR,
                                                        "[%s] kc_async coalesce_get: Failed to start PUT",
                                                        req_id);
+                                            put_req->coalesce_pending = NULL;  /* Return ownership */
                                             free(put_req->bearer_token_copy);
                                             free(put_uri);
                                             free(json_body);
@@ -3187,14 +3210,12 @@ kc_curl_check_completed(void)
                                req_id, http_code);
                 }
 
-                /* On error, call callback. On success, PUT will call callback when done. */
-                if (result != KC_SUCCESS && pending->cb) {
-                    pending->cb(pending->session, result);
+                /* On error, invoke all callbacks. On success, PUT will handle callbacks. */
+                if (result != KC_SUCCESS) {
+                    kc_pending_invoke_all_callbacks(pending, result);
+                    kc_pending_update_free(pending);
+                    req->coalesce_pending = NULL;  /* Don't double-free in cleanup */
                 }
-
-                /* Free the pending update - we're done with it either way */
-                kc_pending_update_free(pending);
-                req->coalesce_pending = NULL;  /* Don't double-free in cleanup */
                 break;
             }
             }
@@ -3718,7 +3739,7 @@ kc_coalesce_flush_cb(void *data)
     /* Check if we have a valid token */
     if (!kc_token_mgr.token || !kc_token_mgr.token->access_token) {
         log_module(KC_LOG, LOG_ERROR, "coalesce: No valid token for flush");
-        if (p->cb) p->cb(p->session, KC_ERROR);
+        kc_pending_invoke_all_callbacks(p, KC_ERROR);
         kc_pending_update_free(p);
         return;
     }
@@ -3735,7 +3756,7 @@ kc_coalesce_flush_cb(void *data)
         json_t *repr = json_deep_copy(cached_repr);
         if (!repr) {
             log_module(KC_LOG, LOG_ERROR, "coalesce: Failed to copy cached repr");
-            if (p->cb) p->cb(p->session, KC_ERROR);
+            kc_pending_invoke_all_callbacks(p, KC_ERROR);
             kc_pending_update_free(p);
             return;
         }
@@ -3769,7 +3790,7 @@ kc_coalesce_flush_cb(void *data)
 
         if (!json_body) {
             log_module(KC_LOG, LOG_ERROR, "coalesce: Failed to serialize JSON");
-            if (p->cb) p->cb(p->session, KC_ERROR);
+            kc_pending_invoke_all_callbacks(p, KC_ERROR);
             kc_pending_update_free(p);
             return;
         }
@@ -3779,14 +3800,13 @@ kc_coalesce_flush_cb(void *data)
         if (!req) {
             log_module(KC_LOG, LOG_ERROR, "coalesce: Out of memory for request");
             free(json_body);
-            if (p->cb) p->cb(p->session, KC_ERROR);
+            kc_pending_invoke_all_callbacks(p, KC_ERROR);
             kc_pending_update_free(p);
             return;
         }
 
-        req->session = p->session;
         req->type = KC_ASYNC_SET_ATTR;
-        req->cb.generic = p->cb;
+        req->coalesce_pending = p;  /* Transfer ownership - callbacks invoked on completion */
         req->uri = kc_build_user_endpoint(kc_token_mgr.realm, p->user_id);
         req->post_fields = json_body;
         req->bearer_token_copy = strdup(kc_token_mgr.token->access_token);
@@ -3797,7 +3817,7 @@ kc_coalesce_flush_cb(void *data)
             if (req->bearer_token_copy) free(req->bearer_token_copy);
             free(json_body);
             free(req);
-            if (p->cb) p->cb(p->session, KC_ERROR);
+            kc_pending_invoke_all_callbacks(p, KC_ERROR);
             kc_pending_update_free(p);
             return;
         }
@@ -3816,14 +3836,14 @@ kc_coalesce_flush_cb(void *data)
             free(req->bearer_token_copy);
             free(req->post_fields);
             free(req);
-            if (p->cb) p->cb(p->session, KC_ERROR);
+            kc_pending_invoke_all_callbacks(p, KC_ERROR);
             kc_pending_update_free(p);
             return;
         }
 
         log_module(KC_LOG, LOG_DEBUG, "coalesce: Started PUT with %d merged attrs for %s",
                    p->attr_count, p->user_id);
-        kc_pending_update_free(p);
+        /* Ownership of p transferred to req->coalesce_pending - don't free here */
         return;
     }
 
@@ -3833,14 +3853,12 @@ kc_coalesce_flush_cb(void *data)
     struct kc_async_request *req = calloc(1, sizeof(*req));
     if (!req) {
         log_module(KC_LOG, LOG_ERROR, "coalesce: Out of memory for GET request");
-        if (p->cb) p->cb(p->session, KC_ERROR);
+        kc_pending_invoke_all_callbacks(p, KC_ERROR);
         kc_pending_update_free(p);
         return;
     }
 
-    req->session = p->session;
     req->type = KC_ASYNC_COALESCE_GET;
-    req->cb.generic = p->cb;
     req->coalesce_pending = p;  /* Transfer ownership to request */
     req->realm_copy = kc_token_mgr.realm;
 
@@ -3852,7 +3870,7 @@ kc_coalesce_flush_cb(void *data)
         if (req->uri) free(req->uri);
         if (req->bearer_token_copy) free(req->bearer_token_copy);
         free(req);
-        if (p->cb) p->cb(p->session, KC_ERROR);
+        kc_pending_invoke_all_callbacks(p, KC_ERROR);
         kc_pending_update_free(p);
         return;
     }
@@ -3867,7 +3885,7 @@ kc_coalesce_flush_cb(void *data)
         free(req->uri);
         free(req->bearer_token_copy);
         free(req);
-        if (p->cb) p->cb(p->session, KC_ERROR);
+        kc_pending_invoke_all_callbacks(p, KC_ERROR);
         kc_pending_update_free(p);
         return;
     }
