@@ -285,15 +285,25 @@ kc_user_repr_cache_put(const char *user_id, json_t *repr)
 {
     if (!user_id || !repr) return;
 
+    /* Create a sanitized copy - strip credentials to avoid duplicate password creation.
+     * Keycloak GET returns credentials array, but including it in PUT adds new credentials
+     * rather than replacing. Credentials should be managed via separate endpoint. */
+    json_t *sanitized = json_deep_copy(repr);
+    if (!sanitized) {
+        log_module(KC_LOG, LOG_ERROR, "user_repr_cache: Failed to copy repr for %s", user_id);
+        return;
+    }
+    json_object_del(sanitized, "credentials");
+
     /* Check if already cached (update in place) */
     for (int i = 0; i < kc_user_repr_cache.count; i++) {
         if (strcmp(kc_user_repr_cache.entries[i].user_id, user_id) == 0) {
             /* Replace existing representation */
             if (kc_user_repr_cache.entries[i].repr)
                 json_decref(kc_user_repr_cache.entries[i].repr);
-            kc_user_repr_cache.entries[i].repr = json_incref(repr);
+            kc_user_repr_cache.entries[i].repr = sanitized;  /* Takes ownership */
             kc_user_repr_cache.entries[i].last_updated = time(NULL);
-            log_module(KC_LOG, LOG_DEBUG, "user_repr_cache: Updated %s", user_id);
+            log_module(KC_LOG, LOG_DEBUG, "user_repr_cache: Updated %s (credentials stripped)", user_id);
             return;
         }
     }
@@ -331,10 +341,10 @@ kc_user_repr_cache_put(const char *user_id, json_t *repr)
     int idx = kc_user_repr_cache.count++;
     safestrncpy(kc_user_repr_cache.entries[idx].user_id, user_id,
                 sizeof(kc_user_repr_cache.entries[idx].user_id));
-    kc_user_repr_cache.entries[idx].repr = json_incref(repr);
+    kc_user_repr_cache.entries[idx].repr = sanitized;  /* Takes ownership */
     kc_user_repr_cache.entries[idx].last_updated = time(NULL);
 
-    log_module(KC_LOG, LOG_DEBUG, "user_repr_cache: Added %s (count=%d)",
+    log_module(KC_LOG, LOG_DEBUG, "user_repr_cache: Added %s (count=%d, credentials stripped)",
                user_id, kc_user_repr_cache.count);
 }
 
@@ -1783,7 +1793,8 @@ enum kc_async_type {
     KC_ASYNC_GROUP_MEMBERS, /* Get group members (phase 2 or standalone) */
     KC_ASYNC_CLIENT_TOKEN,  /* Client credentials token acquisition */
     KC_ASYNC_GET_USER,      /* Get user by username (Phase 3) */
-    KC_ASYNC_UPDATE_USER,   /* Update user representation (Phase 3) */
+    KC_ASYNC_UPDATE_USER,   /* Update user representation (Phase 3) - PUT phase */
+    KC_ASYNC_UPDATE_USER_GET, /* Update user representation (Phase 3) - GET phase (cache miss) */
     KC_ASYNC_GET_GROUP_PATH,/* Get group by path (Phase 4) */
     KC_ASYNC_CREATE_SUBGROUP,/* Create subgroup (Phase 4) */
     KC_ASYNC_SET_GROUP_ATTR, /* Set group attribute (Phase 4) - PUT phase */
@@ -1847,6 +1858,11 @@ struct kc_async_request {
     struct kc_realm realm_copy;   /* For KC_ASYNC_SET_USER_ATTR_GET - realm config copy */
     struct kc_client client_copy; /* For KC_ASYNC_SET_USER_ATTR_GET - client config copy (access_token borrowed) */
     char *bearer_token_copy;      /* Owned copy of bearer token for async request lifetime */
+    /* User representation update (GET-then-PUT flow for KC_ASYNC_UPDATE_USER_GET) */
+    char *update_email;           /* Email to update (allocated, NULL = no change) */
+    char *update_username;        /* Username for credential updates (allocated) */
+    char *update_cred_data;       /* Credential data JSON (allocated, NULL = no change) */
+    char *update_secret_data;     /* Secret data JSON (allocated, NULL = no change) */
     /* Retry logic for transient errors (5xx, 429, connection errors) */
     int retry_count;              /* Current retry attempt (0 = first try) */
     int max_retries;              /* Maximum retries for this request (default: 2) */
@@ -2265,6 +2281,17 @@ kc_async_request_cleanup(struct kc_async_request *req)
     if (req->bearer_token_copy) free(req->bearer_token_copy);  /* JWT tokens are long */
     pool_strfree(req->group_attr_value);
     pool_strfree(req->group_id);
+    /* User representation update fields */
+    pool_strfree(req->update_email);
+    pool_strfree(req->update_username);
+    if (req->update_cred_data) {
+        memset(req->update_cred_data, 0, strlen(req->update_cred_data));
+        free(req->update_cred_data);
+    }
+    if (req->update_secret_data) {
+        memset(req->update_secret_data, 0, strlen(req->update_secret_data));
+        free(req->update_secret_data);
+    }
 
     free(req);
 }
@@ -2342,6 +2369,7 @@ kc_curl_check_completed(void)
                 case KC_ASYNC_CREATE_USER:
                 case KC_ASYNC_DELETE_USER:
                 case KC_ASYNC_UPDATE_USER:
+                case KC_ASYNC_UPDATE_USER_GET:
                 case KC_ASYNC_GET_USER:
                 case KC_ASYNC_SET_USER_ATTR_GET:
                 case KC_ASYNC_SET_GROUP_ATTR:
@@ -2676,6 +2704,119 @@ kc_curl_check_completed(void)
                 }
                 break;
             }
+            case KC_ASYNC_UPDATE_USER_GET: {
+                /* GET phase completed for user representation update.
+                 * Merge updates into full representation and issue PUT. */
+                int result = KC_ERROR;
+
+                if (http_code == 200 && req->response.response) {
+                    json_error_t error;
+                    json_t *repr = json_loads(req->response.response, 0, &error);
+                    if (repr) {
+                        /* Strip credentials from GET response - they should not be in PUT
+                         * as Keycloak treats credentials in PUT as "add" not "replace" */
+                        json_object_del(repr, "credentials");
+
+                        /* Merge email if provided */
+                        if (req->update_email) {
+                            json_object_set_new(repr, "email", json_string(req->update_email));
+                        }
+
+                        /* Cache the merged representation AFTER merging email.
+                         * This ensures subsequent operations have the email.
+                         * kc_user_repr_cache_put already strips credentials. */
+                        json_t *id_json = json_object_get(repr, "id");
+                        if (id_json && json_is_string(id_json)) {
+                            kc_user_repr_cache_put(json_string_value(id_json), repr);
+                        }
+
+                        /* Add credentials if provided - only for PUT, not for cache */
+                        if (req->update_cred_data && req->update_secret_data) {
+                            json_t *cred = json_object();
+                            json_object_set_new(cred, "type", json_string("password"));
+                            json_object_set_new(cred, "credentialData", json_string(req->update_cred_data));
+                            json_object_set_new(cred, "secretData", json_string(req->update_secret_data));
+                            json_object_set_new(cred, "temporary", json_false());
+
+                            json_t *creds = json_array();
+                            json_array_append_new(creds, cred);
+                            json_object_set_new(repr, "credentials", creds);
+                        }
+
+                        /* Serialize merged representation for PUT */
+                        char *json_body = json_dumps(repr, JSON_COMPACT);
+                        json_decref(repr);
+
+                        if (json_body) {
+                            /* Build PUT request */
+                            struct kc_async_request *put_req = calloc(1, sizeof(*put_req));
+                            if (put_req) {
+                                put_req->session = req->session;
+                                put_req->type = KC_ASYNC_UPDATE_USER;
+                                put_req->cb.update_user = req->cb.update_user;
+                                put_req->uri = strdup(req->uri);  /* Same URI for PUT */
+                                put_req->post_fields = json_body;
+
+                                /* Get fresh bearer token for PUT */
+                                if (kc_token_mgr.token && kc_token_mgr.token->access_token) {
+                                    put_req->bearer_token_copy = strdup(kc_token_mgr.token->access_token);
+                                }
+
+                                if (put_req->uri && put_req->bearer_token_copy) {
+                                    struct curl_opts opts = CURL_OPTS_INIT;
+                                    opts.uri = put_req->uri;
+                                    opts.method = HTTP_PUT;
+                                    opts.post_fields = put_req->post_fields;
+                                    opts.xoauth2_bearer = put_req->bearer_token_copy;
+                                    opts.header_list[0] = "Content-Type: application/json";
+                                    opts.header_count = 1;
+
+                                    if (curl_perform_async(put_req, opts) == 0) {
+                                        log_module(KC_LOG, LOG_DEBUG,
+                                                   "[%s] kc_async update_user_get: GET succeeded, issued PUT with merged repr",
+                                                   req_id);
+                                        result = KC_SUCCESS;
+                                        /* Clear callback in original req - PUT will call it */
+                                        req->cb.update_user = NULL;
+                                    } else {
+                                        log_module(KC_LOG, LOG_ERROR,
+                                                   "[%s] kc_async update_user_get: Failed to start PUT", req_id);
+                                        free(put_req->uri);
+                                        free(put_req->bearer_token_copy);
+                                        free(json_body);
+                                        free(put_req);
+                                    }
+                                } else {
+                                    log_module(KC_LOG, LOG_ERROR,
+                                               "[%s] kc_async update_user_get: Failed to prepare PUT request", req_id);
+                                    if (put_req->uri) free(put_req->uri);
+                                    if (put_req->bearer_token_copy) free(put_req->bearer_token_copy);
+                                    free(json_body);
+                                    free(put_req);
+                                }
+                            } else {
+                                free(json_body);
+                            }
+                        }
+                    } else {
+                        log_module(KC_LOG, LOG_ERROR,
+                                   "[%s] kc_async update_user_get: Invalid JSON: %s", req_id, error.text);
+                    }
+                } else if (http_code == 404) {
+                    result = KC_NOT_FOUND;
+                    log_module(KC_LOG, LOG_DEBUG,
+                               "[%s] kc_async update_user_get: User not found (HTTP 404)", req_id);
+                } else {
+                    log_module(KC_LOG, LOG_ERROR,
+                               "[%s] kc_async update_user_get: GET failed (HTTP %ld)", req_id, http_code);
+                }
+
+                /* On error, call callback. On success, PUT will call callback. */
+                if (result != KC_SUCCESS && req->cb.update_user) {
+                    req->cb.update_user(req->session, result);
+                }
+                break;
+            }
             case KC_ASYNC_GET_GROUP_PATH: {
                 int result = KC_ERROR;
                 char *group_id = NULL;
@@ -2982,11 +3123,9 @@ kc_curl_check_completed(void)
                     json_error_t error;
                     json_t *repr = json_loads(req->response.response, 0, &error);
                     if (repr) {
-                        /* Cache this representation for future updates */
-                        json_t *id_json = json_object_get(repr, "id");
-                        if (id_json && json_is_string(id_json)) {
-                            kc_user_repr_cache_put(json_string_value(id_json), repr);
-                        }
+                        /* Strip credentials from GET response - they should not be in PUT
+                         * as Keycloak treats credentials in PUT as "add" not "replace" */
+                        json_object_del(repr, "credentials");
 
                         /* Get or create attributes object */
                         json_t *attrs = json_object_get(repr, "attributes");
@@ -3004,6 +3143,13 @@ kc_curl_check_completed(void)
                             /* NULL value = delete attribute by setting to empty array */
                             json_t *empty_array = json_array();
                             json_object_set_new(attrs, req->user_attr_name, empty_array);
+                        }
+
+                        /* Cache the merged representation AFTER merging attribute.
+                         * kc_user_repr_cache_put already strips credentials. */
+                        json_t *id_json = json_object_get(repr, "id");
+                        if (id_json && json_is_string(id_json)) {
+                            kc_user_repr_cache_put(json_string_value(id_json), repr);
                         }
 
                         /* Now issue the PUT with full representation */
@@ -3105,11 +3251,9 @@ kc_curl_check_completed(void)
                     json_error_t error;
                     json_t *repr = json_loads(req->response.response, 0, &error);
                     if (repr) {
-                        /* Cache this representation for future updates */
-                        json_t *id_json = json_object_get(repr, "id");
-                        if (id_json && json_is_string(id_json)) {
-                            kc_user_repr_cache_put(json_string_value(id_json), repr);
-                        }
+                        /* Strip credentials from GET response - they should not be in PUT
+                         * as Keycloak treats credentials in PUT as "add" not "replace" */
+                        json_object_del(repr, "credentials");
 
                         /* Get or create attributes object */
                         json_t *attrs = json_object_get(repr, "attributes");
@@ -3129,6 +3273,13 @@ kc_curl_check_completed(void)
                                 json_t *empty_array = json_array();
                                 json_object_set_new(attrs, pending->attrs[i].name, empty_array);
                             }
+                        }
+
+                        /* Cache the merged representation AFTER merging attributes.
+                         * kc_user_repr_cache_put already strips credentials. */
+                        json_t *id_json = json_object_get(repr, "id");
+                        if (id_json && json_is_string(id_json)) {
+                            kc_user_repr_cache_put(json_string_value(id_json), repr);
                         }
 
                         /* Now issue PUT with full representation */
@@ -3760,6 +3911,10 @@ kc_coalesce_flush_cb(void *data)
             kc_pending_update_free(p);
             return;
         }
+
+        /* Strip any existing credentials - Keycloak treats credentials in PUT as "add"
+         * not "replace". kc_user_repr_cache_put already strips them, but be defensive. */
+        json_object_del(repr, "credentials");
 
         /* Get or create attributes object */
         json_t *attrs = json_object_get(repr, "attributes");
@@ -8293,6 +8448,16 @@ error:
 
 /*
  * Phase 3: Async update user representation
+ *
+ * IMPORTANT: Keycloak PUT requires the FULL user representation, not a diff.
+ * This function uses the user representation cache to merge updates into the
+ * complete representation before sending.
+ *
+ * Flow:
+ * 1. Check cache for user representation
+ * 2. If cache hit: merge updates into cached repr, PUT directly
+ * 3. If cache miss: GET user first, cache it, merge, then PUT
+ *
  * Returns 0 on success (request started), -1 on error
  */
 int
@@ -8326,61 +8491,146 @@ keycloak_update_user_representation_async(struct kc_realm realm, struct kc_clien
         return -1;
     }
 
-    /* Allocate request structure */
-    req = calloc(1, sizeof(*req));
-    if (!req) {
-        log_module(KC_LOG, LOG_ERROR, "update_user_async: Out of memory");
+    /* Check if we have a valid token */
+    if (!kc_token_mgr.token || !kc_token_mgr.token->access_token) {
+        log_module(KC_LOG, LOG_ERROR, "update_user_async: No valid token available");
         return -1;
     }
+
+    /* Check user representation cache */
+    json_t *cached_repr = kc_user_repr_cache_get(user_id);
+
+    if (cached_repr) {
+        /* Cache hit - merge updates into cached representation and PUT directly */
+        log_module(KC_LOG, LOG_DEBUG, "update_user_async: Cache hit for %s, merging updates", user_id);
+
+        /* Deep copy the representation so we can modify it */
+        json_t *repr = json_deep_copy(cached_repr);
+        if (!repr) {
+            log_module(KC_LOG, LOG_ERROR, "update_user_async: Failed to copy cached repr");
+            return -1;
+        }
+
+        /* Strip any existing credentials - Keycloak treats credentials in PUT as "add"
+         * not "replace", so we must not include old credentials. kc_user_repr_cache_put
+         * already strips them, but be defensive for any old cached entries. */
+        json_object_del(repr, "credentials");
+
+        /* Merge email if provided */
+        if (update->email) {
+            json_object_set_new(repr, "email", json_string(update->email));
+
+            /* Update cache with merged repr (now includes email, no credentials).
+             * This ensures subsequent operations see the email we're about to set. */
+            kc_user_repr_cache_put(user_id, repr);
+        }
+
+        /* Add credentials if provided - these are new credentials to set */
+        if (update->cred_data && update->secret_data) {
+            json_t *cred = json_object();
+            json_object_set_new(cred, "type", json_string("password"));
+            json_object_set_new(cred, "credentialData", json_string(update->cred_data));
+            json_object_set_new(cred, "secretData", json_string(update->secret_data));
+            json_object_set_new(cred, "temporary", json_false());
+
+            json_t *creds = json_array();
+            json_array_append_new(creds, cred);
+            json_object_set_new(repr, "credentials", creds);
+        }
+
+        /* Serialize for PUT */
+        json_body = json_dumps(repr, JSON_COMPACT);
+        json_decref(repr);
+
+        if (!json_body) {
+            log_module(KC_LOG, LOG_ERROR, "update_user_async: Failed to serialize JSON");
+            return -1;
+        }
+
+        /* Build PUT request */
+        req = calloc(1, sizeof(*req));
+        if (!req) {
+            log_module(KC_LOG, LOG_ERROR, "update_user_async: Out of memory");
+            free(json_body);
+            return -1;
+        }
+
+        req->session = session;
+        req->type = KC_ASYNC_UPDATE_USER;
+        req->cb.update_user = callback;
+        req->uri = kc_build_user_endpoint(realm, user_id);
+        req->post_fields = json_body;
+        req->bearer_token_copy = strdup(kc_token_mgr.token->access_token);
+
+        if (!req->uri || !req->bearer_token_copy) {
+            log_module(KC_LOG, LOG_ERROR, "update_user_async: Failed to build request");
+            goto error;
+        }
+
+        log_module(KC_LOG, LOG_DEBUG, "update_user_async: JSON body = %s", json_body);
+
+        struct curl_opts opts = CURL_OPTS_INIT;
+        opts.uri = req->uri;
+        opts.method = HTTP_PUT;
+        opts.post_fields = req->post_fields;
+        opts.xoauth2_bearer = req->bearer_token_copy;
+        opts.header_list[0] = "Content-Type: application/json";
+        opts.header_count = 1;
+
+        if (curl_perform_async(req, opts) < 0) {
+            log_module(KC_LOG, LOG_ERROR, "update_user_async: curl_perform_async failed");
+            goto error;
+        }
+
+        log_module(KC_LOG, LOG_DEBUG, "update_user_async: Started PUT with merged repr for %s", user_id);
+        return 0;
+    }
+
+    /* Cache miss - need to GET user first, then merge and PUT */
+    log_module(KC_LOG, LOG_DEBUG, "update_user_async: Cache miss for %s, doing GET first", user_id);
+
+    req = calloc(1, sizeof(*req));
+    if (!req) {
+        log_module(KC_LOG, LOG_ERROR, "update_user_async: Out of memory for GET request");
+        return -1;
+    }
+
     req->session = session;
-    req->type = KC_ASYNC_UPDATE_USER;
+    req->type = KC_ASYNC_UPDATE_USER_GET;
     req->cb.update_user = callback;
-
-    /* Build URI */
     req->uri = kc_build_user_endpoint(realm, user_id);
-    if (!req->uri) {
-        log_module(KC_LOG, LOG_ERROR, "update_user_async: Failed to build URI");
-        goto error;
-    }
-
-    /* Build JSON body - username required for credential updates (Keycloak bug workaround) */
-    json_body = json_build_user_with_hash(update->username, update->email,
-                                          update->cred_data, update->secret_data);
-    if (!json_body) {
-        log_module(KC_LOG, LOG_ERROR, "update_user_async: Failed to build JSON body");
-        goto error;
-    }
-    req->post_fields = json_body;
-
-    /* DEBUG: Log the JSON body being sent */
-    log_module(KC_LOG, LOG_DEBUG, "update_user_async: JSON body = %s", json_body);
-
-    /* Copy bearer token from global manager (avoids use-after-free if ctx has stale pointer) */
-    if (!kc_token_mgr.token || !kc_token_mgr.token->access_token) {
-        log_module(KC_LOG, LOG_ERROR, "update_user_async: No valid token available (token refresh in progress?)");
-        goto error;
-    }
     req->bearer_token_copy = strdup(kc_token_mgr.token->access_token);
-    if (!req->bearer_token_copy) {
-        log_module(KC_LOG, LOG_ERROR, "update_user_async: Failed to copy bearer token");
+
+    /* Store update info for use after GET completes */
+    if (update->email) {
+        req->update_email = pool_strdup(update->email);
+    }
+    if (update->username) {
+        req->update_username = pool_strdup(update->username);
+    }
+    if (update->cred_data) {
+        req->update_cred_data = strdup(update->cred_data);
+    }
+    if (update->secret_data) {
+        req->update_secret_data = strdup(update->secret_data);
+    }
+
+    if (!req->uri || !req->bearer_token_copy) {
+        log_module(KC_LOG, LOG_ERROR, "update_user_async: Failed to build GET request");
         goto error;
     }
 
-    /* Use unified async API - PUT request */
     struct curl_opts opts = CURL_OPTS_INIT;
     opts.uri = req->uri;
-    opts.method = HTTP_PUT;
+    opts.method = HTTP_GET;
     opts.xoauth2_bearer = req->bearer_token_copy;
-    opts.post_fields = json_body;
-    opts.header_list[0] = "Content-Type: application/json";
-    opts.header_count = 1;
 
     if (curl_perform_async(req, opts) < 0) {
-        log_module(KC_LOG, LOG_ERROR, "update_user_async: curl_perform_async failed");
+        log_module(KC_LOG, LOG_ERROR, "update_user_async: curl_perform_async failed for GET");
         goto error;
     }
 
-    log_module(KC_LOG, LOG_DEBUG, "update_user_async: Started async update for user %s", user_id);
+    log_module(KC_LOG, LOG_DEBUG, "update_user_async: Started GET for %s before merging", user_id);
     return 0;
 
 error:
@@ -8388,6 +8638,16 @@ error:
         if (req->uri) free(req->uri);
         if (req->bearer_token_copy) free(req->bearer_token_copy);
         if (req->post_fields) free(req->post_fields);
+        pool_strfree(req->update_email);
+        pool_strfree(req->update_username);
+        if (req->update_cred_data) {
+            memset(req->update_cred_data, 0, strlen(req->update_cred_data));
+            free(req->update_cred_data);
+        }
+        if (req->update_secret_data) {
+            memset(req->update_secret_data, 0, strlen(req->update_secret_data));
+            free(req->update_secret_data);
+        }
         free(req);
     }
     return -1;

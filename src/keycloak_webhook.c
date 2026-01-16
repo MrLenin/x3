@@ -770,14 +770,25 @@ handle_keycloak_event(const char *body, size_t body_len)
                     if (rep_json) {
                         /* Cache the full user representation for safe attribute updates.
                          * This enables keycloak_set_user_attribute_async() to merge
-                         * attributes without clobbering email/firstName/etc. */
+                         * attributes without clobbering email/firstName/etc.
+                         *
+                         * IMPORTANT: Only cache if not already cached. Webhook events can
+                         * arrive out of order or race with active operations. An active
+                         * update may have cached a repr with email that this webhook's
+                         * GET hasn't seen yet. Don't overwrite with potentially stale data. */
                         json_t *user_id_json = json_object_get(rep_json, "id");
                         if (user_id_json && json_is_string(user_id_json)) {
                             const char *user_id = json_string_value(user_id_json);
-                            kc_user_repr_cache_put(user_id, rep_json);
-                            log_module(webhook_log, LOG_DEBUG,
-                                       "Cached user representation for %s (id=%s)",
-                                       username, user_id);
+                            json_t *existing = kc_user_repr_cache_get(user_id);
+                            if (!existing) {
+                                kc_user_repr_cache_put(user_id, rep_json);
+                                log_module(webhook_log, LOG_DEBUG,
+                                           "Cached user representation for %s (id=%s)",
+                                           username, user_id);
+                            } else {
+                                log_module(webhook_log, LOG_DEBUG,
+                                           "Skipped caching for %s (already cached)", username);
+                            }
                         }
 
                         json_t *attrs = json_object_get(rep_json, "attributes");
