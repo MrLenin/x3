@@ -47,6 +47,6 @@ USER x3
 # Run entrypoint (volume permissions fixed by init container in docker-compose)
 ENTRYPOINT ["/dockerentrypoint.sh"]
 
-# Run with Valgrind for memory testing (logs to cores mount for easy access)
-CMD ["valgrind", "--leak-check=full", "--show-leak-kinds=all", "--track-origins=yes", "--log-file=/x3/cores/valgrind.log", "/x3/x3", "-f", "-d"]
+# Run X3 in foreground with debug logging
+CMD ["/x3/x3", "-f", "-d"]
 

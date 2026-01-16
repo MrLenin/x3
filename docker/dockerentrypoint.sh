@@ -10,7 +10,7 @@
 BASECONFDIST=/x3/x3.conf-dist
 BASECONF=/x3/x3.conf
 
-# Note: Using Valgrind instead of ASAN (ASAN causes mmap failures)
+# Set X3_VALGRIND=1 in environment to run under Valgrind
 
 # If config already exists, use it as-is
 if [ -f "$BASECONF" ] && [ -s "$BASECONF" ]; then
@@ -57,11 +57,12 @@ done
 
 echo "Generated $BASECONF from template"
 
-# Create core dump directory if it doesn't exist
-mkdir -p /x3/cores 2>/dev/null || true
-
-# Change to cores directory so core dumps are saved there
-cd /x3/cores
-
 # Run the command passed to docker (CMD from Dockerfile)
-exec "$@"
+# Optionally wrap with valgrind if X3_VALGRIND=1
+if [ "${X3_VALGRIND:-0}" = "1" ]; then
+    echo "Running with Valgrind (X3_VALGRIND=1)"
+    exec valgrind --leak-check=full --show-leak-kinds=all --track-origins=yes \
+        --log-file=/x3/cores/valgrind.log "$@"
+else
+    exec "$@"
+fi
