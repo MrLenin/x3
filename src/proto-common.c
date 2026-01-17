@@ -97,6 +97,8 @@ socket_destroyed(struct io_fd *fd)
     cManager.uplink->state = DISCONNECTED;
     if (self->uplink)
         DelServer(self->uplink, 0, NULL);
+    /* Clear SASL mechanism cache so reconnect will re-broadcast to new uplink */
+    nickserv_clear_sasl_cache();
 }
 
 void replay_event_loop(void)

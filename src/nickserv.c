@@ -3322,6 +3322,14 @@ void nickserv_update_sasl_mechanisms(void)
     }
 }
 
+void nickserv_clear_sasl_cache(void)
+{
+    /* Clear cached mechanism list to force re-broadcast on next update.
+     * Called when uplink disconnects so reconnect will re-send mechanisms.
+     */
+    last_sasl_mechs[0] = '\0';
+}
+
 void nickserv_do_autoauth(struct userNode *user)
 {
     struct handle_info *hi;
