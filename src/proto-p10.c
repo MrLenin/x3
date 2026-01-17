@@ -27,6 +27,7 @@
 #include "webpush.h"
 #include "x3_lmdb.h"
 #include "base64.h"
+#include "x3_compress.h"
 
 /* Full commands. */
 #define CMD_ACCOUNT		"ACCOUNT"
@@ -3520,6 +3521,7 @@ static CMD_FUNC(cmd_tagmsg)
  * Format from Nefarious (optimized for efficiency):
  *   [SERVER] CH Q <target> <subcmd:1char> <ref> <limit> <reqid>   - Query
  *   [SERVER] CH R <reqid> <msgid> <ts> <type> <sender> <account> :<content>  - Response (plain)
+ *   [SERVER] CH Z <reqid> <msgid> <ts> <type> <sender> <account> :<b64_zstd> - Response (compressed)
  *   [SERVER] CH B <reqid> <msgid> <ts> <type> <sender> <account> [+] :<b64>  - Response (base64)
  *   [SERVER] CH B <reqid> <msgid> [+] :<b64>                                  - Continuation chunk
  *   [SERVER] CH E <reqid> <count>   - End response
@@ -3528,7 +3530,8 @@ static CMD_FUNC(cmd_tagmsg)
  * Ref format: <timestamp> (starts with digit), <msgid> (starts with letter), or *
  * Timestamps (<ts>) are Unix format: seconds.milliseconds (e.g., "1735689600.123")
  *
- * Base64 encoding (CH B) is used when content contains newlines or exceeds safe length.
+ * CH Z is zstd-compressed content (base64 encoded) for bandwidth savings.
+ * CH B (base64) is used when content contains newlines or exceeds safe length.
  * The + marker indicates more chunks are coming; absence means final/only chunk.
  *
  * X3 handles both incoming queries (responds with 0 messages since X3 doesn't store)
@@ -3600,6 +3603,88 @@ static CMD_FUNC(cmd_chathistory)
 
         log_module(MAIN_LOG, LOG_DEBUG,
                    "CHATHISTORY R: Added result %d for %s (msgid=%s)",
+                   pending->count, reqid, result->msgid);
+
+    } else if (subcmd[0] == 'Z' && subcmd[1] == '\0') {
+        /* Compressed Response: CH Z <reqid> <msgid> <ts> <type> <sender> <account> :<b64_zstd>
+         * This is for zstd-compressed content (base64 encoded).
+         * Format mirrors CH R but content is base64(zstd(text)).
+         */
+        struct chathistory_result *result;
+        char *b64_decoded = NULL;
+        size_t b64_decoded_len = 0;
+
+        if (argc < 8) {
+            log_module(MAIN_LOG, LOG_DEBUG, "CHATHISTORY Z: Not enough parameters (%d)", argc);
+            return 0;
+        }
+
+        reqid = argv[2];
+
+        if (!chathistory_pending_queries ||
+            !(pending = dict_find(chathistory_pending_queries, reqid, NULL))) {
+            log_module(MAIN_LOG, LOG_DEBUG, "CHATHISTORY Z: Unknown reqid %s", reqid);
+            return 1;
+        }
+
+        /* Decode base64 first */
+        const char *b64_content = argc > 8 ? argv[8] : "";
+        if (!base64_decode_alloc(b64_content, strlen(b64_content),
+                                 &b64_decoded, &b64_decoded_len) || !b64_decoded) {
+            log_module(MAIN_LOG, LOG_WARNING, "CHATHISTORY Z: Base64 decode failed for reqid %s", reqid);
+            return 1;
+        }
+
+        /* Add result to pending query */
+        result = calloc(1, sizeof(*result));
+        result->msgid = strdup(argv[3]);
+        result->timestamp = strdup(argv[4]);
+        result->type = atoi(argv[5]);
+        result->sender = strdup(argv[6]);
+        result->account = strdup(argv[7]);
+
+#ifdef WITH_ZSTD
+        /* Decompress zstd content */
+        if (x3_is_compressed((const unsigned char *)b64_decoded, b64_decoded_len)) {
+            char decompressed[X3_COMPRESS_MAX_UNCOMPRESSED + 1];
+            size_t decompressed_len = 0;
+
+            if (x3_decompress((const unsigned char *)b64_decoded, b64_decoded_len,
+                              (unsigned char *)decompressed, sizeof(decompressed) - 1,
+                              &decompressed_len) == 1) {
+                decompressed[decompressed_len] = '\0';
+                result->content = strdup(decompressed);
+                log_module(MAIN_LOG, LOG_DEBUG,
+                           "CHATHISTORY Z: Decompressed %zu -> %zu bytes",
+                           b64_decoded_len, decompressed_len);
+            } else {
+                log_module(MAIN_LOG, LOG_WARNING,
+                           "CHATHISTORY Z: Decompression failed for reqid %s", reqid);
+                result->content = strdup("[decompress error]");
+            }
+        } else {
+            /* Not actually compressed, use as-is */
+            result->content = strndup(b64_decoded, b64_decoded_len);
+        }
+#else
+        /* No zstd support - try to use as-is */
+        result->content = strndup(b64_decoded, b64_decoded_len);
+        log_module(MAIN_LOG, LOG_WARNING,
+                   "CHATHISTORY Z: Received compressed data but zstd not compiled in");
+#endif
+        free(b64_decoded);
+
+        /* Append to results list */
+        if (pending->results_tail) {
+            pending->results_tail->next = result;
+        } else {
+            pending->results = result;
+        }
+        pending->results_tail = result;
+        pending->count++;
+
+        log_module(MAIN_LOG, LOG_DEBUG,
+                   "CHATHISTORY Z: Added result %d for %s (msgid=%s)",
                    pending->count, reqid, result->msgid);
 
     } else if (subcmd[0] == 'B' && subcmd[1] == '\0') {
