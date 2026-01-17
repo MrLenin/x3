@@ -12,13 +12,25 @@ BASECONF=/x3/x3.conf
 
 # Set X3_VALGRIND=1 in environment to run under Valgrind
 
+# Create core dump directory and change to it (for both paths)
+mkdir -p /x3/cores 2>/dev/null || true
+cd /x3/cores
+
+# Helper function to run command (optionally under valgrind)
+run_cmd() {
+    if [ "${X3_VALGRIND:-0}" = "1" ]; then
+        echo "Running with Valgrind (X3_VALGRIND=1)"
+        exec valgrind --leak-check=full --show-leak-kinds=all --track-origins=yes \
+            --log-file=/x3/cores/valgrind.log "$@"
+    else
+        exec "$@"
+    fi
+}
+
 # If config already exists, use it as-is
 if [ -f "$BASECONF" ] && [ -s "$BASECONF" ]; then
     echo "Using existing $BASECONF (bind-mounted or pre-configured)"
-    # Create core dump directory and change to it
-    mkdir -p /x3/cores 2>/dev/null || true
-    cd /x3/cores
-    exec "$@"
+    run_cmd "$@"
 fi
 
 # Set defaults for required variables (can be overridden by environment)
@@ -58,11 +70,4 @@ done
 echo "Generated $BASECONF from template"
 
 # Run the command passed to docker (CMD from Dockerfile)
-# Optionally wrap with valgrind if X3_VALGRIND=1
-if [ "${X3_VALGRIND:-0}" = "1" ]; then
-    echo "Running with Valgrind (X3_VALGRIND=1)"
-    exec valgrind --leak-check=full --show-leak-kinds=all --track-origins=yes \
-        --log-file=/x3/cores/valgrind.log "$@"
-else
-    exec "$@"
-fi
+run_cmd "$@"
