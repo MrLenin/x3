@@ -1621,7 +1621,7 @@ static MODCMD_FUNC(cmd_modcmd) {
     return changed;
 }
 
-static void 
+static void
 timeout_god(void *data)
 {
     extern struct userNode *chanserv;
@@ -1631,6 +1631,14 @@ timeout_god(void *data)
 
     HANDLE_CLEAR_FLAG(user->handle_info, HELPING);
     send_message(user, chanserv, "MCMSG_GOD_EXPIRED");
+}
+
+/* Cancel pending god timeout when user quits - prevents use-after-free */
+static void
+modcmd_remove_user(struct userNode *user, UNUSED_ARG(struct userNode *killer),
+                   UNUSED_ARG(const char *why), UNUSED_ARG(void *extra))
+{
+    timeq_del(0, timeout_god, user, TIMEQ_IGNORE_WHEN);
 }
 
 static MODCMD_FUNC(cmd_god) {
@@ -2327,6 +2335,7 @@ modcmd_init(void) {
     services = dict_new();
     dict_set_free_data(services, free_service);
     reg_nick_change_func(modcmd_nick_change, NULL);
+    reg_del_user_func(modcmd_remove_user, NULL);
     reg_exit_func(modcmd_cleanup, NULL);
     conf_register_reload(modcmd_conf_read);
 
