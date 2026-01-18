@@ -159,6 +159,13 @@
 #define X3_META_ANNOUNCEMENTS "x3.announcements"
 #define X3_META_MAXLOGINS "x3.maxlogins"
 
+/* IRCv3 Metadata keys for user profile (exposed to clients) */
+#define X3_META_TITLE "x3.title"           /* User epithet/signature (public) */
+#define X3_META_REGISTERED "x3.registered" /* Account registration timestamp (public) */
+#define X3_META_KARMA "x3.karma"           /* Reputation score (public) */
+#define X3_META_EMAIL "x3.email"           /* Email address (private) */
+#define X3_META_LASTHOST "x3.lasthost"     /* Last seen host (private) */
+
 /* Preference metadata TTL: 90 days in seconds */
 #define X3_PREF_TTL_DAYS 90
 #define X3_PREF_TTL_SECS (X3_PREF_TTL_DAYS * 86400)
@@ -1705,6 +1712,9 @@ set_user_handle_info(struct userNode *user, struct handle_info *hi, int stamp)
 
             /* Sync any stored metadata from Keycloak to the IRCd */
             nickserv_sync_metadata_to_ircd(user);
+
+            /* Sync profile metadata for IRCv3 client exposure */
+            nickserv_sync_profile_metadata_to_ircd(user);
 
             /* Sync $last_present to Nefarious if available */
             if (hi->last_present > 0) {
@@ -10349,6 +10359,28 @@ handle_x3_preference_metadata(struct handle_info *hi, const char *key, const cha
         return 0;
     }
 
+    /* x3.title - User epithet/signature (public profile field) */
+    if (!strcmp(key, X3_META_TITLE)) {
+        size_t max_len = 100;  /* Reasonable max for an epithet */
+        if (hi->epithet)
+            pool_strfree(hi->epithet);
+        if (value[0] == '*' && value[1] == '\0') {
+            /* "*" means clear */
+            hi->epithet = NULL;
+        } else if (strlen(value) > max_len) {
+            /* Truncate if too long - make a local copy first */
+            char truncated[101];
+            strncpy(truncated, value, max_len);
+            truncated[max_len] = '\0';
+            hi->epithet = pool_strdup(truncated);
+        } else {
+            hi->epithet = pool_strdup(value);
+        }
+        log_module(NS_LOG, LOG_DEBUG, "handle_x3_preference_metadata: Set %s title=%s",
+                   hi->handle, hi->epithet ? hi->epithet : "(cleared)");
+        return 1;  /* Return 1 to indicate this is a public profile field, not a private preference */
+    }
+
     /* Unknown x3.* key */
     return -1;
 }
@@ -10363,16 +10395,21 @@ nickserv_set_user_metadata(struct handle_info *hi, const char *key, const char *
     if (!hi || !key)
         return -1;
 
-    /* Handle x3.* preference metadata keys specially.
+    /* Handle x3.* preference and profile metadata keys specially.
      * These update the handle_info struct and use 90-day TTL.
+     * Return codes: 0 = private preference, 1 = public profile field, -1 = unknown key
      */
     if (strncmp(key, X3_METADATA_PREFIX, strlen(X3_METADATA_PREFIX)) == 0) {
         if (value && *value) {
-            if (handle_x3_preference_metadata(hi, key, value) == 0) {
-                /* x3.* preferences are always private */
+            int result = handle_x3_preference_metadata(hi, key, value);
+            if (result == 0) {
+                /* x3.* preferences (screen_width, style, etc.) are always private */
                 visibility = METADATA_VIS_PRIVATE;
+            } else if (result == 1) {
+                /* x3.* profile fields (title) keep their original visibility (should be public) */
+                visibility = METADATA_VIS_PUBLIC;
             }
-            /* Continue to store in LMDB/Keycloak even if struct update failed */
+            /* result == -1: unknown key, continue with original visibility to store in LMDB/Keycloak */
         }
     }
 
@@ -10876,6 +10913,65 @@ nickserv_sync_metadata_to_ircd(struct userNode *user)
 
     /* Step 2: Query Keycloak backend async (cache miss or no LMDB) - fire-and-forget */
     nickserv_sync_metadata_async(user->handle_info->handle, user->nick, 1);
+}
+
+/**
+ * Sync profile metadata fields to IRCd for IRCv3 client exposure.
+ *
+ * This syncs the user's profile fields (epithet/title, registration time,
+ * karma, email, last host) as metadata keys that IRCv3 clients can query
+ * via METADATA GET.
+ *
+ * These are derived from handle_info struct fields, separate from the
+ * user-controlled metadata stored in LMDB.
+ *
+ * @param user The user to sync profile metadata for
+ */
+void
+nickserv_sync_profile_metadata_to_ircd(struct userNode *user)
+{
+    struct handle_info *hi;
+    char buf[64];
+
+    if (!user || !user->handle_info)
+        return;
+
+    hi = user->handle_info;
+
+    /* x3.title - User epithet/signature (public) */
+    if (hi->epithet && hi->epithet[0]) {
+        irc_metadata(user->nick, X3_META_TITLE, hi->epithet, METADATA_VIS_PUBLIC);
+        log_module(NS_LOG, LOG_DEBUG, "nickserv_sync_profile_metadata_to_ircd: Pushed %s %s=%s",
+                   user->nick, X3_META_TITLE, hi->epithet);
+    }
+
+    /* x3.registered - Account registration timestamp (public) */
+    snprintf(buf, sizeof(buf), "%lu", (unsigned long)hi->registered);
+    irc_metadata(user->nick, X3_META_REGISTERED, buf, METADATA_VIS_PUBLIC);
+    log_module(NS_LOG, LOG_DEBUG, "nickserv_sync_profile_metadata_to_ircd: Pushed %s %s=%s",
+               user->nick, X3_META_REGISTERED, buf);
+
+    /* x3.karma - Reputation score (public, only if non-zero) */
+    if (hi->karma != 0) {
+        snprintf(buf, sizeof(buf), "%d", hi->karma);
+        irc_metadata(user->nick, X3_META_KARMA, buf, METADATA_VIS_PUBLIC);
+        log_module(NS_LOG, LOG_DEBUG, "nickserv_sync_profile_metadata_to_ircd: Pushed %s %s=%s",
+                   user->nick, X3_META_KARMA, buf);
+    }
+
+    /* x3.email - Email address (private, self-access only) */
+    if (hi->email_addr && hi->email_addr[0]) {
+        irc_metadata(user->nick, X3_META_EMAIL, hi->email_addr, METADATA_VIS_PRIVATE);
+        log_module(NS_LOG, LOG_DEBUG, "nickserv_sync_profile_metadata_to_ircd: Pushed %s %s=(private)",
+                   user->nick, X3_META_EMAIL);
+    }
+
+    /* x3.lasthost - Last seen host (private, self-access only) */
+    if (hi->last_quit_host[0]) {
+        irc_metadata(user->nick, X3_META_LASTHOST, hi->last_quit_host, METADATA_VIS_PRIVATE);
+        log_module(NS_LOG, LOG_DEBUG, "nickserv_sync_profile_metadata_to_ircd: Pushed %s %s=(private)",
+                   user->nick, X3_META_LASTHOST);
+    }
 }
 
 void

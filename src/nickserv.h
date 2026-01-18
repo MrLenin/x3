@@ -422,6 +422,13 @@ void nickserv_get_user_metadata_async(struct handle_info *hi, const char *key);
 void nickserv_sync_metadata_to_ircd(struct userNode *user);
 
 /**
+ * Sync profile metadata fields to IRCd for IRCv3 client exposure.
+ * Pushes title, registered, karma, email, lasthost as x3.* keys.
+ * @param user The user to sync profile metadata for
+ */
+void nickserv_sync_profile_metadata_to_ircd(struct userNode *user);
+
+/**
  * Sync all metadata for an account to the IRCd by account name.
  * Similar to nickserv_sync_metadata_to_ircd but uses the account handle
  * as the target instead of the user's nick. Used for MDQ responses

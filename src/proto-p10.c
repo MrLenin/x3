@@ -3094,6 +3094,80 @@ static CMD_FUNC(cmd_metadata)
         return 1;
     }
 
+    /* Check for infoline metadata (x3.infoline.#channel) */
+    if (strncmp(key, "x3.infoline.", 12) == 0) {
+        const char *chan_name = key + 12;
+        struct chanNode *channel;
+        struct chanData *cData;
+        struct userData *uData;
+
+        /* Validate channel name */
+        if (chan_name[0] != '#' || chan_name[1] == '\0') {
+            log_module(MAIN_LOG, LOG_DEBUG, "METADATA: Invalid infoline key %s (bad channel name)", key);
+            return 1;
+        }
+
+        /* Look up channel */
+        channel = GetChannel(chan_name);
+        if (!channel) {
+            log_module(MAIN_LOG, LOG_DEBUG, "METADATA: Channel %s not found for infoline SET", chan_name);
+            return 1;
+        }
+
+        cData = channel->channel_info;
+        if (!cData) {
+            log_module(MAIN_LOG, LOG_DEBUG, "METADATA: Channel %s not registered for infoline SET", chan_name);
+            return 1;
+        }
+
+        /* Look up user's access record (override=0, allow_suspended=0) */
+        uData = _GetChannelUser(cData, user->handle_info, 0, 0);
+        if (!uData) {
+            log_module(MAIN_LOG, LOG_DEBUG, "METADATA: User %s has no access to %s for infoline SET",
+                       user->handle_info->handle, chan_name);
+            return 1;
+        }
+
+        /* Validate infoline value */
+        if (value) {
+            size_t len = strlen(value);
+            size_t bp;
+
+            /* Check length against channel's maxsetinfo */
+            if (len > cData->maxsetinfo) {
+                log_module(MAIN_LOG, LOG_DEBUG, "METADATA: Infoline too long (%zu > %u) for %s",
+                           len, cData->maxsetinfo, chan_name);
+                return 1;
+            }
+
+            /* Check for control characters */
+            bp = strcspn(value, "\001");
+            if (value[bp]) {
+                log_module(MAIN_LOG, LOG_DEBUG, "METADATA: Infoline contains invalid char for %s", chan_name);
+                return 1;
+            }
+        }
+
+        /* Update the infoline */
+        if (uData->info)
+            pool_strfree(uData->info);
+
+        if (!value || (value[0] == '*' && value[1] == '\0')) {
+            uData->info = NULL;
+            log_module(MAIN_LOG, LOG_INFO, "METADATA: Cleared infoline for %s in %s",
+                       user->handle_info->handle, chan_name);
+        } else {
+            uData->info = pool_strdup(value);
+            log_module(MAIN_LOG, LOG_INFO, "METADATA: Set infoline for %s in %s: %s",
+                       user->handle_info->handle, chan_name, value);
+        }
+
+        /* Sync back to IRCd (echo the change) */
+        irc_metadata(user->nick, key, uData->info, METADATA_VIS_PUBLIC);
+
+        return 1;
+    }
+
     /* Store in Keycloak as user attribute if keycloak is enabled */
     log_module(MAIN_LOG, LOG_INFO, "METADATA: %s.%s = %s (vis=%s, account: %s)",
                target, key, value ? value : "(deleted)",

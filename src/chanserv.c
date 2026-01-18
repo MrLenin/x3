@@ -170,6 +170,9 @@ extern struct nickserv_config nickserv_conf;
 #define X3_CHAN_META_REGISTERED     "x3.registered"
 #define X3_CHAN_META_FOUNDER        "x3.founder"
 
+/* X3 User Infoline Metadata - per-channel user infolines exposed via IRCv3 METADATA */
+#define X3_META_INFOLINE_PREFIX     "x3.infoline."  /* Followed by channel name */
+
 /* TTL for mutable channel metadata (90 days) */
 #define X3_CHAN_META_TTL_DAYS       90
 #define X3_CHAN_META_TTL_SECS       (X3_CHAN_META_TTL_DAYS * 86400)
@@ -7741,6 +7744,22 @@ static MODCMD_FUNC(user_opt_info)
             uData->info = NULL;
         else
             uData->info = pool_strdup(infoline);
+
+        /* Sync infoline to IRCd for IRCv3 METADATA exposure */
+        {
+            char meta_key[128];
+            snprintf(meta_key, sizeof(meta_key), "%s%s", X3_META_INFOLINE_PREFIX, channel->name);
+            if(uData->info) {
+                irc_metadata(user->nick, meta_key, uData->info, METADATA_VIS_PUBLIC);
+                log_module(CS_LOG, LOG_DEBUG, "user_opt_info: Pushed %s %s=%s",
+                           user->nick, meta_key, uData->info);
+            } else {
+                /* Clear the infoline metadata */
+                irc_metadata(user->nick, meta_key, NULL, METADATA_VIS_PUBLIC);
+                log_module(CS_LOG, LOG_DEBUG, "user_opt_info: Cleared %s %s",
+                           user->nick, meta_key);
+            }
+        }
     }
     if(uData->info)
         reply("CSMSG_USET_INFO", uData->info);
@@ -9215,6 +9234,15 @@ handle_auth(struct userNode *user, UNUSED_ARG(struct handle_info *old_handle), U
 
         channel->seen = now;
         channel->present = 1;
+
+        /* Sync infoline to IRCd for IRCv3 METADATA exposure */
+        if(channel->info && channel->info[0]) {
+            char meta_key[128];
+            snprintf(meta_key, sizeof(meta_key), "%s%s", X3_META_INFOLINE_PREFIX, cn->name);
+            irc_metadata(user->nick, meta_key, channel->info, METADATA_VIS_PUBLIC);
+            log_module(CS_LOG, LOG_DEBUG, "handle_auth: Synced infoline %s %s=%s",
+                       user->nick, meta_key, channel->info);
+        }
     }
 
     for(ii = 0; ii < user->channels.used; ++ii)
