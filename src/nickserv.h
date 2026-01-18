@@ -119,6 +119,7 @@ struct handle_info {
     unsigned char maxlogins;
     char passwd[PASSWD_LEN];
     char last_quit_host[USERLEN+HOSTLEN+2];
+    char *ecdsa_pubkey;  /* ECDSA-NIST256P-CHALLENGE public key (base64 encoded) */
 };
 
 struct nick_info {

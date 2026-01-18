@@ -50,6 +50,9 @@
 
 #ifdef WITH_SSL
 #include <openssl/rand.h>  /* For SCRAM nonce generation */
+#include <openssl/ec.h>    /* For ECDSA public key validation */
+#include <openssl/ecdsa.h> /* For ECDSA operations */
+#include <openssl/obj_mac.h> /* For NID_X9_62_prime256v1 */
 #endif
 
 /* Keycloak webhook needs both Keycloak and LMDB */
@@ -145,6 +148,7 @@
 #define KEY_NOTE_SETTER "setter"
 #define KEY_NOTE_DATE "date"
 #define KEY_KARMA "karma"
+#define KEY_ECDSA_PUBKEY "ecdsa_pubkey"
 #define KEY_FORCE_HANDLES_LOWERCASE "force_handles_lowercase"
 
 /* IRCv3 Metadata keys for user preferences (x3. namespace) */
@@ -888,6 +892,10 @@ static const struct message_entry msgtab[] = {
     { "NSMSG_SET_NOTE", "$bNOTE:         $b%s"},
     { "NSMSG_SET_TITLE", "$bTITLE:        $b%s" },
     { "NSMSG_SET_FAKEHOST", "$bFAKEHOST:     $b%s" },
+    { "NSMSG_SET_PUBKEY", "$bPUBKEY:       $b%s" },
+    { "NSMSG_SET_PUBKEY_REMOVED", "Your ECDSA public key has been removed." },
+    { "NSMSG_SET_PUBKEY_INVALID", "Invalid ECDSA public key format. Must be 33-byte compressed point in base64." },
+    { "NSMSG_SET_PUBKEY_INVALID_CURVE", "Invalid ECDSA public key. Must be a valid NIST P-256 curve point." },
 
     { "NSMSG_AUTO_OPER", "You have been auto-opered" },
     { "NSMSG_AUTO_OPER_ADMIN", "You have been auto-admined" },
@@ -1099,6 +1107,8 @@ free_handle_info(void *vhi)
         if (!hil->used)
             dict_remove(nickserv_email_dict, hi->email_addr);
     }
+    if (hi->ecdsa_pubkey)
+        pool_strfree(hi->ecdsa_pubkey);
     free(hi);
 }
 
@@ -3302,6 +3312,11 @@ const char *nickserv_get_sasl_mechanisms(void)
     /* Add OAUTHBEARER if Keycloak is enabled AND available */
     if (nickserv_conf.keycloak_enable && keycloak_is_available())
         strcat(mechs, ",OAUTHBEARER");
+#endif
+
+#ifdef WITH_SSL
+    /* Add ECDSA-NIST256P-CHALLENGE for public key authentication */
+    strcat(mechs, ",ECDSA-NIST256P-CHALLENGE");
 #endif
 
     return mechs;
@@ -5754,6 +5769,104 @@ static OPTION_FUNC(opt_note)
     return 1;
 }
 
+/**
+ * Validate an ECDSA NIST P-256 public key
+ * @param base64_pubkey Base64-encoded compressed public key (33 bytes)
+ * @return 1 if valid, 0 if invalid format, -1 if invalid curve point
+ */
+#ifdef WITH_SSL
+static int
+validate_ecdsa_pubkey(const char *base64_pubkey)
+{
+    unsigned char pubkey_bytes[64];
+    size_t pubkey_len;
+    EC_GROUP *group = NULL;
+    EC_POINT *point = NULL;
+    int result = 0;
+
+    /* Base64 decode */
+    pubkey_len = sizeof(pubkey_bytes);
+    if (base64_decode(base64_pubkey, strlen(base64_pubkey), (char *)pubkey_bytes, &pubkey_len) != 0)
+        return 0;
+
+    /* Compressed point should be exactly 33 bytes */
+    if (pubkey_len != 33)
+        return 0;
+
+    /* First byte should be 0x02 or 0x03 (compressed point prefix) */
+    if (pubkey_bytes[0] != 0x02 && pubkey_bytes[0] != 0x03)
+        return 0;
+
+    /* Create EC group for P-256 curve */
+    group = EC_GROUP_new_by_curve_name(NID_X9_62_prime256v1);
+    if (!group)
+        return 0;
+
+    /* Create point and decode */
+    point = EC_POINT_new(group);
+    if (!point) {
+        EC_GROUP_free(group);
+        return 0;
+    }
+
+    /* Try to decode the point - this validates it's on the curve */
+    if (EC_POINT_oct2point(group, point, pubkey_bytes, pubkey_len, NULL) == 1)
+        result = 1;  /* Valid point on curve */
+    else
+        result = -1; /* Invalid curve point */
+
+    EC_POINT_free(point);
+    EC_GROUP_free(group);
+    return result;
+}
+#endif
+
+static OPTION_FUNC(opt_pubkey)
+{
+#ifdef WITH_SSL
+    const char *pubkey;
+
+    if (argc > 1) {
+        /* Check for pubkey removal */
+        if ((argv[1][0] == '*') && (argv[1][1] == 0)) {
+            if (hi->ecdsa_pubkey) {
+                pool_strfree(hi->ecdsa_pubkey);
+                hi->ecdsa_pubkey = NULL;
+            }
+            if (!(noreply))
+                reply("NSMSG_SET_PUBKEY_REMOVED");
+            return 1;
+        }
+
+        /* Validate the public key */
+        int valid = validate_ecdsa_pubkey(argv[1]);
+        if (valid == 0) {
+            if (!(noreply))
+                reply("NSMSG_SET_PUBKEY_INVALID");
+            return 0;
+        } else if (valid < 0) {
+            if (!(noreply))
+                reply("NSMSG_SET_PUBKEY_INVALID_CURVE");
+            return 0;
+        }
+
+        /* Store the new public key */
+        if (hi->ecdsa_pubkey)
+            pool_strfree(hi->ecdsa_pubkey);
+        hi->ecdsa_pubkey = pool_strdup(argv[1]);
+    }
+
+    pubkey = hi->ecdsa_pubkey ? hi->ecdsa_pubkey : user_find_message(user, "MSG_NONE");
+    if (!(noreply))
+        reply("NSMSG_SET_PUBKEY", pubkey);
+    return 1;
+#else
+    if (!(noreply))
+        reply("MSG_FEATURE_DISABLED", "ECDSA SASL");
+    return 0;
+#endif
+}
+
 static NICKSERV_FUNC(cmd_reclaim)
 {
     struct nick_info *ni;
@@ -5997,6 +6110,8 @@ nickserv_saxdb_write(struct saxdb_context *ctx) {
             saxdb_write_int(ctx, KEY_LAST_PRESENT, hi->last_present);
         if (hi->karma != 0)
             saxdb_write_sint(ctx, KEY_KARMA, hi->karma);
+        if (hi->ecdsa_pubkey)
+            saxdb_write_string(ctx, KEY_ECDSA_PUBKEY, hi->ecdsa_pubkey);
         if (hi->masks->used)
             saxdb_write_string_list(ctx, KEY_MASKS, hi->masks);
         if (hi->sslfps->used)
@@ -6733,6 +6848,8 @@ nickserv_db_read_handle(char *handle, dict_t obj)
     hi->last_present = str ? (time_t)strtoul(str, NULL, 0) : 0;
     str = database_get_data(obj, KEY_KARMA, RECDB_QSTRING);
     hi->karma = str ? strtoul(str, NULL, 0) : 0;
+    str = database_get_data(obj, KEY_ECDSA_PUBKEY, RECDB_QSTRING);
+    hi->ecdsa_pubkey = str ? pool_strdup(str) : NULL;
     /* We want to read the nicks even if disable_nicks is set.  This is so
      * that we don't lose the nick data entirely. */
     obj2 = database_get_data(obj, KEY_NICKS_EX, RECDB_OBJECT);
@@ -12557,7 +12674,8 @@ enum sasl_state {
     SASL_STATE_TIMEOUT,           /* Session timed out */
     SASL_STATE_SCRAM_CHALLENGE,   /* SCRAM: sent server-first, waiting for client-final */
     SASL_STATE_SCRAM_VERIFY,      /* SCRAM: verifying client proof */
-    SASL_STATE_SCRAM_FETCH        /* SCRAM: fetching credentials from Keycloak */
+    SASL_STATE_SCRAM_FETCH,       /* SCRAM: fetching credentials from Keycloak */
+    SASL_STATE_ECDSA_CHALLENGE    /* ECDSA: sent challenge, waiting for signature */
 };
 
 struct SASLSession
@@ -12568,7 +12686,7 @@ struct SASLSession
     char *buf, *p;
     int buflen;
     char uid[128];
-    char mech[16];  /* Increased from 10 to hold "SCRAM-SHA-256" + null */
+    char mech[32];  /* Holds "ECDSA-NIST256P-CHALLENGE" (25 chars) + null */
     char *sslclifp;
     char *hostmask;
     time_t created;       /* When session was created */
@@ -12580,6 +12698,10 @@ struct SASLSession
     uint32_t sequence;      /* Unique sequence number for async callback validation */
 #ifdef WITH_LMDB
     struct scram_session *scram;  /* SCRAM-SHA-256 session state (if using SCRAM) */
+#endif
+#ifdef WITH_SSL
+    unsigned char ecdsa_challenge[32];  /* ECDSA challenge bytes */
+    char *ecdsa_pubkey;     /* Public key for ECDSA auth (from account) */
 #endif
 };
 
@@ -13369,6 +13491,12 @@ sasl_delete_session(struct SASLSession *session)
     session->scram = NULL;
 #endif
 
+#ifdef WITH_SSL
+    if (session->ecdsa_pubkey)
+        pool_strfree(session->ecdsa_pubkey);
+    session->ecdsa_pubkey = NULL;
+#endif
+
     if (session->next)
         session->next->prev = session->prev;
     if (session->prev)
@@ -13993,15 +14121,22 @@ sasl_packet(struct SASLSession *session)
         else if (!strcmp(session->buf, "OAUTHBEARER") && nickserv_conf.keycloak_enable)
             mech_valid = 1;
 #endif
+#ifdef WITH_SSL
+        else if (!strcmp(session->buf, "ECDSA-NIST256P-CHALLENGE"))
+            mech_valid = 1;
+#endif
 
         if (!mech_valid) {
             /* Build list of available mechanisms */
-            char mechs[64] = "PLAIN";
+            char mechs[128] = "PLAIN";
             if (session->sslclifp)
                 strcat(mechs, ",EXTERNAL");
 #ifdef WITH_KEYCLOAK
             if (nickserv_conf.keycloak_enable)
                 strcat(mechs, ",OAUTHBEARER");
+#endif
+#ifdef WITH_SSL
+            strcat(mechs, ",ECDSA-NIST256P-CHALLENGE");
 #endif
             irc_sasl(session->source, session->uid, "M", mechs);
             irc_sasl(session->source, session->uid, "D", "F");
@@ -14680,6 +14815,218 @@ sasl_packet(struct SASLSession *session)
         }
     }
 #endif /* WITH_LMDB && WITH_SSL */
+#ifdef WITH_SSL
+    else if (!strcmp(session->mech, "ECDSA-NIST256P-CHALLENGE"))
+    {
+        /*
+         * ECDSA-NIST256P-CHALLENGE - Public key authentication
+         *
+         * Flow:
+         * 1. Client sends mechanism name (handled above, server sends "+")
+         * 2. Client sends: base64(accountname\0accountname)
+         * 3. Server sends: base64(32-byte-random-challenge)
+         * 4. Client sends: base64(ECDSA-signature-of-challenge)
+         * 5. Server verifies signature and responds
+         */
+        char *raw = NULL;
+        size_t rawlen = 0;
+        struct handle_info *hi = NULL;
+
+        base64_decode_alloc(session->buf, session->buflen, &raw, &rawlen);
+
+        if (session->state == SASL_STATE_MECH_SELECTED) {
+            /* Step 2: Client sent accountname\0accountname */
+            char *authcid = NULL;
+            char *r;
+            unsigned int i, c = 0;
+
+            if (!raw || rawlen < 3) {
+                log_module(NS_LOG, LOG_DEBUG, "SASL ECDSA: Invalid credentials data");
+                irc_sasl(session->source, session->uid, "D", "F");
+                sasl_delete_session(session);
+                free(raw);
+                return 1;
+            }
+
+            /* Parse authzid\0authcid (we only care about authcid) */
+            r = raw;
+            for (i = 0; i < rawlen; i++) {
+                if (!*r++) {
+                    if (c++ == 0)
+                        authcid = r;
+                }
+            }
+
+            if (!authcid || !*authcid) {
+                log_module(NS_LOG, LOG_DEBUG, "SASL ECDSA: No authcid provided");
+                irc_sasl(session->source, session->uid, "D", "F");
+                sasl_delete_session(session);
+                free(raw);
+                return 1;
+            }
+
+            log_module(NS_LOG, LOG_DEBUG, "SASL ECDSA: Authenticating %s", authcid);
+
+            /* Look up account */
+            hi = get_handle_info(authcid);
+            if (!hi) {
+                log_module(NS_LOG, LOG_DEBUG, "SASL ECDSA: Unknown account %s", authcid);
+                irc_sasl(session->source, session->uid, "D", "F");
+                sasl_delete_session(session);
+                free(raw);
+                return 1;
+            }
+
+            if (HANDLE_FLAGGED(hi, SUSPENDED)) {
+                log_module(NS_LOG, LOG_DEBUG, "SASL ECDSA: Account %s is suspended", authcid);
+                irc_sasl(session->source, session->uid, "D", "F");
+                sasl_delete_session(session);
+                free(raw);
+                return 1;
+            }
+
+            if (!hi->ecdsa_pubkey || !*hi->ecdsa_pubkey) {
+                log_module(NS_LOG, LOG_DEBUG, "SASL ECDSA: Account %s has no public key", authcid);
+                irc_sasl(session->source, session->uid, "D", "F");
+                sasl_delete_session(session);
+                free(raw);
+                return 1;
+            }
+
+            /* Store account name and public key for verification step */
+            session->authcid = pool_strdup(authcid);
+            session->ecdsa_pubkey = pool_strdup(hi->ecdsa_pubkey);
+
+            /* Generate 32-byte random challenge */
+            if (RAND_bytes(session->ecdsa_challenge, 32) != 1) {
+                log_module(NS_LOG, LOG_ERROR, "SASL ECDSA: Failed to generate random challenge");
+                irc_sasl(session->source, session->uid, "D", "F");
+                sasl_delete_session(session);
+                free(raw);
+                return 1;
+            }
+
+            /* Send challenge to client (base64 encoded) */
+            char challenge_b64[64];
+            base64_encode(session->ecdsa_challenge, 32, challenge_b64, sizeof(challenge_b64));
+            irc_sasl(session->source, session->uid, "C", challenge_b64);
+            session->state = SASL_STATE_ECDSA_CHALLENGE;
+
+            free(raw);
+            return 1;
+        }
+        else if (session->state == SASL_STATE_ECDSA_CHALLENGE) {
+            /* Step 4: Client sent signature, verify it */
+            EC_KEY *eckey = NULL;
+            EC_GROUP *group = NULL;
+            EC_POINT *point = NULL;
+            unsigned char pubkey_bytes[64];
+            size_t pubkey_len;
+            int verify_result;
+
+            if (!raw || rawlen < 8) {
+                log_module(NS_LOG, LOG_DEBUG, "SASL ECDSA: Invalid signature data");
+                irc_sasl(session->source, session->uid, "D", "F");
+                sasl_delete_session(session);
+                free(raw);
+                return 1;
+            }
+
+            if (!session->ecdsa_pubkey) {
+                log_module(NS_LOG, LOG_ERROR, "SASL ECDSA: No stored public key");
+                irc_sasl(session->source, session->uid, "D", "F");
+                sasl_delete_session(session);
+                free(raw);
+                return 1;
+            }
+
+            /* Decode public key from base64 */
+            pubkey_len = sizeof(pubkey_bytes);
+            if (base64_decode(session->ecdsa_pubkey, strlen(session->ecdsa_pubkey),
+                              (char *)pubkey_bytes, &pubkey_len) != 0 || pubkey_len != 33) {
+                log_module(NS_LOG, LOG_ERROR, "SASL ECDSA: Failed to decode stored public key");
+                irc_sasl(session->source, session->uid, "D", "F");
+                sasl_delete_session(session);
+                free(raw);
+                return 1;
+            }
+
+            /* Create EC key from public key bytes */
+            group = EC_GROUP_new_by_curve_name(NID_X9_62_prime256v1);
+            if (!group) {
+                log_module(NS_LOG, LOG_ERROR, "SASL ECDSA: Failed to create EC group");
+                irc_sasl(session->source, session->uid, "D", "F");
+                sasl_delete_session(session);
+                free(raw);
+                return 1;
+            }
+
+            point = EC_POINT_new(group);
+            if (!point || EC_POINT_oct2point(group, point, pubkey_bytes, pubkey_len, NULL) != 1) {
+                log_module(NS_LOG, LOG_ERROR, "SASL ECDSA: Failed to decode public key point");
+                if (point) EC_POINT_free(point);
+                EC_GROUP_free(group);
+                irc_sasl(session->source, session->uid, "D", "F");
+                sasl_delete_session(session);
+                free(raw);
+                return 1;
+            }
+
+            eckey = EC_KEY_new_by_curve_name(NID_X9_62_prime256v1);
+            if (!eckey || EC_KEY_set_public_key(eckey, point) != 1) {
+                log_module(NS_LOG, LOG_ERROR, "SASL ECDSA: Failed to set public key");
+                if (eckey) EC_KEY_free(eckey);
+                EC_POINT_free(point);
+                EC_GROUP_free(group);
+                irc_sasl(session->source, session->uid, "D", "F");
+                sasl_delete_session(session);
+                free(raw);
+                return 1;
+            }
+
+            EC_POINT_free(point);
+            EC_GROUP_free(group);
+
+            /* Verify signature of the raw challenge bytes */
+            verify_result = ECDSA_verify(0, session->ecdsa_challenge, 32,
+                                          (unsigned char *)raw, rawlen, eckey);
+            EC_KEY_free(eckey);
+
+            if (verify_result != 1) {
+                log_module(NS_LOG, LOG_DEBUG, "SASL ECDSA: Signature verification failed for %s",
+                           session->authcid);
+                irc_sasl(session->source, session->uid, "D", "F");
+                sasl_delete_session(session);
+                free(raw);
+                return 1;
+            }
+
+            /* Success! */
+            hi = get_handle_info(session->authcid);
+            if (!hi) {
+                log_module(NS_LOG, LOG_ERROR, "SASL ECDSA: Account %s disappeared", session->authcid);
+                irc_sasl(session->source, session->uid, "D", "F");
+                sasl_delete_session(session);
+                free(raw);
+                return 1;
+            }
+
+            log_module(NS_LOG, LOG_DEBUG, "SASL ECDSA: Authentication succeeded for %s", hi->handle);
+            irc_sasl_login(session->source, session->uid, hi->handle, hi->registered);
+            irc_sasl(session->source, session->uid, "D", "S");
+            sasl_delete_session(session);
+            free(raw);
+            return 1;
+        }
+        else {
+            log_module(NS_LOG, LOG_DEBUG, "SASL ECDSA: Unexpected state %d", session->state);
+            irc_sasl(session->source, session->uid, "D", "F");
+            sasl_delete_session(session);
+            free(raw);
+            return 1;
+        }
+    }
+#endif /* WITH_SSL */
     else if (!strcmp(session->mech, "PLAIN"))
     {
         char *raw = NULL;
@@ -15532,6 +15879,7 @@ init_nickserv(const char *nick)
     dict_insert(nickserv_opt_dict, "LEVEL", opt_level);
     dict_insert(nickserv_opt_dict, "EPITHET", opt_epithet);
     dict_insert(nickserv_opt_dict, "NOTE", opt_note);
+    dict_insert(nickserv_opt_dict, "PUBKEY", opt_pubkey);
     if (nickserv_conf.titlehost_suffix) {
         dict_insert(nickserv_opt_dict, "TITLE", opt_title);
         dict_insert(nickserv_opt_dict, "FAKEHOST", opt_fakehost);
