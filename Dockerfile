@@ -4,7 +4,13 @@ ENV GID=1234
 ENV UID=1234
 
 RUN DEBIAN_FRONTEND=noninteractive RUNLEVEL=1 apt-get update 
-RUN DEBIAN_FRONTEND=noninteractive RUNLEVEL=1 apt-get update && apt-get -y install build-essential libcurl4-openssl-dev libjansson-dev libssl-dev flex byacc gawk git vim procps net-tools libtre5 libtre-dev liblmdb-dev gdb valgrind linux-perf
+RUN DEBIAN_FRONTEND=noninteractive RUNLEVEL=1 apt-get update && apt-get -y install build-essential libcurl4-openssl-dev libjansson-dev libssl-dev flex byacc gawk git vim procps net-tools libtre5 libtre-dev liblmdb-dev gdb valgrind linux-perf autoconf automake libtool
+
+# Build and install libkc (shared Keycloak/HTTP library)
+COPY --from=libkc . /tmp/libkc
+WORKDIR /tmp/libkc
+RUN autoreconf -fi && ./configure --prefix=/usr && make && make install && ldconfig
+WORKDIR /
 
 RUN mkdir -p /x3
 RUN mkdir -p /x3/x3src
