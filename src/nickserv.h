@@ -380,6 +380,9 @@ enum nickserv_verify_result nickserv_ircv3_verify(struct userNode *user,
 /** Maximum length of a metadata value (increased for compression support) */
 #define METADATA_VALUE_LEN 4096
 
+/* Push profile metadata to Nefarious on auth */
+void nickserv_sync_profile_metadata_to_ircd(struct userNode *user);
+
 /* Presence aggregation support */
 
 /** Presence states for aggregation */

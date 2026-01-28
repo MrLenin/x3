@@ -151,6 +151,18 @@
 #define KEY_ECDSA_PUBKEY "ecdsa_pubkey"
 #define KEY_FORCE_HANDLES_LOWERCASE "force_handles_lowercase"
 
+/* IRCv3 metadata key names pushed to Nefarious on auth/preference changes */
+#define X3_META_SCREEN_WIDTH "x3.screen_width"
+#define X3_META_TABLE_WIDTH  "x3.table_width"
+#define X3_META_STYLE        "x3.style"
+#define X3_META_ANNOUNCEMENTS "x3.announcements"
+#define X3_META_MAXLOGINS    "x3.maxlogins"
+#define X3_META_TITLE        "x3.title"
+#define X3_META_REGISTERED   "x3.registered"
+#define X3_META_KARMA        "x3.karma"
+#define X3_META_EMAIL        "x3.email"
+#define X3_META_LASTHOST     "x3.lasthost"
+
 #define KEY_LDAP_ENABLE "ldap_enable"
 
 #ifdef WITH_LDAP
@@ -1047,6 +1059,9 @@ free_handle_info(void *vhi)
 }
 
 static void set_user_handle_info(struct userNode *user, struct handle_info *hi, int stamp);
+static void nickserv_sync_preference_metadata(struct handle_info *hi, const char *key, const char *value);
+static void nickserv_clear_metadata_on_ircd(struct handle_info *hi);
+void nickserv_sync_profile_metadata_to_ircd(struct userNode *user);
 
 static int
 nickserv_unregister_handle(struct handle_info *hi, struct userNode *notify, struct userNode *bot)
@@ -1089,6 +1104,9 @@ nickserv_unregister_handle(struct handle_info *hi, struct userNode *notify, stru
         x3_lmdb_scram_acct_delete_all(hi->handle);
     }
 #endif
+
+    /* Clear metadata keys from Nefarious for online users before detaching */
+    nickserv_clear_metadata_on_ircd(hi);
 
     for (n=0; n<unreg_func_used; n++)
         unreg_func_list[n](notify, hi, unreg_func_list_extra[n]);
@@ -1617,6 +1635,16 @@ set_user_handle_info(struct userNode *user, struct handle_info *hi, int stamp)
             }
             /* send the account to the ircd */
             StampUser(user, id, hi->registered);
+
+            /* Push profile metadata to Nefarious for IRCv3 exposure */
+            nickserv_sync_profile_metadata_to_ircd(user);
+
+            /* Push $last_present if available */
+            if (hi->last_present > 0) {
+                char timestamp_str[32];
+                snprintf(timestamp_str, sizeof(timestamp_str), "%ld", (long)hi->last_present);
+                irc_metadata(hi->handle, "$last_present", timestamp_str, METADATA_VIS_PUBLIC);
+            }
         }
 
         /* Stop trying to kick this user off their nick */
@@ -4965,6 +4993,9 @@ static OPTION_FUNC(opt_width)
         else if (hi->screen_width > MAX_LINE_SIZE)
             hi->screen_width = MAX_LINE_SIZE;
 
+        char value_str[16];
+        snprintf(value_str, sizeof(value_str), "%u", hi->screen_width);
+        nickserv_sync_preference_metadata(hi, X3_META_SCREEN_WIDTH, value_str);
     }
 
     if (!(noreply))
@@ -4982,6 +5013,9 @@ static OPTION_FUNC(opt_tablewidth)
         else if (hi->screen_width > MAX_LINE_SIZE)
             hi->table_width = MAX_LINE_SIZE;
 
+        char value_str[16];
+        snprintf(value_str, sizeof(value_str), "%u", hi->table_width);
+        nickserv_sync_preference_metadata(hi, X3_META_TABLE_WIDTH, value_str);
     }
 
     if (!(noreply))
@@ -5063,6 +5097,7 @@ static OPTION_FUNC(opt_style)
             reply("NSMSG_INVALID_STYLE", argv[1]);
             return 0;
         }
+        nickserv_sync_preference_metadata(hi, X3_META_STYLE, argv[1]);
     }
 
     switch (hi->userlist_style) {
@@ -5100,6 +5135,11 @@ static OPTION_FUNC(opt_announcements)
             if (!(noreply))
                 reply("NSMSG_INVALID_ANNOUNCE", argv[1]);
             return 0;
+        }
+        {
+            const char *val = (hi->announcements == 'y') ? "on" :
+                              (hi->announcements == 'n') ? "off" : "default";
+            nickserv_sync_preference_metadata(hi, X3_META_ANNOUNCEMENTS, val);
         }
     }
 
@@ -5241,6 +5281,10 @@ static OPTION_FUNC(opt_maxlogins)
             return 0;
         }
         hi->maxlogins = maxlogins;
+
+        char value_str[16];
+        snprintf(value_str, sizeof(value_str), "%u", hi->maxlogins);
+        nickserv_sync_preference_metadata(hi, X3_META_MAXLOGINS, value_str);
     }
     maxlogins = hi->maxlogins ? hi->maxlogins : nickserv_conf.default_maxlogins;
 
@@ -14298,6 +14342,76 @@ nickserv_ircv3_verify(struct userNode *user, const char *handle,
 
     snprintf(result_msg, 256, "Account '%s' verified and activated", handle);
     return NSVERIFY_SUCCESS;
+}
+
+/*
+ * Push profile metadata to Nefarious for IRCv3 client exposure.
+ * Called on auth to sync handle_info fields as metadata keys.
+ * Nefarious is authoritative for storage/queries — X3 just writes.
+ */
+void
+nickserv_sync_profile_metadata_to_ircd(struct userNode *user)
+{
+    struct handle_info *hi;
+    char buf[64];
+
+    if (!user || !user->handle_info)
+        return;
+    hi = user->handle_info;
+
+    if (hi->epithet && hi->epithet[0])
+        irc_metadata(user->nick, X3_META_TITLE, hi->epithet, METADATA_VIS_PUBLIC);
+
+    snprintf(buf, sizeof(buf), "%lu", (unsigned long)hi->registered);
+    irc_metadata(user->nick, X3_META_REGISTERED, buf, METADATA_VIS_PUBLIC);
+
+    if (hi->karma != 0) {
+        snprintf(buf, sizeof(buf), "%d", hi->karma);
+        irc_metadata(user->nick, X3_META_KARMA, buf, METADATA_VIS_PUBLIC);
+    }
+
+    if (hi->email_addr && hi->email_addr[0])
+        irc_metadata(user->nick, X3_META_EMAIL, hi->email_addr, METADATA_VIS_PRIVATE);
+
+    if (hi->last_quit_host[0])
+        irc_metadata(user->nick, X3_META_LASTHOST, hi->last_quit_host, METADATA_VIS_PRIVATE);
+}
+
+/*
+ * Push a preference change to Nefarious for all online users on this handle.
+ * Called from SET handlers (width, tablewidth, style, announcements, maxlogins).
+ */
+static void
+nickserv_sync_preference_metadata(struct handle_info *hi, const char *key, const char *value)
+{
+    struct userNode *user;
+    if (!hi || !key)
+        return;
+    for (user = hi->users; user; user = user->next_authed)
+        irc_metadata(user->nick, key, value, METADATA_VIS_PRIVATE);
+}
+
+/*
+ * Clear metadata keys from Nefarious for online users on unregister.
+ */
+static void
+nickserv_clear_metadata_on_ircd(struct handle_info *hi)
+{
+    struct userNode *user;
+    static const char *keys[] = {
+        X3_META_TITLE, X3_META_REGISTERED, X3_META_KARMA,
+        X3_META_EMAIL, X3_META_LASTHOST, X3_META_SCREEN_WIDTH,
+        X3_META_TABLE_WIDTH, X3_META_STYLE, X3_META_ANNOUNCEMENTS,
+        X3_META_MAXLOGINS, NULL
+    };
+
+    if (!hi)
+        return;
+    for (user = hi->users; user; user = user->next_authed) {
+        int i;
+        for (i = 0; keys[i]; i++)
+            irc_metadata(user->nick, keys[i], NULL, 0);
+    }
 }
 
 void
