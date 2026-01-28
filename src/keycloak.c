@@ -14,6 +14,7 @@
 #include "log.h"
 #include "ioset.h"
 #include "timeq.h"
+#include "x3_kc_bridge.h"
 #include "base64.h"
 #include "mempool.h"
 #include <curl/multi.h>
@@ -1702,82 +1703,9 @@ curl_apply_opts(CURL *curl, struct curl_opts opts, struct memory *chunk_out,
 
 /*
  * =============================================================================
- * Async HTTP Infrastructure (curl_multi + ioset integration)
+ * Async HTTP Infrastructure (libkc bridge)
  * =============================================================================
  */
-
-/* curl_multi handle for async HTTP */
-static CURLM *kc_curl_multi = NULL;
-
-/* Handle pool for async requests - avoids curl_easy_init() per request */
-#define KC_HANDLE_POOL_SIZE 8
-static CURL *kc_handle_pool[KC_HANDLE_POOL_SIZE];
-static int kc_handle_pool_count = 0;
-
-/* Get a handle from pool (or create new one) */
-static CURL *kc_handle_pool_get(void) {
-    if (kc_handle_pool_count > 0) {
-        CURL *handle = kc_handle_pool[--kc_handle_pool_count];
-        curl_easy_reset(handle);
-        return handle;
-    }
-    return curl_easy_init();
-}
-
-/* Return handle to pool (or destroy if pool full) */
-static void kc_handle_pool_put(CURL *handle) {
-    if (!handle) return;
-    if (kc_handle_pool_count < KC_HANDLE_POOL_SIZE) {
-        kc_handle_pool[kc_handle_pool_count++] = handle;
-    } else {
-        curl_easy_cleanup(handle);
-    }
-}
-
-/* Cleanup the handle pool */
-static void kc_handle_pool_cleanup(void) {
-    while (kc_handle_pool_count > 0) {
-        curl_easy_cleanup(kc_handle_pool[--kc_handle_pool_count]);
-    }
-}
-
-/* Per-socket tracking for ioset integration */
-struct kc_sock_info {
-    curl_socket_t sockfd;
-    struct io_fd *io_fd;
-    int action;  /* CURL_POLL_IN, CURL_POLL_OUT, etc */
-    struct kc_sock_info *next_pending;  /* For deferred cleanup list */
-};
-
-/* Deferred cleanup list for sockets.
- * curl_multi_socket_action can close sockets during a callback, but
- * those sockets might still be in the current epoll event batch.
- * We defer the actual free until after curl_multi_socket_action returns.
- */
-static struct kc_sock_info *kc_pending_cleanup = NULL;
-
-/* Forward declarations */
-static void kc_curl_socket_ready(struct io_fd *fd);
-static void kc_curl_timeout_fired(void *data);
-
-/**
- * Process deferred socket cleanup.
- * Called after curl_multi_socket_action to free sockets that were
- * marked for cleanup during the curl callback.
- */
-static void
-kc_process_pending_cleanup(void)
-{
-    struct kc_sock_info *si;
-    while ((si = kc_pending_cleanup) != NULL) {
-        kc_pending_cleanup = si->next_pending;
-        if (si->io_fd) {
-            ioset_close(si->io_fd, 0);  /* Don't close fd, curl owns it */
-        }
-        free(si);
-    }
-}
-static void kc_curl_check_completed(void);
 
 /* Async request types */
 enum kc_async_type {
@@ -1810,7 +1738,6 @@ enum kc_async_type {
 
 /* Async request tracking */
 struct kc_async_request {
-    CURL *easy;
     void *session;                /* Opaque session pointer (SASLSession) */
     struct memory response;       /* Response buffer */
     char *uri;                    /* Allocated URL */
@@ -1870,7 +1797,7 @@ struct kc_async_request {
     struct kc_pending_user_update *coalesce_pending;
 };
 
-/* Forward declaration for curl_perform_async (used in completion handler) */
+/* Forward declaration for curl_perform_async (used in dispatch handler) */
 static int curl_perform_async(struct kc_async_request *req, struct curl_opts opts);
 
 /* Header callback to capture Location header from HTTP 201 response */
@@ -1900,152 +1827,6 @@ kc_header_callback(char *buffer, size_t size, size_t nitems, void *userdata)
     }
 
     return realsize;
-}
-
-/* Called by curl when socket state changes */
-static int
-kc_curl_socket_cb(CURL *easy, curl_socket_t s, int what,
-                  void *userp, void *sockp)
-{
-    struct kc_sock_info *si = sockp;
-    CURLMcode mc;
-    (void)easy;
-    (void)userp;
-
-    log_module(KC_LOG, LOG_DEBUG, "kc_curl_socket_cb: fd=%d what=%d sockp=%p",
-               (int)s, what, sockp);
-
-    if (what == CURL_POLL_REMOVE) {
-        log_module(KC_LOG, LOG_DEBUG, "kc_curl_socket_cb: REMOVE for fd=%d si=%p", (int)s, (void*)si);
-        if (si) {
-            /* Remove from epoll IMMEDIATELY to allow fd reuse.
-             * This is critical: curl may reuse the fd number for a new connection
-             * before our pending cleanup runs. If we don't remove from epoll now,
-             * we'll get "fd already in epoll" errors or double-registration issues.
-             *
-             * The io_fd structure is freed here, but we still defer freeing the
-             * kc_sock_info to prevent use-after-free in the current epoll event batch. */
-            if (si->io_fd) {
-                log_module(KC_LOG, LOG_DEBUG, "kc_curl_socket_cb: Removing fd=%d from epoll", (int)s);
-                ioset_close(si->io_fd, 0);  /* Remove from epoll, don't close fd (curl owns it) */
-                si->io_fd = NULL;  /* Mark as already cleaned up */
-            }
-            /* Defer si structure cleanup until after curl_multi_socket_action returns. */
-            si->next_pending = kc_pending_cleanup;
-            kc_pending_cleanup = si;
-        } else {
-            log_module(KC_LOG, LOG_WARNING, "kc_curl_socket_cb: REMOVE called with NULL si for fd=%d", (int)s);
-        }
-        mc = curl_multi_assign(kc_curl_multi, s, NULL);
-        if (mc != CURLM_OK) {
-            log_module(KC_LOG, LOG_ERROR, "kc_curl_socket_cb: curl_multi_assign(NULL) failed for fd=%d: %s",
-                       (int)s, curl_multi_strerror(mc));
-        }
-        return 0;
-    }
-
-    if (!si) {
-        /* New socket - register with ioset */
-        si = calloc(1, sizeof(*si));
-        if (!si) return 0;
-        si->sockfd = s;
-        si->io_fd = ioset_add(s);
-        if (!si->io_fd) {
-            log_module(KC_LOG, LOG_ERROR, "kc_curl_socket_cb: ioset_add failed for fd=%d", (int)s);
-            free(si);
-            return 0;
-        }
-        si->io_fd->state = IO_CONNECTED;  /* Already connected by curl */
-        si->io_fd->line_reads = 0;        /* Raw socket, no line buffering */
-        si->io_fd->readable_cb = kc_curl_socket_ready;
-        si->io_fd->data = si;
-        mc = curl_multi_assign(kc_curl_multi, s, si);
-        if (mc != CURLM_OK) {
-            log_module(KC_LOG, LOG_ERROR, "kc_curl_socket_cb: curl_multi_assign failed for fd=%d: %s",
-                       (int)s, curl_multi_strerror(mc));
-            ioset_close(si->io_fd, 0);
-            free(si);
-            return 0;
-        }
-        log_module(KC_LOG, LOG_DEBUG, "kc_async: Registered socket %d with ioset, si=%p", (int)s, (void*)si);
-    }
-
-    si->action = what;
-    ioset_update(si->io_fd);  /* Update poll flags based on action */
-    return 0;
-}
-
-/* Called when ioset reports socket ready */
-static void
-kc_curl_socket_ready(struct io_fd *fd)
-{
-    struct kc_sock_info *si = fd->data;
-    curl_socket_t sockfd;
-    int running;
-    int ev_bitmask = 0;
-
-    if (!si || !kc_curl_multi) return;
-
-    /* Save sockfd before curl call - si may be freed during curl_multi_socket_action
-     * if curl decides to close this socket */
-    sockfd = si->sockfd;
-
-    /* Determine events based on what curl requested */
-    if (si->action & CURL_POLL_IN)
-        ev_bitmask |= CURL_CSELECT_IN;
-    if (si->action & CURL_POLL_OUT)
-        ev_bitmask |= CURL_CSELECT_OUT;
-
-    curl_multi_socket_action(kc_curl_multi, sockfd, ev_bitmask, &running);
-    kc_curl_check_completed();  /* Check for finished transfers */
-
-    /* Process any sockets that were marked for cleanup during curl_multi_socket_action.
-     * This must happen AFTER the curl call to avoid use-after-free in the epoll loop. */
-    kc_process_pending_cleanup();
-}
-
-/* Called by curl when timeout value changes */
-static int
-kc_curl_timer_cb(CURLM *multi, long timeout_ms, void *userp)
-{
-    (void)multi;
-    (void)userp;
-
-    /* Remove any existing second-precision fallback timer */
-    timeq_del(0, kc_curl_timeout_fired, NULL, TIMEQ_IGNORE_WHEN | TIMEQ_IGNORE_DATA);
-
-    if (timeout_ms == -1) {
-        /* Clear curl's timer - no pending operations */
-        ioset_set_poll_hint_ms(0);
-    } else if (timeout_ms == 0) {
-        /* Immediate action needed - hint minimal timeout */
-        ioset_set_poll_hint_ms(1);
-        /* Also schedule immediate timeq callback for safety */
-        timeq_add(now, kc_curl_timeout_fired, NULL);
-    } else {
-        /* Use millisecond-precision poll hint */
-        ioset_set_poll_hint_ms(timeout_ms);
-        /* Also schedule second-precision fallback (coarse, but ensures we don't miss) */
-        timeq_add(now + (timeout_ms / 1000) + 1, kc_curl_timeout_fired, NULL);
-    }
-    return 0;
-}
-
-/* Called by timeq when curl timeout fires */
-static void
-kc_curl_timeout_fired(UNUSED_ARG(void *data))
-{
-    int running;
-    if (!kc_curl_multi) return;
-
-    /* Clear poll hint - curl will reset it via timer callback if needed */
-    ioset_set_poll_hint_ms(0);
-
-    curl_multi_socket_action(kc_curl_multi, CURL_SOCKET_TIMEOUT, 0, &running);
-    kc_curl_check_completed();
-
-    /* Process any sockets that were marked for cleanup during curl_multi_socket_action */
-    kc_process_pending_cleanup();
 }
 
 /* Parse fingerprint lookup response and invoke callback */
@@ -2148,25 +1929,6 @@ kc_async_complete_introspect(struct kc_async_request *req, long http_code)
 static void kc_async_retry_cb(void *data);
 static void kc_async_request_cleanup(struct kc_async_request *req);
 
-/* Check if an error is retryable */
-static int
-kc_async_is_retryable(CURLcode curl_res, long http_code)
-{
-    /* Retryable CURL errors (connection/network issues) */
-    if (curl_res == CURLE_COULDNT_CONNECT ||
-        curl_res == CURLE_OPERATION_TIMEDOUT ||
-        curl_res == CURLE_GOT_NOTHING ||
-        curl_res == CURLE_RECV_ERROR ||
-        curl_res == CURLE_SEND_ERROR) {
-        return 1;
-    }
-    /* Retryable HTTP codes (server errors, rate limiting) */
-    if (http_code >= 500 || http_code == 429) {
-        return 1;
-    }
-    return 0;
-}
-
 /* Schedule a retry for an async request using timeq */
 static int
 kc_async_schedule_retry(struct kc_async_request *req)
@@ -2201,11 +1963,9 @@ kc_async_retry_cb(void *data)
 {
     struct kc_async_request *req = data;
     const char *req_id = req->request_id ? req->request_id : "-";
-    CURLMcode mc;
 
-    if (!kc_curl_multi) {
-        log_module(KC_LOG, LOG_ERROR, "[%s] kc_async retry: curl_multi not initialized", req_id);
-        /* Call error callback and cleanup */
+    if (!x3_kc_bridge_is_ready()) {
+        log_module(KC_LOG, LOG_ERROR, "[%s] kc_async retry: bridge not initialized", req_id);
         if (req->cb.generic)
             req->cb.generic(req->session, KC_ERROR);
         kc_async_request_cleanup(req);
@@ -2226,21 +1986,21 @@ kc_async_retry_cb(void *data)
     log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async: Executing retry %d/%d",
                req_id, req->retry_count, max_retries);
 
-    /* Re-add to curl multi */
-    mc = curl_multi_add_handle(kc_curl_multi, req->easy);
-    if (mc != CURLM_OK) {
-        log_module(KC_LOG, LOG_ERROR, "[%s] kc_async retry: curl_multi_add_handle failed: %s",
-                   req_id, curl_multi_strerror(mc));
-        /* Call error callback and cleanup */
+    /* Re-submit through bridge using stored URI and fields */
+    int rc = x3_kc_bridge_submit(
+        req->uri, NULL /* bridge will default to GET */,
+        req->post_fields, req->post_fields ? strlen(req->post_fields) : 0,
+        req->header_list,
+        req->bearer_token_copy,
+        NULL, NULL,
+        kc_async_bridge_complete, req);
+
+    if (rc != 0) {
+        log_module(KC_LOG, LOG_ERROR, "[%s] kc_async retry: bridge submit failed", req_id);
         if (req->cb.generic)
             req->cb.generic(req->session, KC_ERROR);
         kc_async_request_cleanup(req);
-        return;
     }
-
-    /* Kick curl to start processing */
-    int running;
-    curl_multi_socket_action(kc_curl_multi, CURL_SOCKET_TIMEOUT, 0, &running);
 }
 
 /* Cleanup an async request - frees all allocated resources */
@@ -2249,13 +2009,7 @@ kc_async_request_cleanup(struct kc_async_request *req)
 {
     if (!req) return;
 
-    /* Return curl handle to pool */
-    if (req->easy) {
-        if (kc_curl_multi) {
-            curl_multi_remove_handle(kc_curl_multi, req->easy);
-        }
-        kc_handle_pool_put(req->easy);
-    }
+    /* No curl handle to manage — bridge owns the HTTP lifecycle */
 
     /* Free response buffer (securely zero first) */
     if (req->response.response) {
@@ -2296,1150 +2050,1126 @@ kc_async_request_cleanup(struct kc_async_request *req)
     free(req);
 }
 
-/* Check for completed transfers and invoke callbacks */
+/*
+ * Handle the result of an async HTTP request.
+ * Called from the libkc bridge completion path (kc_async_bridge_complete).
+ *
+ * This contains the stats recording, retry logic, type dispatch switch,
+ * and cleanup.
+ */
 static void
-kc_curl_check_completed(void)
+kc_async_handle_result(struct kc_async_request *req, long http_code,
+                        int curl_failed, unsigned long latency_ms)
 {
-    CURLMsg *msg;
-    int msgs_left;
+    const char *req_id = req->request_id ? req->request_id : "-";
 
-    if (!kc_curl_multi) return;
+    /* Check elapsed time */
+    if (req->started > 0) {
+        time_t elapsed = time(NULL) - req->started;
+        if (elapsed >= 5) {
+            log_module(KC_LOG, LOG_WARNING, "[%s] kc_async: Request took %ld seconds (type=%d)",
+                       req_id, (long)elapsed, req->type);
+        }
+    }
 
-    while ((msg = curl_multi_info_read(kc_curl_multi, &msgs_left))) {
-        if (msg->msg == CURLMSG_DONE) {
-            CURL *easy = msg->easy_handle;
-            struct kc_async_request *req = NULL;
-            long http_code = 0;
+    /* Record async request stats */
+    int is_error = (curl_failed || http_code >= 500);
+    kc_stats_record_request(latency_ms, is_error);
 
-            curl_easy_getinfo(easy, CURLINFO_PRIVATE, &req);
-            if (!req) {
-                log_module(KC_LOG, LOG_ERROR, "kc_async: No request data for completed transfer");
-                curl_multi_remove_handle(kc_curl_multi, easy);
-                curl_easy_cleanup(easy);
-                continue;
-            }
+    /* Log slow async requests */
+    if (latency_ms > 1000) {
+        log_module(KC_LOG, LOG_INFO, "[%s] Async request slow: %lu ms (HTTP %ld, type=%d)",
+                   req_id, latency_ms, http_code, req->type);
+    }
 
-            /* Get request_id for logging */
-            const char *req_id = req->request_id ? req->request_id : "-";
+    /* Check for retryable errors */
+    if (curl_failed || http_code >= 500 || http_code == 429) {
+        /* Only retry certain operation types */
+        int should_retry = 0;
+        switch (req->type) {
+        case KC_ASYNC_SET_ATTR:
+        case KC_ASYNC_GROUP_ADD:
+        case KC_ASYNC_GROUP_REMOVE:
+        case KC_ASYNC_CREATE_USER:
+        case KC_ASYNC_DELETE_USER:
+        case KC_ASYNC_UPDATE_USER:
+        case KC_ASYNC_UPDATE_USER_GET:
+        case KC_ASYNC_GET_USER:
+        case KC_ASYNC_SET_USER_ATTR_GET:
+        case KC_ASYNC_SET_GROUP_ATTR:
+        case KC_ASYNC_SET_GROUP_ATTR_GET:
+        case KC_ASYNC_GET_GROUP_PATH:
+        case KC_ASYNC_GET_GROUP_NAME:
+        case KC_ASYNC_CREATE_SUBGROUP:
+        case KC_ASYNC_DELETE_GROUP:
+        case KC_ASYNC_LIST_ATTRS:
+        case KC_ASYNC_GET_ATTR:
+        case KC_ASYNC_GROUP_INFO:
+        case KC_ASYNC_GROUP_MEMBERS:
+        case KC_ASYNC_COALESCE_GET:
+            should_retry = 1;
+            break;
+        default:
+            break;
+        }
 
-            /* Check elapsed time (Phase 5.3 timeout tracking) */
-            time_t elapsed = 0;
-            if (req->started > 0) {
-                elapsed = time(NULL) - req->started;
-                if (elapsed >= 5) {
-                    log_module(KC_LOG, LOG_WARNING, "[%s] kc_async: Request took %ld seconds (type=%d)",
-                               req_id, (long)elapsed, req->type);
+        if (should_retry && kc_async_schedule_retry(req))
+            return;  /* Retry scheduled, don't dispatch yet */
+    }
+
+    /* === DISPATCH BY TYPE === */
+    switch (req->type) {
+    case KC_ASYNC_AUTH: {
+        int result = KC_ERROR;
+        if (http_code == 200) {
+            result = KC_SUCCESS;
+            log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async auth: Success (HTTP 200)", req_id);
+        } else if (http_code == 401) {
+            result = KC_FORBIDDEN;
+            log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async auth: Failed (HTTP 401)", req_id);
+        } else {
+            log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async auth: Error (HTTP %ld)", req_id, http_code);
+        }
+        if (req->cb.auth) {
+            req->cb.auth(req->session, result);
+        }
+        break;
+    }
+    case KC_ASYNC_FINGERPRINT:
+        kc_async_complete_fingerprint(req, http_code);
+        break;
+    case KC_ASYNC_INTROSPECT:
+        kc_async_complete_introspect(req, http_code);
+        break;
+    case KC_ASYNC_SET_ATTR: {
+        int result = KC_ERROR;
+        if (http_code == 204 || http_code == 200) {
+            result = KC_SUCCESS;
+            log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async set_attr: Success (HTTP %ld)", req_id, http_code);
+        } else if (http_code == 404) {
+            result = KC_NOT_FOUND;
+            log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async set_attr: Not found (HTTP 404)", req_id);
+        } else {
+            log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async set_attr: Error (HTTP %ld)", req_id, http_code);
+        }
+        /* If this came from coalescing, invoke all pending callbacks */
+        if (req->coalesce_pending) {
+            kc_pending_invoke_all_callbacks(req->coalesce_pending, result);
+            kc_pending_update_free(req->coalesce_pending);
+            req->coalesce_pending = NULL;
+        } else if (req->cb.generic) {
+            req->cb.generic(req->session, result);
+        }
+        break;
+    }
+    case KC_ASYNC_GROUP_ADD:
+    case KC_ASYNC_GROUP_REMOVE: {
+        int result = KC_ERROR;
+        if (http_code == 204 || http_code == 200) {
+            result = KC_SUCCESS;
+            log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async group: Success (HTTP %ld)", req_id, http_code);
+        } else if (http_code == 404) {
+            result = KC_NOT_FOUND;
+            log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async group: Not found (HTTP 404)", req_id);
+        } else if (http_code == 409) {
+            /* Conflict - user already in/not in group */
+            result = KC_SUCCESS;  /* Treat as success for idempotency */
+            log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async group: Conflict (HTTP 409), treating as success", req_id);
+        } else {
+            log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async group: Error (HTTP %ld)", req_id, http_code);
+        }
+        if (req->cb.generic) {
+            req->cb.generic(req->session, result);
+        }
+        break;
+    }
+    case KC_ASYNC_WEBPUSH: {
+        int result = KC_ERROR;
+        if (http_code >= 200 && http_code < 300) {
+            result = KC_SUCCESS;
+            log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async webpush: Success (HTTP %ld)", req_id, http_code);
+        } else if (http_code == 410) {
+            /* Subscription expired - special handling for cleanup */
+            result = KC_FORBIDDEN;  /* Using KC_FORBIDDEN to indicate expired */
+            log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async webpush: Subscription expired (HTTP 410)", req_id);
+        } else {
+            log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async webpush: Error (HTTP %ld)", req_id, http_code);
+        }
+        if (req->cb.webpush) {
+            req->cb.webpush(req->session, result, http_code);
+        }
+        break;
+    }
+    case KC_ASYNC_CREATE_USER: {
+        int result = KC_ERROR;
+        if (http_code == 201) {
+            result = KC_SUCCESS;
+            log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async create_user: User created (HTTP 201)", req_id);
+
+            /* Cache user ID from Location header for subsequent operations */
+            if (req->create_username && req->location_header[0]) {
+                /* Location format: .../users/{user-id} - extract last path segment */
+                const char *user_id = strrchr(req->location_header, '/');
+                if (user_id && user_id[1]) {
+                    user_id++;  /* Skip the '/' */
+                    kc_userid_cache_put(req->create_username, user_id);
                 }
             }
+        } else if (http_code == 409) {
+            result = KC_USER_EXISTS;
+            log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async create_user: User exists (HTTP 409)", req_id);
+        } else {
+            log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async create_user: Error (HTTP %ld)", req_id, http_code);
+        }
+        if (req->cb.generic) {
+            req->cb.generic(req->session, result);
+        }
+        break;
+    }
+    case KC_ASYNC_GROUP_INFO: {
+        int result = KC_ERROR;
+        struct kc_group_info *info = NULL;
 
-            /* Get HTTP response code and timing */
-            double total_time = 0;
-            unsigned long latency_ms;
-            int is_error;
+        if (http_code == 404) {
+            result = KC_NOT_FOUND;
+            log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async group_info: Not found (HTTP 404)", req_id);
+        } else if (http_code == 200 && req->response.response) {
+            json_error_t error;
+            json_t *root = json_loads(req->response.response, 0, &error);
+            if (root && json_is_object(root)) {
+                info = calloc(1, sizeof(*info));
+                if (info) {
+                    json_t *jid = json_object_get(root, "id");
+                    json_t *jname = json_object_get(root, "name");
+                    json_t *jpath = json_object_get(root, "path");
+                    json_t *jattrs = json_object_get(root, "attributes");
 
-            if (msg->data.result == CURLE_OK) {
-                curl_easy_getinfo(easy, CURLINFO_RESPONSE_CODE, &http_code);
-                curl_easy_getinfo(easy, CURLINFO_TOTAL_TIME, &total_time);
+                    if (jid && json_is_string(jid))
+                        info->id = strdup(json_string_value(jid));
+                    if (jname && json_is_string(jname))
+                        info->name = strdup(json_string_value(jname));
+                    if (jpath && json_is_string(jpath))
+                        info->path = strdup(json_string_value(jpath));
+
+                    /* Parse x3_access_level attribute */
+                    if (jattrs && json_is_object(jattrs)) {
+                        json_t *level_arr = json_object_get(jattrs, "x3_access_level");
+                        if (level_arr && json_is_array(level_arr) && json_array_size(level_arr) > 0) {
+                            json_t *level_val = json_array_get(level_arr, 0);
+                            if (level_val && json_is_string(level_val)) {
+                                info->access_level = (unsigned short)atoi(json_string_value(level_val));
+                            }
+                        }
+                    }
+                    result = KC_SUCCESS;
+                    log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async group_info: Success (level=%d)",
+                               req_id, info->access_level);
+                }
+                json_decref(root);
             } else {
-                log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async: CURL error: %s (after %lds)",
-                           req_id, curl_easy_strerror(msg->data.result), (long)elapsed);
+                log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async group_info: JSON parse error", req_id);
             }
+        } else {
+            log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async group_info: Error (HTTP %ld)", req_id, http_code);
+        }
+        if (req->cb.group_info) {
+            req->cb.group_info(req->session, result, info);
+        }
+        break;
+    }
+    case KC_ASYNC_GROUP_MEMBERS: {
+        int result = KC_ERROR;
+        struct kc_group_member *members = NULL;
+        int member_count = 0;
 
-            /* Record async request stats */
-            latency_ms = (unsigned long)(total_time * 1000);
-            is_error = (msg->data.result != CURLE_OK || http_code >= 500);
-            kc_stats_record_request(latency_ms, is_error);
+        if (http_code == 404) {
+            result = KC_NOT_FOUND;
+            log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async group_members: Not found (HTTP 404)", req_id);
+        } else if (http_code == 200 && req->response.response) {
+            json_error_t error;
+            json_t *root = json_loads(req->response.response, 0, &error);
+            if (root && json_is_array(root)) {
+                struct kc_group_member *tail = NULL;
+                size_t array_size = json_array_size(root);
 
-            /* Log slow async requests */
-            if (latency_ms > 1000) {
-                log_module(KC_LOG, LOG_INFO, "[%s] Async request slow: %lu ms (HTTP %ld, type=%d)",
-                           req_id, latency_ms, http_code, req->type);
-            }
+                for (size_t i = 0; i < array_size; i++) {
+                    json_t *user_obj = json_array_get(root, i);
+                    json_t *jid = json_object_get(user_obj, "id");
+                    json_t *jusername = json_object_get(user_obj, "username");
 
-            /* Check for retryable errors on supported operation types.
-             * Auth/introspect operations should fail fast - no retry.
-             * Attribute and group operations benefit from retry on transient errors. */
-            if (kc_async_is_retryable(msg->data.result, http_code)) {
-                /* Only retry certain operation types */
-                int should_retry = 0;
-                switch (req->type) {
-                case KC_ASYNC_SET_ATTR:
-                case KC_ASYNC_GROUP_ADD:
-                case KC_ASYNC_GROUP_REMOVE:
-                case KC_ASYNC_CREATE_USER:
-                case KC_ASYNC_DELETE_USER:
-                case KC_ASYNC_UPDATE_USER:
-                case KC_ASYNC_UPDATE_USER_GET:
-                case KC_ASYNC_GET_USER:
-                case KC_ASYNC_SET_USER_ATTR_GET:
-                case KC_ASYNC_SET_GROUP_ATTR:
-                case KC_ASYNC_SET_GROUP_ATTR_GET:
-                case KC_ASYNC_GET_GROUP_PATH:
-                case KC_ASYNC_GET_GROUP_NAME:
-                case KC_ASYNC_CREATE_SUBGROUP:
-                case KC_ASYNC_DELETE_GROUP:
-                case KC_ASYNC_LIST_ATTRS:
-                case KC_ASYNC_GET_ATTR:
-                case KC_ASYNC_GROUP_INFO:
-                case KC_ASYNC_GROUP_MEMBERS:
-                case KC_ASYNC_COALESCE_GET:
-                    should_retry = 1;
-                    break;
-                default:
-                    /* Auth, fingerprint, introspect, webpush, client_token - no retry */
-                    break;
-                }
+                    if (jid && json_is_string(jid) &&
+                        jusername && json_is_string(jusername)) {
+                        struct kc_group_member *member = calloc(1, sizeof(*member));
+                        if (member) {
+                            member->user_id = strdup(json_string_value(jid));
+                            member->username = strdup(json_string_value(jusername));
+                            member->next = NULL;
 
-                if (should_retry && kc_async_schedule_retry(req)) {
-                    /* Retry scheduled - remove from multi but don't cleanup yet */
-                    curl_multi_remove_handle(kc_curl_multi, easy);
-                    continue;  /* Skip to next message */
-                }
-                /* Fall through if retry not scheduled (max retries exceeded or not retryable type) */
-            }
-
-            /* Dispatch based on request type */
-            switch (req->type) {
-            case KC_ASYNC_AUTH: {
-                int result = KC_ERROR;
-                if (http_code == 200) {
-                    result = KC_SUCCESS;
-                    log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async auth: Success (HTTP 200)", req_id);
-                } else if (http_code == 401) {
-                    result = KC_FORBIDDEN;
-                    log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async auth: Failed (HTTP 401)", req_id);
-                } else {
-                    log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async auth: Error (HTTP %ld)", req_id, http_code);
-                }
-                if (req->cb.auth) {
-                    req->cb.auth(req->session, result);
-                }
-                break;
-            }
-            case KC_ASYNC_FINGERPRINT:
-                kc_async_complete_fingerprint(req, http_code);
-                break;
-            case KC_ASYNC_INTROSPECT:
-                kc_async_complete_introspect(req, http_code);
-                break;
-            case KC_ASYNC_SET_ATTR: {
-                int result = KC_ERROR;
-                if (http_code == 204 || http_code == 200) {
-                    result = KC_SUCCESS;
-                    log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async set_attr: Success (HTTP %ld)", req_id, http_code);
-                } else if (http_code == 404) {
-                    result = KC_NOT_FOUND;
-                    log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async set_attr: Not found (HTTP 404)", req_id);
-                } else {
-                    log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async set_attr: Error (HTTP %ld)", req_id, http_code);
-                }
-                /* If this came from coalescing, invoke all pending callbacks */
-                if (req->coalesce_pending) {
-                    kc_pending_invoke_all_callbacks(req->coalesce_pending, result);
-                    kc_pending_update_free(req->coalesce_pending);
-                    req->coalesce_pending = NULL;
-                } else if (req->cb.generic) {
-                    req->cb.generic(req->session, result);
-                }
-                break;
-            }
-            case KC_ASYNC_GROUP_ADD:
-            case KC_ASYNC_GROUP_REMOVE: {
-                int result = KC_ERROR;
-                if (http_code == 204 || http_code == 200) {
-                    result = KC_SUCCESS;
-                    log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async group: Success (HTTP %ld)", req_id, http_code);
-                } else if (http_code == 404) {
-                    result = KC_NOT_FOUND;
-                    log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async group: Not found (HTTP 404)", req_id);
-                } else if (http_code == 409) {
-                    /* Conflict - user already in/not in group */
-                    result = KC_SUCCESS;  /* Treat as success for idempotency */
-                    log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async group: Conflict (HTTP 409), treating as success", req_id);
-                } else {
-                    log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async group: Error (HTTP %ld)", req_id, http_code);
-                }
-                if (req->cb.generic) {
-                    req->cb.generic(req->session, result);
-                }
-                break;
-            }
-            case KC_ASYNC_WEBPUSH: {
-                int result = KC_ERROR;
-                if (http_code >= 200 && http_code < 300) {
-                    result = KC_SUCCESS;
-                    log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async webpush: Success (HTTP %ld)", req_id, http_code);
-                } else if (http_code == 410) {
-                    /* Subscription expired - special handling for cleanup */
-                    result = KC_FORBIDDEN;  /* Using KC_FORBIDDEN to indicate expired */
-                    log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async webpush: Subscription expired (HTTP 410)", req_id);
-                } else {
-                    log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async webpush: Error (HTTP %ld)", req_id, http_code);
-                }
-                if (req->cb.webpush) {
-                    req->cb.webpush(req->session, result, http_code);
-                }
-                break;
-            }
-            case KC_ASYNC_CREATE_USER: {
-                int result = KC_ERROR;
-                if (http_code == 201) {
-                    result = KC_SUCCESS;
-                    log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async create_user: User created (HTTP 201)", req_id);
-
-                    /* Cache user ID from Location header for subsequent operations */
-                    if (req->create_username && req->location_header[0]) {
-                        /* Location format: .../users/{user-id} - extract last path segment */
-                        const char *user_id = strrchr(req->location_header, '/');
-                        if (user_id && user_id[1]) {
-                            user_id++;  /* Skip the '/' */
-                            kc_userid_cache_put(req->create_username, user_id);
-                        }
-                    }
-                } else if (http_code == 409) {
-                    result = KC_USER_EXISTS;
-                    log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async create_user: User exists (HTTP 409)", req_id);
-                } else {
-                    log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async create_user: Error (HTTP %ld)", req_id, http_code);
-                }
-                if (req->cb.generic) {
-                    req->cb.generic(req->session, result);
-                }
-                break;
-            }
-            case KC_ASYNC_GROUP_INFO: {
-                int result = KC_ERROR;
-                struct kc_group_info *info = NULL;
-
-                if (http_code == 404) {
-                    result = KC_NOT_FOUND;
-                    log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async group_info: Not found (HTTP 404)", req_id);
-                } else if (http_code == 200 && req->response.response) {
-                    json_error_t error;
-                    json_t *root = json_loads(req->response.response, 0, &error);
-                    if (root && json_is_object(root)) {
-                        info = calloc(1, sizeof(*info));
-                        if (info) {
-                            json_t *jid = json_object_get(root, "id");
-                            json_t *jname = json_object_get(root, "name");
-                            json_t *jpath = json_object_get(root, "path");
-                            json_t *jattrs = json_object_get(root, "attributes");
-
-                            if (jid && json_is_string(jid))
-                                info->id = strdup(json_string_value(jid));
-                            if (jname && json_is_string(jname))
-                                info->name = strdup(json_string_value(jname));
-                            if (jpath && json_is_string(jpath))
-                                info->path = strdup(json_string_value(jpath));
-
-                            /* Parse x3_access_level attribute */
-                            if (jattrs && json_is_object(jattrs)) {
-                                json_t *level_arr = json_object_get(jattrs, "x3_access_level");
-                                if (level_arr && json_is_array(level_arr) && json_array_size(level_arr) > 0) {
-                                    json_t *level_val = json_array_get(level_arr, 0);
-                                    if (level_val && json_is_string(level_val)) {
-                                        info->access_level = (unsigned short)atoi(json_string_value(level_val));
-                                    }
-                                }
+                            if (!member->user_id || !member->username) {
+                                if (member->user_id) free(member->user_id);
+                                if (member->username) free(member->username);
+                                free(member);
+                                continue;
                             }
-                            result = KC_SUCCESS;
-                            log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async group_info: Success (level=%d)",
-                                       req_id, info->access_level);
-                        }
-                        json_decref(root);
-                    } else {
-                        log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async group_info: JSON parse error", req_id);
-                    }
-                } else {
-                    log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async group_info: Error (HTTP %ld)", req_id, http_code);
-                }
-                if (req->cb.group_info) {
-                    req->cb.group_info(req->session, result, info);
-                }
-                break;
-            }
-            case KC_ASYNC_GROUP_MEMBERS: {
-                int result = KC_ERROR;
-                struct kc_group_member *members = NULL;
-                int member_count = 0;
 
-                if (http_code == 404) {
-                    result = KC_NOT_FOUND;
-                    log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async group_members: Not found (HTTP 404)", req_id);
-                } else if (http_code == 200 && req->response.response) {
-                    json_error_t error;
-                    json_t *root = json_loads(req->response.response, 0, &error);
-                    if (root && json_is_array(root)) {
-                        struct kc_group_member *tail = NULL;
-                        size_t array_size = json_array_size(root);
-
-                        for (size_t i = 0; i < array_size; i++) {
-                            json_t *user_obj = json_array_get(root, i);
-                            json_t *jid = json_object_get(user_obj, "id");
-                            json_t *jusername = json_object_get(user_obj, "username");
-
-                            if (jid && json_is_string(jid) &&
-                                jusername && json_is_string(jusername)) {
-                                struct kc_group_member *member = calloc(1, sizeof(*member));
-                                if (member) {
-                                    member->user_id = strdup(json_string_value(jid));
-                                    member->username = strdup(json_string_value(jusername));
-                                    member->next = NULL;
-
-                                    if (!member->user_id || !member->username) {
-                                        if (member->user_id) free(member->user_id);
-                                        if (member->username) free(member->username);
-                                        free(member);
-                                        continue;
-                                    }
-
-                                    if (!members) {
-                                        members = member;
-                                        tail = member;
-                                    } else {
-                                        tail->next = member;
-                                        tail = member;
-                                    }
-                                    member_count++;
-                                }
+                            if (!members) {
+                                members = member;
+                                tail = member;
+                            } else {
+                                tail->next = member;
+                                tail = member;
                             }
+                            member_count++;
                         }
-                        result = member_count;
-                        log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async group_members: Found %d members",
-                                   req_id, member_count);
-                        json_decref(root);
-                    } else {
-                        log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async group_members: JSON parse error", req_id);
                     }
-                } else {
-                    log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async group_members: Error (HTTP %ld)", req_id, http_code);
                 }
-                if (req->cb.group_members) {
-                    req->cb.group_members(req->session, result, members);
-                }
-                break;
+                result = member_count;
+                log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async group_members: Found %d members",
+                           req_id, member_count);
+                json_decref(root);
+            } else {
+                log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async group_members: JSON parse error", req_id);
             }
-            case KC_ASYNC_CLIENT_TOKEN: {
-                int result = KC_TOKEN_ERROR;
-                struct access_token *token = NULL;
+        } else {
+            log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async group_members: Error (HTTP %ld)", req_id, http_code);
+        }
+        if (req->cb.group_members) {
+            req->cb.group_members(req->session, result, members);
+        }
+        break;
+    }
+    case KC_ASYNC_CLIENT_TOKEN: {
+        int result = KC_TOKEN_ERROR;
+        struct access_token *token = NULL;
 
-                if (http_code == 200 && req->response.response) {
-                    if (json_read_kc_access_token(req->response.response, &token) == KC_SUCCESS) {
+        if (http_code == 200 && req->response.response) {
+            if (json_read_kc_access_token(req->response.response, &token) == KC_SUCCESS) {
+                result = KC_SUCCESS;
+                log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async client_token: Success (HTTP 200)", req_id);
+            } else {
+                log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async client_token: JSON parse error", req_id);
+            }
+        } else {
+            log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async client_token: Error (HTTP %ld)", req_id, http_code);
+        }
+        if (req->cb.client_token) {
+            req->cb.client_token(req->session, result, token);
+            /* Note: token ownership transferred to callback */
+        } else if (token) {
+            keycloak_free_access_token(token);
+        }
+        break;
+    }
+    case KC_ASYNC_GET_USER: {
+        int result = KC_ERROR;
+        struct kc_user user = {0};
+
+        if (http_code == 200 && req->response.response) {
+            /* Parse JSON array response (same format as keycloak_get_users) */
+            json_error_t error;
+            json_t *root = json_loads(req->response.response, 0, &error);
+            if (root && json_is_array(root)) {
+                size_t count = json_array_size(root);
+                if (count == 0) {
+                    result = KC_NOT_FOUND;
+                    log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async get_user: Not found", req_id);
+                } else if (count == 1) {
+                    json_t *user_obj = json_array_get(root, 0);
+                    if (json_read_kc_user(user_obj, &user) == KC_SUCCESS) {
                         result = KC_SUCCESS;
-                        log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async client_token: Success (HTTP 200)", req_id);
-                    } else {
-                        log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async client_token: JSON parse error", req_id);
+                        /* Cache user ID for future lookups */
+                        if (user.username && user.id) {
+                            kc_userid_cache_put(user.username, user.id);
+                        }
+                        log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async get_user: Found user %s", req_id, user.username);
                     }
                 } else {
-                    log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async client_token: Error (HTTP %ld)", req_id, http_code);
+                    log_module(KC_LOG, LOG_WARNING, "[%s] kc_async get_user: Multiple users found (%zu)", req_id, count);
+                    result = KC_ERROR;
                 }
-                if (req->cb.client_token) {
-                    req->cb.client_token(req->session, result, token);
-                    /* Note: token ownership transferred to callback */
-                } else if (token) {
-                    keycloak_free_access_token(token);
-                }
-                break;
+                json_decref(root);
+            } else {
+                log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async get_user: Invalid JSON", req_id);
+                if (root) json_decref(root);
             }
-            case KC_ASYNC_GET_USER: {
-                int result = KC_ERROR;
-                struct kc_user user = {0};
+        } else if (http_code == 404) {
+            result = KC_NOT_FOUND;
+            log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async get_user: Not found (HTTP 404)", req_id);
+        } else {
+            log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async get_user: Error (HTTP %ld)", req_id, http_code);
+        }
+        if (req->cb.get_user) {
+            req->cb.get_user(req->session, result, result == KC_SUCCESS ? &user : NULL);
+        }
+        /* Free user fields if callback didn't take ownership or there was an error */
+        if (result != KC_SUCCESS) {
+            keycloak_user_free_fields(&user);
+        }
+        break;
+    }
+    case KC_ASYNC_UPDATE_USER: {
+        int result = KC_ERROR;
+        if (http_code == 204 || http_code == 200) {
+            result = KC_SUCCESS;
+            log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async update_user: Success (HTTP %ld)", req_id, http_code);
+        } else if (http_code == 404) {
+            result = KC_NOT_FOUND;
+            log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async update_user: Not found (HTTP 404)", req_id);
+        } else {
+            log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async update_user: Error (HTTP %ld)", req_id, http_code);
+        }
+        if (req->cb.update_user) {
+            req->cb.update_user(req->session, result);
+        }
+        break;
+    }
+    case KC_ASYNC_UPDATE_USER_GET: {
+        /* GET phase completed for user representation update.
+         * Merge updates into full representation and issue PUT. */
+        int result = KC_ERROR;
 
-                if (http_code == 200 && req->response.response) {
-                    /* Parse JSON array response (same format as keycloak_get_users) */
-                    json_error_t error;
-                    json_t *root = json_loads(req->response.response, 0, &error);
-                    if (root && json_is_array(root)) {
-                        size_t count = json_array_size(root);
-                        if (count == 0) {
-                            result = KC_NOT_FOUND;
-                            log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async get_user: Not found", req_id);
-                        } else if (count == 1) {
-                            json_t *user_obj = json_array_get(root, 0);
-                            if (json_read_kc_user(user_obj, &user) == KC_SUCCESS) {
+        if (http_code == 200 && req->response.response) {
+            json_error_t error;
+            json_t *repr = json_loads(req->response.response, 0, &error);
+            if (repr) {
+                /* Strip credentials from GET response - they should not be in PUT
+                 * as Keycloak treats credentials in PUT as "add" not "replace" */
+                json_object_del(repr, "credentials");
+
+                /* Merge email if provided */
+                if (req->update_email) {
+                    json_object_set_new(repr, "email", json_string(req->update_email));
+                }
+
+                /* Cache the merged representation AFTER merging email.
+                 * This ensures subsequent operations have the email.
+                 * kc_user_repr_cache_put already strips credentials. */
+                json_t *id_json = json_object_get(repr, "id");
+                if (id_json && json_is_string(id_json)) {
+                    kc_user_repr_cache_put(json_string_value(id_json), repr);
+                }
+
+                /* Add credentials if provided - only for PUT, not for cache */
+                if (req->update_cred_data && req->update_secret_data) {
+                    json_t *cred = json_object();
+                    json_object_set_new(cred, "type", json_string("password"));
+                    json_object_set_new(cred, "credentialData", json_string(req->update_cred_data));
+                    json_object_set_new(cred, "secretData", json_string(req->update_secret_data));
+                    json_object_set_new(cred, "temporary", json_false());
+
+                    json_t *creds = json_array();
+                    json_array_append_new(creds, cred);
+                    json_object_set_new(repr, "credentials", creds);
+                }
+
+                /* Serialize merged representation for PUT */
+                char *json_body = json_dumps(repr, JSON_COMPACT);
+                json_decref(repr);
+
+                if (json_body) {
+                    /* Build PUT request */
+                    struct kc_async_request *put_req = calloc(1, sizeof(*put_req));
+                    if (put_req) {
+                        put_req->session = req->session;
+                        put_req->type = KC_ASYNC_UPDATE_USER;
+                        put_req->cb.update_user = req->cb.update_user;
+                        put_req->uri = strdup(req->uri);  /* Same URI for PUT */
+                        put_req->post_fields = json_body;
+
+                        /* Get fresh bearer token for PUT */
+                        if (kc_token_mgr.token && kc_token_mgr.token->access_token) {
+                            put_req->bearer_token_copy = strdup(kc_token_mgr.token->access_token);
+                        }
+
+                        if (put_req->uri && put_req->bearer_token_copy) {
+                            struct curl_opts opts = CURL_OPTS_INIT;
+                            opts.uri = put_req->uri;
+                            opts.method = HTTP_PUT;
+                            opts.post_fields = put_req->post_fields;
+                            opts.xoauth2_bearer = put_req->bearer_token_copy;
+                            opts.header_list[0] = "Content-Type: application/json";
+                            opts.header_count = 1;
+
+                            if (curl_perform_async(put_req, opts) == 0) {
+                                log_module(KC_LOG, LOG_DEBUG,
+                                           "[%s] kc_async update_user_get: GET succeeded, issued PUT with merged repr",
+                                           req_id);
                                 result = KC_SUCCESS;
-                                /* Cache user ID for future lookups */
-                                if (user.username && user.id) {
-                                    kc_userid_cache_put(user.username, user.id);
-                                }
-                                log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async get_user: Found user %s", req_id, user.username);
+                                /* Clear callback in original req - PUT will call it */
+                                req->cb.update_user = NULL;
+                            } else {
+                                log_module(KC_LOG, LOG_ERROR,
+                                           "[%s] kc_async update_user_get: Failed to start PUT", req_id);
+                                free(put_req->uri);
+                                free(put_req->bearer_token_copy);
+                                free(json_body);
+                                free(put_req);
                             }
                         } else {
-                            log_module(KC_LOG, LOG_WARNING, "[%s] kc_async get_user: Multiple users found (%zu)", req_id, count);
-                            result = KC_ERROR;
+                            log_module(KC_LOG, LOG_ERROR,
+                                       "[%s] kc_async update_user_get: Failed to prepare PUT request", req_id);
+                            if (put_req->uri) free(put_req->uri);
+                            if (put_req->bearer_token_copy) free(put_req->bearer_token_copy);
+                            free(json_body);
+                            free(put_req);
                         }
-                        json_decref(root);
                     } else {
-                        log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async get_user: Invalid JSON", req_id);
-                        if (root) json_decref(root);
+                        free(json_body);
                     }
-                } else if (http_code == 404) {
-                    result = KC_NOT_FOUND;
-                    log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async get_user: Not found (HTTP 404)", req_id);
-                } else {
-                    log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async get_user: Error (HTTP %ld)", req_id, http_code);
                 }
-                if (req->cb.get_user) {
-                    req->cb.get_user(req->session, result, result == KC_SUCCESS ? &user : NULL);
-                }
-                /* Free user fields if callback didn't take ownership or there was an error */
-                if (result != KC_SUCCESS) {
-                    keycloak_user_free_fields(&user);
-                }
-                break;
+            } else {
+                log_module(KC_LOG, LOG_ERROR,
+                           "[%s] kc_async update_user_get: Invalid JSON: %s", req_id, error.text);
             }
-            case KC_ASYNC_UPDATE_USER: {
-                int result = KC_ERROR;
-                if (http_code == 204 || http_code == 200) {
+        } else if (http_code == 404) {
+            result = KC_NOT_FOUND;
+            log_module(KC_LOG, LOG_DEBUG,
+                       "[%s] kc_async update_user_get: User not found (HTTP 404)", req_id);
+        } else {
+            log_module(KC_LOG, LOG_ERROR,
+                       "[%s] kc_async update_user_get: GET failed (HTTP %ld)", req_id, http_code);
+        }
+
+        /* On error, call callback. On success, PUT will call callback. */
+        if (result != KC_SUCCESS && req->cb.update_user) {
+            req->cb.update_user(req->session, result);
+        }
+        break;
+    }
+    case KC_ASYNC_GET_GROUP_PATH: {
+        int result = KC_ERROR;
+        char *group_id = NULL;
+
+        if (http_code == 404) {
+            result = KC_NOT_FOUND;
+            log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async get_group_path: Not found (HTTP 404)", req_id);
+        } else if (http_code == 200 && req->response.response) {
+            /* Parse JSON response to get group ID */
+            json_error_t error;
+            json_t *root = json_loads(req->response.response, 0, &error);
+            if (root) {
+                const char *id = json_string_value(json_object_get(root, "id"));
+                if (id) {
+                    group_id = pool_strdup(id);
                     result = KC_SUCCESS;
-                    log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async update_user: Success (HTTP %ld)", req_id, http_code);
-                } else if (http_code == 404) {
-                    result = KC_NOT_FOUND;
-                    log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async update_user: Not found (HTTP 404)", req_id);
-                } else {
-                    log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async update_user: Error (HTTP %ld)", req_id, http_code);
+                    log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async get_group_path: Found group %s", req_id, group_id);
                 }
-                if (req->cb.update_user) {
-                    req->cb.update_user(req->session, result);
-                }
-                break;
+                json_decref(root);
             }
-            case KC_ASYNC_UPDATE_USER_GET: {
-                /* GET phase completed for user representation update.
-                 * Merge updates into full representation and issue PUT. */
-                int result = KC_ERROR;
+            if (result != KC_SUCCESS) {
+                log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async get_group_path: Failed to parse response", req_id);
+            }
+        } else {
+            log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async get_group_path: Error (HTTP %ld)", req_id, http_code);
+        }
+        if (req->cb.get_group_path) {
+            req->cb.get_group_path(req->session, result, group_id);
+            /* Note: group_id ownership transferred to callback */
+        } else if (group_id) {
+            pool_strfree(group_id);
+        }
+        break;
+    }
+    case KC_ASYNC_CREATE_SUBGROUP: {
+        int result = KC_ERROR;
+        char *group_id = NULL;
 
-                if (http_code == 200 && req->response.response) {
-                    json_error_t error;
-                    json_t *repr = json_loads(req->response.response, 0, &error);
-                    if (repr) {
-                        /* Strip credentials from GET response - they should not be in PUT
-                         * as Keycloak treats credentials in PUT as "add" not "replace" */
-                        json_object_del(repr, "credentials");
+        if (http_code == 201) {
+            /* Extract group ID from Location header */
+            if (req->location_header[0]) {
+                /* Location header format: .../groups/{id} */
+                const char *last_slash = strrchr(req->location_header, '/');
+                if (last_slash && last_slash[1]) {
+                    group_id = pool_strdup(last_slash + 1);
+                    result = KC_SUCCESS;
+                    log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async create_subgroup: Created group %s", req_id, group_id);
+                }
+            }
+            if (!group_id) {
+                log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async create_subgroup: Created but no Location header", req_id);
+                result = KC_SUCCESS;  /* Still success, just no ID */
+            }
+        } else if (http_code == 409) {
+            result = KC_USER_EXISTS;  /* Group already exists */
+            log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async create_subgroup: Group already exists", req_id);
+        } else if (http_code == 404) {
+            result = KC_NOT_FOUND;  /* Parent not found */
+            log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async create_subgroup: Parent not found", req_id);
+        } else {
+            log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async create_subgroup: Error (HTTP %ld)", req_id, http_code);
+        }
+        if (req->cb.create_subgroup) {
+            req->cb.create_subgroup(req->session, result, group_id);
+            /* Note: group_id ownership transferred to callback */
+        } else if (group_id) {
+            pool_strfree(group_id);
+        }
+        break;
+    }
+    case KC_ASYNC_SET_GROUP_ATTR: {
+        int result = KC_ERROR;
+        if (http_code == 204 || http_code == 200) {
+            result = KC_SUCCESS;
+            log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async set_group_attr: Success (HTTP %ld)", req_id, http_code);
+        } else if (http_code == 404) {
+            result = KC_NOT_FOUND;
+            log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async set_group_attr: Not found (HTTP 404)", req_id);
+        } else {
+            log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async set_group_attr: Error (HTTP %ld)", req_id, http_code);
+        }
+        if (req->cb.generic) {
+            req->cb.generic(req->session, result);
+        }
+        break;
+    }
+    case KC_ASYNC_GET_GROUP_NAME: {
+        /* Parse group search results - returns array of groups */
+        int result = KC_ERROR;
+        char *group_id = NULL;
 
-                        /* Merge email if provided */
-                        if (req->update_email) {
-                            json_object_set_new(repr, "email", json_string(req->update_email));
+        if (http_code == 200 && req->response.response) {
+            json_error_t error;
+            json_t *root = json_loads(req->response.response, 0, &error);
+            if (root) {
+                if (json_is_array(root) && json_array_size(root) > 0) {
+                    json_t *first_group = json_array_get(root, 0);
+                    json_t *id_val = json_object_get(first_group, "id");
+                    if (id_val && json_is_string(id_val)) {
+                        group_id = pool_strdup(json_string_value(id_val));
+                        if (group_id) {
+                            result = KC_SUCCESS;
+                            log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async get_group_name: Found group ID %s", req_id, group_id);
+                        }
+                    }
+                } else {
+                    result = KC_NOT_FOUND;
+                    log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async get_group_name: Group not found", req_id);
+                }
+                json_decref(root);
+            } else {
+                log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async get_group_name: JSON parse error: %s", req_id, error.text);
+            }
+        } else if (http_code == 404) {
+            result = KC_NOT_FOUND;
+            log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async get_group_name: Not found (HTTP 404)", req_id);
+        } else {
+            log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async get_group_name: Error (HTTP %ld)", req_id, http_code);
+        }
+        if (req->cb.get_group_name) {
+            req->cb.get_group_name(req->session, result, group_id);
+            /* Note: group_id ownership transferred to callback */
+        } else if (group_id) {
+            pool_strfree(group_id);
+        }
+        break;
+    }
+    case KC_ASYNC_DELETE_GROUP: {
+        int result = KC_ERROR;
+        if (http_code == 204 || http_code == 200) {
+            result = KC_SUCCESS;
+            log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async delete_group: Success (HTTP %ld)", req_id, http_code);
+        } else if (http_code == 404) {
+            result = KC_NOT_FOUND;
+            log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async delete_group: Not found (HTTP 404)", req_id);
+        } else {
+            log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async delete_group: Error (HTTP %ld)", req_id, http_code);
+        }
+        if (req->cb.delete_group) {
+            req->cb.delete_group(req->session, result);
+        }
+        break;
+    }
+    case KC_ASYNC_DELETE_USER: {
+        int result = KC_ERROR;
+        if (http_code == 204 || http_code == 200) {
+            result = KC_SUCCESS;
+            log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async delete_user: Success (HTTP %ld)", req_id, http_code);
+        } else if (http_code == 404) {
+            result = KC_NOT_FOUND;
+            log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async delete_user: Not found (HTTP 404)", req_id);
+        } else {
+            log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async delete_user: Error (HTTP %ld)", req_id, http_code);
+        }
+        if (req->cb.delete_user) {
+            req->cb.delete_user(req->session, result);
+        }
+        break;
+    }
+    case KC_ASYNC_LIST_ATTRS: {
+        int result = KC_ERROR;
+        struct kc_metadata_entry *entries = NULL;
+
+        if (http_code == 200 && req->response.response) {
+            json_error_t error;
+            json_t *root = json_loads(req->response.response, 0, &error);
+            if (root) {
+                json_t *attrs = json_object_get(root, "attributes");
+                if (attrs && json_is_object(attrs)) {
+                    const char *key;
+                    json_t *value;
+                    struct kc_metadata_entry *head = NULL;
+                    struct kc_metadata_entry *tail = NULL;
+                    size_t prefix_len = req->attr_prefix ? strlen(req->attr_prefix) : 0;
+
+                    json_object_foreach(attrs, key, value) {
+                        /* Skip if prefix specified and doesn't match */
+                        if (req->attr_prefix && prefix_len > 0) {
+                            if (strncmp(key, req->attr_prefix, prefix_len) != 0)
+                                continue;
                         }
 
-                        /* Cache the merged representation AFTER merging email.
-                         * This ensures subsequent operations have the email.
-                         * kc_user_repr_cache_put already strips credentials. */
-                        json_t *id_json = json_object_get(repr, "id");
-                        if (id_json && json_is_string(id_json)) {
-                            kc_user_repr_cache_put(json_string_value(id_json), repr);
+                        /* Get first value from array */
+                        if (!json_is_array(value) || json_array_size(value) == 0)
+                            continue;
+
+                        json_t *first_val = json_array_get(value, 0);
+                        if (!first_val || !json_is_string(first_val))
+                            continue;
+
+                        const char *val_str = json_string_value(first_val);
+                        if (!val_str || !*val_str)
+                            continue;
+
+                        /* Create entry */
+                        struct kc_metadata_entry *entry = malloc(sizeof(*entry));
+                        if (!entry)
+                            continue;
+
+                        entry->key = strdup(key);
+                        entry->value = strdup(val_str);
+                        entry->next = NULL;
+
+                        if (!entry->key || !entry->value) {
+                            if (entry->key) free(entry->key);
+                            if (entry->value) free(entry->value);
+                            free(entry);
+                            continue;
                         }
 
-                        /* Add credentials if provided - only for PUT, not for cache */
-                        if (req->update_cred_data && req->update_secret_data) {
-                            json_t *cred = json_object();
-                            json_object_set_new(cred, "type", json_string("password"));
-                            json_object_set_new(cred, "credentialData", json_string(req->update_cred_data));
-                            json_object_set_new(cred, "secretData", json_string(req->update_secret_data));
-                            json_object_set_new(cred, "temporary", json_false());
-
-                            json_t *creds = json_array();
-                            json_array_append_new(creds, cred);
-                            json_object_set_new(repr, "credentials", creds);
+                        /* Add to list */
+                        if (!head) {
+                            head = tail = entry;
+                        } else {
+                            tail->next = entry;
+                            tail = entry;
                         }
+                    }
 
-                        /* Serialize merged representation for PUT */
-                        char *json_body = json_dumps(repr, JSON_COMPACT);
-                        json_decref(repr);
+                    entries = head;
+                    result = KC_SUCCESS;
+                    log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async list_attrs: Success", req_id);
+                } else {
+                    /* No attributes object is valid - empty list */
+                    result = KC_SUCCESS;
+                    log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async list_attrs: No attributes on user", req_id);
+                }
+                json_decref(root);
+            } else {
+                log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async list_attrs: Invalid JSON: %s", req_id, error.text);
+            }
+        } else if (http_code == 404) {
+            result = KC_NOT_FOUND;
+            log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async list_attrs: Not found (HTTP 404)", req_id);
+        } else {
+            log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async list_attrs: Error (HTTP %ld)", req_id, http_code);
+        }
+        if (req->cb.list_attrs) {
+            req->cb.list_attrs(req->session, result, entries);
+        }
+        /* Note: callback owns entries on success, must free on error */
+        if (result != KC_SUCCESS && entries) {
+            keycloak_free_metadata_entries(entries);
+        }
+        break;
+    }
+    case KC_ASYNC_GET_ATTR: {
+        int result = KC_ERROR;
+        char *attr_value = NULL;
 
-                        if (json_body) {
-                            /* Build PUT request */
-                            struct kc_async_request *put_req = calloc(1, sizeof(*put_req));
-                            if (put_req) {
-                                put_req->session = req->session;
-                                put_req->type = KC_ASYNC_UPDATE_USER;
-                                put_req->cb.update_user = req->cb.update_user;
-                                put_req->uri = strdup(req->uri);  /* Same URI for PUT */
-                                put_req->post_fields = json_body;
-
-                                /* Get fresh bearer token for PUT */
-                                if (kc_token_mgr.token && kc_token_mgr.token->access_token) {
-                                    put_req->bearer_token_copy = strdup(kc_token_mgr.token->access_token);
+        if (http_code == 200 && req->response.response) {
+            json_error_t error;
+            json_t *root = json_loads(req->response.response, 0, &error);
+            if (root) {
+                json_t *attrs = json_object_get(root, "attributes");
+                if (attrs && json_is_object(attrs) && req->attr_name) {
+                    json_t *attr_arr = json_object_get(attrs, req->attr_name);
+                    if (attr_arr && json_is_array(attr_arr) && json_array_size(attr_arr) > 0) {
+                        json_t *first_val = json_array_get(attr_arr, 0);
+                        if (first_val && json_is_string(first_val)) {
+                            const char *val_str = json_string_value(first_val);
+                            if (val_str && *val_str) {
+                                attr_value = strdup(val_str);
+                                if (attr_value) {
+                                    result = KC_SUCCESS;
+                                    log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async get_attr: Found %s", req_id, req->attr_name);
                                 }
+                            }
+                        }
+                    }
+                    if (result != KC_SUCCESS) {
+                        result = KC_NOT_FOUND;
+                        log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async get_attr: Attribute %s not found", req_id, req->attr_name);
+                    }
+                } else if (!attrs || !json_is_object(attrs)) {
+                    result = KC_NOT_FOUND;
+                    log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async get_attr: No attributes on user", req_id);
+                }
+                json_decref(root);
+            } else {
+                log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async get_attr: Invalid JSON: %s", req_id, error.text);
+            }
+        } else if (http_code == 404) {
+            result = KC_NOT_FOUND;
+            log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async get_attr: User not found (HTTP 404)", req_id);
+        } else {
+            log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async get_attr: Error (HTTP %ld)", req_id, http_code);
+        }
+        if (req->cb.get_attr) {
+            req->cb.get_attr(req->session, result, attr_value);
+        }
+        /* Note: callback owns attr_value on success, must free on error */
+        if (result != KC_SUCCESS && attr_value) {
+            free(attr_value);
+        }
+        break;
+    }
+    case KC_ASYNC_SET_USER_ATTR_GET: {
+        /* GET phase completed for user attribute update (cache miss case).
+         * Now merge the attribute and issue PUT with full representation. */
+        int result = KC_ERROR;
 
-                                if (put_req->uri && put_req->bearer_token_copy) {
-                                    struct curl_opts opts = CURL_OPTS_INIT;
-                                    opts.uri = put_req->uri;
-                                    opts.method = HTTP_PUT;
-                                    opts.post_fields = put_req->post_fields;
-                                    opts.xoauth2_bearer = put_req->bearer_token_copy;
-                                    opts.header_list[0] = "Content-Type: application/json";
-                                    opts.header_count = 1;
+        if (http_code == 200 && req->response.response) {
+            json_error_t error;
+            json_t *repr = json_loads(req->response.response, 0, &error);
+            if (repr) {
+                /* Strip credentials from GET response - they should not be in PUT
+                 * as Keycloak treats credentials in PUT as "add" not "replace" */
+                json_object_del(repr, "credentials");
 
-                                    if (curl_perform_async(put_req, opts) == 0) {
-                                        log_module(KC_LOG, LOG_DEBUG,
-                                                   "[%s] kc_async update_user_get: GET succeeded, issued PUT with merged repr",
-                                                   req_id);
-                                        result = KC_SUCCESS;
-                                        /* Clear callback in original req - PUT will call it */
-                                        req->cb.update_user = NULL;
-                                    } else {
-                                        log_module(KC_LOG, LOG_ERROR,
-                                                   "[%s] kc_async update_user_get: Failed to start PUT", req_id);
-                                        free(put_req->uri);
-                                        free(put_req->bearer_token_copy);
-                                        free(json_body);
-                                        free(put_req);
-                                    }
+                /* Get or create attributes object */
+                json_t *attrs = json_object_get(repr, "attributes");
+                if (!attrs) {
+                    attrs = json_object();
+                    json_object_set_new(repr, "attributes", attrs);
+                }
+
+                /* Set the attribute (or remove if value is NULL) */
+                if (req->user_attr_value) {
+                    json_t *attr_array = json_array();
+                    json_array_append_new(attr_array, json_string(req->user_attr_value));
+                    json_object_set_new(attrs, req->user_attr_name, attr_array);
+                } else {
+                    /* NULL value = delete attribute by setting to empty array */
+                    json_t *empty_array = json_array();
+                    json_object_set_new(attrs, req->user_attr_name, empty_array);
+                }
+
+                /* Cache the merged representation AFTER merging attribute.
+                 * kc_user_repr_cache_put already strips credentials. */
+                json_t *id_json = json_object_get(repr, "id");
+                if (id_json && json_is_string(id_json)) {
+                    kc_user_repr_cache_put(json_string_value(id_json), repr);
+                }
+
+                /* Now issue the PUT with full representation */
+                char *json_body = json_dumps(repr, JSON_COMPACT);
+                json_decref(repr);
+
+                if (json_body) {
+                    /* Build PUT request */
+                    char *put_uri = kc_build_user_endpoint(req->realm_copy, req->user_id_copy);
+                    if (put_uri) {
+                        struct kc_async_request *put_req = calloc(1, sizeof(*put_req));
+                        if (put_req) {
+                            put_req->session = req->session;
+                            put_req->type = KC_ASYNC_SET_ATTR;
+                            put_req->cb.generic = req->cb.generic;
+                            put_req->uri = put_uri;
+                            put_req->post_fields = json_body;
+
+                            /* Copy bearer token for PUT request lifetime (original req will be freed) */
+                            put_req->bearer_token_copy = strdup(req->bearer_token_copy);
+                            if (!put_req->bearer_token_copy) {
+                                log_module(KC_LOG, LOG_ERROR,
+                                           "[%s] kc_async set_user_attr_get: Failed to copy bearer token",
+                                           req_id);
+                                free(put_uri);
+                                free(json_body);
+                                free(put_req);
+                            } else {
+                                struct curl_opts opts = CURL_OPTS_INIT;
+                                opts.uri = put_req->uri;
+                                opts.method = HTTP_PUT;
+                                opts.post_fields = put_req->post_fields;
+                                opts.xoauth2_bearer = put_req->bearer_token_copy;
+                                opts.header_list[0] = "Content-Type: application/json";
+                                opts.header_count = 1;
+
+                                if (curl_perform_async(put_req, opts) == 0) {
+                                    log_module(KC_LOG, LOG_DEBUG,
+                                               "[%s] kc_async set_user_attr_get: GET succeeded, "
+                                               "issued PUT with merged attributes for %s.%s",
+                                               req_id, req->user_id_copy, req->user_attr_name);
+                                    /* PUT request is now in flight, will call callback when done.
+                                     * Don't call callback here - the PUT completion will do it. */
+                                    result = KC_SUCCESS;
                                 } else {
                                     log_module(KC_LOG, LOG_ERROR,
-                                               "[%s] kc_async update_user_get: Failed to prepare PUT request", req_id);
-                                    if (put_req->uri) free(put_req->uri);
-                                    if (put_req->bearer_token_copy) free(put_req->bearer_token_copy);
+                                               "[%s] kc_async set_user_attr_get: Failed to start PUT",
+                                               req_id);
+                                    free(put_req->bearer_token_copy);
+                                    free(put_uri);
                                     free(json_body);
                                     free(put_req);
                                 }
-                            } else {
-                                free(json_body);
-                            }
-                        }
-                    } else {
-                        log_module(KC_LOG, LOG_ERROR,
-                                   "[%s] kc_async update_user_get: Invalid JSON: %s", req_id, error.text);
-                    }
-                } else if (http_code == 404) {
-                    result = KC_NOT_FOUND;
-                    log_module(KC_LOG, LOG_DEBUG,
-                               "[%s] kc_async update_user_get: User not found (HTTP 404)", req_id);
-                } else {
-                    log_module(KC_LOG, LOG_ERROR,
-                               "[%s] kc_async update_user_get: GET failed (HTTP %ld)", req_id, http_code);
-                }
-
-                /* On error, call callback. On success, PUT will call callback. */
-                if (result != KC_SUCCESS && req->cb.update_user) {
-                    req->cb.update_user(req->session, result);
-                }
-                break;
-            }
-            case KC_ASYNC_GET_GROUP_PATH: {
-                int result = KC_ERROR;
-                char *group_id = NULL;
-
-                if (http_code == 404) {
-                    result = KC_NOT_FOUND;
-                    log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async get_group_path: Not found (HTTP 404)", req_id);
-                } else if (http_code == 200 && req->response.response) {
-                    /* Parse JSON response to get group ID */
-                    json_error_t error;
-                    json_t *root = json_loads(req->response.response, 0, &error);
-                    if (root) {
-                        const char *id = json_string_value(json_object_get(root, "id"));
-                        if (id) {
-                            group_id = pool_strdup(id);
-                            result = KC_SUCCESS;
-                            log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async get_group_path: Found group %s", req_id, group_id);
-                        }
-                        json_decref(root);
-                    }
-                    if (result != KC_SUCCESS) {
-                        log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async get_group_path: Failed to parse response", req_id);
-                    }
-                } else {
-                    log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async get_group_path: Error (HTTP %ld)", req_id, http_code);
-                }
-                if (req->cb.get_group_path) {
-                    req->cb.get_group_path(req->session, result, group_id);
-                    /* Note: group_id ownership transferred to callback */
-                } else if (group_id) {
-                    pool_strfree(group_id);
-                }
-                break;
-            }
-            case KC_ASYNC_CREATE_SUBGROUP: {
-                int result = KC_ERROR;
-                char *group_id = NULL;
-
-                if (http_code == 201) {
-                    /* Extract group ID from Location header */
-                    if (req->location_header[0]) {
-                        /* Location header format: .../groups/{id} */
-                        const char *last_slash = strrchr(req->location_header, '/');
-                        if (last_slash && last_slash[1]) {
-                            group_id = pool_strdup(last_slash + 1);
-                            result = KC_SUCCESS;
-                            log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async create_subgroup: Created group %s", req_id, group_id);
-                        }
-                    }
-                    if (!group_id) {
-                        log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async create_subgroup: Created but no Location header", req_id);
-                        result = KC_SUCCESS;  /* Still success, just no ID */
-                    }
-                } else if (http_code == 409) {
-                    result = KC_USER_EXISTS;  /* Group already exists */
-                    log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async create_subgroup: Group already exists", req_id);
-                } else if (http_code == 404) {
-                    result = KC_NOT_FOUND;  /* Parent not found */
-                    log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async create_subgroup: Parent not found", req_id);
-                } else {
-                    log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async create_subgroup: Error (HTTP %ld)", req_id, http_code);
-                }
-                if (req->cb.create_subgroup) {
-                    req->cb.create_subgroup(req->session, result, group_id);
-                    /* Note: group_id ownership transferred to callback */
-                } else if (group_id) {
-                    pool_strfree(group_id);
-                }
-                break;
-            }
-            case KC_ASYNC_SET_GROUP_ATTR: {
-                int result = KC_ERROR;
-                if (http_code == 204 || http_code == 200) {
-                    result = KC_SUCCESS;
-                    log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async set_group_attr: Success (HTTP %ld)", req_id, http_code);
-                } else if (http_code == 404) {
-                    result = KC_NOT_FOUND;
-                    log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async set_group_attr: Not found (HTTP 404)", req_id);
-                } else {
-                    log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async set_group_attr: Error (HTTP %ld)", req_id, http_code);
-                }
-                if (req->cb.generic) {
-                    req->cb.generic(req->session, result);
-                }
-                break;
-            }
-            case KC_ASYNC_GET_GROUP_NAME: {
-                /* Parse group search results - returns array of groups */
-                int result = KC_ERROR;
-                char *group_id = NULL;
-
-                if (http_code == 200 && req->response.response) {
-                    json_error_t error;
-                    json_t *root = json_loads(req->response.response, 0, &error);
-                    if (root) {
-                        if (json_is_array(root) && json_array_size(root) > 0) {
-                            json_t *first_group = json_array_get(root, 0);
-                            json_t *id_val = json_object_get(first_group, "id");
-                            if (id_val && json_is_string(id_val)) {
-                                group_id = pool_strdup(json_string_value(id_val));
-                                if (group_id) {
-                                    result = KC_SUCCESS;
-                                    log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async get_group_name: Found group ID %s", req_id, group_id);
-                                }
                             }
                         } else {
-                            result = KC_NOT_FOUND;
-                            log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async get_group_name: Group not found", req_id);
-                        }
-                        json_decref(root);
-                    } else {
-                        log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async get_group_name: JSON parse error: %s", req_id, error.text);
-                    }
-                } else if (http_code == 404) {
-                    result = KC_NOT_FOUND;
-                    log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async get_group_name: Not found (HTTP 404)", req_id);
-                } else {
-                    log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async get_group_name: Error (HTTP %ld)", req_id, http_code);
-                }
-                if (req->cb.get_group_name) {
-                    req->cb.get_group_name(req->session, result, group_id);
-                    /* Note: group_id ownership transferred to callback */
-                } else if (group_id) {
-                    pool_strfree(group_id);
-                }
-                break;
-            }
-            case KC_ASYNC_DELETE_GROUP: {
-                int result = KC_ERROR;
-                if (http_code == 204 || http_code == 200) {
-                    result = KC_SUCCESS;
-                    log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async delete_group: Success (HTTP %ld)", req_id, http_code);
-                } else if (http_code == 404) {
-                    result = KC_NOT_FOUND;
-                    log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async delete_group: Not found (HTTP 404)", req_id);
-                } else {
-                    log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async delete_group: Error (HTTP %ld)", req_id, http_code);
-                }
-                if (req->cb.delete_group) {
-                    req->cb.delete_group(req->session, result);
-                }
-                break;
-            }
-            case KC_ASYNC_DELETE_USER: {
-                int result = KC_ERROR;
-                if (http_code == 204 || http_code == 200) {
-                    result = KC_SUCCESS;
-                    log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async delete_user: Success (HTTP %ld)", req_id, http_code);
-                } else if (http_code == 404) {
-                    result = KC_NOT_FOUND;
-                    log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async delete_user: Not found (HTTP 404)", req_id);
-                } else {
-                    log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async delete_user: Error (HTTP %ld)", req_id, http_code);
-                }
-                if (req->cb.delete_user) {
-                    req->cb.delete_user(req->session, result);
-                }
-                break;
-            }
-            case KC_ASYNC_LIST_ATTRS: {
-                int result = KC_ERROR;
-                struct kc_metadata_entry *entries = NULL;
-
-                if (http_code == 200 && req->response.response) {
-                    json_error_t error;
-                    json_t *root = json_loads(req->response.response, 0, &error);
-                    if (root) {
-                        json_t *attrs = json_object_get(root, "attributes");
-                        if (attrs && json_is_object(attrs)) {
-                            const char *key;
-                            json_t *value;
-                            struct kc_metadata_entry *head = NULL;
-                            struct kc_metadata_entry *tail = NULL;
-                            size_t prefix_len = req->attr_prefix ? strlen(req->attr_prefix) : 0;
-
-                            json_object_foreach(attrs, key, value) {
-                                /* Skip if prefix specified and doesn't match */
-                                if (req->attr_prefix && prefix_len > 0) {
-                                    if (strncmp(key, req->attr_prefix, prefix_len) != 0)
-                                        continue;
-                                }
-
-                                /* Get first value from array */
-                                if (!json_is_array(value) || json_array_size(value) == 0)
-                                    continue;
-
-                                json_t *first_val = json_array_get(value, 0);
-                                if (!first_val || !json_is_string(first_val))
-                                    continue;
-
-                                const char *val_str = json_string_value(first_val);
-                                if (!val_str || !*val_str)
-                                    continue;
-
-                                /* Create entry */
-                                struct kc_metadata_entry *entry = malloc(sizeof(*entry));
-                                if (!entry)
-                                    continue;
-
-                                entry->key = strdup(key);
-                                entry->value = strdup(val_str);
-                                entry->next = NULL;
-
-                                if (!entry->key || !entry->value) {
-                                    if (entry->key) free(entry->key);
-                                    if (entry->value) free(entry->value);
-                                    free(entry);
-                                    continue;
-                                }
-
-                                /* Add to list */
-                                if (!head) {
-                                    head = tail = entry;
-                                } else {
-                                    tail->next = entry;
-                                    tail = entry;
-                                }
-                            }
-
-                            entries = head;
-                            result = KC_SUCCESS;
-                            log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async list_attrs: Success", req_id);
-                        } else {
-                            /* No attributes object is valid - empty list */
-                            result = KC_SUCCESS;
-                            log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async list_attrs: No attributes on user", req_id);
-                        }
-                        json_decref(root);
-                    } else {
-                        log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async list_attrs: Invalid JSON: %s", req_id, error.text);
-                    }
-                } else if (http_code == 404) {
-                    result = KC_NOT_FOUND;
-                    log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async list_attrs: Not found (HTTP 404)", req_id);
-                } else {
-                    log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async list_attrs: Error (HTTP %ld)", req_id, http_code);
-                }
-                if (req->cb.list_attrs) {
-                    req->cb.list_attrs(req->session, result, entries);
-                }
-                /* Note: callback owns entries on success, must free on error */
-                if (result != KC_SUCCESS && entries) {
-                    keycloak_free_metadata_entries(entries);
-                }
-                break;
-            }
-            case KC_ASYNC_GET_ATTR: {
-                int result = KC_ERROR;
-                char *attr_value = NULL;
-
-                if (http_code == 200 && req->response.response) {
-                    json_error_t error;
-                    json_t *root = json_loads(req->response.response, 0, &error);
-                    if (root) {
-                        json_t *attrs = json_object_get(root, "attributes");
-                        if (attrs && json_is_object(attrs) && req->attr_name) {
-                            json_t *attr_arr = json_object_get(attrs, req->attr_name);
-                            if (attr_arr && json_is_array(attr_arr) && json_array_size(attr_arr) > 0) {
-                                json_t *first_val = json_array_get(attr_arr, 0);
-                                if (first_val && json_is_string(first_val)) {
-                                    const char *val_str = json_string_value(first_val);
-                                    if (val_str && *val_str) {
-                                        attr_value = strdup(val_str);
-                                        if (attr_value) {
-                                            result = KC_SUCCESS;
-                                            log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async get_attr: Found %s", req_id, req->attr_name);
-                                        }
-                                    }
-                                }
-                            }
-                            if (result != KC_SUCCESS) {
-                                result = KC_NOT_FOUND;
-                                log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async get_attr: Attribute %s not found", req_id, req->attr_name);
-                            }
-                        } else if (!attrs || !json_is_object(attrs)) {
-                            result = KC_NOT_FOUND;
-                            log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async get_attr: No attributes on user", req_id);
-                        }
-                        json_decref(root);
-                    } else {
-                        log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async get_attr: Invalid JSON: %s", req_id, error.text);
-                    }
-                } else if (http_code == 404) {
-                    result = KC_NOT_FOUND;
-                    log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async get_attr: User not found (HTTP 404)", req_id);
-                } else {
-                    log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async get_attr: Error (HTTP %ld)", req_id, http_code);
-                }
-                if (req->cb.get_attr) {
-                    req->cb.get_attr(req->session, result, attr_value);
-                }
-                /* Note: callback owns attr_value on success, must free on error */
-                if (result != KC_SUCCESS && attr_value) {
-                    free(attr_value);
-                }
-                break;
-            }
-            case KC_ASYNC_SET_USER_ATTR_GET: {
-                /* GET phase completed for user attribute update (cache miss case).
-                 * Now merge the attribute and issue PUT with full representation. */
-                int result = KC_ERROR;
-
-                if (http_code == 200 && req->response.response) {
-                    json_error_t error;
-                    json_t *repr = json_loads(req->response.response, 0, &error);
-                    if (repr) {
-                        /* Strip credentials from GET response - they should not be in PUT
-                         * as Keycloak treats credentials in PUT as "add" not "replace" */
-                        json_object_del(repr, "credentials");
-
-                        /* Get or create attributes object */
-                        json_t *attrs = json_object_get(repr, "attributes");
-                        if (!attrs) {
-                            attrs = json_object();
-                            json_object_set_new(repr, "attributes", attrs);
-                        }
-
-                        /* Set the attribute (or remove if value is NULL) */
-                        if (req->user_attr_value) {
-                            json_t *attr_array = json_array();
-                            json_array_append_new(attr_array, json_string(req->user_attr_value));
-                            json_object_set_new(attrs, req->user_attr_name, attr_array);
-                        } else {
-                            /* NULL value = delete attribute by setting to empty array */
-                            json_t *empty_array = json_array();
-                            json_object_set_new(attrs, req->user_attr_name, empty_array);
-                        }
-
-                        /* Cache the merged representation AFTER merging attribute.
-                         * kc_user_repr_cache_put already strips credentials. */
-                        json_t *id_json = json_object_get(repr, "id");
-                        if (id_json && json_is_string(id_json)) {
-                            kc_user_repr_cache_put(json_string_value(id_json), repr);
-                        }
-
-                        /* Now issue the PUT with full representation */
-                        char *json_body = json_dumps(repr, JSON_COMPACT);
-                        json_decref(repr);
-
-                        if (json_body) {
-                            /* Build PUT request */
-                            char *put_uri = kc_build_user_endpoint(req->realm_copy, req->user_id_copy);
-                            if (put_uri) {
-                                struct kc_async_request *put_req = calloc(1, sizeof(*put_req));
-                                if (put_req) {
-                                    put_req->session = req->session;
-                                    put_req->type = KC_ASYNC_SET_ATTR;
-                                    put_req->cb.generic = req->cb.generic;
-                                    put_req->uri = put_uri;
-                                    put_req->post_fields = json_body;
-
-                                    /* Copy bearer token for PUT request lifetime (original req will be freed) */
-                                    put_req->bearer_token_copy = strdup(req->bearer_token_copy);
-                                    if (!put_req->bearer_token_copy) {
-                                        log_module(KC_LOG, LOG_ERROR,
-                                                   "[%s] kc_async set_user_attr_get: Failed to copy bearer token",
-                                                   req_id);
-                                        free(put_uri);
-                                        free(json_body);
-                                        free(put_req);
-                                    } else {
-                                        struct curl_opts opts = CURL_OPTS_INIT;
-                                        opts.uri = put_req->uri;
-                                        opts.method = HTTP_PUT;
-                                        opts.post_fields = put_req->post_fields;
-                                        opts.xoauth2_bearer = put_req->bearer_token_copy;
-                                        opts.header_list[0] = "Content-Type: application/json";
-                                        opts.header_count = 1;
-
-                                        if (curl_perform_async(put_req, opts) == 0) {
-                                            log_module(KC_LOG, LOG_DEBUG,
-                                                       "[%s] kc_async set_user_attr_get: GET succeeded, "
-                                                       "issued PUT with merged attributes for %s.%s",
-                                                       req_id, req->user_id_copy, req->user_attr_name);
-                                            /* PUT request is now in flight, will call callback when done.
-                                             * Don't call callback here - the PUT completion will do it. */
-                                            result = KC_SUCCESS;
-                                        } else {
-                                            log_module(KC_LOG, LOG_ERROR,
-                                                       "[%s] kc_async set_user_attr_get: Failed to start PUT",
-                                                       req_id);
-                                            free(put_req->bearer_token_copy);
-                                            free(put_uri);
-                                            free(json_body);
-                                            free(put_req);
-                                        }
-                                    }
-                                } else {
-                                    free(put_uri);
-                                    free(json_body);
-                                }
-                            } else {
-                                free(json_body);
-                            }
+                            free(put_uri);
+                            free(json_body);
                         }
                     } else {
-                        log_module(KC_LOG, LOG_ERROR,
-                                   "[%s] kc_async set_user_attr_get: Invalid JSON: %s",
-                                   req_id, error.text);
+                        free(json_body);
                     }
-                } else if (http_code == 404) {
-                    result = KC_NOT_FOUND;
-                    log_module(KC_LOG, LOG_DEBUG,
-                               "[%s] kc_async set_user_attr_get: User not found (HTTP 404)",
-                               req_id);
-                } else {
-                    log_module(KC_LOG, LOG_ERROR,
-                               "[%s] kc_async set_user_attr_get: GET failed (HTTP %ld)",
-                               req_id, http_code);
                 }
-
-                /* Only call callback on error - success continues to PUT phase */
-                if (result != KC_SUCCESS && req->cb.generic) {
-                    req->cb.generic(req->session, result);
-                }
-                break;
+            } else {
+                log_module(KC_LOG, LOG_ERROR,
+                           "[%s] kc_async set_user_attr_get: Invalid JSON: %s",
+                           req_id, error.text);
             }
-            case KC_ASYNC_COALESCE_GET: {
-                /* GET phase completed for coalesced attribute update (cache miss case).
-                 * Merge all pending attributes and issue single PUT. */
-                struct kc_pending_user_update *pending = req->coalesce_pending;
-                int result = KC_ERROR;
-
-                if (!pending) {
-                    log_module(KC_LOG, LOG_ERROR,
-                               "[%s] kc_async coalesce_get: No pending update context",
-                               req_id);
-                    break;
-                }
-
-                if (http_code == 200 && req->response.response) {
-                    json_error_t error;
-                    json_t *repr = json_loads(req->response.response, 0, &error);
-                    if (repr) {
-                        /* Strip credentials from GET response - they should not be in PUT
-                         * as Keycloak treats credentials in PUT as "add" not "replace" */
-                        json_object_del(repr, "credentials");
-
-                        /* Get or create attributes object */
-                        json_t *attrs = json_object_get(repr, "attributes");
-                        if (!attrs) {
-                            attrs = json_object();
-                            json_object_set_new(repr, "attributes", attrs);
-                        }
-
-                        /* Merge ALL pending attributes */
-                        for (int i = 0; i < pending->attr_count; i++) {
-                            if (pending->attrs[i].value) {
-                                json_t *attr_array = json_array();
-                                json_array_append_new(attr_array, json_string(pending->attrs[i].value));
-                                json_object_set_new(attrs, pending->attrs[i].name, attr_array);
-                            } else {
-                                /* NULL value = delete attribute by setting to empty array */
-                                json_t *empty_array = json_array();
-                                json_object_set_new(attrs, pending->attrs[i].name, empty_array);
-                            }
-                        }
-
-                        /* Cache the merged representation AFTER merging attributes.
-                         * kc_user_repr_cache_put already strips credentials. */
-                        json_t *id_json = json_object_get(repr, "id");
-                        if (id_json && json_is_string(id_json)) {
-                            kc_user_repr_cache_put(json_string_value(id_json), repr);
-                        }
-
-                        /* Now issue PUT with full representation */
-                        char *json_body = json_dumps(repr, JSON_COMPACT);
-                        json_decref(repr);
-
-                        if (json_body) {
-                            char *put_uri = kc_build_user_endpoint(req->realm_copy, pending->user_id);
-                            if (put_uri) {
-                                struct kc_async_request *put_req = calloc(1, sizeof(*put_req));
-                                if (put_req) {
-                                    put_req->type = KC_ASYNC_SET_ATTR;
-                                    put_req->coalesce_pending = pending;  /* Transfer ownership */
-                                    put_req->uri = put_uri;
-                                    put_req->post_fields = json_body;
-
-                                    /* Get fresh token for PUT request */
-                                    if (kc_token_mgr.token && kc_token_mgr.token->access_token) {
-                                        put_req->bearer_token_copy = strdup(kc_token_mgr.token->access_token);
-                                    }
-
-                                    if (!put_req->bearer_token_copy) {
-                                        log_module(KC_LOG, LOG_ERROR,
-                                                   "[%s] kc_async coalesce_get: Failed to get bearer token for PUT",
-                                                   req_id);
-                                        put_req->coalesce_pending = NULL;  /* Return ownership */
-                                        free(put_uri);
-                                        free(json_body);
-                                        free(put_req);
-                                    } else {
-                                        struct curl_opts opts = CURL_OPTS_INIT;
-                                        opts.uri = put_req->uri;
-                                        opts.method = HTTP_PUT;
-                                        opts.post_fields = put_req->post_fields;
-                                        opts.xoauth2_bearer = put_req->bearer_token_copy;
-                                        opts.header_list[0] = "Content-Type: application/json";
-                                        opts.header_count = 1;
-
-                                        if (curl_perform_async(put_req, opts) == 0) {
-                                            log_module(KC_LOG, LOG_DEBUG,
-                                                       "[%s] kc_async coalesce_get: GET succeeded, "
-                                                       "issued PUT with %d merged attrs for %s",
-                                                       req_id, pending->attr_count, pending->user_id);
-                                            result = KC_SUCCESS;
-                                            /* Ownership transferred to put_req - don't free pending */
-                                            req->coalesce_pending = NULL;
-                                        } else {
-                                            log_module(KC_LOG, LOG_ERROR,
-                                                       "[%s] kc_async coalesce_get: Failed to start PUT",
-                                                       req_id);
-                                            put_req->coalesce_pending = NULL;  /* Return ownership */
-                                            free(put_req->bearer_token_copy);
-                                            free(put_uri);
-                                            free(json_body);
-                                            free(put_req);
-                                        }
-                                    }
-                                } else {
-                                    free(put_uri);
-                                    free(json_body);
-                                }
-                            } else {
-                                free(json_body);
-                            }
-                        }
-                    } else {
-                        log_module(KC_LOG, LOG_ERROR,
-                                   "[%s] kc_async coalesce_get: Invalid JSON: %s",
-                                   req_id, error.text);
-                    }
-                } else if (http_code == 404) {
-                    result = KC_NOT_FOUND;
-                    log_module(KC_LOG, LOG_DEBUG,
-                               "[%s] kc_async coalesce_get: User not found (HTTP 404)",
-                               req_id);
-                } else {
-                    log_module(KC_LOG, LOG_ERROR,
-                               "[%s] kc_async coalesce_get: GET failed (HTTP %ld)",
-                               req_id, http_code);
-                }
-
-                /* On error, invoke all callbacks. On success, PUT will handle callbacks. */
-                if (result != KC_SUCCESS) {
-                    kc_pending_invoke_all_callbacks(pending, result);
-                    kc_pending_update_free(pending);
-                    req->coalesce_pending = NULL;  /* Don't double-free in cleanup */
-                }
-                break;
-            }
-            }
-
-            /* Cleanup request */
-            kc_async_request_cleanup(req);
+        } else if (http_code == 404) {
+            result = KC_NOT_FOUND;
+            log_module(KC_LOG, LOG_DEBUG,
+                       "[%s] kc_async set_user_attr_get: User not found (HTTP 404)",
+                       req_id);
+        } else {
+            log_module(KC_LOG, LOG_ERROR,
+                       "[%s] kc_async set_user_attr_get: GET failed (HTTP %ld)",
+                       req_id, http_code);
         }
+
+        /* Only call callback on error - success continues to PUT phase */
+        if (result != KC_SUCCESS && req->cb.generic) {
+            req->cb.generic(req->session, result);
+        }
+        break;
     }
+    case KC_ASYNC_COALESCE_GET: {
+        /* GET phase completed for coalesced attribute update (cache miss case).
+         * Merge all pending attributes and issue single PUT. */
+        struct kc_pending_user_update *pending = req->coalesce_pending;
+        int result = KC_ERROR;
+
+        if (!pending) {
+            log_module(KC_LOG, LOG_ERROR,
+                       "[%s] kc_async coalesce_get: No pending update context",
+                       req_id);
+            break;
+        }
+
+        if (http_code == 200 && req->response.response) {
+            json_error_t error;
+            json_t *repr = json_loads(req->response.response, 0, &error);
+            if (repr) {
+                /* Strip credentials from GET response - they should not be in PUT
+                 * as Keycloak treats credentials in PUT as "add" not "replace" */
+                json_object_del(repr, "credentials");
+
+                /* Get or create attributes object */
+                json_t *attrs = json_object_get(repr, "attributes");
+                if (!attrs) {
+                    attrs = json_object();
+                    json_object_set_new(repr, "attributes", attrs);
+                }
+
+                /* Merge ALL pending attributes */
+                for (int i = 0; i < pending->attr_count; i++) {
+                    if (pending->attrs[i].value) {
+                        json_t *attr_array = json_array();
+                        json_array_append_new(attr_array, json_string(pending->attrs[i].value));
+                        json_object_set_new(attrs, pending->attrs[i].name, attr_array);
+                    } else {
+                        /* NULL value = delete attribute by setting to empty array */
+                        json_t *empty_array = json_array();
+                        json_object_set_new(attrs, pending->attrs[i].name, empty_array);
+                    }
+                }
+
+                /* Cache the merged representation AFTER merging attributes.
+                 * kc_user_repr_cache_put already strips credentials. */
+                json_t *id_json = json_object_get(repr, "id");
+                if (id_json && json_is_string(id_json)) {
+                    kc_user_repr_cache_put(json_string_value(id_json), repr);
+                }
+
+                /* Now issue PUT with full representation */
+                char *json_body = json_dumps(repr, JSON_COMPACT);
+                json_decref(repr);
+
+                if (json_body) {
+                    char *put_uri = kc_build_user_endpoint(req->realm_copy, pending->user_id);
+                    if (put_uri) {
+                        struct kc_async_request *put_req = calloc(1, sizeof(*put_req));
+                        if (put_req) {
+                            put_req->type = KC_ASYNC_SET_ATTR;
+                            put_req->coalesce_pending = pending;  /* Transfer ownership */
+                            put_req->uri = put_uri;
+                            put_req->post_fields = json_body;
+
+                            /* Get fresh token for PUT request */
+                            if (kc_token_mgr.token && kc_token_mgr.token->access_token) {
+                                put_req->bearer_token_copy = strdup(kc_token_mgr.token->access_token);
+                            }
+
+                            if (!put_req->bearer_token_copy) {
+                                log_module(KC_LOG, LOG_ERROR,
+                                           "[%s] kc_async coalesce_get: Failed to get bearer token for PUT",
+                                           req_id);
+                                put_req->coalesce_pending = NULL;  /* Return ownership */
+                                free(put_uri);
+                                free(json_body);
+                                free(put_req);
+                            } else {
+                                struct curl_opts opts = CURL_OPTS_INIT;
+                                opts.uri = put_req->uri;
+                                opts.method = HTTP_PUT;
+                                opts.post_fields = put_req->post_fields;
+                                opts.xoauth2_bearer = put_req->bearer_token_copy;
+                                opts.header_list[0] = "Content-Type: application/json";
+                                opts.header_count = 1;
+
+                                if (curl_perform_async(put_req, opts) == 0) {
+                                    log_module(KC_LOG, LOG_DEBUG,
+                                               "[%s] kc_async coalesce_get: GET succeeded, "
+                                               "issued PUT with %d merged attrs for %s",
+                                               req_id, pending->attr_count, pending->user_id);
+                                    result = KC_SUCCESS;
+                                    /* Ownership transferred to put_req - don't free pending */
+                                    req->coalesce_pending = NULL;
+                                } else {
+                                    log_module(KC_LOG, LOG_ERROR,
+                                               "[%s] kc_async coalesce_get: Failed to start PUT",
+                                               req_id);
+                                    put_req->coalesce_pending = NULL;  /* Return ownership */
+                                    free(put_req->bearer_token_copy);
+                                    free(put_uri);
+                                    free(json_body);
+                                    free(put_req);
+                                }
+                            }
+                        } else {
+                            free(put_uri);
+                            free(json_body);
+                        }
+                    } else {
+                        free(json_body);
+                    }
+                }
+            } else {
+                log_module(KC_LOG, LOG_ERROR,
+                           "[%s] kc_async coalesce_get: Invalid JSON: %s",
+                           req_id, error.text);
+            }
+        } else if (http_code == 404) {
+            result = KC_NOT_FOUND;
+            log_module(KC_LOG, LOG_DEBUG,
+                       "[%s] kc_async coalesce_get: User not found (HTTP 404)",
+                       req_id);
+        } else {
+            log_module(KC_LOG, LOG_ERROR,
+                       "[%s] kc_async coalesce_get: GET failed (HTTP %ld)",
+                       req_id, http_code);
+        }
+
+        /* On error, invoke all callbacks. On success, PUT will handle callbacks. */
+        if (result != KC_SUCCESS) {
+            kc_pending_invoke_all_callbacks(pending, result);
+            kc_pending_update_free(pending);
+            req->coalesce_pending = NULL;  /* Don't double-free in cleanup */
+        }
+        break;
+    }
+    }
+
+    /* Cleanup request */
+    kc_async_request_cleanup(req);
 }
 
-/* Initialize async HTTP infrastructure */
+/*
+ * Bridge completion callback — called by x3_kc_bridge when a request completes.
+ * Copies response data into kc_async_request and dispatches via the standard
+ * result handler.
+ */
+static void
+kc_async_bridge_complete(long http_code, const char *body, size_t body_len,
+                          json_t *json, const char *error, void *req_data)
+{
+    struct kc_async_request *req = (struct kc_async_request *)req_data;
+    (void)json;  /* Response is already in req->response from bridge copy */
+
+    /* Copy response body into req->response for existing parsing code */
+    if (body && body_len > 0) {
+        req->response.response = malloc(body_len + 1);
+        if (req->response.response) {
+            memcpy(req->response.response, body, body_len);
+            req->response.response[body_len] = '\0';
+            req->response.size = body_len;
+        }
+    }
+
+    /* Calculate latency from req->started */
+    unsigned long latency_ms = 0;
+    if (req->started > 0) {
+        time_t elapsed = time(NULL) - req->started;
+        latency_ms = (unsigned long)(elapsed * 1000);
+    }
+
+    int curl_failed = (http_code == 0 && error != NULL);
+    kc_async_handle_result(req, http_code, curl_failed, latency_ms);
+}
+
+/* Initialize async HTTP infrastructure via libkc bridge */
 static void
 kc_async_init(void)
 {
-    if (kc_curl_multi) return;  /* Already initialized */
+    if (x3_kc_bridge_is_ready()) return;  /* Already initialized */
 
-    kc_curl_multi = curl_multi_init();
-    if (!kc_curl_multi) {
-        log_module(KC_LOG, LOG_ERROR, "Failed to initialize curl_multi");
+    if (x3_kc_bridge_init() != 0) {
+        log_module(KC_LOG, LOG_ERROR, "Failed to initialize libkc bridge");
         return;
     }
-
-    /* Register callbacks */
-    curl_multi_setopt(kc_curl_multi, CURLMOPT_SOCKETFUNCTION, kc_curl_socket_cb);
-    curl_multi_setopt(kc_curl_multi, CURLMOPT_TIMERFUNCTION, kc_curl_timer_cb);
-
-    log_module(KC_LOG, LOG_INFO, "Keycloak async HTTP initialized (curl_multi + ioset)");
+    log_module(KC_LOG, LOG_INFO, "Keycloak async HTTP initialized (libkc bridge)");
 }
 
 /* Cleanup async HTTP infrastructure */
 static void
 kc_async_cleanup(void)
 {
-    /* Process any pending socket cleanup before shutting down curl */
-    kc_process_pending_cleanup();
-
-    if (kc_curl_multi) {
-        /* Remove any pending timers and clear poll hint */
-        timeq_del(0, kc_curl_timeout_fired, NULL, TIMEQ_IGNORE_WHEN | TIMEQ_IGNORE_DATA);
-        ioset_set_poll_hint_ms(0);
-
-        curl_multi_cleanup(kc_curl_multi);
-        kc_curl_multi = NULL;
-        log_module(KC_LOG, LOG_INFO, "Keycloak async HTTP cleaned up");
-    }
-
-    /* Cleanup handle pool */
-    kc_handle_pool_cleanup();
+    x3_kc_bridge_shutdown();
+    log_module(KC_LOG, LOG_INFO, "Keycloak async HTTP cleaned up (libkc bridge)");
 }
 
 /*
- * Async version of curl_perform - uses curl_multi for non-blocking HTTP
+ * Async version of curl_perform - submits HTTP request through libkc bridge.
  * The request struct must have uri, post_fields (if needed), session, type, and callback set.
  * Returns 0 on success (request started), -1 on error
  */
 static int
 curl_perform_async(struct kc_async_request *req, struct curl_opts opts)
 {
-    CURL *easy = NULL;
     const char *req_id = opts.request_id ? opts.request_id : "-";
-
-    /* Initialize async infrastructure if needed */
-    if (!kc_curl_multi) {
-        kc_async_init();
-        if (!kc_curl_multi) {
-            log_module(KC_LOG, LOG_ERROR, "[%s] curl_perform_async: Failed to init async", req_id);
-            return -1;
-        }
-    }
 
     if (!req || !opts.uri) {
         log_module(KC_LOG, LOG_DEBUG, "[%s] curl_perform_async: Invalid arguments", req_id);
         return -1;
+    }
+
+    /* Initialize bridge if needed */
+    if (!x3_kc_bridge_is_ready()) {
+        kc_async_init();
+        if (!x3_kc_bridge_is_ready()) {
+            log_module(KC_LOG, LOG_ERROR, "[%s] curl_perform_async: Failed to init bridge", req_id);
+            return -1;
+        }
     }
 
     /* Store request_id for completion logging */
@@ -3450,45 +3180,53 @@ curl_perform_async(struct kc_async_request *req, struct curl_opts opts)
     /* Record start time for timeout tracking */
     req->started = time(NULL);
 
-    /* Get handle from pool (or create new one) */
-    easy = kc_handle_pool_get();
-    if (!easy) {
-        log_module(KC_LOG, LOG_ERROR, "[%s] curl_perform_async: Failed to get handle", req_id);
-        return -1;
-    }
-    req->easy = easy;
+    /* Store max retries from opts */
+    if (opts.max_retries > 0)
+        req->max_retries = opts.max_retries;
 
-    /* Initialize response buffer */
-    req->response.response = malloc(1);
-    if (req->response.response) {
-        req->response.response[0] = 0;
-        req->response.size = 0;
+    /* Determine method string */
+    const char *method = "GET";
+    switch (opts.method) {
+    case HTTP_POST:   method = "POST";   break;
+    case HTTP_PUT:    method = "PUT";    break;
+    case HTTP_DELETE: method = "DELETE"; break;
+    default:          method = "GET";    break;
     }
 
-    /* Apply unified options - track header_list for cleanup */
-    if (curl_apply_opts(easy, opts, &req->response, &req->header_list) < 0) {
-        log_module(KC_LOG, LOG_ERROR, "[%s] curl_perform_async: Failed to apply options", req_id);
-        kc_handle_pool_put(easy);
-        req->easy = NULL;
-        return -1;
+    /* Determine body */
+    const char *body = NULL;
+    size_t body_len = 0;
+    if (opts.post_data && opts.post_data_len > 0) {
+        body = (const char *)opts.post_data;
+        body_len = opts.post_data_len;
+    } else if (opts.post_fields) {
+        body = opts.post_fields;
+        body_len = strlen(opts.post_fields);
     }
 
-    /* Store request pointer for callback retrieval */
-    curl_easy_setopt(easy, CURLOPT_PRIVATE, req);
+    /* Build headers list from curl_opts array */
+    struct curl_slist *headers = NULL;
+    for (size_t i = 0; i < opts.header_count && i < 10; i++) {
+        if (opts.header_list[i])
+            headers = curl_slist_append(headers, opts.header_list[i]);
+    }
+    req->header_list = headers;  /* Track for cleanup */
 
-    /* Add to multi handle - returns immediately */
-    CURLMcode mc = curl_multi_add_handle(kc_curl_multi, easy);
-    if (mc != CURLM_OK) {
-        log_module(KC_LOG, LOG_ERROR, "[%s] curl_perform_async: curl_multi_add_handle failed: %s",
-                   req_id, curl_multi_strerror(mc));
-        if (req->header_list) curl_slist_free_all(req->header_list);
+    /* Submit through bridge */
+    int rc = x3_kc_bridge_submit(
+        opts.uri, method, body, body_len,
+        headers, opts.xoauth2_bearer,
+        opts.auth_user, opts.auth_passwd,
+        kc_async_bridge_complete, req);
+
+    if (rc != 0) {
+        log_module(KC_LOG, LOG_ERROR, "[%s] curl_perform_async: Bridge submit failed", req_id);
+        if (headers) curl_slist_free_all(headers);
         req->header_list = NULL;
-        curl_easy_cleanup(easy);
-        req->easy = NULL;
         return -1;
     }
 
-    log_module(KC_LOG, LOG_DEBUG, "[%s] curl_perform_async: Request started", req_id);
+    log_module(KC_LOG, LOG_DEBUG, "[%s] curl_perform_async: Request started via bridge", req_id);
     return 0;
 }
 
@@ -3570,7 +3308,6 @@ error:
         curl_free(passwd_enc);
     }
     if (req) {
-        if (req->easy) curl_easy_cleanup(req->easy);
         if (req->uri) free(req->uri);
         if (req->post_fields) {
             memset(req->post_fields, 0, strlen(req->post_fields));
@@ -3721,7 +3458,6 @@ keycloak_find_user_by_fingerprint_async(struct kc_realm realm, struct kc_client 
 error:
     if (escaped_fp) curl_free(escaped_fp);
     if (req) {
-        if (req->easy) curl_easy_cleanup(req->easy);
         if (req->uri) free(req->uri);
         if (req->bearer_token_copy) free(req->bearer_token_copy);
         if (req->response.response) free(req->response.response);
@@ -3804,7 +3540,6 @@ keycloak_introspect_token_async(struct kc_realm realm, struct kc_client client,
 error:
     if (token_enc) curl_free(token_enc);
     if (req) {
-        if (req->easy) curl_easy_cleanup(req->easy);
         if (req->uri) free(req->uri);
         if (req->post_fields) {
             memset(req->post_fields, 0, strlen(req->post_fields));
@@ -4255,7 +3990,6 @@ keycloak_set_user_attribute_array_async(struct kc_realm realm, struct kc_client 
 error:
     if (json_body) free(json_body);
     if (req) {
-        if (req->easy) curl_easy_cleanup(req->easy);
         if (req->uri) free(req->uri);
         if (req->bearer_token_copy) free(req->bearer_token_copy);
         if (req->post_fields) {
@@ -4351,7 +4085,6 @@ keycloak_set_email_verified_async(struct kc_realm realm, struct kc_client client
 error:
     if (json_body) free(json_body);
     if (req) {
-        if (req->easy) curl_easy_cleanup(req->easy);
         if (req->uri) free(req->uri);
         if (req->bearer_token_copy) free(req->bearer_token_copy);
         if (req->post_fields) {
@@ -4427,7 +4160,6 @@ keycloak_add_user_to_group_async(struct kc_realm realm, struct kc_client client,
 
 error:
     if (req) {
-        if (req->easy) curl_easy_cleanup(req->easy);
         if (req->uri) free(req->uri);
         if (req->bearer_token_copy) free(req->bearer_token_copy);
         if (req->response.response) free(req->response.response);
@@ -4499,7 +4231,6 @@ keycloak_remove_user_from_group_async(struct kc_realm realm, struct kc_client cl
 
 error:
     if (req) {
-        if (req->easy) curl_easy_cleanup(req->easy);
         if (req->uri) free(req->uri);
         if (req->bearer_token_copy) free(req->bearer_token_copy);
         if (req->response.response) free(req->response.response);
@@ -4586,7 +4317,6 @@ kc_webpush_send_async(const char *endpoint,
 
 error:
     if (req) {
-        if (req->easy) curl_easy_cleanup(req->easy);
         if (req->uri) free(req->uri);
         if (req->post_data_copy) free(req->post_data_copy);
         if (req->response.response) free(req->response.response);
@@ -4694,7 +4424,6 @@ keycloak_create_user_async(struct kc_realm realm, struct kc_client client,
 
 error:
     if (req) {
-        if (req->easy) curl_easy_cleanup(req->easy);
         if (req->uri) free(req->uri);
         if (req->bearer_token_copy) free(req->bearer_token_copy);
         if (req->post_fields) {
@@ -4806,7 +4535,6 @@ keycloak_create_user_with_hash_async(struct kc_realm realm, struct kc_client cli
 
 error:
     if (req) {
-        if (req->easy) curl_easy_cleanup(req->easy);
         if (req->uri) free(req->uri);
         if (req->bearer_token_copy) free(req->bearer_token_copy);
         if (req->post_fields) {
