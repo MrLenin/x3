@@ -122,14 +122,15 @@ am_x3_OBJECTS = base64.$(OBJEXT) chanserv.$(OBJEXT) compat.$(OBJEXT) \
 	getopt.$(OBJEXT) getopt1.$(OBJEXT) gline.$(OBJEXT) \
 	global.$(OBJEXT) hash.$(OBJEXT) heap.$(OBJEXT) \
 	helpfile.$(OBJEXT) ioset.$(OBJEXT) log.$(OBJEXT) \
-	log_async.$(OBJEXT) main.$(OBJEXT) math.$(OBJEXT) md5.$(OBJEXT) modcmd.$(OBJEXT) \
-	modules.$(OBJEXT) password.$(OBJEXT) keycloak.$(OBJEXT) \
+	log_async.$(OBJEXT) main.$(OBJEXT) math.$(OBJEXT) \
+	md5.$(OBJEXT) modcmd.$(OBJEXT) modules.$(OBJEXT) \
+	password.$(OBJEXT) keycloak.$(OBJEXT) \
 	keycloak_webhook.$(OBJEXT) nickserv.$(OBJEXT) opserv.$(OBJEXT) \
 	policer.$(OBJEXT) recdb.$(OBJEXT) sar.$(OBJEXT) \
 	saxdb.$(OBJEXT) spamserv.$(OBJEXT) shun.$(OBJEXT) \
 	timeq.$(OBJEXT) tools.$(OBJEXT) x3ldap.$(OBJEXT) \
-	x3_ssl.$(OBJEXT) x3_compress.$(OBJEXT) \
-	mempool.$(OBJEXT) threadpool.$(OBJEXT) version.$(OBJEXT)
+	x3_ssl.$(OBJEXT) x3_compress.$(OBJEXT) mempool.$(OBJEXT) \
+	threadpool.$(OBJEXT) version.$(OBJEXT)
 x3_OBJECTS = $(am_x3_OBJECTS)
 AM_V_P = $(am__v_P_@AM_V@)
 am__v_P_ = $(am__v_P_@AM_DEFAULT_V@)
@@ -158,24 +159,25 @@ am__depfiles_remade = ./$(DEPDIR)/alloc-slab.Po \
 	./$(DEPDIR)/ioset-epoll.Po ./$(DEPDIR)/ioset-kevent.Po \
 	./$(DEPDIR)/ioset-select.Po ./$(DEPDIR)/ioset.Po \
 	./$(DEPDIR)/keycloak.Po ./$(DEPDIR)/keycloak_webhook.Po \
-	./$(DEPDIR)/log.Po ./$(DEPDIR)/mail-common.Po \
-	./$(DEPDIR)/mail-sendmail.Po ./$(DEPDIR)/main-common.Po \
-	./$(DEPDIR)/main.Po ./$(DEPDIR)/math.Po ./$(DEPDIR)/md5.Po \
-	./$(DEPDIR)/mempool.Po ./$(DEPDIR)/mod-blacklist.Po \
-	./$(DEPDIR)/mod-helpserv.Po ./$(DEPDIR)/mod-histserv.Po \
-	./$(DEPDIR)/mod-memoserv.Po ./$(DEPDIR)/mod-python.Po \
-	./$(DEPDIR)/mod-qserver.Po ./$(DEPDIR)/mod-snoop.Po \
-	./$(DEPDIR)/mod-sockcheck.Po ./$(DEPDIR)/mod-track.Po \
-	./$(DEPDIR)/mod-webtv.Po ./$(DEPDIR)/modcmd.Po \
-	./$(DEPDIR)/modules.Po ./$(DEPDIR)/nickserv.Po \
-	./$(DEPDIR)/opserv.Po ./$(DEPDIR)/password.Po \
-	./$(DEPDIR)/policer.Po ./$(DEPDIR)/proto-common.Po \
-	./$(DEPDIR)/proto-p10.Po ./$(DEPDIR)/recdb.Po \
-	./$(DEPDIR)/sar.Po ./$(DEPDIR)/saxdb.Po ./$(DEPDIR)/shun.Po \
-	./$(DEPDIR)/slab-read.Po ./$(DEPDIR)/spamserv.Po \
-	./$(DEPDIR)/threadpool.Po ./$(DEPDIR)/timeq.Po \
-	./$(DEPDIR)/tools.Po ./$(DEPDIR)/version.Po \
-	./$(DEPDIR)/x3_compress.Po \
+	./$(DEPDIR)/log.Po ./$(DEPDIR)/log_async.Po \
+	./$(DEPDIR)/mail-common.Po ./$(DEPDIR)/mail-sendmail.Po \
+	./$(DEPDIR)/main-common.Po ./$(DEPDIR)/main.Po \
+	./$(DEPDIR)/math.Po ./$(DEPDIR)/md5.Po ./$(DEPDIR)/mempool.Po \
+	./$(DEPDIR)/mod-blacklist.Po ./$(DEPDIR)/mod-helpserv.Po \
+	./$(DEPDIR)/mod-histserv.Po ./$(DEPDIR)/mod-memoserv.Po \
+	./$(DEPDIR)/mod-python.Po ./$(DEPDIR)/mod-qserver.Po \
+	./$(DEPDIR)/mod-snoop.Po ./$(DEPDIR)/mod-sockcheck.Po \
+	./$(DEPDIR)/mod-track.Po ./$(DEPDIR)/mod-webtv.Po \
+	./$(DEPDIR)/modcmd.Po ./$(DEPDIR)/modules.Po \
+	./$(DEPDIR)/nickserv.Po ./$(DEPDIR)/opserv.Po \
+	./$(DEPDIR)/password.Po ./$(DEPDIR)/policer.Po \
+	./$(DEPDIR)/proto-common.Po ./$(DEPDIR)/proto-p10.Po \
+	./$(DEPDIR)/recdb.Po ./$(DEPDIR)/sar.Po ./$(DEPDIR)/saxdb.Po \
+	./$(DEPDIR)/shun.Po ./$(DEPDIR)/slab-read.Po \
+	./$(DEPDIR)/spamserv.Po ./$(DEPDIR)/threadpool.Po \
+	./$(DEPDIR)/timeq.Po ./$(DEPDIR)/tools.Po \
+	./$(DEPDIR)/version.Po ./$(DEPDIR)/x3_compress.Po \
+	./$(DEPDIR)/x3_kc_adapter.Po ./$(DEPDIR)/x3_kc_bridge.Po \
 	./$(DEPDIR)/x3_lmdb.Po ./$(DEPDIR)/x3_ssl.Po \
 	./$(DEPDIR)/x3ldap.Po
 am__mv = mv -f
@@ -342,7 +344,7 @@ top_builddir = @top_builddir@
 top_srcdir = @top_srcdir@
 
 # -D__USE_ISOC23=0 prevents glibc C23 strtol redirects that cause linker errors on Debian 12
-AM_CPPFLAGS = @RX_INCLUDES@ -DPREFIX=\"@prefix@\" -D__USE_ISOC23=0
+AM_CPPFLAGS = @RX_INCLUDES@ -DPREFIX=\"@prefix@\" -D__USE_ISOC23=0 -I$(top_srcdir)/../libkc/include
 noinst_DATA = \
 	chanserv.help \
 	global.help \
@@ -382,9 +384,11 @@ EXTRA_x3_SOURCES = \
 	mod-webtv.c \
 	mod-python.c \
 	mod-qserver.c \
-	x3_lmdb.c
+	x3_lmdb.c \
+	x3_kc_adapter.c \
+	x3_kc_bridge.c
 
-x3_LDADD = @MODULE_OBJS@
+x3_LDADD = @MODULE_OBJS@ $(top_srcdir)/../libkc/libkc.a
 x3_DEPENDENCIES = @MODULE_OBJS@
 x3_SOURCES = \
 	base64.c base64.h \
@@ -412,6 +416,8 @@ x3_SOURCES = \
 	password.c password.h \
 	keycloak.c keycloak.h \
 	keycloak_webhook.c keycloak_webhook.h \
+	x3_kc_adapter.h \
+	x3_kc_bridge.h \
 	nickserv.c nickserv.h \
 	x3_lmdb.h \
 	opserv.c opserv.h \
@@ -532,6 +538,7 @@ distclean-compile:
 @AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/keycloak.Po@am__quote@ # am--include-marker
 @AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/keycloak_webhook.Po@am__quote@ # am--include-marker
 @AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/log.Po@am__quote@ # am--include-marker
+@AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/log_async.Po@am__quote@ # am--include-marker
 @AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/mail-common.Po@am__quote@ # am--include-marker
 @AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/mail-sendmail.Po@am__quote@ # am--include-marker
 @AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/main-common.Po@am__quote@ # am--include-marker
@@ -568,6 +575,8 @@ distclean-compile:
 @AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/tools.Po@am__quote@ # am--include-marker
 @AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/version.Po@am__quote@ # am--include-marker
 @AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/x3_compress.Po@am__quote@ # am--include-marker
+@AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/x3_kc_adapter.Po@am__quote@ # am--include-marker
+@AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/x3_kc_bridge.Po@am__quote@ # am--include-marker
 @AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/x3_lmdb.Po@am__quote@ # am--include-marker
 @AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/x3_ssl.Po@am__quote@ # am--include-marker
 @AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/x3ldap.Po@am__quote@ # am--include-marker
@@ -739,6 +748,7 @@ distclean: distclean-am
 	-rm -f ./$(DEPDIR)/keycloak.Po
 	-rm -f ./$(DEPDIR)/keycloak_webhook.Po
 	-rm -f ./$(DEPDIR)/log.Po
+	-rm -f ./$(DEPDIR)/log_async.Po
 	-rm -f ./$(DEPDIR)/mail-common.Po
 	-rm -f ./$(DEPDIR)/mail-sendmail.Po
 	-rm -f ./$(DEPDIR)/main-common.Po
@@ -774,8 +784,9 @@ distclean: distclean-am
 	-rm -f ./$(DEPDIR)/timeq.Po
 	-rm -f ./$(DEPDIR)/tools.Po
 	-rm -f ./$(DEPDIR)/version.Po
-
 	-rm -f ./$(DEPDIR)/x3_compress.Po
+	-rm -f ./$(DEPDIR)/x3_kc_adapter.Po
+	-rm -f ./$(DEPDIR)/x3_kc_bridge.Po
 	-rm -f ./$(DEPDIR)/x3_lmdb.Po
 	-rm -f ./$(DEPDIR)/x3_ssl.Po
 	-rm -f ./$(DEPDIR)/x3ldap.Po
@@ -848,6 +859,7 @@ maintainer-clean: maintainer-clean-am
 	-rm -f ./$(DEPDIR)/keycloak.Po
 	-rm -f ./$(DEPDIR)/keycloak_webhook.Po
 	-rm -f ./$(DEPDIR)/log.Po
+	-rm -f ./$(DEPDIR)/log_async.Po
 	-rm -f ./$(DEPDIR)/mail-common.Po
 	-rm -f ./$(DEPDIR)/mail-sendmail.Po
 	-rm -f ./$(DEPDIR)/main-common.Po
@@ -883,8 +895,9 @@ maintainer-clean: maintainer-clean-am
 	-rm -f ./$(DEPDIR)/timeq.Po
 	-rm -f ./$(DEPDIR)/tools.Po
 	-rm -f ./$(DEPDIR)/version.Po
-
 	-rm -f ./$(DEPDIR)/x3_compress.Po
+	-rm -f ./$(DEPDIR)/x3_kc_adapter.Po
+	-rm -f ./$(DEPDIR)/x3_kc_bridge.Po
 	-rm -f ./$(DEPDIR)/x3_lmdb.Po
 	-rm -f ./$(DEPDIR)/x3_ssl.Po
 	-rm -f ./$(DEPDIR)/x3ldap.Po

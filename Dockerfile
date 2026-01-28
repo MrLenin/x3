@@ -26,7 +26,6 @@ USER x3
 
 WORKDIR  /x3/x3src
 
-# configure script already regenerated with LMDB support - no autogen.sh needed
 # Enable SSL for encrypted uplink connections to IRCd
 # Disable glibc C23 features to avoid __isoc23_strtol linker errors on Debian 12
 ENV CFLAGS="-D__USE_ISOC23=0 -g -O2 -fno-omit-frame-pointer"

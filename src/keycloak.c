@@ -657,8 +657,10 @@ keycloak_exit_handler(UNUSED_ARG(void *extra))
     cleanup_keycloak();
 }
 
-/* Forward declaration for async cleanup */
+/* Forward declarations */
 static void kc_async_cleanup(void);
+static void kc_async_bridge_complete(long http_code, const char *body, size_t body_len,
+                                      json_t *json, const char *error, void *req_data);
 
 void
 cleanup_keycloak(void)
@@ -2599,6 +2601,101 @@ kc_async_handle_result(struct kc_async_request *req, long http_code,
             log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async set_group_attr: Error (HTTP %ld)", req_id, http_code);
         }
         if (req->cb.generic) {
+            req->cb.generic(req->session, result);
+        }
+        break;
+    }
+    case KC_ASYNC_SET_GROUP_ATTR_GET: {
+        /* GET phase completed for group attribute update.
+         * Merge the attribute and issue PUT with full representation. */
+        int result = KC_ERROR;
+
+        if (http_code == 200 && req->response.response) {
+            json_error_t error;
+            json_t *repr = json_loads(req->response.response, 0, &error);
+            if (repr) {
+                /* Get or create attributes object */
+                json_t *attrs = json_object_get(repr, "attributes");
+                if (!attrs) {
+                    attrs = json_object();
+                    json_object_set_new(repr, "attributes", attrs);
+                }
+
+                /* Set the attribute */
+                if (req->group_attr_value) {
+                    json_t *attr_array = json_array();
+                    json_array_append_new(attr_array, json_string(req->group_attr_value));
+                    json_object_set_new(attrs, req->user_attr_name, attr_array);
+                }
+
+                /* Issue PUT with full representation */
+                char *json_body = json_dumps(repr, JSON_COMPACT);
+                json_decref(repr);
+
+                if (json_body) {
+                    char *put_uri = kc_build_group_endpoint(req->realm_copy, req->group_id);
+                    if (put_uri) {
+                        struct kc_async_request *put_req = calloc(1, sizeof(*put_req));
+                        if (put_req) {
+                            put_req->session = req->session;
+                            put_req->type = KC_ASYNC_SET_GROUP_ATTR;
+                            put_req->cb.generic = req->cb.generic;
+                            put_req->uri = put_uri;
+                            put_req->post_fields = json_body;
+
+                            put_req->bearer_token_copy = strdup(req->bearer_token_copy);
+                            if (!put_req->bearer_token_copy) {
+                                log_module(KC_LOG, LOG_ERROR,
+                                           "[%s] kc_async set_group_attr_get: Failed to copy bearer token",
+                                           req_id);
+                                free(put_uri);
+                                free(json_body);
+                                free(put_req);
+                            } else {
+                                struct curl_opts opts = CURL_OPTS_INIT;
+                                opts.uri = put_req->uri;
+                                opts.method = HTTP_PUT;
+                                opts.post_fields = put_req->post_fields;
+                                opts.xoauth2_bearer = put_req->bearer_token_copy;
+                                opts.header_list[0] = "Content-Type: application/json";
+                                opts.header_count = 1;
+
+                                if (curl_perform_async(put_req, opts) == 0) {
+                                    log_module(KC_LOG, LOG_DEBUG,
+                                               "[%s] kc_async set_group_attr_get: GET succeeded, "
+                                               "issued PUT with merged attributes for group %s",
+                                               req_id, req->group_id);
+                                    result = KC_SUCCESS;
+                                } else {
+                                    log_module(KC_LOG, LOG_ERROR,
+                                               "[%s] kc_async set_group_attr_get: PUT submit failed",
+                                               req_id);
+                                    free(put_req->bearer_token_copy);
+                                    free(put_uri);
+                                    free(json_body);
+                                    free(put_req);
+                                }
+                            }
+                        } else {
+                            free(put_uri);
+                            free(json_body);
+                        }
+                    } else {
+                        free(json_body);
+                    }
+                }
+            } else {
+                log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async set_group_attr_get: JSON parse error", req_id);
+            }
+        } else if (http_code == 404) {
+            result = KC_NOT_FOUND;
+            log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async set_group_attr_get: Not found (HTTP 404)", req_id);
+        } else {
+            log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async set_group_attr_get: Error (HTTP %ld)", req_id, http_code);
+        }
+
+        /* Only invoke callback on error - success means PUT is in flight */
+        if (result != KC_SUCCESS && req->cb.generic) {
             req->cb.generic(req->session, result);
         }
         break;

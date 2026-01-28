@@ -9027,6 +9027,8 @@ fi
 printf "%s\n" "#define WITH_KEYCLOAK 1" >>confdefs.h
 
       keycloak_message="Keycloak support:   enabled"
+
+            MODULE_OBJS="$MODULE_OBJS x3_kc_adapter.\$(OBJEXT) x3_kc_bridge.\$(OBJEXT)"
    fi
 fi
 
