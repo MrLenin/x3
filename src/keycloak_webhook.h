@@ -5,11 +5,9 @@
  * Receives real-time events from Keycloak to invalidate caches immediately
  * when credentials change, users are deleted, or fingerprints are revoked.
  *
- * Keycloak Configuration:
- *   1. Go to Realm Settings -> Events -> Admin Events Settings
- *   2. Enable "Include Representation" for UPDATE operations
- *   3. Add an Event Listener SPI or use a custom webhook provider
- *   4. Point webhook URL to: http://x3-host:WEBHOOK_PORT/keycloak-webhook
+ * Uses libkc's kc_webhook module for TCP/HTTP/queue infrastructure.
+ * This file contains only X3-specific business logic (cache invalidation,
+ * SCRAM pre-population, ChanServ access sync).
  */
 #ifndef KEYCLOAK_WEBHOOK_H
 #define KEYCLOAK_WEBHOOK_H
@@ -26,53 +24,34 @@
 
 #if WITH_KEYCLOAK_WEBHOOK
 
-/* Default webhook port (0 = disabled) */
-#define KC_WEBHOOK_PORT_DEFAULT 0
-
-/* Maximum HTTP request size (64KB should be plenty for Keycloak events) */
-#define KC_WEBHOOK_MAX_REQUEST 65536
-
-/* Webhook event types we handle */
-typedef enum {
-    KC_EVENT_UNKNOWN = 0,
-    KC_EVENT_DELETE_CREDENTIAL,    /* Fingerprint/cert removed */
-    KC_EVENT_UPDATE_PASSWORD,      /* Password changed */
-    KC_EVENT_LOGOUT_ALL_SESSIONS,  /* User logged out all sessions */
-    KC_EVENT_DELETE_USER,          /* User account deleted */
-    KC_EVENT_UPDATE_USER,          /* User details updated */
-    KC_EVENT_REVOKE_GRANT,         /* OAuth grant revoked */
-    KC_EVENT_GROUP_MEMBERSHIP,     /* User added/removed from group */
-    KC_EVENT_GROUP_UPDATE          /* Group attributes updated */
-} kc_webhook_event_type;
-
-/* Webhook statistics */
-struct kc_webhook_stats {
-    unsigned long events_received;
+/* X3-specific webhook statistics (libkc tracks transport-level stats separately) */
+struct x3_webhook_stats {
     unsigned long events_processed;
-    unsigned long events_invalid;
-    unsigned long events_queued;          /* Events currently in async queue */
     unsigned long cache_invalidations;
     unsigned long fingerprint_deletions;
-    unsigned long fingerprint_additions;  /* Fingerprints pre-cached from webhook */
+    unsigned long fingerprint_additions;
     unsigned long session_revocations;
-    unsigned long group_syncs;            /* Channel syncs triggered by group events */
-    unsigned long scram_invalidations;    /* SCRAM caches invalidated */
-    unsigned long opserv_invalidations;   /* OpServ level cache invalidations */
-    unsigned long metadata_invalidations; /* Metadata cache invalidations */
-    unsigned long access_updates_skipped; /* No-op access updates skipped */
-    unsigned long access_updates_queued;  /* Access updates queued for processing */
-    unsigned long access_updates_processed; /* Access updates processed from queue */
-    unsigned long access_updates_dropped; /* Access updates dropped (queue full) */
-    unsigned long access_queue_depth;     /* Current access update queue depth */
+    unsigned long group_syncs;
+    unsigned long scram_invalidations;
+    unsigned long opserv_invalidations;
+    unsigned long metadata_invalidations;
+    unsigned long access_updates_skipped;
+    unsigned long access_updates_queued;
+    unsigned long access_updates_processed;
+    unsigned long access_updates_dropped;
+    unsigned long access_queue_depth;
     time_t last_event_time;
 };
 
 /**
- * Initialize the Keycloak webhook listener
+ * Initialize the Keycloak webhook listener (wraps kc_webhook_init)
  * Called from nickserv_init() if webhook_enable is configured
+ * @param port      Port to listen on (0 = disabled)
+ * @param secret    Shared secret for X-Webhook-Secret validation (NULL = no auth)
+ * @param bind_addr Bind address (NULL = all interfaces)
  * @return 0 on success, -1 on failure
  */
-int keycloak_webhook_init(void);
+int keycloak_webhook_init(int port, const char *secret, const char *bind_addr);
 
 /**
  * Shutdown the webhook listener
@@ -87,17 +66,15 @@ void keycloak_webhook_shutdown(void);
 int keycloak_webhook_is_running(void);
 
 /**
- * Get webhook statistics
+ * Get X3-specific webhook statistics
  * @return Pointer to static stats structure
  */
-const struct kc_webhook_stats *keycloak_webhook_get_stats(void);
+const struct x3_webhook_stats *keycloak_webhook_get_x3_stats(void);
 
 /**
- * Configuration accessors
+ * Update the webhook secret at runtime (e.g. on rehash)
+ * @param secret New shared secret (NULL = disable auth)
  */
-int keycloak_webhook_get_port(void);
-const char *keycloak_webhook_get_secret(void);
-void keycloak_webhook_set_port(int port);
 void keycloak_webhook_set_secret(const char *secret);
 
 /**
@@ -114,13 +91,10 @@ int keycloak_invalidate_user_caches(const char *username,
 #else /* !WITH_KEYCLOAK_WEBHOOK */
 
 /* Stub macros when webhook is not available */
-#define keycloak_webhook_init()           (0)
+#define keycloak_webhook_init(p, s, b)    (0)
 #define keycloak_webhook_shutdown()       do {} while(0)
 #define keycloak_webhook_is_running()     (0)
-#define keycloak_webhook_get_stats()      ((const struct kc_webhook_stats *)NULL)
-#define keycloak_webhook_get_port()       (0)
-#define keycloak_webhook_get_secret()     ("")
-#define keycloak_webhook_set_port(p)      do {} while(0)
+#define keycloak_webhook_get_x3_stats()   ((const struct x3_webhook_stats *)NULL)
 #define keycloak_webhook_set_secret(s)    do {} while(0)
 #define keycloak_invalidate_user_caches(u, f, s) (0)
 

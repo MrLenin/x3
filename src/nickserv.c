@@ -10405,10 +10405,10 @@ nickserv_conf_read(void)
         log_module(NS_LOG, LOG_INFO, "Keycloak integration enabled for realm %s", nickserv_conf.keycloak_realm);
 
         /* Initialize webhook listener if configured */
-        keycloak_webhook_set_port(nickserv_conf.keycloak_webhook_port);
-        keycloak_webhook_set_secret(nickserv_conf.keycloak_webhook_secret);
         if (nickserv_conf.keycloak_webhook_port > 0) {
-            if (keycloak_webhook_init() == 0) {
+            if (keycloak_webhook_init(nickserv_conf.keycloak_webhook_port,
+                                       nickserv_conf.keycloak_webhook_secret,
+                                       nickserv_conf.keycloak_webhook_bind) == 0) {
                 log_module(NS_LOG, LOG_INFO, "Keycloak webhook listener started on port %u",
                            nickserv_conf.keycloak_webhook_port);
             } else {

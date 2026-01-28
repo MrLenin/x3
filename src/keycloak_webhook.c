@@ -2,65 +2,39 @@
  * Keycloak Webhook Handler for X3
  * Copyright (C) 2025 AfterNET Development Team
  *
- * Receives Keycloak Admin Events via HTTP POST for real-time cache invalidation.
+ * X3-specific business logic for Keycloak webhook events.
+ * TCP/HTTP/queue infrastructure is provided by libkc's kc_webhook module.
  */
 
 #include "keycloak_webhook.h"
 
 #if WITH_KEYCLOAK_WEBHOOK
 
-#include "ioset.h"
 #include "log.h"
-#include "conf.h"
 #include "common.h"
 #include "x3_lmdb.h"
 #include "nickserv.h"
 #include "chanserv.h"  /* For chanserv_queue_keycloak_sync, kc_group_path_to_channel */
 #include "keycloak.h"  /* For kc_user_repr_cache_put/remove */
-#include "timeq.h"     /* For async event processing */
+#include "timeq.h"     /* For access queue timer */
 
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
-#include <ctype.h>
-#include <time.h>
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
 #include <jansson.h>
+
+#include <kc/kc_webhook.h>
 
 /* Log module */
 static struct log_type *webhook_log;
 
-/* Configuration */
-static int webhook_port = KC_WEBHOOK_PORT_DEFAULT;
-static char *webhook_secret = NULL;
-static char *webhook_bind_address = NULL;
-
-/* Listener socket */
-static struct io_fd *webhook_listener = NULL;
-
-/* Statistics */
-static struct kc_webhook_stats stats = {0};
-
-/* Async event queue */
-#define WEBHOOK_QUEUE_MAX 1000  /* Max queued events before dropping */
-
-struct webhook_event {
-    char *payload;
-    size_t payload_len;
-    struct webhook_event *next;
-};
-
-static struct webhook_event *event_queue_head = NULL;
-static struct webhook_event *event_queue_tail = NULL;
-static unsigned int event_queue_size = 0;
-static int process_scheduled = 0;
+/* X3-specific statistics */
+static struct x3_webhook_stats x3_stats = {0};
 
 /* Access update queue - decouples webhook receipt from chanserv processing */
-#define ACCESS_QUEUE_MAX 5000       /* Max queued access updates */
-#define ACCESS_QUEUE_BATCH 20       /* Process this many per timer tick */
-#define ACCESS_QUEUE_INTERVAL 1     /* Timer interval in seconds */
+#define ACCESS_QUEUE_MAX 5000
+#define ACCESS_QUEUE_BATCH 20
+#define ACCESS_QUEUE_INTERVAL 1
 
 struct access_update_entry {
     char channel[CHANNELLEN+1];
@@ -74,418 +48,9 @@ static struct access_update_entry *access_queue_tail = NULL;
 static unsigned int access_queue_size = 0;
 static int access_queue_scheduled = 0;
 
-/* Forward declaration for access queue processing */
-static void access_queue_process(void *data);
-
-/* HTTP connection state */
-struct webhook_conn {
-    struct io_fd *fd;
-    char *buffer;
-    size_t buf_size;
-    size_t buf_used;
-    int headers_complete;
-    size_t content_length;
-    char method[16];
-    char path[256];
-    char content_type[128];
-    char auth_header[256];
-};
-
 /* Forward declarations */
-static void webhook_accept(struct io_fd *listener, struct io_fd *new_fd);
-static void webhook_readable(struct io_fd *fd);
-static void webhook_destroy(struct io_fd *fd);
-static int process_webhook_request(struct webhook_conn *conn);
-static int parse_http_headers(struct webhook_conn *conn);
-static int handle_keycloak_event(const char *body, size_t body_len);
-static void send_http_response(struct io_fd *fd, int status, const char *message);
-static void webhook_process_queue(void *data);
-static int webhook_queue_event(const char *payload, size_t len);
-
-/*
- * Initialize webhook listener
- */
-int
-keycloak_webhook_init(void)
-{
-    struct addrinfo hints, *ai;
-    char port_str[16];
-    int res;
-
-    webhook_log = log_register_type("Webhook", "file:webhook.log");
-
-    if (webhook_port <= 0) {
-        log_module(webhook_log, LOG_DEBUG, "Keycloak webhook disabled (port=0)");
-        return 0;
-    }
-
-    /* Close existing listener if any */
-    if (webhook_listener) {
-        ioset_close(webhook_listener, 1);
-        webhook_listener = NULL;
-    }
-
-    memset(&hints, 0, sizeof(hints));
-    hints.ai_flags = AI_PASSIVE;
-    hints.ai_family = AF_INET;  /* IPv4 for simplicity */
-    hints.ai_socktype = SOCK_STREAM;
-
-    snprintf(port_str, sizeof(port_str), "%d", webhook_port);
-    res = getaddrinfo(webhook_bind_address, port_str, &hints, &ai);
-    if (res) {
-        log_module(webhook_log, LOG_ERROR,
-                   "Failed to resolve webhook address [%s]:%s: %s",
-                   webhook_bind_address ? webhook_bind_address : "*",
-                   port_str, gai_strerror(res));
-        return -1;
-    }
-
-    webhook_listener = ioset_listen(ai->ai_addr, ai->ai_addrlen, NULL, webhook_accept);
-    freeaddrinfo(ai);
-
-    if (!webhook_listener) {
-        log_module(webhook_log, LOG_ERROR,
-                   "Failed to listen on [%s]:%d for Keycloak webhook",
-                   webhook_bind_address ? webhook_bind_address : "*",
-                   webhook_port);
-        return -1;
-    }
-
-    log_module(webhook_log, LOG_INFO,
-               "Keycloak webhook listening on port %d", webhook_port);
-    return 0;
-}
-
-/*
- * Shutdown webhook listener
- */
-void
-keycloak_webhook_shutdown(void)
-{
-    struct webhook_event *evt, *next;
-
-    if (webhook_listener) {
-        ioset_close(webhook_listener, 1);
-        webhook_listener = NULL;
-        log_module(webhook_log, LOG_INFO, "Keycloak webhook listener closed");
-    }
-
-    /* Drain the event queue */
-    for (evt = event_queue_head; evt; evt = next) {
-        next = evt->next;
-        free(evt->payload);
-        free(evt);
-    }
-    event_queue_head = event_queue_tail = NULL;
-    event_queue_size = 0;
-    process_scheduled = 0;
-
-    free(webhook_secret);
-    webhook_secret = NULL;
-    free(webhook_bind_address);
-    webhook_bind_address = NULL;
-}
-
-/*
- * Check if webhook is running
- */
-int
-keycloak_webhook_is_running(void)
-{
-    return webhook_listener != NULL;
-}
-
-/*
- * Get webhook statistics
- */
-const struct kc_webhook_stats *
-keycloak_webhook_get_stats(void)
-{
-    return &stats;
-}
-
-/*
- * Configuration accessors
- */
-int keycloak_webhook_get_port(void) { return webhook_port; }
-const char *keycloak_webhook_get_secret(void) { return webhook_secret ? webhook_secret : ""; }
-
-void
-keycloak_webhook_set_port(int port)
-{
-    webhook_port = port;
-}
-
-void
-keycloak_webhook_set_secret(const char *secret)
-{
-    free(webhook_secret);
-    webhook_secret = secret ? strdup(secret) : NULL;
-}
-
-/*
- * Accept new webhook connection
- */
-static void
-webhook_accept(UNUSED_ARG(struct io_fd *listener), struct io_fd *new_fd)
-{
-    struct webhook_conn *conn;
-
-    conn = calloc(1, sizeof(*conn));
-    if (!conn) {
-        ioset_close(new_fd, 1);
-        return;
-    }
-
-    conn->fd = new_fd;
-    conn->buf_size = 4096;  /* Initial buffer size */
-    conn->buffer = malloc(conn->buf_size);
-    if (!conn->buffer) {
-        free(conn);
-        ioset_close(new_fd, 1);
-        return;
-    }
-
-    new_fd->data = conn;
-    new_fd->line_reads = 0;  /* Binary mode - we parse HTTP ourselves */
-    new_fd->readable_cb = webhook_readable;
-    new_fd->destroy_cb = webhook_destroy;
-
-    log_module(webhook_log, LOG_DEBUG, "Webhook connection accepted");
-}
-
-/*
- * Read and process webhook data
- */
-static void
-webhook_readable(struct io_fd *fd)
-{
-    struct webhook_conn *conn = fd->data;
-    char readbuf[4096];
-    int nbytes;
-
-    /* Read available data */
-    nbytes = recv(fd->fd, readbuf, sizeof(readbuf), 0);
-    if (nbytes <= 0) {
-        ioset_close(fd, 1);
-        return;
-    }
-
-    /* Expand buffer if needed */
-    if (conn->buf_used + nbytes > conn->buf_size) {
-        size_t new_size = conn->buf_size * 2;
-        if (new_size > KC_WEBHOOK_MAX_REQUEST) {
-            log_module(webhook_log, LOG_WARNING, "Webhook request too large");
-            send_http_response(fd, 413, "Request Too Large");
-            ioset_close(fd, 3);  /* Flush response then close */
-            return;
-        }
-        char *new_buf = realloc(conn->buffer, new_size);
-        if (!new_buf) {
-            ioset_close(fd, 1);
-            return;
-        }
-        conn->buffer = new_buf;
-        conn->buf_size = new_size;
-    }
-
-    memcpy(conn->buffer + conn->buf_used, readbuf, nbytes);
-    conn->buf_used += nbytes;
-
-    /* Try to parse headers if not done yet */
-    if (!conn->headers_complete) {
-        if (parse_http_headers(conn) < 0) {
-            send_http_response(fd, 400, "Bad Request");
-            ioset_close(fd, 3);  /* Flush response then close */
-            return;
-        }
-        if (!conn->headers_complete) {
-            /* Need more data */
-            return;
-        }
-    }
-
-    /* Check if we have the complete body */
-    char *body_start = strstr(conn->buffer, "\r\n\r\n");
-    if (!body_start)
-        return;
-    body_start += 4;
-
-    size_t headers_len = body_start - conn->buffer;
-    size_t body_received = conn->buf_used - headers_len;
-
-    if (body_received < conn->content_length) {
-        /* Need more body data */
-        return;
-    }
-
-    /* Process the complete request */
-    stats.events_received++;
-    if (process_webhook_request(conn) == 0) {
-        send_http_response(fd, 200, "OK");
-    } else {
-        send_http_response(fd, 400, "Bad Request");
-    }
-
-    /* Use flag 3 to flush pending writes (2) and close socket (1) */
-    ioset_close(fd, 3);
-}
-
-/*
- * Cleanup webhook connection
- */
-static void
-webhook_destroy(struct io_fd *fd)
-{
-    struct webhook_conn *conn = fd->data;
-    if (conn) {
-        free(conn->buffer);
-        free(conn);
-    }
-}
-
-/*
- * Parse HTTP headers
- */
-static int
-parse_http_headers(struct webhook_conn *conn)
-{
-    char *line_end;
-    char *p = conn->buffer;
-
-    /* Null-terminate for string operations (temporary) */
-    if (conn->buf_used >= conn->buf_size)
-        return -1;
-    conn->buffer[conn->buf_used] = '\0';
-
-    /* Parse request line */
-    line_end = strstr(p, "\r\n");
-    if (!line_end)
-        return 0;  /* Need more data */
-
-    /* Parse "METHOD /path HTTP/1.x" */
-    if (sscanf(p, "%15s %255s", conn->method, conn->path) != 2)
-        return -1;
-
-    p = line_end + 2;
-
-    /* Parse headers */
-    while ((line_end = strstr(p, "\r\n")) != NULL) {
-        if (p == line_end) {
-            /* Empty line = end of headers */
-            conn->headers_complete = 1;
-            return 0;
-        }
-
-        *line_end = '\0';
-
-        /* Parse header */
-        if (strncasecmp(p, "Content-Length:", 15) == 0) {
-            conn->content_length = atoi(p + 15);
-        } else if (strncasecmp(p, "Content-Type:", 13) == 0) {
-            const char *val = p + 13;
-            while (*val == ' ') val++;
-            snprintf(conn->content_type, sizeof(conn->content_type), "%s", val);
-        } else if (strncasecmp(p, "Authorization:", 14) == 0) {
-            const char *val = p + 14;
-            while (*val == ' ') val++;
-            snprintf(conn->auth_header, sizeof(conn->auth_header), "%s", val);
-        } else if (strncasecmp(p, "X-Webhook-Secret:", 17) == 0) {
-            const char *val = p + 17;
-            while (*val == ' ') val++;
-            snprintf(conn->auth_header, sizeof(conn->auth_header), "%s", val);
-        }
-
-        *line_end = '\r';  /* Restore */
-        p = line_end + 2;
-    }
-
-    return 0;  /* Need more data */
-}
-
-/*
- * Queue an event for async processing
- */
-static int
-webhook_queue_event(const char *payload, size_t len)
-{
-    struct webhook_event *evt;
-
-    if (event_queue_size >= WEBHOOK_QUEUE_MAX) {
-        log_module(webhook_log, LOG_WARNING,
-                   "Webhook queue full (%u events), dropping event", event_queue_size);
-        return -1;
-    }
-
-    evt = calloc(1, sizeof(*evt));
-    if (!evt)
-        return -1;
-
-    evt->payload = malloc(len + 1);
-    if (!evt->payload) {
-        free(evt);
-        return -1;
-    }
-
-    memcpy(evt->payload, payload, len);
-    evt->payload[len] = '\0';
-    evt->payload_len = len;
-    evt->next = NULL;
-
-    /* Add to tail of queue */
-    if (event_queue_tail) {
-        event_queue_tail->next = evt;
-    } else {
-        event_queue_head = evt;
-    }
-    event_queue_tail = evt;
-    event_queue_size++;
-    stats.events_queued = event_queue_size;
-
-    /* Schedule processing if not already scheduled */
-    if (!process_scheduled) {
-        process_scheduled = 1;
-        timeq_add(now, webhook_process_queue, NULL);
-    }
-
-    return 0;
-}
-
-/*
- * Process queued events (called from timeq)
- */
-static void
-webhook_process_queue(UNUSED_ARG(void *data))
-{
-    struct webhook_event *evt;
-    int batch = 0;
-    const int batch_max = 10;  /* Process up to 10 events per iteration */
-
-    process_scheduled = 0;
-
-    while (event_queue_head && batch < batch_max) {
-        evt = event_queue_head;
-        event_queue_head = evt->next;
-        if (!event_queue_head)
-            event_queue_tail = NULL;
-        event_queue_size--;
-
-        /* Process the event */
-        handle_keycloak_event(evt->payload, evt->payload_len);
-
-        free(evt->payload);
-        free(evt);
-        batch++;
-    }
-
-    stats.events_queued = event_queue_size;
-
-    /* If more events remain, schedule another processing round */
-    if (event_queue_head && !process_scheduled) {
-        process_scheduled = 1;
-        timeq_add(now, webhook_process_queue, NULL);
-    }
-}
+static void access_queue_process(void *data);
+static void x3_webhook_handle_event(const struct kc_webhook_event *event, void *data);
 
 /*
  * Queue an access update for deferred processing.
@@ -500,32 +65,27 @@ queue_access_update(const char *channel, const char *username, unsigned short le
     for (entry = access_queue_head; entry; entry = entry->next) {
         if (strcasecmp(entry->channel, channel) == 0 &&
             strcasecmp(entry->username, username) == 0) {
-            /* Update existing entry's level */
             if (entry->level != level) {
                 log_module(webhook_log, LOG_DEBUG,
                            "access_queue: Updating queued entry %s/%s: %u -> %u",
                            channel, username, entry->level, level);
                 entry->level = level;
             }
-            return 0;  /* Deduplicated */
+            return 0;
         }
     }
 
-    /* Check queue limit */
     if (access_queue_size >= ACCESS_QUEUE_MAX) {
         log_module(webhook_log, LOG_WARNING,
                    "access_queue: Queue full (%u), dropping update for %s/%s",
                    access_queue_size, channel, username);
-        stats.access_updates_dropped++;
+        x3_stats.access_updates_dropped++;
         return -1;
     }
 
-    /* Create new entry */
     entry = malloc(sizeof(*entry));
-    if (!entry) {
-        log_module(webhook_log, LOG_ERROR, "access_queue: malloc failed");
+    if (!entry)
         return -1;
-    }
 
     strncpy(entry->channel, channel, CHANNELLEN);
     entry->channel[CHANNELLEN] = '\0';
@@ -534,7 +94,6 @@ queue_access_update(const char *channel, const char *username, unsigned short le
     entry->level = level;
     entry->next = NULL;
 
-    /* Append to queue */
     if (access_queue_tail) {
         access_queue_tail->next = entry;
     } else {
@@ -542,9 +101,8 @@ queue_access_update(const char *channel, const char *username, unsigned short le
     }
     access_queue_tail = entry;
     access_queue_size++;
-    stats.access_updates_queued++;
+    x3_stats.access_updates_queued++;
 
-    /* Schedule processing if not already scheduled */
     if (!access_queue_scheduled) {
         access_queue_scheduled = 1;
         timeq_add(now + ACCESS_QUEUE_INTERVAL, access_queue_process, NULL);
@@ -553,13 +111,11 @@ queue_access_update(const char *channel, const char *username, unsigned short le
     log_module(webhook_log, LOG_DEBUG,
                "access_queue: Queued %s/%s level %u (queue size: %u)",
                channel, username, level, access_queue_size);
-
     return 0;
 }
 
 /*
  * Process queued access updates - called via timeq timer.
- * Processes up to ACCESS_QUEUE_BATCH entries per invocation.
  */
 static void
 access_queue_process(UNUSED_ARG(void *data))
@@ -576,573 +132,377 @@ access_queue_process(UNUSED_ARG(void *data))
             access_queue_tail = NULL;
         access_queue_size--;
 
-        /* Apply the access update */
         log_module(webhook_log, LOG_DEBUG,
                    "access_queue: Processing %s/%s level %u",
                    entry->channel, entry->username, entry->level);
 
         chanserv_keycloak_access_update(entry->channel, entry->username, entry->level);
-        stats.access_updates_processed++;
+        x3_stats.access_updates_processed++;
 
         free(entry);
         batch++;
     }
 
-    stats.access_queue_depth = access_queue_size;
+    x3_stats.access_queue_depth = access_queue_size;
 
-    /* If more entries remain, schedule another processing round */
     if (access_queue_head && !access_queue_scheduled) {
         access_queue_scheduled = 1;
         timeq_add(now + ACCESS_QUEUE_INTERVAL, access_queue_process, NULL);
     }
-
-    if (batch > 0) {
-        log_module(webhook_log, LOG_DEBUG,
-                   "access_queue: Processed %d entries, %u remaining",
-                   batch, access_queue_size);
-    }
 }
 
 /*
- * Process a complete webhook request
+ * Handle a parsed Keycloak event from libkc.
+ * This is the callback passed to kc_webhook_init().
+ * All TCP/HTTP/JSON parsing is done by libkc — we just handle the business logic.
  */
-static int
-process_webhook_request(struct webhook_conn *conn)
+static void
+x3_webhook_handle_event(const struct kc_webhook_event *event, UNUSED_ARG(void *data))
 {
-    char *body;
-    size_t body_len;
-
-    /* Verify method */
-    if (strcmp(conn->method, "POST") != 0) {
-        log_module(webhook_log, LOG_DEBUG, "Ignoring non-POST request: %s", conn->method);
-        return 0;  /* Not an error, just ignore */
-    }
-
-    /* Verify path */
-    if (strcmp(conn->path, "/keycloak-webhook") != 0 &&
-        strcmp(conn->path, "/webhook") != 0 &&
-        strcmp(conn->path, "/") != 0) {
-        log_module(webhook_log, LOG_DEBUG, "Ignoring request to unknown path: %s", conn->path);
-        return 0;
-    }
-
-    /* Verify secret if configured */
-    if (webhook_secret && webhook_secret[0]) {
-        if (!conn->auth_header[0] || strcmp(conn->auth_header, webhook_secret) != 0) {
-            log_module(webhook_log, LOG_WARNING,
-                       "Webhook request with invalid/missing secret");
-            stats.events_invalid++;
-            return -1;
-        }
-    }
-
-    /* Find body */
-    body = strstr(conn->buffer, "\r\n\r\n");
-    if (!body) {
-        stats.events_invalid++;
-        return -1;
-    }
-    body += 4;
-    body_len = conn->content_length;
-
-    /* Queue the event for async processing - return immediately */
-    if (webhook_queue_event(body, body_len) < 0) {
-        stats.events_invalid++;
-        return -1;
-    }
-
-    log_module(webhook_log, LOG_DEBUG, "Webhook event queued (queue size: %u)", event_queue_size);
-    return 0;
-}
-
-/*
- * Handle a Keycloak admin event
- *
- * Expected JSON format from Keycloak Admin Events:
- * {
- *   "id": "event-uuid",
- *   "time": 1234567890000,
- *   "realmId": "realm-uuid",
- *   "authDetails": { "userId": "...", "username": "..." },
- *   "resourceType": "USER" | "CREDENTIAL" | "CLIENT_SCOPE_MAPPING",
- *   "operationType": "CREATE" | "UPDATE" | "DELETE" | "ACTION",
- *   "resourcePath": "users/user-uuid/credentials/cred-id",
- *   "representation": "{...}" (JSON string of the resource)
- * }
- */
-static int
-handle_keycloak_event(const char *body, size_t body_len)
-{
-    json_t *root = NULL;
-    json_error_t error;
-    const char *resource_type = NULL;
-    const char *operation_type = NULL;
-    const char *resource_path = NULL;
-    const char *representation = NULL;
-    int result = 0;
-
-    /* Parse JSON */
-    root = json_loadb(body, body_len, 0, &error);
-    if (!root) {
-        log_module(webhook_log, LOG_WARNING,
-                   "Failed to parse webhook JSON: %s", error.text);
-        stats.events_invalid++;
-        return -1;
-    }
-
-    /* Extract event fields */
-    json_t *rt = json_object_get(root, "resourceType");
-    json_t *ot = json_object_get(root, "operationType");
-    json_t *rp = json_object_get(root, "resourcePath");
-    json_t *rep = json_object_get(root, "representation");
-
-    if (rt && json_is_string(rt))
-        resource_type = json_string_value(rt);
-    if (ot && json_is_string(ot))
-        operation_type = json_string_value(ot);
-    if (rp && json_is_string(rp))
-        resource_path = json_string_value(rp);
-    if (rep && json_is_string(rep))
-        representation = json_string_value(rep);
+    x3_stats.last_event_time = time(NULL);
 
     log_module(webhook_log, LOG_DEBUG,
-               "Webhook event: resourceType=%s operationType=%s path=%s",
-               resource_type ? resource_type : "(null)",
-               operation_type ? operation_type : "(null)",
-               resource_path ? resource_path : "(null)");
+               "Webhook event: resource=%s operation=%s path=%s",
+               event->resource_type_str ? event->resource_type_str : "(null)",
+               event->operation_type_str ? event->operation_type_str : "(null)",
+               event->resource_path ? event->resource_path : "(null)");
 
-    if (!resource_type || !operation_type) {
-        log_module(webhook_log, LOG_DEBUG, "Missing resourceType or operationType");
-        json_decref(root);
-        stats.events_invalid++;
-        return -1;
-    }
-
-    stats.last_event_time = time(NULL);
-
-    /* Handle different event types */
-    if (strcmp(resource_type, "USER") == 0) {
-        /* User events - extract username from authDetails or representation */
-        const char *username = NULL;
-        char *username_alloc = NULL;  /* Track if we allocated username */
-        json_t *auth = json_object_get(root, "authDetails");
-        if (auth) {
-            json_t *uname = json_object_get(auth, "username");
-            if (uname && json_is_string(uname))
-                username = json_string_value(uname);
-        }
-
-        /* Try to get username from representation if not in authDetails */
-        if (!username && representation) {
-            json_t *rep_json = json_loads(representation, 0, NULL);
-            if (rep_json) {
-                json_t *uname = json_object_get(rep_json, "username");
-                if (uname && json_is_string(uname)) {
-                    /* Must strdup because rep_json will be freed */
-                    username_alloc = strdup(json_string_value(uname));
-                    username = username_alloc;
-                }
-                json_decref(rep_json);
-            }
-        }
-
-        if (username) {
-            if (strcmp(operation_type, "DELETE") == 0) {
+    switch (event->resource_type) {
+    case KC_WH_RESOURCE_USER:
+        if (event->username) {
+            if (event->operation_type == KC_WH_OP_DELETE) {
                 /* User deleted - clear all caches */
                 log_module(webhook_log, LOG_INFO,
-                           "User deleted via Keycloak: %s", username);
-                keycloak_invalidate_user_caches(username, 1, 1);
+                           "User deleted via Keycloak: %s", event->username);
+                keycloak_invalidate_user_caches(event->username, 1, 1);
 
-                /* Also remove from user representation cache.
-                 * Extract user_id from resource_path (e.g., "users/<uuid>") */
-                if (resource_path && strncmp(resource_path, "users/", 6) == 0) {
-                    const char *user_id = resource_path + 6;
-                    kc_user_repr_cache_remove(user_id);
-                    log_module(webhook_log, LOG_DEBUG,
-                               "Removed user representation cache for %s", user_id);
-                }
-            } else if (strcmp(operation_type, "UPDATE") == 0) {
-                /* User updated - check for x3-specific attribute changes */
+                /* Remove from user representation cache */
+                if (event->user_id)
+                    kc_user_repr_cache_remove(event->user_id);
+
+            } else if (event->operation_type == KC_WH_OP_UPDATE) {
                 int invalidated = 0;
 
-                if (representation) {
-                    json_t *rep_json = json_loads(representation, 0, NULL);
-                    if (rep_json) {
-                        /* Cache the full user representation for safe attribute updates.
-                         * This enables keycloak_set_user_attribute_async() to merge
-                         * attributes without clobbering email/firstName/etc.
-                         *
-                         * IMPORTANT: Only cache if not already cached. Webhook events can
-                         * arrive out of order or race with active operations. An active
-                         * update may have cached a repr with email that this webhook's
-                         * GET hasn't seen yet. Don't overwrite with potentially stale data. */
-                        json_t *user_id_json = json_object_get(rep_json, "id");
-                        if (user_id_json && json_is_string(user_id_json)) {
-                            const char *user_id = json_string_value(user_id_json);
-                            json_t *existing = kc_user_repr_cache_get(user_id);
-                            if (!existing) {
-                                kc_user_repr_cache_put(user_id, rep_json);
-                                log_module(webhook_log, LOG_DEBUG,
-                                           "Cached user representation for %s (id=%s)",
-                                           username, user_id);
-                            } else {
-                                log_module(webhook_log, LOG_DEBUG,
-                                           "Skipped caching for %s (already cached)", username);
-                            }
+                if (event->representation) {
+                    /* Cache the full user representation for safe attribute updates.
+                     * Only cache if not already cached to avoid overwriting with stale data. */
+                    json_t *user_id_json = json_object_get(event->representation, "id");
+                    if (user_id_json && json_is_string(user_id_json)) {
+                        const char *uid = json_string_value(user_id_json);
+                        json_t *existing = kc_user_repr_cache_get(uid);
+                        if (!existing) {
+                            kc_user_repr_cache_put(uid, event->representation);
+                            log_module(webhook_log, LOG_DEBUG,
+                                       "Cached user representation for %s (id=%s)",
+                                       event->username, uid);
+                        }
+                    }
+
+                    json_t *attrs = json_object_get(event->representation, "attributes");
+                    if (attrs && json_is_object(attrs)) {
+                        /* Check for x3_opserv_level change */
+                        if (json_object_get(attrs, "x3_opserv_level")) {
+                            log_module(webhook_log, LOG_INFO,
+                                       "OpServ level changed for %s via Keycloak", event->username);
+                            x3_stats.opserv_invalidations++;
+                            x3_stats.cache_invalidations++;
+                            invalidated = 1;
                         }
 
-                        json_t *attrs = json_object_get(rep_json, "attributes");
-                        if (attrs && json_is_object(attrs)) {
-                            /* Check for x3_opserv_level change */
-                            if (json_object_get(attrs, "x3_opserv_level")) {
-                                log_module(webhook_log, LOG_INFO,
-                                           "OpServ level changed for %s via Keycloak", username);
-                                /* Note: OpServ level is checked live from Keycloak,
-                                 * but we log for tracking. Could add a local cache later. */
-                                stats.opserv_invalidations++;
-                                stats.cache_invalidations++;
-                                invalidated = 1;
+                        /* Check for x3_metadata changes */
+                        if (json_object_get(attrs, "x3_metadata")) {
+                            log_module(webhook_log, LOG_INFO,
+                                       "Metadata changed for %s via Keycloak - invalidating cache",
+                                       event->username);
+                            int deleted = x3_lmdb_metadata_delete_by_user(event->username);
+                            if (deleted > 0) {
+                                log_module(webhook_log, LOG_DEBUG,
+                                           "Deleted %d metadata entries for %s",
+                                           deleted, event->username);
                             }
-                            /* Check for x3_metadata changes */
-                            if (json_object_get(attrs, "x3_metadata")) {
-                                log_module(webhook_log, LOG_INFO,
-                                           "Metadata changed for %s via Keycloak - invalidating cache", username);
-                                /* Immediately purge all metadata entries for this user from LMDB */
-                                int deleted = x3_lmdb_metadata_delete_by_user(username);
-                                if (deleted > 0) {
-                                    log_module(webhook_log, LOG_DEBUG,
-                                               "Deleted %d metadata entries for %s", deleted, username);
+                            x3_stats.metadata_invalidations++;
+                            x3_stats.cache_invalidations++;
+                            invalidated = 1;
+                        }
+
+                        /* Check for x3.channel.* attribute changes (bidirectional access sync) */
+                        const char *key;
+                        json_t *value;
+                        json_object_foreach(attrs, key, value) {
+                            if (strncmp(key, "x3.channel.", 11) == 0) {
+                                const char *channel = key + 11;
+                                unsigned short level = 0;
+
+                                if (json_is_array(value) && json_array_size(value) > 0) {
+                                    json_t *first = json_array_get(value, 0);
+                                    if (first && json_is_string(first))
+                                        level = (unsigned short)atoi(json_string_value(first));
                                 }
-                                stats.metadata_invalidations++;
-                                stats.cache_invalidations++;
-                                invalidated = 1;
-                            }
 
-                            /* Check for x3.channel.* attribute changes (bidirectional access sync) */
-                            const char *key;
-                            json_t *value;
-                            json_object_foreach(attrs, key, value) {
-                                if (strncmp(key, "x3.channel.", 11) == 0) {
-                                    const char *channel = key + 11;  /* "#channelname" */
-                                    unsigned short level = 0;
-
-                                    /* Extract level from attribute value array */
-                                    if (json_is_array(value) && json_array_size(value) > 0) {
-                                        json_t *first = json_array_get(value, 0);
-                                        if (first && json_is_string(first)) {
-                                            level = (unsigned short)atoi(json_string_value(first));
-                                        }
-                                    }
-
-                                    /* Skip no-op updates to avoid blocking event loop */
-                                    {
-                                        struct chanNode *cn = GetChannel(channel);
-                                        if (cn && cn->channel_info) {
-                                            struct handle_info *hi = get_handle_info(username);
-                                            if (hi) {
-                                                struct userData *uData = GetChannelUser(cn->channel_info, hi);
-                                                if (uData && uData->access == level) {
-                                                    log_module(webhook_log, LOG_DEBUG,
-                                                               "Skipping no-op access update for %s in %s: %u",
-                                                               username, channel, level);
-                                                    stats.access_updates_skipped++;
-                                                    continue;  /* Skip to next attribute */
-                                                }
+                                /* Skip no-op updates */
+                                {
+                                    struct chanNode *cn = GetChannel(channel);
+                                    if (cn && cn->channel_info) {
+                                        struct handle_info *hi = get_handle_info(event->username);
+                                        if (hi) {
+                                            struct userData *uData = GetChannelUser(cn->channel_info, hi);
+                                            if (uData && uData->access == level) {
+                                                x3_stats.access_updates_skipped++;
+                                                continue;
                                             }
                                         }
                                     }
-
-                                    log_module(webhook_log, LOG_DEBUG,
-                                               "Queueing access update for %s via Keycloak: %s = %u",
-                                               username, channel, level);
-
-                                    /* Queue for deferred processing to avoid blocking event loop */
-                                    queue_access_update(channel, username, level);
-                                    stats.cache_invalidations++;
-                                    invalidated = 1;
                                 }
+
+                                queue_access_update(channel, event->username, level);
+                                x3_stats.cache_invalidations++;
+                                invalidated = 1;
                             }
                         }
-                        json_decref(rep_json);
                     }
                 }
 
                 if (invalidated) {
                     log_module(webhook_log, LOG_DEBUG,
-                               "User updated via Keycloak: %s (caches invalidated)", username);
-                } else {
-                    log_module(webhook_log, LOG_DEBUG,
-                               "User updated via Keycloak: %s (no x3 attributes)", username);
+                               "User updated via Keycloak: %s (caches invalidated)", event->username);
                 }
             }
         }
-        free(username_alloc);  /* Free if we allocated from representation */
-    } else if (strcmp(resource_type, "CREDENTIAL") == 0) {
-        /* Credential events - password or cert changes */
-        if (strcmp(operation_type, "DELETE") == 0) {
-            /* Credential deleted - might be a certificate fingerprint */
-            if (representation) {
-                json_t *rep_json = json_loads(representation, 0, NULL);
-                if (rep_json) {
-                    json_t *type = json_object_get(rep_json, "type");
-                    json_t *cred_data = json_object_get(rep_json, "credentialData");
+        break;
 
-                    if (type && json_is_string(type) &&
-                        strcmp(json_string_value(type), "x509") == 0 && cred_data) {
-                        /* X.509 certificate credential - extract fingerprint */
+    case KC_WH_RESOURCE_CREDENTIAL:
+        if (event->operation_type == KC_WH_OP_DELETE && event->representation) {
+            /* Credential deleted - check for x509 cert */
+            json_t *type = json_object_get(event->representation, "type");
+            json_t *cred_data = json_object_get(event->representation, "credentialData");
+
+            if (type && json_is_string(type) &&
+                strcmp(json_string_value(type), "x509") == 0 && cred_data) {
+                json_t *cd = json_loads(json_string_value(cred_data), 0, NULL);
+                if (cd) {
+                    json_t *fp = json_object_get(cd, "fingerprint");
+                    if (fp && json_is_string(fp)) {
+                        log_module(webhook_log, LOG_INFO,
+                                   "Certificate revoked via Keycloak: %.32s...",
+                                   json_string_value(fp));
+                        x3_lmdb_fingerprint_delete(json_string_value(fp));
+                        x3_stats.fingerprint_deletions++;
+                        x3_stats.cache_invalidations++;
+                    }
+                    json_decref(cd);
+                }
+            }
+        } else if (event->operation_type == KC_WH_OP_UPDATE ||
+                   event->operation_type == KC_WH_OP_CREATE) {
+            if (event->representation) {
+                json_t *type = json_object_get(event->representation, "type");
+                const char *cred_type = (type && json_is_string(type))
+                    ? json_string_value(type) : NULL;
+
+                if (cred_type && strcmp(cred_type, "password") == 0 && event->username) {
+                    /* Password changed - invalidate all auth caches */
+                    log_module(webhook_log, LOG_INFO,
+                               "Password changed for %s via Keycloak - invalidating",
+                               event->username);
+                    invalidate_authsuccess_cache(event->username);
+                    x3_lmdb_scram_revoke_all(event->username);
+                    x3_lmdb_scram_acct_delete_all(event->username);
+                    x3_stats.scram_invalidations++;
+                    x3_stats.cache_invalidations++;
+
+                    /* Pre-populate SCRAM cache from webhook payload (Keycloak SPI) */
+                    if (event->has_scram) {
+                        log_module(webhook_log, LOG_INFO,
+                                   "Pre-populating SCRAM cache for %s from webhook",
+                                   event->username);
+                        int rc = x3_lmdb_scram_acct_set(
+                            event->username,
+                            event->scram.salt,
+                            event->scram.iterations,
+                            event->scram.stored_key,
+                            event->scram.server_key,
+                            now, 0);
+                        if (rc == LMDB_SUCCESS) {
+                            log_module(webhook_log, LOG_DEBUG,
+                                       "SCRAM cache pre-populated for %s", event->username);
+                        } else {
+                            log_module(webhook_log, LOG_WARNING,
+                                       "Failed to pre-populate SCRAM cache for %s: %d",
+                                       event->username, rc);
+                        }
+                    }
+                } else if (cred_type && strcmp(cred_type, "x509") == 0 &&
+                           event->operation_type == KC_WH_OP_CREATE) {
+                    /* New X.509 cert - pre-warm fingerprint cache */
+                    json_t *cred_data = json_object_get(event->representation, "credentialData");
+                    if (cred_data && json_is_string(cred_data)) {
                         json_t *cd = json_loads(json_string_value(cred_data), 0, NULL);
                         if (cd) {
                             json_t *fp = json_object_get(cd, "fingerprint");
-                            if (fp && json_is_string(fp)) {
-                                const char *fingerprint = json_string_value(fp);
+                            if (fp && json_is_string(fp) && event->username) {
                                 log_module(webhook_log, LOG_INFO,
-                                           "Certificate revoked via Keycloak: %.32s...",
-                                           fingerprint);
-                                x3_lmdb_fingerprint_delete(fingerprint);
-                                stats.fingerprint_deletions++;
-                                stats.cache_invalidations++;
+                                           "Pre-warming fingerprint cache for %s: %.32s...",
+                                           event->username, json_string_value(fp));
+                                x3_lmdb_fingerprint_set(json_string_value(fp),
+                                                        event->username, now, 0);
+                                x3_stats.fingerprint_additions++;
+                                x3_stats.cache_invalidations++;
                             }
                             json_decref(cd);
                         }
                     }
-                    json_decref(rep_json);
-                }
-            }
-        } else if (strcmp(operation_type, "UPDATE") == 0 ||
-                   strcmp(operation_type, "CREATE") == 0) {
-            /* Credential created or updated - check type and handle accordingly */
-            if (representation) {
-                json_t *rep_json = json_loads(representation, 0, NULL);
-                if (rep_json) {
-                    json_t *type = json_object_get(rep_json, "type");
-                    const char *cred_type = type && json_is_string(type) ? json_string_value(type) : NULL;
-
-                    /* Try to get username from root (webhook SPI), representation, or authDetails */
-                    const char *username = NULL;
-                    json_t *root_uname = json_object_get(root, "username");
-                    if (root_uname && json_is_string(root_uname)) {
-                        username = json_string_value(root_uname);
-                    }
-                    if (!username) {
-                        json_t *user_uname = json_object_get(rep_json, "username");
-                        if (user_uname && json_is_string(user_uname)) {
-                            username = json_string_value(user_uname);
-                        }
-                    }
-                    if (!username) {
-                        json_t *auth = json_object_get(root, "authDetails");
-                        if (auth) {
-                            json_t *uname = json_object_get(auth, "username");
-                            if (uname && json_is_string(uname))
-                                username = json_string_value(uname);
-                        }
-                    }
-
-                    if (cred_type && strcmp(cred_type, "password") == 0 && username) {
-                        /* Password credential changed - invalidate all auth caches */
-                        log_module(webhook_log, LOG_INFO,
-                                   "Password changed for %s via Keycloak - invalidating auth caches",
-                                   username);
-                        /* Invalidate positive auth cache */
-                        invalidate_authsuccess_cache(username);
-                        /* Invalidate SCRAM caches */
-                        x3_lmdb_scram_revoke_all(username);
-                        x3_lmdb_scram_acct_delete_all(username);
-                        stats.scram_invalidations++;
-                        stats.cache_invalidations++;
-
-                        /* Check for SCRAM credentials in webhook payload (from Keycloak SPI) */
-                        json_t *scram = json_object_get(root, "scram");
-                        if (scram && json_is_object(scram)) {
-                            json_t *salt = json_object_get(scram, "salt");
-                            json_t *iterations = json_object_get(scram, "iterations");
-                            json_t *stored_key = json_object_get(scram, "storedKey");
-                            json_t *server_key = json_object_get(scram, "serverKey");
-
-                            if (salt && json_is_string(salt) &&
-                                iterations && json_is_integer(iterations) &&
-                                stored_key && json_is_string(stored_key) &&
-                                server_key && json_is_string(server_key)) {
-
-                                log_module(webhook_log, LOG_INFO,
-                                           "Pre-populating SCRAM cache for %s from webhook",
-                                           username);
-
-                                /* Pre-populate account-level SCRAM cache (scram_acct:)
-                                 * This eliminates the need for Keycloak lookup on first auth */
-                                int rc = x3_lmdb_scram_acct_set(
-                                    username,
-                                    json_string_value(salt),
-                                    (int)json_integer_value(iterations),
-                                    json_string_value(stored_key),
-                                    json_string_value(server_key),
-                                    now,
-                                    0  /* No TTL - refreshed on next password change */
-                                );
-
-                                if (rc == LMDB_SUCCESS) {
-                                    log_module(webhook_log, LOG_DEBUG,
-                                               "SCRAM cache pre-populated for %s", username);
-                                    stats.cache_invalidations++;  /* Count as a cache update */
-                                } else {
-                                    log_module(webhook_log, LOG_WARNING,
-                                               "Failed to pre-populate SCRAM cache for %s: %d",
-                                               username, rc);
-                                }
-                            } else {
-                                log_module(webhook_log, LOG_DEBUG,
-                                           "Incomplete SCRAM credentials in webhook for %s",
-                                           username);
-                            }
-                        }
-                    } else if (cred_type && strcmp(cred_type, "x509") == 0 &&
-                               strcmp(operation_type, "CREATE") == 0) {
-                        /* New X.509 certificate - pre-warm fingerprint cache */
-                        json_t *cred_data = json_object_get(rep_json, "credentialData");
-                        if (cred_data && json_is_string(cred_data)) {
-                            json_t *cd = json_loads(json_string_value(cred_data), 0, NULL);
-                            if (cd) {
-                                json_t *fp = json_object_get(cd, "fingerprint");
-                                if (fp && json_is_string(fp) && username) {
-                                    const char *fingerprint = json_string_value(fp);
-                                    log_module(webhook_log, LOG_INFO,
-                                               "Pre-warming fingerprint cache for %s: %.32s...",
-                                               username, fingerprint);
-                                    /* Pre-warm the fingerprint cache with the account name */
-                                    x3_lmdb_fingerprint_set(fingerprint, username, now, 0);
-                                    stats.fingerprint_additions++;
-                                    stats.cache_invalidations++;
-                                }
-                                json_decref(cd);
-                            }
-                        }
-                    }
-                    json_decref(rep_json);
                 }
             }
         }
-    } else if (strcmp(resource_type, "USER_SESSION") == 0 ||
-               strcmp(resource_type, "ADMIN_EVENT") == 0) {
-        /* Session management events */
-        if (operation_type && strcmp(operation_type, "DELETE") == 0) {
-            /* Logout - might be a "logout all" action */
-            /* Extract username and revoke X3 sessions */
-            const char *username = NULL;
-            json_t *auth = json_object_get(root, "authDetails");
-            if (auth) {
-                json_t *uname = json_object_get(auth, "username");
-                if (uname && json_is_string(uname))
-                    username = json_string_value(uname);
-            }
+        break;
+
+    case KC_WH_RESOURCE_USER_SESSION:
+    case KC_WH_RESOURCE_ADMIN_EVENT:
+        if (event->operation_type == KC_WH_OP_DELETE) {
+            /* Session logout - use username from event or auth details */
+            const char *username = event->username;
+            if (!username && event->has_auth_details)
+                username = event->auth_details.username;
 
             if (username) {
                 log_module(webhook_log, LOG_INFO,
                            "Session logout via Keycloak for: %s", username);
                 x3_lmdb_session_revoke_all(username);
-                stats.session_revocations++;
-                stats.cache_invalidations++;
+                x3_stats.session_revocations++;
+                x3_stats.cache_invalidations++;
             }
         }
-    } else if (strcmp(resource_type, "GROUP_MEMBERSHIP") == 0) {
-        /* Group membership change - sync affected channel */
-        const char *group_path = NULL;
+        break;
 
-        /* Try to get group path from representation */
-        if (representation) {
-            json_t *rep_json = json_loads(representation, 0, NULL);
-            if (rep_json) {
-                json_t *gpath = json_object_get(rep_json, "path");
-                if (gpath && json_is_string(gpath)) {
-                    group_path = json_string_value(gpath);
-                }
-
-                if (group_path) {
-                    /* Convert group path to channel name */
-                    char *channel = kc_group_path_to_channel(group_path);
-                    if (channel) {
-                        log_module(webhook_log, LOG_INFO,
-                                   "Group membership %s for channel %s (via webhook)",
-                                   operation_type, channel);
-
-                        /* Queue immediate sync for this channel */
-                        int rc = chanserv_queue_keycloak_sync(channel, KC_SYNC_PRIORITY_IMMEDIATE);
-                        if (rc == 0) {
-                            stats.group_syncs++;
-                            stats.cache_invalidations++;
-                        }
-                        free(channel);
+    case KC_WH_RESOURCE_GROUP_MEMBERSHIP:
+        if (event->representation) {
+            json_t *gpath = json_object_get(event->representation, "path");
+            if (gpath && json_is_string(gpath)) {
+                char *channel = kc_group_path_to_channel(json_string_value(gpath));
+                if (channel) {
+                    log_module(webhook_log, LOG_INFO,
+                               "Group membership %s for channel %s (via webhook)",
+                               event->operation_type_str, channel);
+                    if (chanserv_queue_keycloak_sync(channel, KC_SYNC_PRIORITY_IMMEDIATE) == 0) {
+                        x3_stats.group_syncs++;
+                        x3_stats.cache_invalidations++;
                     }
+                    free(channel);
                 }
-                json_decref(rep_json);
             }
         }
-    } else if (strcmp(resource_type, "GROUP") == 0) {
-        /* Group settings changed - might affect access level configuration */
-        if (strcmp(operation_type, "UPDATE") == 0 && representation) {
-            json_t *rep_json = json_loads(representation, 0, NULL);
-            if (rep_json) {
-                json_t *gpath = json_object_get(rep_json, "path");
-                if (gpath && json_is_string(gpath)) {
-                    const char *group_path = json_string_value(gpath);
+        break;
 
-                    /* Convert group path to channel name */
-                    char *channel = kc_group_path_to_channel(group_path);
-                    if (channel) {
-                        log_module(webhook_log, LOG_INFO,
-                                   "Group attributes changed for %s - queueing re-sync", channel);
-
-                        /* Queue high-priority sync (not immediate, give time for batch changes) */
-                        int rc = chanserv_queue_keycloak_sync(channel, KC_SYNC_PRIORITY_HIGH);
-                        if (rc == 0) {
-                            stats.group_syncs++;
-                        }
-                        free(channel);
-                    }
+    case KC_WH_RESOURCE_GROUP:
+        if (event->operation_type == KC_WH_OP_UPDATE && event->representation) {
+            json_t *gpath = json_object_get(event->representation, "path");
+            if (gpath && json_is_string(gpath)) {
+                char *channel = kc_group_path_to_channel(json_string_value(gpath));
+                if (channel) {
+                    log_module(webhook_log, LOG_INFO,
+                               "Group attributes changed for %s - queueing re-sync", channel);
+                    if (chanserv_queue_keycloak_sync(channel, KC_SYNC_PRIORITY_HIGH) == 0)
+                        x3_stats.group_syncs++;
+                    free(channel);
                 }
-                json_decref(rep_json);
             }
         }
+        break;
+
+    default:
+        log_module(webhook_log, LOG_DEBUG,
+                   "Ignoring unhandled resource type: %s",
+                   event->resource_type_str ? event->resource_type_str : "(null)");
+        break;
     }
 
-    stats.events_processed++;
-    json_decref(root);
-    return result;
+    x3_stats.events_processed++;
 }
 
 /*
- * Send HTTP response
+ * Initialize webhook listener (thin wrapper around libkc)
  */
-static void
-send_http_response(struct io_fd *fd, int status, const char *message)
+int
+keycloak_webhook_init(int port, const char *secret, const char *bind_addr)
 {
-    char response[512];
-    const char *status_text;
+    struct kc_webhook_config cfg;
 
-    switch (status) {
-    case 200: status_text = "OK"; break;
-    case 400: status_text = "Bad Request"; break;
-    case 401: status_text = "Unauthorized"; break;
-    case 403: status_text = "Forbidden"; break;
-    case 404: status_text = "Not Found"; break;
-    case 413: status_text = "Payload Too Large"; break;
-    case 500: status_text = "Internal Server Error"; break;
-    default: status_text = "Unknown"; break;
+    webhook_log = log_register_type("Webhook", "file:webhook.log");
+
+    if (port <= 0) {
+        log_module(webhook_log, LOG_DEBUG, "Keycloak webhook disabled (port=0)");
+        return 0;
     }
 
-    snprintf(response, sizeof(response),
-             "HTTP/1.1 %d %s\r\n"
-             "Content-Type: text/plain\r\n"
-             "Content-Length: %zu\r\n"
-             "Connection: close\r\n"
-             "\r\n"
-             "%s",
-             status, status_text, strlen(message), message);
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.port = port;
+    cfg.secret = secret;
+    cfg.bind_address = bind_addr;
+    /* Use libkc defaults for max_request_size, max_connections, queue_max, batch_size */
 
-    ioset_write(fd, response, strlen(response));
+    int rc = kc_webhook_init(&cfg, x3_webhook_handle_event, &x3_stats);
+    if (rc < 0) {
+        log_module(webhook_log, LOG_ERROR,
+                   "Failed to start Keycloak webhook on port %d", port);
+        return -1;
+    }
+
+    log_module(webhook_log, LOG_INFO,
+               "Keycloak webhook listening on port %d (via libkc)", port);
+    return 0;
 }
 
 /*
- * Manual cache invalidation function
+ * Shutdown webhook listener
+ */
+void
+keycloak_webhook_shutdown(void)
+{
+    struct access_update_entry *entry, *next;
+
+    kc_webhook_shutdown();
+
+    /* Drain the access queue */
+    for (entry = access_queue_head; entry; entry = next) {
+        next = entry->next;
+        free(entry);
+    }
+    access_queue_head = access_queue_tail = NULL;
+    access_queue_size = 0;
+    access_queue_scheduled = 0;
+
+    log_module(webhook_log, LOG_INFO, "Keycloak webhook shut down");
+}
+
+/*
+ * Check if webhook is running
+ */
+int
+keycloak_webhook_is_running(void)
+{
+    return kc_webhook_is_running();
+}
+
+/*
+ * Get X3-specific statistics
+ */
+const struct x3_webhook_stats *
+keycloak_webhook_get_x3_stats(void)
+{
+    return &x3_stats;
+}
+
+/*
+ * Update secret at runtime
+ */
+void
+keycloak_webhook_set_secret(const char *secret)
+{
+    kc_webhook_set_secret(secret);
+}
+
+/*
+ * Manual cache invalidation function (OpServ command interface)
  */
 int
 keycloak_invalidate_user_caches(const char *username,
@@ -1150,7 +510,6 @@ keycloak_invalidate_user_caches(const char *username,
                                  int invalidate_sessions)
 {
     int count = 0;
-    char keybuf[256];
 
     if (!username || !username[0])
         return 0;
@@ -1158,13 +517,6 @@ keycloak_invalidate_user_caches(const char *username,
     log_module(webhook_log, LOG_DEBUG,
                "Invalidating caches for user: %s (fp=%d, sess=%d)",
                username, invalidate_fingerprints, invalidate_sessions);
-
-    /* Clear auth failure cache entries for this user */
-    /* Note: We're using a simple approach - in practice we'd need
-     * to iterate all authfail: keys and check if they match this user.
-     * For now, auth failures are keyed by hash, not username, so we
-     * can't easily clear them by username. This is by design to prevent
-     * timing attacks. */
 
     /* Clear fingerprint cache if requested */
     if (invalidate_fingerprints) {
@@ -1179,22 +531,18 @@ keycloak_invalidate_user_caches(const char *username,
             }
             x3_lmdb_free_fingerprint_entries(fps);
         }
-        stats.fingerprint_deletions += count;
+        x3_stats.fingerprint_deletions += count;
     }
 
     /* Revoke session tokens if requested */
     if (invalidate_sessions) {
         if (x3_lmdb_session_revoke_all(username) == LMDB_SUCCESS) {
             count++;
-            stats.session_revocations++;
+            x3_stats.session_revocations++;
         }
     }
 
-    /* Clear failed fingerprint lookup cache */
-    snprintf(keybuf, sizeof(keybuf), "%s%s", LMDB_PREFIX_FPFAIL, username);
-    /* Note: fpfail is keyed by fingerprint, not username, so same issue */
-
-    stats.cache_invalidations += count;
+    x3_stats.cache_invalidations += count;
     return count;
 }
 
