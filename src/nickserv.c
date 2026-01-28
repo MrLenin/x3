@@ -151,25 +151,6 @@
 #define KEY_ECDSA_PUBKEY "ecdsa_pubkey"
 #define KEY_FORCE_HANDLES_LOWERCASE "force_handles_lowercase"
 
-/* IRCv3 Metadata keys for user preferences (x3. namespace) */
-#define X3_METADATA_PREFIX "x3."
-#define X3_META_SCREEN_WIDTH "x3.screen_width"
-#define X3_META_TABLE_WIDTH "x3.table_width"
-#define X3_META_STYLE "x3.style"
-#define X3_META_ANNOUNCEMENTS "x3.announcements"
-#define X3_META_MAXLOGINS "x3.maxlogins"
-
-/* IRCv3 Metadata keys for user profile (exposed to clients) */
-#define X3_META_TITLE "x3.title"           /* User epithet/signature (public) */
-#define X3_META_REGISTERED "x3.registered" /* Account registration timestamp (public) */
-#define X3_META_KARMA "x3.karma"           /* Reputation score (public) */
-#define X3_META_EMAIL "x3.email"           /* Email address (private) */
-#define X3_META_LASTHOST "x3.lasthost"     /* Last seen host (private) */
-
-/* Preference metadata TTL: 90 days in seconds */
-#define X3_PREF_TTL_DAYS 90
-#define X3_PREF_TTL_SECS (X3_PREF_TTL_DAYS * 86400)
-
 #define KEY_LDAP_ENABLE "ldap_enable"
 
 #ifdef WITH_LDAP
@@ -208,16 +189,6 @@
 #define KEY_KEYCLOAK_WEBHOOK_BIND "keycloak_webhook_bind"
 #endif
 
-/* Metadata TTL configuration keys */
-#define KEY_METADATA_TTL_ENABLED "metadata_ttl_enabled"
-#define KEY_METADATA_DEFAULT_TTL "metadata_default_ttl"
-#define KEY_METADATA_PURGE_FREQUENCY "metadata_purge_frequency"
-#define KEY_METADATA_IMMUTABLE_KEYS "metadata_immutable_keys"
-
-/* Metadata compression configuration keys */
-#define KEY_METADATA_COMPRESS_THRESHOLD "metadata_compress_threshold"
-#define KEY_METADATA_COMPRESS_LEVEL     "metadata_compress_level"
-
 /* Password hashing configuration keys */
 #define KEY_PASSWORD_ALGORITHM       "password_algorithm"
 #define KEY_PASSWORD_PBKDF2_ITERATIONS "password_pbkdf2_iterations"
@@ -229,9 +200,6 @@
 
 /* Certificate auto-registration */
 #define KEY_CERT_AUTOREGISTER        "cert_autoregister"
-
-/* Default immutable keys (space-separated) that never expire */
-#define DEFAULT_IMMUTABLE_KEYS "avatar pronouns bot homepage"
 
 #define NICKSERV_VALID_CHARS	"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_"
 
@@ -271,7 +239,6 @@ static char last_sasl_mechs[192] = "";  /* Must match nickserv_get_sasl_mechanis
 /* Timer scheduling flags - timers are scheduled after config loads, not at init time */
 static int expire_handles_timer_set = 0;
 static int expire_nicks_timer_set = 0;
-static int metadata_purge_timer_set = 0;
 
 #ifdef WITH_KEYCLOAK
 /* Structure for async AUTH command (Phase 2 + Phase 5.10 email chain) */
@@ -352,27 +319,6 @@ static void webpush_subs_token_cb(void *ctx, int result, struct access_token *to
 static int webpush_subs_user_cb(void *session, int result, struct kc_user *user);
 static int webpush_subs_list_cb(void *session, int result, struct kc_metadata_entry *entries);
 
-/* Metadata sync async context (Phase 5.10) - fire-and-forget pattern */
-struct metadata_sync_ctx {
-    char handle[NICKSERV_HANDLE_LEN + 1];  /* Account handle */
-    char nick[NICKLEN + 1];                 /* User's nick (for irc_metadata target) */
-    char *user_id;                          /* Keycloak user ID (from lookup) */
-    int use_nick;                           /* 1=use nick as target, 0=use handle */
-};
-static void metadata_sync_token_cb(void *ctx, int result, struct access_token *token);
-static int metadata_sync_user_cb(void *session, int result, struct kc_user *user);
-static int metadata_sync_list_cb(void *session, int result, struct kc_metadata_entry *entries);
-static void nickserv_sync_metadata_async(const char *handle, const char *nick, int use_nick);
-
-/* Single-key metadata async context (Phase 5.10) - for MDQ single-key queries */
-struct mdq_single_ctx {
-    char handle[NICKSERV_HANDLE_LEN + 1];  /* Account handle (also used as irc_metadata target) */
-    char key[128];                          /* Metadata key */
-    char *user_id;                          /* Keycloak user ID (from lookup) */
-};
-static void mdq_single_token_cb(void *ctx, int result, struct access_token *token);
-static int mdq_single_user_cb(void *session, int result, struct kc_user *user);
-static int mdq_single_attr_cb(void *session, int result, char *value);
 #endif
 
 /*
@@ -965,17 +911,11 @@ static void nickserv_reclaim(struct userNode *user, struct nick_info *ni, enum r
 static void nickserv_reclaim_p(void *data);
 static int nickserv_addmask(struct userNode *user, struct handle_info *hi, const char *mask);
 static void nickserv_update_activity_lmdb(struct handle_info *hi, int update_lastseen, int update_last_present);
-static void nickserv_sync_preference_metadata(struct handle_info *hi, const char *key, const char *value);
 
 struct nickserv_config nickserv_conf;
 
 /* We have 2^32 unique account IDs to use. */
 unsigned long int highest_id = 0;
-
-/* X3 startup time - used to detect stale LMDB metadata.
- * If account's _metadata_sync_time < x3_metadata_startup_time,
- * the LMDB data is from a previous X3 session and may be stale. */
-static time_t x3_metadata_startup_time = 0;
 
 static char *
 canonicalize_hostmask(char *mask)
@@ -1149,30 +1089,11 @@ nickserv_unregister_handle(struct handle_info *hi, struct userNode *notify, stru
 #endif
 
 #ifdef WITH_LMDB
-    /* Clean up all LMDB data for this account and notify IRCd */
+    /* Clean up all LMDB data for this account */
     if (x3_lmdb_is_available()) {
-        struct lmdb_metadata_entry *entries = NULL;
-        struct lmdb_metadata_entry *entry;
-        struct userNode *user;
-        int count, cleared;
+        int cleared;
 
-        /* First, list all account metadata */
-        count = x3_lmdb_account_list(hi->handle, &entries);
-        if (count > 0) {
-            /* Notify IRCd to clear metadata for each online user authed to this account */
-            for (user = hi->users; user; user = user->next_authed) {
-                for (entry = entries; entry; entry = entry->next) {
-                    /* Skip internal keys */
-                    if (entry->key && entry->key[0] != '_') {
-                        irc_metadata(user->nick, entry->key, NULL, 0);
-                    }
-                }
-            }
-            x3_lmdb_free_entries(entries);
-            log_module(NS_LOG, LOG_DEBUG, "nickserv_unregister_handle[%s]: Sent metadata deletions to IRCd for %d keys", hi->handle, count);
-        }
-
-        /* Now clear LMDB */
+        /* Clear LMDB */
         cleared = x3_lmdb_account_clear(hi->handle);
         if (cleared > 0)
             log_module(NS_LOG, LOG_DEBUG, "nickserv_unregister_handle[%s]: Cleared %d LMDB metadata entries", hi->handle, cleared);
@@ -1709,19 +1630,6 @@ set_user_handle_info(struct userNode *user, struct handle_info *hi, int stamp)
             }
             /* send the account to the ircd */
             StampUser(user, id, hi->registered);
-
-            /* Sync any stored metadata from Keycloak to the IRCd */
-            nickserv_sync_metadata_to_ircd(user);
-
-            /* Sync profile metadata for IRCv3 client exposure */
-            nickserv_sync_profile_metadata_to_ircd(user);
-
-            /* Sync $last_present to Nefarious if available */
-            if (hi->last_present > 0) {
-                char timestamp_str[32];
-                snprintf(timestamp_str, sizeof(timestamp_str), "%ld", (long)hi->last_present);
-                irc_metadata(hi->handle, "$last_present", timestamp_str, METADATA_VIS_PUBLIC);
-            }
         }
 
         /* Stop trying to kick this user off their nick */
@@ -5070,10 +4978,6 @@ static OPTION_FUNC(opt_width)
         else if (hi->screen_width > MAX_LINE_SIZE)
             hi->screen_width = MAX_LINE_SIZE;
 
-        /* Sync to IRCv3 metadata */
-        char value_str[16];
-        snprintf(value_str, sizeof(value_str), "%u", hi->screen_width);
-        nickserv_sync_preference_metadata(hi, X3_META_SCREEN_WIDTH, value_str);
     }
 
     if (!(noreply))
@@ -5091,10 +4995,6 @@ static OPTION_FUNC(opt_tablewidth)
         else if (hi->screen_width > MAX_LINE_SIZE)
             hi->table_width = MAX_LINE_SIZE;
 
-        /* Sync to IRCv3 metadata */
-        char value_str[16];
-        snprintf(value_str, sizeof(value_str), "%u", hi->table_width);
-        nickserv_sync_preference_metadata(hi, X3_META_TABLE_WIDTH, value_str);
     }
 
     if (!(noreply))
@@ -5162,7 +5062,6 @@ static OPTION_FUNC(opt_autohide)
 static OPTION_FUNC(opt_style)
 {
     char *style;
-    int changed = 0;
 
     if (argc > 1) {
         if (!irccasecmp(argv[1], "Clean"))
@@ -5177,7 +5076,6 @@ static OPTION_FUNC(opt_style)
             reply("NSMSG_INVALID_STYLE", argv[1]);
             return 0;
         }
-        changed = 1;
     }
 
     switch (hi->userlist_style) {
@@ -5195,10 +5093,6 @@ static OPTION_FUNC(opt_style)
         style = "Normal";
     }
 
-    /* Sync to IRCv3 metadata if changed */
-    if (changed)
-        nickserv_sync_preference_metadata(hi, X3_META_STYLE, style);
-
     if (!(noreply))
         reply("NSMSG_SET_STYLE", style);
     return 1;
@@ -5207,25 +5101,19 @@ static OPTION_FUNC(opt_style)
 static OPTION_FUNC(opt_announcements)
 {
     const char *choice;
-    const char *metadata_value = NULL;
-    int changed = 0;
 
     if (argc > 1) {
         if (enabled_string(argv[1])) {
             hi->announcements = 'y';
-            metadata_value = "on";
         } else if (disabled_string(argv[1])) {
             hi->announcements = 'n';
-            metadata_value = "off";
         } else if (!strcmp(argv[1], "?") || !irccasecmp(argv[1], "default")) {
             hi->announcements = '?';
-            metadata_value = "default";
         } else {
             if (!(noreply))
                 reply("NSMSG_INVALID_ANNOUNCE", argv[1]);
             return 0;
         }
-        changed = 1;
     }
 
     switch (hi->announcements) {
@@ -5234,10 +5122,6 @@ static OPTION_FUNC(opt_announcements)
     case '?': choice = "default"; break;
     default: choice = "unknown"; break;
     }
-
-    /* Sync to IRCv3 metadata if changed */
-    if (changed && metadata_value)
-        nickserv_sync_preference_metadata(hi, X3_META_ANNOUNCEMENTS, metadata_value);
 
     if (!(noreply))
         reply("NSMSG_SET_ANNOUNCEMENTS", choice);
@@ -5362,7 +5246,6 @@ static OPTION_FUNC(opt_email)
 static OPTION_FUNC(opt_maxlogins)
 {
     unsigned char maxlogins;
-    int changed = 0;
     if (argc > 1) {
         maxlogins = strtoul(argv[1], NULL, 0);
         if ((maxlogins > nickserv_conf.hard_maxlogins) && !override) {
@@ -5371,16 +5254,8 @@ static OPTION_FUNC(opt_maxlogins)
             return 0;
         }
         hi->maxlogins = maxlogins;
-        changed = 1;
     }
     maxlogins = hi->maxlogins ? hi->maxlogins : nickserv_conf.default_maxlogins;
-
-    /* Sync to IRCv3 metadata if changed */
-    if (changed) {
-        char value_str[16];
-        snprintf(value_str, sizeof(value_str), "%u", (unsigned)maxlogins);
-        nickserv_sync_preference_metadata(hi, X3_META_MAXLOGINS, value_str);
-    }
 
     if (!(noreply))
         reply("NSMSG_SET_MAXLOGINS", maxlogins);
@@ -7123,28 +6998,6 @@ expire_nicks(UNUSED_ARG(void *data))
 
     if (nickserv_conf.nick_expire_frequency && nickserv_conf.expire_nicks)
         timeq_add(now + nickserv_conf.nick_expire_frequency, expire_nicks, NULL);
-}
-
-static void
-metadata_purge_expired(UNUSED_ARG(void *data))
-{
-#ifdef WITH_LMDB
-    if (nickserv_conf.metadata_ttl_enabled && x3_lmdb_is_available()) {
-        int deleted = x3_lmdb_metadata_purge_expired();
-        if (deleted > 0) {
-            log_module(NS_LOG, LOG_INFO, "Metadata purge: deleted %d expired entries", deleted);
-        } else if (deleted == 0) {
-            log_module(NS_LOG, LOG_DEBUG, "Metadata purge: no expired entries found");
-        } else {
-            log_module(NS_LOG, LOG_WARNING, "Metadata purge: error during purge operation");
-        }
-    }
-#endif
-
-    /* Reschedule if still enabled */
-    if (nickserv_conf.metadata_ttl_enabled && nickserv_conf.metadata_purge_frequency > 0) {
-        timeq_add(now + nickserv_conf.metadata_purge_frequency, metadata_purge_expired, NULL);
-    }
 }
 
 static void
@@ -9705,112 +9558,6 @@ kc_delfromgroup(const char *handle, const char *group_name)
                handle, group_name);
 }
 
-/* Context for async metadata set operations */
-struct kc_metadata_ctx {
-    char handle[NICKSERV_HANDLE_LEN + 1];
-    char *attr_name;
-    char *attr_value;
-};
-
-static void
-kc_metadata_ctx_free(struct kc_metadata_ctx *ctx)
-{
-    if (ctx) {
-        if (ctx->attr_name) free(ctx->attr_name);  /* malloc'd */
-        if (ctx->attr_value) pool_strfree(ctx->attr_value);  /* pool_strdup'd */
-        free(ctx);
-    }
-}
-
-/* Final callback for metadata set (fire-and-forget) */
-static int
-kc_metadata_done_cb(void *session, int result)
-{
-    struct kc_metadata_ctx *ctx = session;
-    if (result == KC_SUCCESS) {
-        log_module(NS_LOG, LOG_DEBUG, "kc_metadata_done_cb[%s]: %s set succeeded",
-                   ctx ? ctx->handle : "?", ctx ? ctx->attr_name : "?");
-    } else {
-        log_module(NS_LOG, LOG_DEBUG, "kc_metadata_done_cb[%s]: %s set failed: %d",
-                   ctx ? ctx->handle : "?", ctx ? ctx->attr_name : "?", result);
-    }
-    kc_metadata_ctx_free(ctx);
-    return 1;  /* Terminal - fire-and-forget operation complete */
-}
-
-/* User lookup callback for metadata set */
-static int
-kc_metadata_user_cb(void *session, int result, struct kc_user *user)
-{
-    struct kc_metadata_ctx *ctx = session;
-    int rc;
-
-    if (!ctx) {
-        log_module(NS_LOG, LOG_ERROR, "kc_metadata_user_cb: NULL context");
-        if (user) keycloak_user_free_fields(user);
-        return 1;
-    }
-
-    if (result != KC_SUCCESS || !user || !user->id) {
-        log_module(NS_LOG, LOG_DEBUG, "kc_metadata_user_cb[%s]: User not found in Keycloak",
-                   ctx->handle);
-        if (user) keycloak_user_free_fields(user);
-        kc_metadata_ctx_free(ctx);
-        return 1;
-    }
-
-    /* Start async attribute set */
-    rc = keycloak_set_user_attribute_async(keycloak_get_realm(), keycloak_get_authed_client(),
-                                           user->id, ctx->attr_name, ctx->attr_value,
-                                           ctx, kc_metadata_done_cb);
-    keycloak_user_free_fields(user);
-
-    if (rc < 0) {
-        log_module(NS_LOG, LOG_DEBUG, "kc_metadata_user_cb[%s]: Failed to start async set: %d",
-                   ctx->handle, rc);
-        kc_metadata_ctx_free(ctx);
-        return 1;
-    }
-
-    log_module(NS_LOG, LOG_DEBUG, "kc_metadata_user_cb[%s]: Started async attribute set",
-               ctx->handle);
-    return 1;  /* Terminal - async continues via next callback */
-}
-
-/* Token callback for metadata set */
-static void
-kc_metadata_token_cb(void *context, int result, struct access_token *token)
-{
-    struct kc_metadata_ctx *ctx = context;
-    int rc;
-
-    (void)token;  /* Token managed by keycloak module */
-
-    if (!ctx) {
-        log_module(NS_LOG, LOG_ERROR, "kc_metadata_token_cb: NULL context");
-        return;
-    }
-
-    if (result != KC_SUCCESS) {
-        log_module(NS_LOG, LOG_DEBUG, "kc_metadata_token_cb[%s]: Token refresh failed: %d",
-                   ctx->handle, result);
-        kc_metadata_ctx_free(ctx);
-        return;
-    }
-
-    /* Start async user lookup */
-    rc = keycloak_get_user_async(keycloak_get_realm(), keycloak_get_authed_client(),
-                                 ctx->handle, ctx, kc_metadata_user_cb);
-    if (rc < 0) {
-        log_module(NS_LOG, LOG_DEBUG, "kc_metadata_token_cb[%s]: Failed to start user lookup: %d",
-                   ctx->handle, rc);
-        kc_metadata_ctx_free(ctx);
-        return;
-    }
-
-    log_module(NS_LOG, LOG_DEBUG, "kc_metadata_token_cb[%s]: Started async user lookup",
-               ctx->handle);
-}
 
 /**
  * Authenticate via OAuth2 bearer token (for SASL OAUTHBEARER)
@@ -10208,512 +9955,7 @@ loc_auth_external(const char *fingerprint, const char *authzid, const char *host
 /*
  * IRCv3 Metadata-2 Support
  *
- * Metadata is stored in Keycloak as user attributes with a "metadata." prefix.
- * This allows IRC clients to set/get metadata that persists across sessions.
- *
- * Visibility is stored as a prefix in the value:
- *   - Public values are stored as-is: "value"
- *   - Private values are stored with prefix: "P:value"
- *
- * TTL (Time-To-Live) support:
- *   - Configurable default TTL for metadata entries
- *   - Immutable keys (e.g., avatar, pronouns) never expire
- *   - TTL encoded as T:timestamp: prefix in stored value
- */
 
-#ifdef WITH_LMDB
-/**
- * Check if a metadata key is immutable (should not expire).
- * @param key The metadata key to check
- * @return 1 if immutable, 0 if subject to TTL expiry
- */
-static int
-is_immutable_key(const char *key)
-{
-    const char *immutable_list;
-    const char *p;
-    size_t key_len;
-
-    if (!key || !*key)
-        return 0;
-
-    immutable_list = nickserv_conf.metadata_immutable_keys;
-    if (!immutable_list || !*immutable_list)
-        return 0;
-
-    key_len = strlen(key);
-
-    /* Search for key in space-separated list */
-    p = immutable_list;
-    while (*p) {
-        const char *start = p;
-
-        /* Skip leading spaces */
-        while (*p == ' ')
-            p++;
-        if (!*p)
-            break;
-
-        start = p;
-
-        /* Find end of current word */
-        while (*p && *p != ' ')
-            p++;
-
-        /* Check if this word matches the key */
-        if ((size_t)(p - start) == key_len && strncasecmp(start, key, key_len) == 0)
-            return 1;
-    }
-
-    return 0;
-}
-#endif /* WITH_LMDB */
-
-/**
- * Handle x3.* preference metadata keys from IRCv3 METADATA SET.
- * This validates the value and updates the handle_info struct.
- *
- * @param hi Handle info to update
- * @param key The metadata key (must start with "x3.")
- * @param value The value to set
- * @return 0 on success, -1 on invalid key/value
- */
-static int
-handle_x3_preference_metadata(struct handle_info *hi, const char *key, const char *value)
-{
-    if (!hi || !key || !value)
-        return -1;
-
-    /* x3.screen_width */
-    if (!strcmp(key, X3_META_SCREEN_WIDTH)) {
-        unsigned int width = strtoul(value, NULL, 0);
-        if (width > 0 && width < MIN_LINE_SIZE)
-            width = MIN_LINE_SIZE;
-        else if (width > MAX_LINE_SIZE)
-            width = MAX_LINE_SIZE;
-        hi->screen_width = width;
-        log_module(NS_LOG, LOG_DEBUG, "handle_x3_preference_metadata: Set %s screen_width=%u",
-                   hi->handle, width);
-        return 0;
-    }
-
-    /* x3.table_width */
-    if (!strcmp(key, X3_META_TABLE_WIDTH)) {
-        unsigned int width = strtoul(value, NULL, 0);
-        if (width > 0 && width < MIN_LINE_SIZE)
-            width = MIN_LINE_SIZE;
-        else if (width > MAX_LINE_SIZE)
-            width = MAX_LINE_SIZE;
-        hi->table_width = width;
-        log_module(NS_LOG, LOG_DEBUG, "handle_x3_preference_metadata: Set %s table_width=%u",
-                   hi->handle, width);
-        return 0;
-    }
-
-    /* x3.style */
-    if (!strcmp(key, X3_META_STYLE)) {
-        if (!irccasecmp(value, "Clean"))
-            hi->userlist_style = HI_STYLE_CLEAN;
-        else if (!irccasecmp(value, "Advanced"))
-            hi->userlist_style = HI_STYLE_ADVANCED;
-        else if (!irccasecmp(value, "Classic"))
-            hi->userlist_style = HI_STYLE_CLASSIC;
-        else if (!irccasecmp(value, "Normal"))
-            hi->userlist_style = HI_STYLE_NORMAL;
-        else {
-            log_module(NS_LOG, LOG_WARNING, "handle_x3_preference_metadata: Invalid style '%s' for %s",
-                       value, hi->handle);
-            return -1;
-        }
-        log_module(NS_LOG, LOG_DEBUG, "handle_x3_preference_metadata: Set %s style=%s",
-                   hi->handle, value);
-        return 0;
-    }
-
-    /* x3.announcements */
-    if (!strcmp(key, X3_META_ANNOUNCEMENTS)) {
-        if (!irccasecmp(value, "on") || !irccasecmp(value, "yes") || !strcmp(value, "1"))
-            hi->announcements = 'y';
-        else if (!irccasecmp(value, "off") || !irccasecmp(value, "no") || !strcmp(value, "0"))
-            hi->announcements = 'n';
-        else if (!irccasecmp(value, "default") || !strcmp(value, "?"))
-            hi->announcements = '?';
-        else {
-            log_module(NS_LOG, LOG_WARNING, "handle_x3_preference_metadata: Invalid announcements '%s' for %s",
-                       value, hi->handle);
-            return -1;
-        }
-        log_module(NS_LOG, LOG_DEBUG, "handle_x3_preference_metadata: Set %s announcements=%c",
-                   hi->handle, hi->announcements);
-        return 0;
-    }
-
-    /* x3.maxlogins */
-    if (!strcmp(key, X3_META_MAXLOGINS)) {
-        unsigned int maxlogins = strtoul(value, NULL, 0);
-        if (maxlogins > nickserv_conf.hard_maxlogins)
-            maxlogins = nickserv_conf.hard_maxlogins;
-        hi->maxlogins = maxlogins;
-        log_module(NS_LOG, LOG_DEBUG, "handle_x3_preference_metadata: Set %s maxlogins=%u",
-                   hi->handle, maxlogins);
-        return 0;
-    }
-
-    /* x3.title - User epithet/signature (public profile field) */
-    if (!strcmp(key, X3_META_TITLE)) {
-        size_t max_len = 100;  /* Reasonable max for an epithet */
-        if (hi->epithet)
-            pool_strfree(hi->epithet);
-        if (value[0] == '*' && value[1] == '\0') {
-            /* "*" means clear */
-            hi->epithet = NULL;
-        } else if (strlen(value) > max_len) {
-            /* Truncate if too long - make a local copy first */
-            char truncated[101];
-            strncpy(truncated, value, max_len);
-            truncated[max_len] = '\0';
-            hi->epithet = pool_strdup(truncated);
-        } else {
-            hi->epithet = pool_strdup(value);
-        }
-        log_module(NS_LOG, LOG_DEBUG, "handle_x3_preference_metadata: Set %s title=%s",
-                   hi->handle, hi->epithet ? hi->epithet : "(cleared)");
-        return 1;  /* Return 1 to indicate this is a public profile field, not a private preference */
-    }
-
-    /* Unknown x3.* key */
-    return -1;
-}
-
-int
-nickserv_set_user_metadata(struct handle_info *hi, const char *key, const char *value, int visibility)
-{
-    char stored_value[2048];
-    int lmdb_ok = 0;
-    int keycloak_ok = 0;
-
-    if (!hi || !key)
-        return -1;
-
-    /* Handle x3.* preference and profile metadata keys specially.
-     * These update the handle_info struct and use 90-day TTL.
-     * Return codes: 0 = private preference, 1 = public profile field, -1 = unknown key
-     */
-    if (strncmp(key, X3_METADATA_PREFIX, strlen(X3_METADATA_PREFIX)) == 0) {
-        if (value && *value) {
-            int result = handle_x3_preference_metadata(hi, key, value);
-            if (result == 0) {
-                /* x3.* preferences (screen_width, style, etc.) are always private */
-                visibility = METADATA_VIS_PRIVATE;
-            } else if (result == 1) {
-                /* x3.* profile fields (title) keep their original visibility (should be public) */
-                visibility = METADATA_VIS_PUBLIC;
-            }
-            /* result == -1: unknown key, continue with original visibility to store in LMDB/Keycloak */
-        }
-    }
-
-    /* Encode visibility in stored value: P:value for private, value for public */
-    if (value && *value) {
-        if (visibility == METADATA_VIS_PRIVATE) {
-            snprintf(stored_value, sizeof(stored_value), "P:%s", value);
-        } else {
-            snprintf(stored_value, sizeof(stored_value), "%s", value);
-        }
-    } else {
-        stored_value[0] = '\0';
-    }
-
-    /*
-     * Write-through cache pattern:
-     * 1. Write to LMDB cache first (fast, local)
-     * 2. Write to Keycloak backend (authoritative, may be slow/unavailable)
-     * Success if either succeeds, prefer Keycloak as authoritative.
-     */
-
-#ifdef WITH_LMDB
-    /* Step 1: Write to LMDB cache */
-    if (x3_lmdb_is_available()) {
-        int rc;
-        int is_x3_pref = (strncmp(key, X3_METADATA_PREFIX, strlen(X3_METADATA_PREFIX)) == 0);
-
-        if (value && *value) {
-            /* Determine expiry time based on TTL settings */
-            time_t expires = 0;
-            if (!is_immutable_key(key)) {
-                if (is_x3_pref) {
-                    /* x3.* preference keys use 90-day TTL */
-                    expires = now + X3_PREF_TTL_SECS;
-                } else if (nickserv_conf.metadata_ttl_enabled) {
-                    expires = now + nickserv_conf.metadata_default_ttl;
-                }
-            }
-            rc = x3_lmdb_account_set_ex(hi->handle, key, stored_value, expires);
-        } else {
-            rc = x3_lmdb_account_delete(hi->handle, key);
-        }
-
-        if (rc == LMDB_SUCCESS || rc == LMDB_NOT_FOUND) {
-            lmdb_ok = 1;
-            log_module(NS_LOG, LOG_DEBUG, "nickserv_set_user_metadata: LMDB cache set %s.%s = %s (vis=%d, ttl=%s)",
-                       hi->handle, key, value ? value : "(deleted)", visibility,
-                       is_immutable_key(key) ? "immutable" : (is_x3_pref ? "90d" : "default"));
-        } else {
-            log_module(NS_LOG, LOG_WARNING, "nickserv_set_user_metadata: LMDB cache failed for %s.%s",
-                       hi->handle, key);
-        }
-    }
-#endif
-
-#ifdef WITH_KEYCLOAK
-    /* Step 2: Write to Keycloak backend (fully async fire-and-forget) */
-    if (nickserv_conf.keycloak_enable) {
-        /* Use fully async path - token → user lookup → set attribute */
-        struct kc_metadata_ctx *kc_ctx = calloc(1, sizeof(*kc_ctx));
-        if (kc_ctx) {
-            safestrncpy(kc_ctx->handle, hi->handle, sizeof(kc_ctx->handle));
-            kc_ctx->attr_name = malloc(128);
-            if (kc_ctx->attr_name) {
-                snprintf(kc_ctx->attr_name, 128, "metadata.%s", key);
-                kc_ctx->attr_value = pool_strdup((value && *value) ? stored_value : "");
-                if (kc_ctx->attr_value) {
-                    int kc_rc = keycloak_ensure_token_async(kc_metadata_token_cb, kc_ctx);
-                    if (kc_rc >= 0) {
-                        /* Async started (0) or callback invoked synchronously (1) - either way
-                         * the callback chain owns the context now. Consider optimistically successful. */
-                        keycloak_ok = 1;
-                        log_module(NS_LOG, LOG_DEBUG, "nickserv_set_user_metadata: %s async Keycloak set %s.%s",
-                                   kc_rc == 1 ? "Sync" : "Started", hi->handle, key);
-                    } else {
-                        log_module(NS_LOG, LOG_DEBUG, "nickserv_set_user_metadata: Failed to start async token");
-                        kc_metadata_ctx_free(kc_ctx);
-                    }
-                } else {
-                    free(kc_ctx->attr_name);
-                    free(kc_ctx);
-                }
-            } else {
-                free(kc_ctx);
-            }
-        }
-    }
-#endif
-
-    /* Success if either backend succeeded */
-    if (lmdb_ok || keycloak_ok) {
-        /* Push metadata to Nefarious for online users
-         * This proactively updates the IRCd's cache when metadata changes in X3.
-         */
-        struct userNode *user;
-        for (user = hi->users; user; user = user->next_authed) {
-            irc_metadata(user->nick, key, value, visibility);
-            log_module(NS_LOG, LOG_DEBUG, "nickserv_set_user_metadata: Pushed %s.%s to IRCd for online user %s",
-                       hi->handle, key, user->nick);
-        }
-        return 0;
-    }
-
-    log_module(NS_LOG, LOG_DEBUG, "nickserv_set_user_metadata: No backend available for %s.%s", hi->handle, key);
-    return -1;
-}
-
-int
-nickserv_get_user_metadata(struct handle_info *hi, const char *key, char *value_out, int *visibility_out)
-{
-    if (!hi || !key || !value_out)
-        return -1;
-
-    value_out[0] = '\0';
-    if (visibility_out)
-        *visibility_out = METADATA_VIS_PUBLIC;
-
-    /*
-     * LMDB cache lookup only (non-blocking).
-     * For cache misses, caller should use nickserv_get_user_metadata_async()
-     * which will query Keycloak and send the MD response from callback.
-     */
-
-#ifdef WITH_LMDB
-    if (x3_lmdb_is_available()) {
-        char stored_value[2048];
-        int rc;
-
-        rc = x3_lmdb_account_get(hi->handle, key, stored_value);
-        if (rc == LMDB_SUCCESS) {
-            /* Cache hit! */
-            if (stored_value[0] == 'P' && stored_value[1] == ':') {
-                if (visibility_out)
-                    *visibility_out = METADATA_VIS_PRIVATE;
-                strncpy(value_out, stored_value + 2, 1023);
-            } else {
-                strncpy(value_out, stored_value, 1023);
-            }
-            value_out[1023] = '\0';
-            log_module(NS_LOG, LOG_DEBUG, "nickserv_get_user_metadata: LMDB cache hit for %s.%s",
-                       hi->handle, key);
-            return 0;
-        }
-        /* Cache miss - caller should use async API */
-        log_module(NS_LOG, LOG_DEBUG, "nickserv_get_user_metadata: LMDB cache miss for %s.%s",
-                   hi->handle, key);
-    }
-#endif
-
-    return 1; /* Cache miss or no LMDB - caller should use async */
-}
-
-/**
- * Async single-key metadata lookup - callback chain stage 1 (token ready).
- */
-static void
-mdq_single_token_cb(void *ctx_ptr, int result, struct access_token *token)
-{
-    struct mdq_single_ctx *ctx = (struct mdq_single_ctx *)ctx_ptr;
-    (void)token;  /* Token is managed by token manager */
-
-    if (result != KC_SUCCESS) {
-        log_module(NS_LOG, LOG_DEBUG, "mdq_single_async: Token acquisition failed (%d)", result);
-        free(ctx);
-        return;
-    }
-
-    /* Stage 2: Get user ID from Keycloak */
-    if (keycloak_get_user_async(keycloak_get_realm(), keycloak_get_authed_client(),
-                                 ctx->handle, ctx, mdq_single_user_cb) < 0) {
-        log_module(NS_LOG, LOG_DEBUG, "mdq_single_async: Failed to start user lookup for %s", ctx->handle);
-        free(ctx);
-        return;
-    }
-}
-
-/**
- * Async single-key metadata lookup - callback chain stage 2 (user ID ready).
- */
-static int
-mdq_single_user_cb(void *session, int result, struct kc_user *user)
-{
-    struct mdq_single_ctx *ctx = (struct mdq_single_ctx *)session;
-    char attr_name[128];
-
-    if (result != KC_SUCCESS || !user || !user->id) {
-        log_module(NS_LOG, LOG_DEBUG, "mdq_single_async: User %s not found (%d)", ctx->handle, result);
-        if (user) keycloak_user_free_fields(user);
-        free(ctx);
-        return 1;
-    }
-
-    /* Store user ID for stage 3 */
-    ctx->user_id = pool_strdup(user->id);
-    keycloak_user_free_fields(user);
-
-    if (!ctx->user_id) {
-        log_module(NS_LOG, LOG_ERROR, "mdq_single_async: Out of memory");
-        free(ctx);
-        return 1;
-    }
-
-    /* Stage 3: Get specific attribute */
-    snprintf(attr_name, sizeof(attr_name), "metadata.%s", ctx->key);
-    if (keycloak_get_user_attribute_async(keycloak_get_realm(), keycloak_get_authed_client(),
-                                           ctx->user_id, attr_name, ctx,
-                                           mdq_single_attr_cb) < 0) {
-        log_module(NS_LOG, LOG_DEBUG, "mdq_single_async: Failed to start attribute lookup for %s.%s",
-                   ctx->handle, ctx->key);
-        pool_strfree(ctx->user_id);
-        free(ctx);
-        return 1;
-    }
-
-    return 0;  /* Continue processing */
-}
-
-/**
- * Async single-key metadata lookup - callback chain stage 3 (attribute ready).
- * Sends MD response to IRCd and populates LMDB cache.
- */
-static int
-mdq_single_attr_cb(void *session, int result, char *value)
-{
-    struct mdq_single_ctx *ctx = (struct mdq_single_ctx *)session;
-
-    if (result == KC_SUCCESS && value) {
-        const char *display_value = value;
-        int visibility = METADATA_VIS_PUBLIC;
-
-        /* Parse visibility prefix */
-        if (value[0] == 'P' && value[1] == ':') {
-            visibility = METADATA_VIS_PRIVATE;
-            display_value = value + 2;
-        }
-
-        log_module(NS_LOG, LOG_DEBUG, "mdq_single_async: Pushing %s.%s = %s (vis=%d) from Keycloak",
-                   ctx->handle, ctx->key, display_value, visibility);
-
-        /* Send MD response to IRCd */
-        irc_metadata(ctx->handle, ctx->key, display_value, visibility);
-
-#ifdef WITH_LMDB
-        /* Populate LMDB cache */
-        if (x3_lmdb_is_available()) {
-            x3_lmdb_account_set(ctx->handle, ctx->key, value);
-            /* Also update sync timestamp */
-            char ts_buf[32];
-            snprintf(ts_buf, sizeof(ts_buf), "%lu", (unsigned long)now);
-            x3_lmdb_account_set(ctx->handle, "_metadata_sync_time", ts_buf);
-        }
-#endif
-        free(value);
-    } else {
-        log_module(NS_LOG, LOG_DEBUG, "mdq_single_async: Attribute %s.%s not found (%d)",
-                   ctx->handle, ctx->key, result);
-        if (value) free(value);
-    }
-
-    /* Cleanup context */
-    if (ctx->user_id) pool_strfree(ctx->user_id);
-    free(ctx);
-    return 1;  /* Terminal callback */
-}
-
-/**
- * Start async single-key metadata lookup (fire-and-forget).
- * Called when LMDB cache miss occurs for MDQ single-key queries.
- */
-void
-nickserv_get_user_metadata_async(struct handle_info *hi, const char *key)
-{
-#ifdef WITH_KEYCLOAK
-    if (!nickserv_conf.keycloak_enable)
-        return;
-
-    if (!hi || !key)
-        return;
-
-    struct mdq_single_ctx *ctx = calloc(1, sizeof(*ctx));
-    if (!ctx) {
-        log_module(NS_LOG, LOG_ERROR, "mdq_single_async: Out of memory");
-        return;
-    }
-
-    strncpy(ctx->handle, hi->handle, sizeof(ctx->handle) - 1);
-    strncpy(ctx->key, key, sizeof(ctx->key) - 1);
-
-    /* Start async token acquisition - fire-and-forget
-     * Note: rc >= 0 means either async pending (0) or callback invoked synchronously (1).
-     * Only free context on error (rc < 0) when no callback was invoked. */
-    if (keycloak_ensure_token_async(mdq_single_token_cb, ctx) < 0) {
-        log_module(NS_LOG, LOG_DEBUG, "mdq_single_async: Failed to start token acquisition for %s.%s",
-                   hi->handle, key);
-        free(ctx);
-        return;
-    }
-
-    log_module(NS_LOG, LOG_DEBUG, "mdq_single_async: Started async lookup for %s.%s", hi->handle, key);
-#else
-    (void)hi;
-    (void)key;
-#endif
-}
 
 /**
  * Update activity data (lastseen/last_present) in LMDB.
@@ -10749,171 +9991,7 @@ nickserv_update_activity_lmdb(struct handle_info *hi, int update_lastseen, int u
 #endif
 }
 
-/**
- * Sync a user preference to IRCv3 metadata.
- * This writes to LMDB with 90-day TTL and pushes to Nefarious for online users.
- *
- * User preferences use the x3. namespace and are PRIVATE visibility.
- * TTL is refreshed whenever the preference is modified.
- *
- * @param hi Handle info for the user
- * @param key Metadata key (should be x3.screen_width, x3.style, etc.)
- * @param value The preference value as a string
- */
-static void
-nickserv_sync_preference_metadata(struct handle_info *hi, const char *key, const char *value)
-{
-    if (!hi || !key)
-        return;
 
-#ifdef WITH_LMDB
-    if (x3_lmdb_is_available()) {
-        char stored_value[256];
-        time_t expires;
-
-        /* Preferences are private - prefix with P: */
-        snprintf(stored_value, sizeof(stored_value), "P:%s", value ? value : "");
-
-        /* Calculate 90-day TTL expiry */
-        expires = now + X3_PREF_TTL_SECS;
-
-        int rc = x3_lmdb_account_set_ex(hi->handle, key, stored_value, expires);
-        if (rc == LMDB_SUCCESS) {
-            log_module(NS_LOG, LOG_DEBUG, "nickserv_sync_preference_metadata: Stored %s.%s = %s (ttl=%dd)",
-                       hi->handle, key, value ? value : "(empty)", X3_PREF_TTL_DAYS);
-        } else {
-            log_module(NS_LOG, LOG_WARNING, "nickserv_sync_preference_metadata: LMDB failed for %s.%s (rc=%d)",
-                       hi->handle, key, rc);
-        }
-    }
-#endif
-
-    /* Push to Nefarious for online users */
-    struct userNode *user;
-    for (user = hi->users; user; user = user->next_authed) {
-        irc_metadata(user->nick, key, value, METADATA_VIS_PRIVATE);
-        log_module(NS_LOG, LOG_DEBUG, "nickserv_sync_preference_metadata: Pushed %s to IRCd for %s",
-                   key, user->nick);
-    }
-}
-
-void
-nickserv_sync_metadata_to_ircd(struct userNode *user)
-{
-    int found_entries = 0;
-    int lmdb_stale = 0;
-
-    if (!user || !user->handle_info)
-        return;
-
-    /*
-     * Sync pattern: Try LMDB cache first, then Keycloak.
-     * When loading from Keycloak, populate LMDB cache for next time.
-     *
-     * Staleness detection: If LMDB data was written before X3 started,
-     * it may be stale (Keycloak may have been updated while X3 was down).
-     * In that case, skip LMDB and refresh from Keycloak.
-     */
-
-#ifdef WITH_LMDB
-    /* Step 1: Check if LMDB data is stale (from a previous X3 session) */
-    if (x3_lmdb_is_available() && x3_metadata_startup_time > 0) {
-        char sync_time_buf[32];
-        if (x3_lmdb_account_get(user->handle_info->handle, "_metadata_sync_time", sync_time_buf) == LMDB_SUCCESS) {
-            time_t sync_time = (time_t)strtoul(sync_time_buf, NULL, 10);
-            if (sync_time < x3_metadata_startup_time) {
-                log_module(NS_LOG, LOG_DEBUG, "nickserv_sync_metadata_to_ircd: LMDB data for %s is stale (sync_time=%lu < startup=%lu), refreshing from Keycloak",
-                           user->handle_info->handle, (unsigned long)sync_time, (unsigned long)x3_metadata_startup_time);
-                lmdb_stale = 1;
-            }
-        } else {
-            /* No sync time found - data predates timestamp tracking, treat as stale */
-            log_module(NS_LOG, LOG_DEBUG, "nickserv_sync_metadata_to_ircd: No _metadata_sync_time for %s, treating as stale",
-                       user->handle_info->handle);
-            lmdb_stale = 1;
-        }
-    }
-
-    /* Step 2: Try LMDB cache if not stale */
-    if (x3_lmdb_is_available() && !lmdb_stale) {
-        struct lmdb_metadata_entry *entries = NULL;
-        struct lmdb_metadata_entry *entry;
-        int count;
-
-        count = x3_lmdb_account_list(user->handle_info->handle, &entries);
-        if (count > 0) {
-            log_module(NS_LOG, LOG_DEBUG, "nickserv_sync_metadata_to_ircd: Found %d LMDB entries for %s",
-                       count, user->handle_info->handle);
-
-            for (entry = entries; entry; entry = entry->next) {
-                const char *key = entry->key;
-                const char *value = entry->value;
-                int visibility = METADATA_VIS_PUBLIC;
-
-                /* Skip internal keys (start with _) */
-                if (key && key[0] == '_')
-                    continue;
-
-                /* Parse visibility prefix from stored value (P:value for private) */
-                if (value && value[0] == 'P' && value[1] == ':') {
-                    visibility = METADATA_VIS_PRIVATE;
-                    value += 2;
-                }
-
-                log_module(NS_LOG, LOG_DEBUG, "nickserv_sync_metadata_to_ircd: Pushing %s.%s = %s (vis=%d) from LMDB",
-                           user->nick, key, value, visibility);
-
-                irc_metadata(user->nick, key, value, visibility);
-                found_entries++;
-
-#ifdef WITH_KEYCLOAK
-                /* Also sync LMDB entries to Keycloak to keep them in sync.
-                 * X3/LMDB is authoritative - this ensures Keycloak stays current
-                 * even if the Keycloak user was deleted and recreated. */
-                if (nickserv_conf.keycloak_enable) {
-                    struct kc_metadata_ctx *kc_ctx = calloc(1, sizeof(*kc_ctx));
-                    if (kc_ctx) {
-                        safestrncpy(kc_ctx->handle, user->handle_info->handle, sizeof(kc_ctx->handle));
-                        kc_ctx->attr_name = malloc(128);
-                        if (kc_ctx->attr_name) {
-                            snprintf(kc_ctx->attr_name, 128, "metadata.%s", key);
-                            /* Re-encode with visibility prefix for Keycloak storage */
-                            char stored_val[2048];
-                            if (visibility == METADATA_VIS_PRIVATE) {
-                                snprintf(stored_val, sizeof(stored_val), "P:%s", value);
-                            } else {
-                                snprintf(stored_val, sizeof(stored_val), "%s", value);
-                            }
-                            kc_ctx->attr_value = pool_strdup(stored_val);
-                            if (kc_ctx->attr_value) {
-                                if (keycloak_ensure_token_async(kc_metadata_token_cb, kc_ctx) < 0) {
-                                    kc_metadata_ctx_free(kc_ctx);
-                                }
-                                /* else: async chain owns context now */
-                            } else {
-                                free(kc_ctx->attr_name);
-                                free(kc_ctx);
-                            }
-                        } else {
-                            free(kc_ctx);
-                        }
-                    }
-                }
-#endif
-            }
-
-            x3_lmdb_free_entries(entries);
-        }
-    }
-#endif
-
-    /* If we found entries in LMDB cache, we're done (already synced to IRCd and Keycloak) */
-    if (found_entries > 0)
-        return;
-
-    /* Step 2: Query Keycloak backend async (cache miss or no LMDB) - fire-and-forget */
-    nickserv_sync_metadata_async(user->handle_info->handle, user->nick, 1);
-}
 
 /**
  * Sync profile metadata fields to IRCd for IRCv3 client exposure.
@@ -10927,357 +10005,6 @@ nickserv_sync_metadata_to_ircd(struct userNode *user)
  *
  * @param user The user to sync profile metadata for
  */
-void
-nickserv_sync_profile_metadata_to_ircd(struct userNode *user)
-{
-    struct handle_info *hi;
-    char buf[64];
-
-    if (!user || !user->handle_info)
-        return;
-
-    hi = user->handle_info;
-
-    /* x3.title - User epithet/signature (public) */
-    if (hi->epithet && hi->epithet[0]) {
-        irc_metadata(user->nick, X3_META_TITLE, hi->epithet, METADATA_VIS_PUBLIC);
-        log_module(NS_LOG, LOG_DEBUG, "nickserv_sync_profile_metadata_to_ircd: Pushed %s %s=%s",
-                   user->nick, X3_META_TITLE, hi->epithet);
-    }
-
-    /* x3.registered - Account registration timestamp (public) */
-    snprintf(buf, sizeof(buf), "%lu", (unsigned long)hi->registered);
-    irc_metadata(user->nick, X3_META_REGISTERED, buf, METADATA_VIS_PUBLIC);
-    log_module(NS_LOG, LOG_DEBUG, "nickserv_sync_profile_metadata_to_ircd: Pushed %s %s=%s",
-               user->nick, X3_META_REGISTERED, buf);
-
-    /* x3.karma - Reputation score (public, only if non-zero) */
-    if (hi->karma != 0) {
-        snprintf(buf, sizeof(buf), "%d", hi->karma);
-        irc_metadata(user->nick, X3_META_KARMA, buf, METADATA_VIS_PUBLIC);
-        log_module(NS_LOG, LOG_DEBUG, "nickserv_sync_profile_metadata_to_ircd: Pushed %s %s=%s",
-                   user->nick, X3_META_KARMA, buf);
-    }
-
-    /* x3.email - Email address (private, self-access only) */
-    if (hi->email_addr && hi->email_addr[0]) {
-        irc_metadata(user->nick, X3_META_EMAIL, hi->email_addr, METADATA_VIS_PRIVATE);
-        log_module(NS_LOG, LOG_DEBUG, "nickserv_sync_profile_metadata_to_ircd: Pushed %s %s=(private)",
-                   user->nick, X3_META_EMAIL);
-    }
-
-    /* x3.lasthost - Last seen host (private, self-access only) */
-    if (hi->last_quit_host[0]) {
-        irc_metadata(user->nick, X3_META_LASTHOST, hi->last_quit_host, METADATA_VIS_PRIVATE);
-        log_module(NS_LOG, LOG_DEBUG, "nickserv_sync_profile_metadata_to_ircd: Pushed %s %s=(private)",
-                   user->nick, X3_META_LASTHOST);
-    }
-}
-
-void
-nickserv_sync_account_metadata_to_ircd(struct handle_info *hi)
-{
-    int found_entries = 0;
-    int lmdb_stale = 0;
-
-    if (!hi)
-        return;
-
-    /* This variant uses the account name (handle) as the target,
-     * for MDQ responses where the user may be offline.
-     *
-     * Uses compression passthrough: if data in LMDB is already compressed,
-     * send it via irc_metadata_raw() with Z flag to avoid decompression/recompression.
-     *
-     * Staleness detection: If LMDB data was written before X3 started,
-     * skip LMDB and refresh from Keycloak.
-     */
-
-#ifdef WITH_LMDB
-    /* Step 1: Check if LMDB data is stale (from a previous X3 session) */
-    if (x3_lmdb_is_available() && x3_metadata_startup_time > 0) {
-        char sync_time_buf[32];
-        if (x3_lmdb_account_get(hi->handle, "_metadata_sync_time", sync_time_buf) == LMDB_SUCCESS) {
-            time_t sync_time = (time_t)strtoul(sync_time_buf, NULL, 10);
-            if (sync_time < x3_metadata_startup_time) {
-                log_module(NS_LOG, LOG_DEBUG, "nickserv_sync_account_metadata_to_ircd: LMDB data for %s is stale (sync_time=%lu < startup=%lu), refreshing from Keycloak",
-                           hi->handle, (unsigned long)sync_time, (unsigned long)x3_metadata_startup_time);
-                lmdb_stale = 1;
-            }
-        } else {
-            /* No sync time found - data predates timestamp tracking, treat as stale */
-            log_module(NS_LOG, LOG_DEBUG, "nickserv_sync_account_metadata_to_ircd: No _metadata_sync_time for %s, treating as stale",
-                       hi->handle);
-            lmdb_stale = 1;
-        }
-    }
-
-    /* Step 2: Try LMDB cache first with raw passthrough (if not stale) */
-    if (x3_lmdb_is_available() && !lmdb_stale) {
-        struct lmdb_raw_metadata_entry *entries = NULL;
-        struct lmdb_raw_metadata_entry *entry;
-        int count;
-
-        count = x3_lmdb_account_list_raw(hi->handle, &entries);
-        if (count > 0) {
-            log_module(NS_LOG, LOG_DEBUG, "nickserv_sync_account_metadata_to_ircd: Found %d LMDB entries for %s (raw passthrough)",
-                       count, hi->handle);
-
-            for (entry = entries; entry; entry = entry->next) {
-                const char *key = entry->key;
-                int visibility = METADATA_VIS_PUBLIC;
-
-                /* Skip internal keys (start with _) */
-                if (key && key[0] == '_')
-                    continue;
-
-                /* For compressed data, check visibility prefix in raw data */
-                if (entry->is_compressed) {
-                    /* Compressed data - use raw passthrough
-                     * Note: visibility prefix is part of the compressed payload,
-                     * so we send as-is and let the receiver handle it */
-                    log_module(NS_LOG, LOG_DEBUG, "nickserv_sync_account_metadata_to_ircd: Pushing %s.%s raw (%zu bytes, compressed) from LMDB",
-                               hi->handle, key, entry->raw_len);
-
-                    irc_metadata_raw(hi->handle, key, entry->raw_value, entry->raw_len, 1, visibility);
-                } else {
-                    /* Not compressed - treat as string and check visibility prefix */
-                    const char *value = (const char *)entry->raw_value;
-                    if (entry->raw_len > 0 && value[0] == 'P' && entry->raw_len > 1 && value[1] == ':') {
-                        visibility = METADATA_VIS_PRIVATE;
-                        value += 2;
-                    }
-
-                    log_module(NS_LOG, LOG_DEBUG, "nickserv_sync_account_metadata_to_ircd: Pushing %s.%s = %s (vis=%d) from LMDB",
-                               hi->handle, key, value, visibility);
-
-                    irc_metadata(hi->handle, key, value, visibility);
-
-#ifdef WITH_KEYCLOAK
-                    /* Also sync LMDB entries to Keycloak to keep them in sync.
-                     * X3/LMDB is authoritative - this ensures Keycloak stays current. */
-                    if (nickserv_conf.keycloak_enable) {
-                        struct kc_metadata_ctx *kc_ctx = calloc(1, sizeof(*kc_ctx));
-                        if (kc_ctx) {
-                            safestrncpy(kc_ctx->handle, hi->handle, sizeof(kc_ctx->handle));
-                            kc_ctx->attr_name = malloc(128);
-                            if (kc_ctx->attr_name) {
-                                snprintf(kc_ctx->attr_name, 128, "metadata.%s", key);
-                                /* Re-encode with visibility prefix for Keycloak storage */
-                                char stored_val[2048];
-                                if (visibility == METADATA_VIS_PRIVATE) {
-                                    snprintf(stored_val, sizeof(stored_val), "P:%s", value);
-                                } else {
-                                    snprintf(stored_val, sizeof(stored_val), "%s", value);
-                                }
-                                kc_ctx->attr_value = pool_strdup(stored_val);
-                                if (kc_ctx->attr_value) {
-                                    if (keycloak_ensure_token_async(kc_metadata_token_cb, kc_ctx) < 0) {
-                                        kc_metadata_ctx_free(kc_ctx);
-                                    }
-                                } else {
-                                    free(kc_ctx->attr_name);
-                                    free(kc_ctx);
-                                }
-                            } else {
-                                free(kc_ctx);
-                            }
-                        }
-                    }
-#endif
-                }
-                found_entries++;
-            }
-
-            x3_lmdb_free_raw_entries(entries);
-        }
-    }
-#endif
-
-    /* If we found entries in LMDB cache, we're done (already synced to IRCd and Keycloak) */
-    if (found_entries > 0)
-        return;
-
-    /* Step 2: Query Keycloak backend async (cache miss or no LMDB) - fire-and-forget */
-    nickserv_sync_metadata_async(hi->handle, NULL, 0);
-}
-
-/**
- * Async metadata sync - callback chain stage 1 (token ready).
- */
-static void
-metadata_sync_token_cb(void *ctx_ptr, int result, struct access_token *token)
-{
-    struct metadata_sync_ctx *ctx = (struct metadata_sync_ctx *)ctx_ptr;
-    (void)token;  /* Token is managed by token manager */
-
-    if (result != KC_SUCCESS) {
-        log_module(NS_LOG, LOG_DEBUG, "metadata_sync_async: Token acquisition failed (%d)", result);
-        free(ctx);
-        return;
-    }
-
-    /* Stage 2: Get user ID from Keycloak */
-    if (keycloak_get_user_async(keycloak_get_realm(), keycloak_get_authed_client(),
-                                 ctx->handle, ctx, metadata_sync_user_cb) < 0) {
-        log_module(NS_LOG, LOG_DEBUG, "metadata_sync_async: Failed to start user lookup for %s", ctx->handle);
-        free(ctx);
-        return;
-    }
-}
-
-/**
- * Async metadata sync - callback chain stage 2 (user ID ready).
- */
-static int
-metadata_sync_user_cb(void *session, int result, struct kc_user *user)
-{
-    struct metadata_sync_ctx *ctx = (struct metadata_sync_ctx *)session;
-
-    if (result != KC_SUCCESS || !user || !user->id) {
-        log_module(NS_LOG, LOG_DEBUG, "metadata_sync_async: User %s not found (%d)", ctx->handle, result);
-        if (user) keycloak_user_free_fields(user);
-        free(ctx);
-        return 1;
-    }
-
-    /* Store user ID for stage 3 */
-    ctx->user_id = pool_strdup(user->id);
-    keycloak_user_free_fields(user);
-
-    if (!ctx->user_id) {
-        log_module(NS_LOG, LOG_ERROR, "metadata_sync_async: Out of memory");
-        free(ctx);
-        return 1;
-    }
-
-    /* Stage 3: List metadata.* attributes */
-    if (keycloak_list_user_attributes_async(keycloak_get_realm(), keycloak_get_authed_client(),
-                                             ctx->user_id, "metadata.", ctx,
-                                             metadata_sync_list_cb) < 0) {
-        log_module(NS_LOG, LOG_DEBUG, "metadata_sync_async: Failed to start attribute listing for %s", ctx->handle);
-        pool_strfree(ctx->user_id);
-        free(ctx);
-        return 1;
-    }
-
-    return 0;  /* Continue processing */
-}
-
-/**
- * Async metadata sync - callback chain stage 3 (attributes ready).
- * Pushes metadata to IRCd and populates LMDB cache.
- */
-static int
-metadata_sync_list_cb(void *session, int result, struct kc_metadata_entry *entries)
-{
-    struct metadata_sync_ctx *ctx = (struct metadata_sync_ctx *)session;
-    struct kc_metadata_entry *entry;
-    const char *target;
-
-    if (result != KC_SUCCESS || !entries) {
-        log_module(NS_LOG, LOG_DEBUG, "metadata_sync_async: No attributes for %s (%d)", ctx->handle, result);
-        if (entries) keycloak_free_metadata_entries(entries);
-        if (ctx->user_id) pool_strfree(ctx->user_id);
-        free(ctx);
-        return 1;
-    }
-
-    /* Determine target (nick or handle) */
-    target = ctx->use_nick ? ctx->nick : ctx->handle;
-
-    /* Push each metadata entry to the IRCd and populate LMDB cache */
-    for (entry = entries; entry; entry = entry->next) {
-        /* Strip "metadata." prefix from key */
-        const char *key = entry->key;
-        const char *value = entry->value;
-        const char *original_value = entry->value;
-        int visibility = METADATA_VIS_PUBLIC;
-
-        if (strncmp(key, "metadata.", 9) == 0)
-            key += 9;
-
-        /* Parse visibility prefix from stored value (P:value for private) */
-        if (value && value[0] == 'P' && value[1] == ':') {
-            visibility = METADATA_VIS_PRIVATE;
-            value += 2;
-        }
-
-        log_module(NS_LOG, LOG_DEBUG, "metadata_sync_async: Pushing %s.%s = %s (vis=%d) from Keycloak",
-                   target, key, value, visibility);
-
-        irc_metadata(target, key, value, visibility);
-
-#ifdef WITH_LMDB
-        /* Populate LMDB cache */
-        if (x3_lmdb_is_available()) {
-            x3_lmdb_account_set(ctx->handle, key, original_value);
-        }
-#endif
-    }
-
-#ifdef WITH_LMDB
-    /* Store sync timestamp to track when LMDB was last populated from Keycloak.
-     * On subsequent logins, if this timestamp < x3_metadata_startup_time,
-     * we know the LMDB data is from a previous X3 session and may be stale. */
-    if (x3_lmdb_is_available()) {
-        char ts_buf[32];
-        snprintf(ts_buf, sizeof(ts_buf), "%lu", (unsigned long)now);
-        x3_lmdb_account_set(ctx->handle, "_metadata_sync_time", ts_buf);
-        log_module(NS_LOG, LOG_DEBUG, "metadata_sync_async: Stored _metadata_sync_time=%s for %s",
-                   ts_buf, ctx->handle);
-    }
-#endif
-
-    keycloak_free_metadata_entries(entries);
-
-    /* Cleanup context */
-    if (ctx->user_id) pool_strfree(ctx->user_id);
-    free(ctx);
-    return 1;  /* Terminal callback */
-}
-
-/**
- * Start async metadata sync for a user (fire-and-forget).
- * Called when LMDB cache miss occurs.
- */
-static void
-nickserv_sync_metadata_async(const char *handle, const char *nick, int use_nick)
-{
-#ifdef WITH_KEYCLOAK
-    if (!nickserv_conf.keycloak_enable)
-        return;
-
-    struct metadata_sync_ctx *ctx = calloc(1, sizeof(*ctx));
-    if (!ctx) {
-        log_module(NS_LOG, LOG_ERROR, "metadata_sync_async: Out of memory");
-        return;
-    }
-
-    strncpy(ctx->handle, handle, sizeof(ctx->handle) - 1);
-    if (nick)
-        strncpy(ctx->nick, nick, sizeof(ctx->nick) - 1);
-    ctx->use_nick = use_nick;
-
-    /* Note: Log before async call because callback may free ctx synchronously */
-    log_module(NS_LOG, LOG_DEBUG, "metadata_sync_async: Starting async sync for %s (target=%s)",
-               handle, use_nick ? nick : handle);
-
-    /* Start async token acquisition - fire-and-forget
-     * Note: rc >= 0 means either async pending (0) or callback invoked synchronously (1).
-     * Only free context on error (rc < 0) when no callback was invoked. */
-    if (keycloak_ensure_token_async(metadata_sync_token_cb, ctx) < 0) {
-        log_module(NS_LOG, LOG_DEBUG, "metadata_sync_async: Failed to start token acquisition for %s", handle);
-        free(ctx);
-        return;
-    }
-#else
-    (void)handle;
-    (void)nick;
-    (void)use_nick;
-#endif
-}
-
 int
 nickserv_get_webpush_subscriptions(const char *account_name,
                                    struct kc_metadata_entry **entries_out)
@@ -11518,11 +10245,6 @@ handle_update_last_present(struct handle_info *hi)
         hi->last_present = now;
         /* Also update LMDB (dual-write during migration) */
         nickserv_update_activity_lmdb(hi, 0, 1);
-
-        /* Sync to Nefarious via metadata - clients can query $last_present */
-        char timestamp_str[32];
-        snprintf(timestamp_str, sizeof(timestamp_str), "%ld", (long)now);
-        irc_metadata(hi->handle, "$last_present", timestamp_str, METADATA_VIS_PUBLIC);
     }
 }
 
@@ -11879,39 +10601,6 @@ nickserv_conf_read(void)
     }
 #endif
 
-    /* Metadata TTL configuration */
-    str = database_get_data(conf_node, KEY_METADATA_TTL_ENABLED, RECDB_QSTRING);
-    nickserv_conf.metadata_ttl_enabled = str ? !disabled_string(str) : 1;  /* Enabled by default */
-
-    str = database_get_data(conf_node, KEY_METADATA_DEFAULT_TTL, RECDB_QSTRING);
-    nickserv_conf.metadata_default_ttl = str ? ParseInterval(str) : 2592000;  /* 30 days default */
-
-    str = database_get_data(conf_node, KEY_METADATA_PURGE_FREQUENCY, RECDB_QSTRING);
-    nickserv_conf.metadata_purge_frequency = str ? ParseInterval(str) : 3600;  /* Hourly default */
-
-    str = database_get_data(conf_node, KEY_METADATA_IMMUTABLE_KEYS, RECDB_QSTRING);
-    nickserv_conf.metadata_immutable_keys = str ? str : DEFAULT_IMMUTABLE_KEYS;
-
-    if (nickserv_conf.metadata_ttl_enabled) {
-        log_module(NS_LOG, LOG_INFO, "Metadata TTL enabled: default=%lu seconds, purge every %lu seconds",
-                   nickserv_conf.metadata_default_ttl, nickserv_conf.metadata_purge_frequency);
-        log_module(NS_LOG, LOG_INFO, "Metadata immutable keys: %s", nickserv_conf.metadata_immutable_keys);
-    }
-
-    /* Metadata compression configuration */
-#ifdef WITH_ZSTD
-    str = database_get_data(conf_node, KEY_METADATA_COMPRESS_THRESHOLD, RECDB_QSTRING);
-    if (str)
-        x3_compress_set_threshold(strtoul(str, NULL, 10));
-
-    str = database_get_data(conf_node, KEY_METADATA_COMPRESS_LEVEL, RECDB_QSTRING);
-    if (str)
-        x3_compress_set_level(atoi(str));
-
-    log_module(NS_LOG, LOG_INFO, "Metadata compression enabled: threshold=%zu bytes, level=%d",
-               x3_compress_get_threshold(), x3_compress_get_level());
-#endif
-
     /* Password hashing configuration */
     str = database_get_data(conf_node, KEY_PASSWORD_ALGORITHM, RECDB_QSTRING);
     nickserv_conf.password_algorithm = str ? str : "pbkdf2-sha256";
@@ -11981,12 +10670,6 @@ nickserv_conf_read(void)
         timeq_add(now + nickserv_conf.nick_expire_frequency, expire_nicks, NULL);
         log_module(NS_LOG, LOG_INFO, "Scheduled nick expiration timer (interval: %lu)",
                    nickserv_conf.nick_expire_frequency);
-    }
-    if (nickserv_conf.metadata_ttl_enabled && nickserv_conf.metadata_purge_frequency && !metadata_purge_timer_set) {
-        metadata_purge_timer_set = 1;
-        timeq_add(now + nickserv_conf.metadata_purge_frequency, metadata_purge_expired, NULL);
-        log_module(NS_LOG, LOG_INFO, "Scheduled metadata purge timer (interval: %lu)",
-                   nickserv_conf.metadata_purge_frequency);
     }
 }
 
@@ -15852,10 +14535,6 @@ init_nickserv(const char *nick)
 #ifdef WITH_KEYCLOAK
     init_keycloak();
 #endif
-
-    /* Record startup time for LMDB metadata staleness detection */
-    x3_metadata_startup_time = now;
-    log_module(NS_LOG, LOG_INFO, "Metadata startup time set to %lu", (unsigned long)x3_metadata_startup_time);
 
     reg_new_user_func(new_user_event, NULL);
     reg_nick_change_func(handle_nick_change, NULL);

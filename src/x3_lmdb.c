@@ -14,7 +14,6 @@
 #include "common.h"
 #include "conf.h"
 #include "log.h"
-#include "proto.h"
 #include "timeq.h"
 #include "threadpool.h"
 
@@ -1114,47 +1113,12 @@ int x3_lmdb_channel_get_ex(const char *channel, const char *key,
 
 /* ========== Purge Expired Entries ========== */
 
-/**
- * Helper to parse composite key "target\0key" and propagate deletion to IRCd.
- * @param key_data Pointer to key data
- * @param key_size Size of key data
- */
-static void propagate_metadata_deletion(const void *key_data, size_t key_size)
-{
-    const char *data = (const char *)key_data;
-    const char *target;
-    const char *meta_key;
-    size_t i;
-
-    /* Find the NUL separator between target and metadata key */
-    for (i = 0; i < key_size; i++) {
-        if (data[i] == '\0') {
-            break;
-        }
-    }
-
-    if (i >= key_size - 1) {
-        /* No separator found or no key after separator */
-        return;
-    }
-
-    target = data;                /* Points to start (target name) */
-    meta_key = data + i + 1;      /* Points to after NUL (metadata key) */
-
-    /* Propagate deletion to IRCd - NULL value signals deletion */
-    irc_metadata(target, meta_key, NULL, 0);
-
-    log_module(MAIN_LOG, LOG_DEBUG, "x3_lmdb: Propagated expired metadata deletion: %s/%s",
-               target, meta_key);
-}
-
 int x3_lmdb_metadata_purge_expired(void)
 {
     MDB_txn *txn;
     MDB_cursor *cursor;
     MDB_val mkey, mdata;
     int count = 0;
-    int propagated = 0;
     int rc;
 
     if (!x3_lmdb_is_available()) {
@@ -1173,9 +1137,6 @@ int x3_lmdb_metadata_purge_expired(void)
         while (rc == 0) {
             const char *stored = (const char *)mdata.mv_data;
             if (is_value_expired(stored)) {
-                /* Propagate deletion to IRCd before removing from LMDB */
-                propagate_metadata_deletion(mkey.mv_data, mkey.mv_size);
-                propagated++;
                 mdb_cursor_del(cursor, 0);
                 count++;
             }
@@ -1191,9 +1152,6 @@ int x3_lmdb_metadata_purge_expired(void)
         while (rc == 0) {
             const char *stored = (const char *)mdata.mv_data;
             if (is_value_expired(stored)) {
-                /* Propagate deletion to IRCd before removing from LMDB */
-                propagate_metadata_deletion(mkey.mv_data, mkey.mv_size);
-                propagated++;
                 mdb_cursor_del(cursor, 0);
                 count++;
             }
@@ -1208,8 +1166,8 @@ int x3_lmdb_metadata_purge_expired(void)
     }
 
     if (count > 0) {
-        log_module(MAIN_LOG, LOG_INFO, "x3_lmdb: Purged %d expired metadata entries (%d propagated to IRCd)",
-                   count, propagated);
+        log_module(MAIN_LOG, LOG_INFO, "x3_lmdb: Purged %d expired metadata entries",
+                   count);
     }
 
     return count;
@@ -1221,7 +1179,6 @@ int x3_lmdb_metadata_delete_by_user(const char *account)
     MDB_cursor *cursor;
     MDB_val mkey, mdata;
     int count = 0;
-    int propagated = 0;
     int rc;
     size_t account_len;
 
@@ -1248,8 +1205,6 @@ int x3_lmdb_metadata_delete_by_user(const char *account)
                 memcmp(mkey.mv_data, account, account_len) == 0 &&
                 ((char *)mkey.mv_data)[account_len] == '\0') {
                 /* This entry belongs to the target account - delete it */
-                propagate_metadata_deletion(mkey.mv_data, mkey.mv_size);
-                propagated++;
                 mdb_cursor_del(cursor, 0);
                 count++;
             }
@@ -1265,8 +1220,8 @@ int x3_lmdb_metadata_delete_by_user(const char *account)
 
     if (count > 0) {
         log_module(MAIN_LOG, LOG_INFO,
-                   "x3_lmdb: Deleted %d metadata entries for account %s (%d propagated to IRCd)",
-                   count, account, propagated);
+                   "x3_lmdb: Deleted %d metadata entries for account %s",
+                   count, account);
     }
 
     return count;

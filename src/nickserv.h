@@ -234,11 +234,6 @@ struct nickserv_config {
     const char *keycloak_webhook_secret;    // Shared secret for webhook authentication
     const char *keycloak_webhook_bind;      // Bind address for webhook (NULL = all interfaces)
 #endif
-    /* Metadata TTL configuration */
-    unsigned int metadata_ttl_enabled;      // Enable metadata expiry
-    unsigned long metadata_default_ttl;     // Default TTL in seconds (2592000 = 30 days)
-    unsigned long metadata_purge_frequency; // Purge interval in seconds (3600 = hourly)
-    const char *metadata_immutable_keys;    // Space-separated keys that never expire
     /* Password hashing configuration */
     const char *password_algorithm;         // "pbkdf2-sha256", "pbkdf2-sha512", "bcrypt"
     unsigned long password_pbkdf2_iterations; // PBKDF2 iterations (default: 10000)
@@ -384,58 +379,6 @@ enum nickserv_verify_result nickserv_ircv3_verify(struct userNode *user,
 
 /** Maximum length of a metadata value (increased for compression support) */
 #define METADATA_VALUE_LEN 4096
-
-/**
- * Set user metadata (stored in Keycloak as user attribute if available).
- * @param hi Handle info for the user
- * @param key Metadata key name
- * @param value Metadata value (NULL to delete)
- * @param visibility Visibility level (METADATA_VIS_PUBLIC or METADATA_VIS_PRIVATE)
- * @return 0 on success, -1 on error
- */
-int nickserv_set_user_metadata(struct handle_info *hi, const char *key, const char *value, int visibility);
-
-/**
- * Get user metadata (from Keycloak if available).
- * @param hi Handle info for the user
- * @param key Metadata key name
- * @param value_out Buffer to receive value (at least 1024 bytes)
- * @param visibility_out Pointer to receive visibility (or NULL)
- * @return 0 on success, 1 if not found, -1 on error
- */
-int nickserv_get_user_metadata(struct handle_info *hi, const char *key, char *value_out, int *visibility_out);
-
-/**
- * Async version of nickserv_get_user_metadata for non-blocking MDQ.
- * Uses LMDB cache first (fast sync check), then async Keycloak on miss.
- * Response is sent via irc_metadata() from callback - fire-and-forget pattern.
- * @param hi The handle_info for the account
- * @param key The metadata key to look up
- */
-void nickserv_get_user_metadata_async(struct handle_info *hi, const char *key);
-
-/**
- * Send all metadata for a user to the IRCd.
- * Called when a user authenticates to push their stored metadata.
- * @param user The user who just authenticated
- */
-void nickserv_sync_metadata_to_ircd(struct userNode *user);
-
-/**
- * Sync profile metadata fields to IRCd for IRCv3 client exposure.
- * Pushes title, registered, karma, email, lasthost as x3.* keys.
- * @param user The user to sync profile metadata for
- */
-void nickserv_sync_profile_metadata_to_ircd(struct userNode *user);
-
-/**
- * Sync all metadata for an account to the IRCd by account name.
- * Similar to nickserv_sync_metadata_to_ircd but uses the account handle
- * as the target instead of the user's nick. Used for MDQ responses
- * where the user may be offline.
- * @param hi The handle_info for the account to sync
- */
-void nickserv_sync_account_metadata_to_ircd(struct handle_info *hi);
 
 /* IRCv3 draft/webpush support */
 

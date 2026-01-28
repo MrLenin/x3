@@ -2145,27 +2145,12 @@ unregister_channel(struct chanData *channel, const char *reason)
 #endif
 
 #ifdef WITH_LMDB
-    /* Clean up all LMDB data for this channel and notify IRCd */
+    /* Clean up all LMDB data for this channel */
     if (x3_lmdb_is_available()) {
         const char *chan_name = channel->channel->name;
-        struct lmdb_metadata_entry *entries = NULL;
-        struct lmdb_metadata_entry *entry;
-        int count, cleared;
+        int cleared;
 
-        /* First, list all channel metadata and notify IRCd to clear each key */
-        count = x3_lmdb_channel_list(chan_name, &entries);
-        if (count > 0) {
-            for (entry = entries; entry; entry = entry->next) {
-                /* Skip internal keys */
-                if (entry->key && entry->key[0] != '_') {
-                    irc_metadata(chan_name, entry->key, NULL, 0);
-                }
-            }
-            x3_lmdb_free_entries(entries);
-            log_module(CS_LOG, LOG_DEBUG, "unregister_channel[%s]: Sent %d metadata deletions to IRCd", chan_name, count);
-        }
-
-        /* Now clear LMDB */
+        /* Clear LMDB channel metadata */
         cleared = x3_lmdb_channel_clear(chan_name);
         if (cleared > 0)
             log_module(CS_LOG, LOG_DEBUG, "unregister_channel[%s]: Cleared %d LMDB channel metadata entries", chan_name, cleared);
@@ -10737,85 +10722,6 @@ chanserv_set_channel_metadata(struct chanData *cData, const char *key, const cha
     log_module(CS_LOG, LOG_DEBUG, "chanserv_set_channel_metadata: No backend available for %s.%s",
                cData->channel->name, key);
     return -1;
-}
-
-int
-chanserv_get_channel_metadata(struct chanData *cData, const char *key, char *value_out, int *visibility_out)
-{
-    if (!cData || !cData->channel || !key || !value_out)
-        return -1;
-
-    value_out[0] = '\0';
-    if (visibility_out)
-        *visibility_out = METADATA_VIS_PUBLIC;
-
-#ifdef WITH_LMDB
-    if (x3_lmdb_is_available()) {
-        char stored_value[2048];
-        int rc;
-
-        rc = x3_lmdb_channel_get(cData->channel->name, key, stored_value);
-        if (rc == LMDB_SUCCESS) {
-            /* Check for visibility prefix "P:" for private */
-            if (stored_value[0] == 'P' && stored_value[1] == ':') {
-                if (visibility_out)
-                    *visibility_out = METADATA_VIS_PRIVATE;
-                strncpy(value_out, stored_value + 2, 1023);
-            } else {
-                strncpy(value_out, stored_value, 1023);
-            }
-            value_out[1023] = '\0';
-            log_module(CS_LOG, LOG_DEBUG, "chanserv_get_channel_metadata: LMDB hit for %s.%s",
-                       cData->channel->name, key);
-            return 0;
-        } else if (rc == LMDB_NOT_FOUND) {
-            return 1; /* Not found */
-        }
-        return -1; /* Error */
-    }
-#endif
-
-    return 1; /* Not found - no backend */
-}
-
-void
-chanserv_sync_metadata_to_ircd(struct chanData *cData)
-{
-    if (!cData || !cData->channel)
-        return;
-
-#ifdef WITH_LMDB
-    if (x3_lmdb_is_available()) {
-        struct lmdb_metadata_entry *entries = NULL;
-        struct lmdb_metadata_entry *entry;
-        int count;
-
-        count = x3_lmdb_channel_list(cData->channel->name, &entries);
-        if (count > 0) {
-            log_module(CS_LOG, LOG_DEBUG, "chanserv_sync_metadata_to_ircd: Found %d LMDB entries for %s",
-                       count, cData->channel->name);
-
-            for (entry = entries; entry; entry = entry->next) {
-                const char *key = entry->key;
-                const char *value = entry->value;
-                int visibility = METADATA_VIS_PUBLIC;
-
-                /* Parse visibility prefix from stored value (P:value for private) */
-                if (value && value[0] == 'P' && value[1] == ':') {
-                    visibility = METADATA_VIS_PRIVATE;
-                    value += 2;
-                }
-
-                log_module(CS_LOG, LOG_DEBUG, "chanserv_sync_metadata_to_ircd: Pushing %s.%s = %s (vis=%d)",
-                           cData->channel->name, key, value, visibility);
-
-                irc_metadata(cData->channel->name, key, value, visibility);
-            }
-
-            x3_lmdb_free_entries(entries);
-        }
-    }
-#endif
 }
 
 /**

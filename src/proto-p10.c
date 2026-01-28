@@ -133,8 +133,6 @@
 #define CMD_VERIFY_ACCT         "VERIFY"
 #define CMD_REGREPLY            "REGREPLY"
 #define CMD_METADATA            "METADATA"
-#define CMD_METADATAQUERY       "METADATAQUERY"
-#define CMD_MARKREAD            "MARKREAD"
 #define CMD_WEBPUSH             "WEBPUSH"
 #define CMD_TAGMSG              "TAGMSG"
 #define CMD_MULTILINE           "MULTILINE"
@@ -243,8 +241,6 @@
 #define TOK_ZLINE		"ZL"
 #define TOK_REGISTER_ACCT       "RG"
 #define TOK_METADATA            "MD"
-#define TOK_METADATAQUERY       "MDQ"
-#define TOK_MARKREAD            "MR"
 #define TOK_WEBPUSH             "WP"
 #define TOK_TAGMSG              "TM"
 #define TOK_MULTILINE           "ML"
@@ -366,8 +362,6 @@
 #define P10_VERIFY_ACCT         TYPE(VERIFY_ACCT)
 #define P10_REGREPLY            TYPE(REGREPLY)
 #define P10_METADATA            TYPE(METADATA)
-#define P10_METADATAQUERY       TYPE(METADATAQUERY)
-#define P10_MARKREAD            TYPE(MARKREAD)
 #define P10_WEBPUSH             TYPE(WEBPUSH)
 #define P10_CHATHISTORY         TYPE(CHATHISTORY)
 
@@ -734,42 +728,6 @@ irc_metadata(const char *target, const char *key, const char *value, int visibil
         putsock("%s " P10_METADATA " %s %s", self->numeric, target, key);
 }
 
-void
-irc_metadata_raw(const char *target, const char *key, const unsigned char *raw_value,
-                 size_t raw_len, int is_compressed, int visibility)
-{
-    const char *vis_token = (visibility == METADATA_VIS_PRIVATE) ? "P" : "*";
-
-    if (!raw_value || raw_len == 0) {
-        /* Delete - same as regular metadata */
-        putsock("%s " P10_METADATA " %s %s", self->numeric, target, key);
-        return;
-    }
-
-    if (is_compressed) {
-        /* Send compressed data with Z flag, base64-encoded */
-        size_t b64_len = BASE64_LENGTH(raw_len) + 1;
-        char *b64_buf = alloca(b64_len);
-
-        base64_encode((const char *)raw_value, raw_len, b64_buf, b64_len);
-
-        /* Format: <server> MD <target> <key> <visibility> Z :<base64_compressed> */
-        putsock("%s " P10_METADATA " %s %s %s Z :%s", self->numeric, target, key, vis_token, b64_buf);
-    } else {
-        /* Not compressed - send as regular metadata (null-terminated string) */
-        putsock("%s " P10_METADATA " %s %s %s :%s", self->numeric, target, key, vis_token, (const char *)raw_value);
-    }
-}
-
-void
-irc_metadataquery(const char *target, const char *key)
-{
-    /* Send MDQ (MetadataQuery) to request metadata for an account/channel.
-     * Format: <server> MDQ <target> <key|*>
-     * The IRCd will respond with MD tokens containing the requested metadata.
-     */
-    putsock("%s " P10_METADATAQUERY " %s %s", self->numeric, target, key ? key : "*");
-}
 
 void
 irc_fakehost(struct userNode *user, const char *host)
@@ -3044,219 +3002,6 @@ static CMD_FUNC(cmd_verify_acct)
     return 1;
 }
 
-/** Handle MD (METADATA) command - P10 metadata propagation.
- * Format: <source> MD <target> <key> [<visibility>] [:<value>]
- * When value is omitted, the key is being deleted.
- * Visibility is "*" for public or "P" for private.
- * X3 stores account-linked metadata in Keycloak as user attributes.
- */
-static CMD_FUNC(cmd_metadata)
-{
-    struct userNode *user;
-    const char *target;
-    const char *key;
-    const char *value = NULL;
-    int visibility = METADATA_VIS_PUBLIC;
-
-    if (argc < 3)
-        return 0;
-
-    target = argv[1];
-    key = argv[2];
-
-    /* Parse visibility and value.
-     * New format: target key [visibility] [:value]
-     * Old format: target key [:value]
-     */
-    if (argc >= 4) {
-        /* Check if argv[3] is a visibility token */
-        if ((argv[3][0] == '*' && argv[3][1] == '\0') ||
-            (argv[3][0] == 'P' && argv[3][1] == '\0')) {
-            visibility = (argv[3][0] == 'P') ? METADATA_VIS_PRIVATE : METADATA_VIS_PUBLIC;
-            if (argc >= 5)
-                value = argv[4];
-        } else {
-            /* Old format or no visibility - argv[3] is value */
-            value = argv[3];
-        }
-    }
-
-    /* Find the target user */
-    user = GetUserH(target);
-    if (!user) {
-        /* Target might be a channel, or user is gone - ignore */
-        return 1;
-    }
-
-    /* Only store metadata for authenticated users */
-    if (!user->handle_info) {
-        log_module(MAIN_LOG, LOG_DEBUG, "METADATA for unauthenticated user %s ignored", target);
-        return 1;
-    }
-
-    /* Check for infoline metadata (x3.infoline.#channel) */
-    if (strncmp(key, "x3.infoline.", 12) == 0) {
-        const char *chan_name = key + 12;
-        struct chanNode *channel;
-        struct chanData *cData;
-        struct userData *uData;
-
-        /* Validate channel name */
-        if (chan_name[0] != '#' || chan_name[1] == '\0') {
-            log_module(MAIN_LOG, LOG_DEBUG, "METADATA: Invalid infoline key %s (bad channel name)", key);
-            return 1;
-        }
-
-        /* Look up channel */
-        channel = GetChannel(chan_name);
-        if (!channel) {
-            log_module(MAIN_LOG, LOG_DEBUG, "METADATA: Channel %s not found for infoline SET", chan_name);
-            return 1;
-        }
-
-        cData = channel->channel_info;
-        if (!cData) {
-            log_module(MAIN_LOG, LOG_DEBUG, "METADATA: Channel %s not registered for infoline SET", chan_name);
-            return 1;
-        }
-
-        /* Look up user's access record (override=0, allow_suspended=0) */
-        uData = _GetChannelUser(cData, user->handle_info, 0, 0);
-        if (!uData) {
-            log_module(MAIN_LOG, LOG_DEBUG, "METADATA: User %s has no access to %s for infoline SET",
-                       user->handle_info->handle, chan_name);
-            return 1;
-        }
-
-        /* Validate infoline value */
-        if (value) {
-            size_t len = strlen(value);
-            size_t bp;
-
-            /* Check length against channel's maxsetinfo */
-            if (len > cData->maxsetinfo) {
-                log_module(MAIN_LOG, LOG_DEBUG, "METADATA: Infoline too long (%zu > %u) for %s",
-                           len, cData->maxsetinfo, chan_name);
-                return 1;
-            }
-
-            /* Check for control characters */
-            bp = strcspn(value, "\001");
-            if (value[bp]) {
-                log_module(MAIN_LOG, LOG_DEBUG, "METADATA: Infoline contains invalid char for %s", chan_name);
-                return 1;
-            }
-        }
-
-        /* Update the infoline */
-        if (uData->info)
-            pool_strfree(uData->info);
-
-        if (!value || (value[0] == '*' && value[1] == '\0')) {
-            uData->info = NULL;
-            log_module(MAIN_LOG, LOG_INFO, "METADATA: Cleared infoline for %s in %s",
-                       user->handle_info->handle, chan_name);
-        } else {
-            uData->info = pool_strdup(value);
-            log_module(MAIN_LOG, LOG_INFO, "METADATA: Set infoline for %s in %s: %s",
-                       user->handle_info->handle, chan_name, value);
-        }
-
-        /* Sync back to IRCd (echo the change) */
-        irc_metadata(user->nick, key, uData->info, METADATA_VIS_PUBLIC);
-
-        return 1;
-    }
-
-    /* Store in Keycloak as user attribute if keycloak is enabled */
-    log_module(MAIN_LOG, LOG_INFO, "METADATA: %s.%s = %s (vis=%s, account: %s)",
-               target, key, value ? value : "(deleted)",
-               visibility == METADATA_VIS_PRIVATE ? "private" : "public",
-               user->handle_info->handle);
-
-    /* Call the keycloak attribute API if available */
-    nickserv_set_user_metadata(user->handle_info, key, value, visibility);
-
-    return 1;
-}
-
-/** Handle MDQ (METADATAQUERY) command - P10 on-demand metadata query.
- * Format: <source> MDQ <target> <key|*>
- *
- * This is sent by the IRCd when it needs metadata for an account or channel
- * that it doesn't have in its local cache. X3 looks up the metadata from
- * its storage (Keycloak/LMDB) and responds with standard MD tokens.
- *
- * Examples:
- *   AB MDQ accountname *       -> Query all metadata for account
- *   AB MDQ accountname avatar  -> Query specific key for account
- *   AB MDQ #channel *          -> Query all metadata for channel
- */
-static CMD_FUNC(cmd_metadataquery)
-{
-    const char *target;
-    const char *key;
-    struct handle_info *hi;
-    char value[METADATA_VALUE_LEN + 1];
-    int visibility;
-
-    if (argc < 3)
-        return 0;
-
-    target = argv[1];
-    key = argv[2];
-
-    log_module(MAIN_LOG, LOG_DEBUG, "MDQ: Query for %s key=%s", target, key);
-
-    /* Check if target is a channel */
-    if (target[0] == '#') {
-        /* Channel metadata query */
-        struct chanNode *channel = GetChannel(target);
-        struct chanData *cData = channel ? channel->channel_info : NULL;
-        if (!cData) {
-            log_module(MAIN_LOG, LOG_DEBUG, "MDQ: Channel %s not registered", target);
-            /* Send error response with original key so IRCd matches pending request */
-            irc_metadata(target, key, "NOTARGET", METADATA_VIS_ERROR);
-            return 1;
-        }
-
-        if (key[0] == '*' && key[1] == '\0') {
-            /* Query all metadata for channel - iterate through stored keys */
-            chanserv_sync_metadata_to_ircd(cData);
-        } else {
-            /* Single key query */
-            if (chanserv_get_channel_metadata(cData, key, value, &visibility) == 0) {
-                irc_metadata(target, key, value, visibility);
-            }
-        }
-        return 1;
-    }
-
-    /* Account metadata query - look up the handle */
-    hi = get_handle_info(target);
-    if (!hi) {
-        log_module(MAIN_LOG, LOG_DEBUG, "MDQ: Account %s not found", target);
-        /* Send error response with original key so IRCd matches pending request */
-        irc_metadata(target, key, "NOTARGET", METADATA_VIS_ERROR);
-        return 1;
-    }
-
-    if (key[0] == '*' && key[1] == '\0') {
-        /* Query all metadata for account - sync all stored metadata to IRCd */
-        nickserv_sync_account_metadata_to_ircd(hi);
-    } else {
-        /* Single key query - try LMDB cache first (instant) */
-        if (nickserv_get_user_metadata(hi, key, value, &visibility) == 0) {
-            /* Cache hit - send immediately */
-            irc_metadata(target, key, value, visibility);
-        } else {
-            /* Cache miss - start async Keycloak lookup, response sent from callback */
-            nickserv_get_user_metadata_async(hi, key);
-        }
-    }
-
-    return 1;
-}
 
 /** Simple djb2 hash for endpoint URLs */
 static unsigned long
@@ -3326,8 +3071,8 @@ static CMD_FUNC(cmd_webpush)
         snprintf(attr_value, sizeof(attr_value), "%s|%s|%s",
                  endpoint, p256dh, auth_secret);
 
-        /* Webpush subscriptions are private data */
-        nickserv_set_user_metadata(user->handle_info, attr_name, attr_value, METADATA_VIS_PRIVATE);
+        /* Webpush subscriptions are private data - store directly in LMDB */
+        x3_lmdb_account_set(user->handle_info->handle, attr_name, attr_value);
 
     } else if (subcmd[0] == 'U') {
         /* UNREGISTER: WP U <user_numeric> <endpoint> */
@@ -3347,8 +3092,8 @@ static CMD_FUNC(cmd_webpush)
         snprintf(attr_name, sizeof(attr_name), "webpush.%08lx",
                  webpush_hash(endpoint));
 
-        /* Visibility doesn't matter for deletion */
-        nickserv_set_user_metadata(user->handle_info, attr_name, NULL, METADATA_VIS_PUBLIC);
+        /* Delete from LMDB */
+        x3_lmdb_account_delete(user->handle_info->handle, attr_name);
 
     } else if (subcmd[0] == 'P') {
         /* PUSH: WP P <account_name> :<message>
@@ -3378,127 +3123,6 @@ static CMD_FUNC(cmd_webpush)
     return 1;
 }
 
-/** Handle MARKREAD (MR) command - P10 read marker synchronization.
- * Format from Nefarious:
- *   MR S <user_numeric> <target> <timestamp>  - Set marker
- *   MR G <user_numeric> <target>              - Get marker
- *
- * X3 stores markers and broadcasts updates:
- *   MR <account> <target> <timestamp>         - Broadcast to all servers
- *   MR R <target_server> <user_numeric> <target> <timestamp> - Reply to get
- *
- * Timestamps are Unix format: seconds.milliseconds (e.g., "1735689600.123")
- */
-static CMD_FUNC(cmd_markread)
-{
-    struct userNode *user;
-    const char *subcmd;
-    const char *target;
-    const char *timestamp;
-    char key[128];
-    char stored_ts[64];
-    int rc;
-
-    if (argc < 3)
-        return 0;
-
-    subcmd = argv[1];
-
-    if (subcmd[0] == 'S' && subcmd[1] == '\0') {
-        /* SET: MR S <user_numeric> <target> <timestamp> */
-        if (argc < 5) {
-            log_module(MAIN_LOG, LOG_WARNING, "MARKREAD SET: Not enough parameters");
-            return 0;
-        }
-
-        /* Find the user by numeric */
-        user = GetUserN(argv[2]);
-        if (!user) {
-            log_module(MAIN_LOG, LOG_DEBUG, "MARKREAD SET: Unknown user numeric %s", argv[2]);
-            return 0;
-        }
-
-        /* Must be authenticated */
-        if (!user->handle_info) {
-            log_module(MAIN_LOG, LOG_DEBUG, "MARKREAD SET: User %s not authenticated", user->nick);
-            return 0;
-        }
-
-        target = argv[3];
-        timestamp = argv[4];
-
-        /* Build key: readmarker.<target> */
-        snprintf(key, sizeof(key), "readmarker.%s", target);
-
-        log_module(MAIN_LOG, LOG_INFO, "MARKREAD SET: %s (%s) %s = %s",
-                   user->nick, user->handle_info->handle, target, timestamp);
-
-        /* Check if existing timestamp is newer (only update if newer) */
-        rc = x3_lmdb_account_get(user->handle_info->handle, key, stored_ts);
-        if (rc == LMDB_SUCCESS) {
-            /* Compare timestamps lexicographically (Unix timestamps sort correctly) */
-            if (strcmp(timestamp, stored_ts) <= 0) {
-                log_module(MAIN_LOG, LOG_DEBUG, "MARKREAD SET: Existing timestamp %s is newer, ignoring", stored_ts);
-                return 1;
-            }
-        }
-
-        /* Store in LMDB */
-        x3_lmdb_account_set(user->handle_info->handle, key, timestamp);
-
-        /* Also store in Keycloak for persistence */
-        nickserv_set_user_metadata(user->handle_info, key, timestamp, METADATA_VIS_PRIVATE);
-
-        /* Broadcast to all servers: MR <account> <target> <timestamp> */
-        putsock("%s " P10_MARKREAD " %s %s %s",
-                self->numeric, user->handle_info->handle, target, timestamp);
-
-    } else if (subcmd[0] == 'G' && subcmd[1] == '\0') {
-        /* GET: MR G <user_numeric> <target> */
-        if (argc < 4) {
-            log_module(MAIN_LOG, LOG_WARNING, "MARKREAD GET: Not enough parameters");
-            return 0;
-        }
-
-        /* Find the user by numeric */
-        user = GetUserN(argv[2]);
-        if (!user) {
-            log_module(MAIN_LOG, LOG_DEBUG, "MARKREAD GET: Unknown user numeric %s", argv[2]);
-            return 0;
-        }
-
-        /* Must be authenticated */
-        if (!user->handle_info) {
-            log_module(MAIN_LOG, LOG_DEBUG, "MARKREAD GET: User %s not authenticated", user->nick);
-            return 0;
-        }
-
-        target = argv[3];
-
-        /* Build key: readmarker.<target> */
-        snprintf(key, sizeof(key), "readmarker.%s", target);
-
-        log_module(MAIN_LOG, LOG_DEBUG, "MARKREAD GET: %s (%s) %s",
-                   user->nick, user->handle_info->handle, target);
-
-        /* Look up in LMDB */
-        rc = x3_lmdb_account_get(user->handle_info->handle, key, stored_ts);
-        if (rc == LMDB_SUCCESS) {
-            /* Send reply: MR R <target_server> <user_numeric> <target> <timestamp> */
-            putsock("%s " P10_MARKREAD " R %s %s %s %s",
-                    self->numeric, user->uplink->numeric, user->numeric, target, stored_ts);
-        } else {
-            /* Not found - send "*" as timestamp */
-            putsock("%s " P10_MARKREAD " R %s %s %s *",
-                    self->numeric, user->uplink->numeric, user->numeric, target);
-        }
-
-    } else {
-        log_module(MAIN_LOG, LOG_DEBUG, "MARKREAD: Unknown or ignored subcommand %s", subcmd);
-    }
-
-    return 1;
-}
 
 /* CHATHISTORY query helper functions */
 
@@ -4099,19 +3723,9 @@ init_parse(void)
     dict_insert(irc_func_dict, CMD_VERIFY_ACCT, cmd_verify_acct);
     dict_insert(irc_func_dict, TOK_VERIFY_ACCT, cmd_verify_acct);
 
-    /* IRCv3 metadata-2 support */
-    dict_insert(irc_func_dict, CMD_METADATA, cmd_metadata);
-    dict_insert(irc_func_dict, TOK_METADATA, cmd_metadata);
-    dict_insert(irc_func_dict, CMD_METADATAQUERY, cmd_metadataquery);
-    dict_insert(irc_func_dict, TOK_METADATAQUERY, cmd_metadataquery);
-
     /* IRCv3 draft/webpush support */
     dict_insert(irc_func_dict, CMD_WEBPUSH, cmd_webpush);
     dict_insert(irc_func_dict, TOK_WEBPUSH, cmd_webpush);
-
-    /* IRCv3 draft/read-marker support */
-    dict_insert(irc_func_dict, CMD_MARKREAD, cmd_markread);
-    dict_insert(irc_func_dict, TOK_MARKREAD, cmd_markread);
 
     /* IRCv3 message-tags TAGMSG support - just acknowledge, don't process */
     dict_insert(irc_func_dict, CMD_TAGMSG, cmd_tagmsg);
