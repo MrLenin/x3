@@ -128,7 +128,7 @@ am_x3_OBJECTS = base64.$(OBJEXT) chanserv.$(OBJEXT) compat.$(OBJEXT) \
 	policer.$(OBJEXT) recdb.$(OBJEXT) sar.$(OBJEXT) \
 	saxdb.$(OBJEXT) spamserv.$(OBJEXT) shun.$(OBJEXT) \
 	timeq.$(OBJEXT) tools.$(OBJEXT) x3ldap.$(OBJEXT) \
-	x3_ssl.$(OBJEXT) x3_compress.$(OBJEXT) webpush.$(OBJEXT) \
+	x3_ssl.$(OBJEXT) x3_compress.$(OBJEXT) \
 	mempool.$(OBJEXT) threadpool.$(OBJEXT) version.$(OBJEXT)
 x3_OBJECTS = $(am_x3_OBJECTS)
 AM_V_P = $(am__v_P_@AM_V@)
@@ -175,7 +175,7 @@ am__depfiles_remade = ./$(DEPDIR)/alloc-slab.Po \
 	./$(DEPDIR)/slab-read.Po ./$(DEPDIR)/spamserv.Po \
 	./$(DEPDIR)/threadpool.Po ./$(DEPDIR)/timeq.Po \
 	./$(DEPDIR)/tools.Po ./$(DEPDIR)/version.Po \
-	./$(DEPDIR)/webpush.Po ./$(DEPDIR)/x3_compress.Po \
+	./$(DEPDIR)/x3_compress.Po \
 	./$(DEPDIR)/x3_lmdb.Po ./$(DEPDIR)/x3_ssl.Po \
 	./$(DEPDIR)/x3ldap.Po
 am__mv = mv -f
@@ -426,7 +426,6 @@ x3_SOURCES = \
 	tools.c x3ldap.c x3ldap.h \
 	x3_ssl.c x3_ssl.h \
 	x3_compress.c x3_compress.h \
-	webpush.c webpush.h \
 	mempool.c mempool.h \
 	threadpool.c threadpool.h \
 	version.c version.h
@@ -568,7 +567,6 @@ distclean-compile:
 @AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/timeq.Po@am__quote@ # am--include-marker
 @AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/tools.Po@am__quote@ # am--include-marker
 @AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/version.Po@am__quote@ # am--include-marker
-@AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/webpush.Po@am__quote@ # am--include-marker
 @AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/x3_compress.Po@am__quote@ # am--include-marker
 @AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/x3_lmdb.Po@am__quote@ # am--include-marker
 @AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/x3_ssl.Po@am__quote@ # am--include-marker
@@ -776,7 +774,7 @@ distclean: distclean-am
 	-rm -f ./$(DEPDIR)/timeq.Po
 	-rm -f ./$(DEPDIR)/tools.Po
 	-rm -f ./$(DEPDIR)/version.Po
-	-rm -f ./$(DEPDIR)/webpush.Po
+
 	-rm -f ./$(DEPDIR)/x3_compress.Po
 	-rm -f ./$(DEPDIR)/x3_lmdb.Po
 	-rm -f ./$(DEPDIR)/x3_ssl.Po
@@ -885,7 +883,7 @@ maintainer-clean: maintainer-clean-am
 	-rm -f ./$(DEPDIR)/timeq.Po
 	-rm -f ./$(DEPDIR)/tools.Po
 	-rm -f ./$(DEPDIR)/version.Po
-	-rm -f ./$(DEPDIR)/webpush.Po
+
 	-rm -f ./$(DEPDIR)/x3_compress.Po
 	-rm -f ./$(DEPDIR)/x3_lmdb.Po
 	-rm -f ./$(DEPDIR)/x3_ssl.Po

@@ -1715,7 +1715,6 @@ enum kc_async_type {
     KC_ASYNC_SET_ATTR,      /* Set user attribute */
     KC_ASYNC_GROUP_ADD,     /* Add user to group */
     KC_ASYNC_GROUP_REMOVE,  /* Remove user from group */
-    KC_ASYNC_WEBPUSH,       /* WebPush notification delivery */
     KC_ASYNC_CREATE_USER,   /* User creation */
     KC_ASYNC_GROUP_INFO,    /* Get group info (phase 1 of group members) */
     KC_ASYNC_GROUP_MEMBERS, /* Get group members (phase 2 or standalone) */
@@ -1750,7 +1749,6 @@ struct kc_async_request {
         kc_async_callback generic;/* Generic success/failure callback */
         kc_fingerprint_callback fingerprint;  /* Fingerprint callback */
         kc_introspect_callback introspect;    /* Introspect callback */
-        void (*webpush)(void *session, int result, long http_code);  /* WebPush callback */
         kc_group_info_callback group_info;    /* Group info callback */
         kc_group_members_callback group_members; /* Group members callback */
         kc_client_token_callback client_token;   /* Client token callback */
@@ -2180,23 +2178,6 @@ kc_async_handle_result(struct kc_async_request *req, long http_code,
         }
         if (req->cb.generic) {
             req->cb.generic(req->session, result);
-        }
-        break;
-    }
-    case KC_ASYNC_WEBPUSH: {
-        int result = KC_ERROR;
-        if (http_code >= 200 && http_code < 300) {
-            result = KC_SUCCESS;
-            log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async webpush: Success (HTTP %ld)", req_id, http_code);
-        } else if (http_code == 410) {
-            /* Subscription expired - special handling for cleanup */
-            result = KC_FORBIDDEN;  /* Using KC_FORBIDDEN to indicate expired */
-            log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async webpush: Subscription expired (HTTP 410)", req_id);
-        } else {
-            log_module(KC_LOG, LOG_DEBUG, "[%s] kc_async webpush: Error (HTTP %ld)", req_id, http_code);
-        }
-        if (req->cb.webpush) {
-            req->cb.webpush(req->session, result, http_code);
         }
         break;
     }
@@ -4233,92 +4214,6 @@ error:
     if (req) {
         if (req->uri) free(req->uri);
         if (req->bearer_token_copy) free(req->bearer_token_copy);
-        if (req->response.response) free(req->response.response);
-        free(req);
-    }
-    return -1;
-}
-
-/**
- * Send a WebPush notification asynchronously.
- * This is a generic HTTP POST for WebPush that uses the async curl_multi infrastructure.
- *
- * @param endpoint      Push service endpoint URL
- * @param headers       Array of header strings (e.g., "Content-Type: application/octet-stream")
- * @param header_count  Number of headers
- * @param body          Binary body data
- * @param body_len      Length of body data
- * @param session       Opaque session pointer (passed to callback)
- * @param callback      Function to call when request completes
- * @return 0 on success (request started), -1 on error
- */
-int
-kc_webpush_send_async(const char *endpoint,
-                      const char **headers, size_t header_count,
-                      const void *body, size_t body_len,
-                      void *session,
-                      kc_webpush_callback callback)
-{
-    struct kc_async_request *req = NULL;
-
-    /* Validate inputs */
-    if (!endpoint || !body || body_len == 0 || !callback) {
-        log_module(KC_LOG, LOG_DEBUG, "webpush_async: Invalid arguments");
-        return -1;
-    }
-
-    /* Allocate request structure */
-    req = calloc(1, sizeof(*req));
-    if (!req) {
-        log_module(KC_LOG, LOG_ERROR, "webpush_async: Out of memory");
-        return -1;
-    }
-    req->session = session;
-    req->type = KC_ASYNC_WEBPUSH;
-    req->cb.webpush = callback;
-
-    /* Copy endpoint URL */
-    req->uri = strdup(endpoint);
-    if (!req->uri) {
-        log_module(KC_LOG, LOG_ERROR, "webpush_async: Failed to copy URI");
-        goto error;
-    }
-
-    /* Copy binary body data (must persist until request completes) */
-    req->post_data_copy = malloc(body_len);
-    if (!req->post_data_copy) {
-        log_module(KC_LOG, LOG_ERROR, "webpush_async: Failed to copy body");
-        goto error;
-    }
-    memcpy(req->post_data_copy, body, body_len);
-    req->post_data_len = body_len;
-
-    /* Build curl options */
-    struct curl_opts opts = CURL_OPTS_INIT;
-    opts.uri = req->uri;
-    opts.method = HTTP_POST;
-    opts.post_data = req->post_data_copy;
-    opts.post_data_len = body_len;
-
-    /* Copy headers (up to 10) */
-    if (header_count > 10) header_count = 10;
-    for (size_t i = 0; i < header_count && headers[i]; i++) {
-        opts.header_list[i] = headers[i];
-    }
-    opts.header_count = header_count;
-
-    if (curl_perform_async(req, opts) < 0) {
-        log_module(KC_LOG, LOG_ERROR, "webpush_async: curl_perform_async failed");
-        goto error;
-    }
-
-    log_module(KC_LOG, LOG_DEBUG, "webpush_async: Started push to %s", endpoint);
-    return 0;
-
-error:
-    if (req) {
-        if (req->uri) free(req->uri);
-        if (req->post_data_copy) free(req->post_data_copy);
         if (req->response.response) free(req->response.response);
         free(req);
     }

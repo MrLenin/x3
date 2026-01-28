@@ -97,7 +97,6 @@ x3_SOURCES = \
 	tools.c x3ldap.c x3ldap.h \
 	x3_ssl.c x3_ssl.h \
 	x3_compress.c x3_compress.h \
-	webpush.c webpush.h \
 	mempool.c mempool.h \
 	threadpool.c threadpool.h \
 	version.c version.h

@@ -187,8 +187,6 @@ void irc_sasl(struct server* dest, const char *identifier, const char *subcmd, c
 void irc_sasl_login(struct server* dest, const char *identifier, const char *account, time_t registered);
 void irc_sasl_mechs_broadcast(const char *mechs);
 void irc_regreply(const char *user_numeric, char status, const char *account, const char *message);
-void irc_vapid_broadcast(const char *vapid_pubkey);
-
 /* CHATHISTORY query functions (for HistServ) */
 struct chathistory_result {
     char *msgid;

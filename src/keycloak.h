@@ -876,33 +876,6 @@ int keycloak_remove_user_from_group_async(struct kc_realm realm, struct kc_clien
                                            void *session, kc_async_callback callback);
 
 /**
- * WebPush callback type.
- * @param session   Opaque session pointer
- * @param result    KC_SUCCESS, KC_FORBIDDEN (expired), or KC_ERROR
- * @param http_code Raw HTTP response code for detailed handling
- */
-typedef void (*kc_webpush_callback)(void *session, int result, long http_code);
-
-/**
- * Send a WebPush notification asynchronously.
- * Uses the async curl_multi infrastructure for non-blocking HTTP.
- *
- * @param endpoint      Push service endpoint URL
- * @param headers       Array of header strings (e.g., "Content-Type: application/octet-stream")
- * @param header_count  Number of headers (max 10)
- * @param body          Binary body data (encrypted payload)
- * @param body_len      Length of body data
- * @param session       Opaque session pointer (passed to callback)
- * @param callback      Function to call when request completes
- * @return 0 on success (request started), -1 on error
- */
-int kc_webpush_send_async(const char *endpoint,
-                          const char **headers, size_t header_count,
-                          const void *body, size_t body_len,
-                          void *session,
-                          kc_webpush_callback callback);
-
-/**
  * Callback type for async user creation.
  * @param session   Opaque session pointer (registration context)
  * @param result    KC_SUCCESS, KC_USER_EXISTS, or KC_ERROR

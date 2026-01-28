@@ -380,38 +380,6 @@ enum nickserv_verify_result nickserv_ircv3_verify(struct userNode *user,
 /** Maximum length of a metadata value (increased for compression support) */
 #define METADATA_VALUE_LEN 4096
 
-/* IRCv3 draft/webpush support */
-
-/**
- * Get webpush subscriptions for an account.
- * Returns a linked list of subscription values (endpoint|p256dh|auth format).
- * @param account_name The account name to look up
- * @param entries_out Output pointer for linked list (caller must free with keycloak_free_metadata_entries)
- * @return 0 on success, -1 on error
- */
-int nickserv_get_webpush_subscriptions(const char *account_name,
-                                       struct kc_metadata_entry **entries_out);
-
-/**
- * Callback type for async webpush subscription lookup.
- * @param session  Opaque session pointer
- * @param result   KC_SUCCESS on success, error code on failure
- * @param entries  Linked list of subscription entries (caller must free with keycloak_free_metadata_entries)
- */
-typedef void (*webpush_subs_callback)(void *session, int result, struct kc_metadata_entry *entries);
-
-/**
- * Get webpush subscriptions for an account asynchronously.
- * Uses the async token manager and attribute listing APIs.
- * @param account_name The account name to look up
- * @param session      Opaque session pointer passed to callback
- * @param callback     Function to call when lookup completes
- * @return 0 on success (request started), -1 on error
- */
-int nickserv_get_webpush_subscriptions_async(const char *account_name,
-                                              void *session,
-                                              webpush_subs_callback callback);
-
 /* Presence aggregation support */
 
 /** Presence states for aggregation */

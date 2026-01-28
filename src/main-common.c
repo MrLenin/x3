@@ -542,7 +542,7 @@ conf_globals(void)
     const char *info;
     dict_t dict;
 
-    /* Initialize SSL library early (needed for crypto operations like webpush) */
+    /* Initialize SSL library early (needed for crypto operations) */
     x3_ssl_init();
 
 #ifdef WITH_LMDB

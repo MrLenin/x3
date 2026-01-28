@@ -24,7 +24,6 @@
 #include "helpfile.h"
 #include "proto-common.c"
 #include "opserv.h"
-#include "webpush.h"
 #include "x3_lmdb.h"
 #include "base64.h"
 #include "x3_compress.h"
@@ -133,7 +132,6 @@
 #define CMD_VERIFY_ACCT         "VERIFY"
 #define CMD_REGREPLY            "REGREPLY"
 #define CMD_METADATA            "METADATA"
-#define CMD_WEBPUSH             "WEBPUSH"
 #define CMD_TAGMSG              "TAGMSG"
 #define CMD_MULTILINE           "MULTILINE"
 #define CMD_CHATHISTORY         "CHATHISTORY"
@@ -241,7 +239,6 @@
 #define TOK_ZLINE		"ZL"
 #define TOK_REGISTER_ACCT       "RG"
 #define TOK_METADATA            "MD"
-#define TOK_WEBPUSH             "WP"
 #define TOK_TAGMSG              "TM"
 #define TOK_MULTILINE           "ML"
 #define TOK_VERIFY_ACCT         "VF"
@@ -362,7 +359,6 @@
 #define P10_VERIFY_ACCT         TYPE(VERIFY_ACCT)
 #define P10_REGREPLY            TYPE(REGREPLY)
 #define P10_METADATA            TYPE(METADATA)
-#define P10_WEBPUSH             TYPE(WEBPUSH)
 #define P10_CHATHISTORY         TYPE(CHATHISTORY)
 
 /* Servers claiming to have a boot or link time before PREHISTORY
@@ -1435,16 +1431,6 @@ irc_sasl_mechs_broadcast(const char *mechs)
     putsock("%s " P10_SASL " * * M :%s", self->numeric, mechs);
 }
 
-void
-irc_vapid_broadcast(const char *vapid_pubkey)
-{
-    /* Broadcast VAPID public key to all servers: WP V :<base64url_pubkey> */
-    if (vapid_pubkey && *vapid_pubkey) {
-        putsock("%s " P10_WEBPUSH " V :%s", self->numeric, vapid_pubkey);
-        log_module(MAIN_LOG, LOG_INFO, "WEBPUSH: Broadcasting VAPID key: %s", vapid_pubkey);
-    }
-}
-
 static void send_burst(void);
 
 static void
@@ -1623,14 +1609,6 @@ static CMD_FUNC(cmd_eob)
 
         /* Broadcast SASL mechanism list to all servers (uses change tracking) */
         nickserv_update_sasl_mechanisms();
-
-        /* Initialize webpush and broadcast VAPID key to all servers */
-        if (webpush_init() == 0) {
-            char vapid_key[128];
-            if (webpush_get_vapid_pubkey(vapid_key, sizeof(vapid_key)) > 0) {
-                irc_vapid_broadcast(vapid_key);
-            }
-        }
 
         /* now that we know who our uplink is,
          * we can center the routing map and activate auto-routing.
@@ -3003,127 +2981,6 @@ static CMD_FUNC(cmd_verify_acct)
 }
 
 
-/** Simple djb2 hash for endpoint URLs */
-static unsigned long
-webpush_hash(const char *str)
-{
-    unsigned long hash = 5381;
-    int c;
-    while ((c = *str++))
-        hash = ((hash << 5) + hash) + c;
-    return hash;
-}
-
-/** Handle WP (WEBPUSH) command - P10 webpush subscription management.
- * Format: <source> WP R <user_numeric> <endpoint> <p256dh> <auth>  - Register
- *         <source> WP U <user_numeric> <endpoint>                   - Unregister
- * X3 stores subscriptions in Keycloak as user attributes.
- */
-static CMD_FUNC(cmd_webpush)
-{
-    struct userNode *user;
-    const char *subcmd;
-    const char *endpoint;
-
-    if (argc < 3)
-        return 0;
-
-    subcmd = argv[1];
-
-    /* Find the target user by numeric */
-    user = GetUserN(argv[2]);
-    if (!user) {
-        log_module(MAIN_LOG, LOG_WARNING, "WEBPUSH: Unknown user numeric %s", argv[2]);
-        return 0;
-    }
-
-    /* Must be authenticated */
-    if (!user->handle_info) {
-        log_module(MAIN_LOG, LOG_WARNING, "WEBPUSH: User %s not authenticated", user->nick);
-        return 0;
-    }
-
-    if (subcmd[0] == 'R') {
-        /* REGISTER: WP R <user_numeric> <endpoint> <p256dh> <auth> */
-        const char *p256dh;
-        const char *auth_secret;
-        char attr_name[128];
-        char attr_value[1024];
-
-        if (argc < 6) {
-            log_module(MAIN_LOG, LOG_WARNING, "WEBPUSH REGISTER: Not enough parameters");
-            return 0;
-        }
-
-        endpoint = argv[3];
-        p256dh = argv[4];
-        auth_secret = argv[5];
-
-        log_module(MAIN_LOG, LOG_INFO, "WEBPUSH REGISTER: %s (%s) -> %s",
-                   user->nick, user->handle_info->handle, endpoint);
-
-        /* Store in Keycloak as user attribute
-         * Format: webpush.<hash> = <endpoint>|<p256dh>|<auth>
-         * For simplicity, we use a hash of the endpoint as the key suffix
-         */
-        snprintf(attr_name, sizeof(attr_name), "webpush.%08lx",
-                 webpush_hash(endpoint));
-        snprintf(attr_value, sizeof(attr_value), "%s|%s|%s",
-                 endpoint, p256dh, auth_secret);
-
-        /* Webpush subscriptions are private data - store directly in LMDB */
-        x3_lmdb_account_set(user->handle_info->handle, attr_name, attr_value);
-
-    } else if (subcmd[0] == 'U') {
-        /* UNREGISTER: WP U <user_numeric> <endpoint> */
-        char attr_name[128];
-
-        if (argc < 4) {
-            log_module(MAIN_LOG, LOG_WARNING, "WEBPUSH UNREGISTER: Not enough parameters");
-            return 0;
-        }
-
-        endpoint = argv[3];
-
-        log_module(MAIN_LOG, LOG_INFO, "WEBPUSH UNREGISTER: %s (%s) -> %s",
-                   user->nick, user->handle_info->handle, endpoint);
-
-        /* Delete from Keycloak by setting to empty */
-        snprintf(attr_name, sizeof(attr_name), "webpush.%08lx",
-                 webpush_hash(endpoint));
-
-        /* Delete from LMDB */
-        x3_lmdb_account_delete(user->handle_info->handle, attr_name);
-
-    } else if (subcmd[0] == 'P') {
-        /* PUSH: WP P <account_name> :<message>
-         * This is sent by the IRCd when a message arrives for an offline user
-         * with registered push subscriptions.
-         */
-        const char *account_name;
-        const char *message;
-
-        if (argc < 4) {
-            log_module(MAIN_LOG, LOG_WARNING, "WEBPUSH PUSH: Not enough parameters");
-            return 0;
-        }
-
-        account_name = argv[2];
-        message = argv[3];
-
-        log_module(MAIN_LOG, LOG_INFO, "WEBPUSH PUSH: Sending notification for account %s",
-                   account_name);
-
-        webpush_notify_user(account_name, message);
-
-    } else {
-        log_module(MAIN_LOG, LOG_WARNING, "WEBPUSH: Unknown subcommand %s", subcmd);
-    }
-
-    return 1;
-}
-
-
 /* CHATHISTORY query helper functions */
 
 static void
@@ -3722,10 +3579,6 @@ init_parse(void)
     dict_insert(irc_func_dict, TOK_REGISTER_ACCT, cmd_register_acct);
     dict_insert(irc_func_dict, CMD_VERIFY_ACCT, cmd_verify_acct);
     dict_insert(irc_func_dict, TOK_VERIFY_ACCT, cmd_verify_acct);
-
-    /* IRCv3 draft/webpush support */
-    dict_insert(irc_func_dict, CMD_WEBPUSH, cmd_webpush);
-    dict_insert(irc_func_dict, TOK_WEBPUSH, cmd_webpush);
 
     /* IRCv3 message-tags TAGMSG support - just acknowledge, don't process */
     dict_insert(irc_func_dict, CMD_TAGMSG, cmd_tagmsg);
