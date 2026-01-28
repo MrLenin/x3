@@ -620,6 +620,9 @@ if test "x$with_keycloak" = "xyes"; then
    if test "x$have_curl" = "xyes" -a "x$have_jansson" = "xyes"; then
       AC_DEFINE(WITH_KEYCLOAK, 1, [Define if Keycloak support is enabled])
       keycloak_message="Keycloak support:   enabled"
+
+      dnl libkc bridge: adapter and bridge objects for async HTTP via libkc
+      MODULE_OBJS="$MODULE_OBJS x3_kc_adapter.\$(OBJEXT) x3_kc_bridge.\$(OBJEXT)"
    fi
 fi
 
