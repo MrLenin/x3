@@ -3,6 +3,10 @@ extern FILE *replay_file;
 #include "mempool.h"
 #include "threadpool.h"
 
+/* Forward declarations for functions used by other modules */
+struct uplinkNode *uplink_find(char *name);
+void received_ping(void);
+
 time_t boot_time;
 time_t burst_begin;
 time_t now;

@@ -18,6 +18,7 @@
  */
 
 #include "conf.h"
+#include "chanserv.h"
 #include "helpfile.h"
 #include "nickserv.h"
 #include "modcmd.h"

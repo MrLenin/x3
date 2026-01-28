@@ -395,7 +395,7 @@ void
 mempool_dump_all(void)
 {
     unsigned int i;
-    struct mempool_stats stats;
+    struct mempool_stats stats = {0};
 
     log_module(MP_LOG, LOG_INFO, "=== Memory Pool Status ===");
     log_module(MP_LOG, LOG_INFO, "%-16s %8s %8s %8s %8s %10s",

@@ -109,6 +109,10 @@ struct userNode *histserv;
                                      HISTSERV_SYNTAX(); \
                                      return 0; }
 
+/* Forward declarations */
+int histserv_init(void);
+int histserv_finalize(void);
+
 const char *histserv_module_deps[] = { NULL };
 static struct module *histserv_module;
 static struct log_type *HS_LOG;
@@ -249,7 +253,10 @@ format_timestamp(const char *ts_str)
 
     /* Use configured format or default */
     if (histserv_conf.timestamp_format) {
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wformat-nonliteral"
         strftime(buf, sizeof(buf), histserv_conf.timestamp_format, tm);
+#pragma GCC diagnostic pop
     } else {
         strftime(buf, sizeof(buf), "%H:%M:%S", tm);
     }
@@ -625,9 +632,9 @@ static HISTSERV_FUNC(cmd_latest)
     /* Create query context */
     ctx = calloc(1, sizeof(*ctx));
     ctx->user = user;
-    strncpy(ctx->numeric, user->numeric, COMBO_NUMERIC_LEN);
-    strncpy(ctx->target, resolved_target, sizeof(ctx->target) - 1);
-    strncpy(ctx->ref, ref, sizeof(ctx->ref) - 1);
+    snprintf(ctx->numeric, sizeof(ctx->numeric), "%s", user->numeric);
+    snprintf(ctx->target, sizeof(ctx->target), "%s", resolved_target);
+    snprintf(ctx->ref, sizeof(ctx->ref), "%s", ref);
     ctx->type = QUERY_LATEST;
     ctx->is_dm = is_dm;
 
@@ -676,9 +683,9 @@ static HISTSERV_FUNC(cmd_before)
     /* Create query context */
     ctx = calloc(1, sizeof(*ctx));
     ctx->user = user;
-    strncpy(ctx->numeric, user->numeric, COMBO_NUMERIC_LEN);
-    strncpy(ctx->target, resolved_target, sizeof(ctx->target) - 1);
-    strncpy(ctx->ref, ref, sizeof(ctx->ref) - 1);
+    snprintf(ctx->numeric, sizeof(ctx->numeric), "%s", user->numeric);
+    snprintf(ctx->target, sizeof(ctx->target), "%s", resolved_target);
+    snprintf(ctx->ref, sizeof(ctx->ref), "%s", ref);
     ctx->type = QUERY_BEFORE;
     ctx->is_dm = is_dm;
 
@@ -727,9 +734,9 @@ static HISTSERV_FUNC(cmd_after)
     /* Create query context */
     ctx = calloc(1, sizeof(*ctx));
     ctx->user = user;
-    strncpy(ctx->numeric, user->numeric, COMBO_NUMERIC_LEN);
-    strncpy(ctx->target, resolved_target, sizeof(ctx->target) - 1);
-    strncpy(ctx->ref, ref, sizeof(ctx->ref) - 1);
+    snprintf(ctx->numeric, sizeof(ctx->numeric), "%s", user->numeric);
+    snprintf(ctx->target, sizeof(ctx->target), "%s", resolved_target);
+    snprintf(ctx->ref, sizeof(ctx->ref), "%s", ref);
     ctx->type = QUERY_AFTER;
     ctx->is_dm = is_dm;
 
@@ -778,9 +785,9 @@ static HISTSERV_FUNC(cmd_around)
     /* Create query context */
     ctx = calloc(1, sizeof(*ctx));
     ctx->user = user;
-    strncpy(ctx->numeric, user->numeric, COMBO_NUMERIC_LEN);
-    strncpy(ctx->target, resolved_target, sizeof(ctx->target) - 1);
-    strncpy(ctx->ref, ref, sizeof(ctx->ref) - 1);
+    snprintf(ctx->numeric, sizeof(ctx->numeric), "%s", user->numeric);
+    snprintf(ctx->target, sizeof(ctx->target), "%s", resolved_target);
+    snprintf(ctx->ref, sizeof(ctx->ref), "%s", ref);
     ctx->type = QUERY_AROUND;
     ctx->is_dm = is_dm;
 
@@ -815,9 +822,9 @@ static HISTSERV_FUNC(cmd_fetch)
     /* Create query context */
     ctx = calloc(1, sizeof(*ctx));
     ctx->user = user;
-    strncpy(ctx->numeric, user->numeric, COMBO_NUMERIC_LEN);
-    strncpy(ctx->target, resolved_target, sizeof(ctx->target) - 1);
-    strncpy(ctx->ref, msgid, sizeof(ctx->ref) - 1);
+    snprintf(ctx->numeric, sizeof(ctx->numeric), "%s", user->numeric);
+    snprintf(ctx->target, sizeof(ctx->target), "%s", resolved_target);
+    snprintf(ctx->ref, sizeof(ctx->ref), "%s", msgid);
     ctx->type = QUERY_FETCH;
     ctx->is_dm = is_dm;
 

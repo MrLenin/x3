@@ -80,6 +80,10 @@ x3_SOURCES = \
 	modules.c modules.h \
 	password.c password.h \
 	keycloak.c keycloak.h \
+	kc_async.c kc_async.h \
+	kc_token.c kc_token.h \
+	kc_sync.c kc_sync.h \
+	kc_http_internal.h \
 	keycloak_webhook.c keycloak_webhook.h \
 	x3_kc_adapter.h \
 	x3_kc_bridge.h \

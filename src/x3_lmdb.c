@@ -16,6 +16,7 @@
 #include "log.h"
 #include "timeq.h"
 #include "threadpool.h"
+#include "base64.h"
 
 #include <lmdb.h>
 #include <stdlib.h>
@@ -2898,8 +2899,11 @@ int x3_lmdb_cleanup_old_snapshots(const char *base_path)
         char lock_file[MAXLEN];
 
         snprintf(full_path, sizeof(full_path), "%s/%s", base_path, snapshots[0]);
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wformat-truncation"
         snprintf(data_file, sizeof(data_file), "%s/data.mdb", full_path);
         snprintf(lock_file, sizeof(lock_file), "%s/lock.mdb", full_path);
+#pragma GCC diagnostic pop
 
         /* Remove files in the snapshot directory */
         unlink(data_file);
@@ -3513,7 +3517,6 @@ int x3_lmdb_session_create(const char *username, char *token_out, size_t token_s
     char lmdb_value[256];
     unsigned int version = 0;
     int rc;
-    int i;
 
     if (!lmdb_initialized || !username || !token_out || token_size < 64) {
         return LMDB_ERROR;
@@ -3912,34 +3915,6 @@ int x3_lmdb_is_scram_token(const char *password)
 }
 
 #ifdef WITH_SSL
-
-/**
- * Base64 encode for SCRAM
- */
-static int scram_base64_encode(const unsigned char *input, size_t input_len,
-                               char *output, size_t output_size)
-{
-    static const char base64_chars[] =
-        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    size_t i, j;
-    size_t needed = ((input_len + 2) / 3) * 4 + 1;
-
-    if (output_size < needed) return -1;
-
-    for (i = 0, j = 0; i < input_len; ) {
-        unsigned int a = i < input_len ? input[i++] : 0;
-        unsigned int b = i < input_len ? input[i++] : 0;
-        unsigned int c = i < input_len ? input[i++] : 0;
-        unsigned int triple = (a << 16) | (b << 8) | c;
-
-        output[j++] = base64_chars[(triple >> 18) & 0x3F];
-        output[j++] = base64_chars[(triple >> 12) & 0x3F];
-        output[j++] = (i > input_len + 1) ? '=' : base64_chars[(triple >> 6) & 0x3F];
-        output[j++] = (i > input_len) ? '=' : base64_chars[triple & 0x3F];
-    }
-    output[j] = '\0';
-    return (int)j;
-}
 
 /**
  * Base64 decode for SCRAM
@@ -4623,47 +4598,6 @@ int x3_lmdb_scram_delete(const char *token_id)
     return deleted > 0 ? LMDB_SUCCESS : LMDB_NOT_FOUND;
 }
 
-/* Legacy delete for old key format (used during migration) */
-static int x3_lmdb_scram_delete_legacy(const char *token_id)
-{
-    MDB_txn *txn;
-    MDB_val key;
-    char lmdb_key[LMDB_KEY_BUFFER_SIZE];
-    int rc;
-
-    if (!lmdb_initialized || !token_id) {
-        return LMDB_ERROR;
-    }
-
-    /* Old key format without hash type */
-    snprintf(lmdb_key, sizeof(lmdb_key), "%s%s", LMDB_PREFIX_SCRAM, token_id);
-
-    rc = mdb_txn_begin(lmdb_env, NULL, 0, &txn);
-    if (rc != 0) {
-        return LMDB_ERROR;
-    }
-
-    key.mv_size = strlen(lmdb_key);
-    key.mv_data = lmdb_key;
-
-    rc = mdb_del(txn, dbi_metadata, &key, NULL);
-    if (rc == MDB_NOTFOUND) {
-        mdb_txn_abort(txn);
-        return LMDB_NOT_FOUND;
-    }
-    if (rc != 0) {
-        mdb_txn_abort(txn);
-        return LMDB_ERROR;
-    }
-
-    rc = mdb_txn_commit(txn);
-    if (rc != 0) {
-        return LMDB_ERROR;
-    }
-
-    return LMDB_SUCCESS;
-}
-
 int x3_lmdb_scram_revoke_all(const char *username)
 {
     MDB_txn *txn;
@@ -4992,7 +4926,7 @@ int x3_lmdb_scram_acct_get(const char *account, enum scram_hash_type hash_type,
     char *value_copy, *p, *fields[7];
     int field_count = 0;
     size_t hash_len;
-    int rc, i;
+    int rc;
 
     if (!lmdb_initialized || !account || !cred_out) {
         return LMDB_ERROR;

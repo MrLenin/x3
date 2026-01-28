@@ -342,20 +342,6 @@ static void local_auth_verify_callback(void *ctx, int result, const char *hash);
 static void local_auth_rehash_callback(void *ctx, int result, const char *hash);
 static void local_auth_complete(struct local_auth_ctx *ctx);
 
-/* Fire-and-forget SCRAM creation callback - just logs result */
-static void scram_create_log_callback(void *ctx, int result)
-{
-    const char *account = (const char *)ctx;
-    if (result > 0) {
-        log_module(NS_LOG, LOG_DEBUG, "Async SCRAM creation completed for %s: %d credentials",
-                   account ? account : "(unknown)", result);
-    } else {
-        log_module(NS_LOG, LOG_WARNING, "Async SCRAM creation failed for %s",
-                   account ? account : "(unknown)");
-    }
-    /* Note: account string must remain valid or be NULL - caller manages lifetime */
-}
-
 #if defined(WITH_LMDB) && defined(WITH_SSL)
 /* Context for async SCRAM creation with user notification */
 struct scram_async_ctx {
@@ -1844,6 +1830,8 @@ nickserv_make_cookie(struct userNode *user, struct handle_info *hi, enum cookie_
     netname = nickserv_conf.network_name;
     subject[0] = 0;
 
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wformat-nonliteral"
     switch (cookie->type) {
     case ACTIVATION:
         hi->passwd[0] = 0; /* invalidate password */
@@ -1897,6 +1885,7 @@ nickserv_make_cookie(struct userNode *user, struct handle_info *hi, enum cookie_
         log_module(NS_LOG, LOG_ERROR, "Bad cookie type %d in nickserv_make_cookie.", cookie->type);
         break;
     }
+#pragma GCC diagnostic pop
 
     /* Log cookie for debugging/testing (remove in production) */
     log_module(NS_LOG, LOG_INFO, "Created cookie type=%d for %s: %s",
@@ -9985,10 +9974,9 @@ loc_auth_external(const char *fingerprint, const char *authzid, const char *host
 
 /*
  * IRCv3 Metadata-2 Support
- *
+ */
 
-
-/**
+/*
  * Update activity data (lastseen/last_present) in LMDB.
  * This is a dual-write: data is stored both in the struct (for SAXDB)
  * and in LMDB (for fast access and TTL management).
@@ -11053,8 +11041,11 @@ reg_complete_registration(struct RegSession *session)
 #endif
 
         session->state = REG_STATE_COMPLETE;
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wformat-truncation"
         snprintf(session->result_msg, sizeof(session->result_msg),
                  "Verification email sent to %s", session->email);
+#pragma GCC diagnostic pop
         irc_regreply(session->uid, 'V', session->account, session->result_msg);
     } else {
         /* No email verification needed - create account immediately */
@@ -11504,7 +11495,7 @@ scram_fetch_resume(struct scram_fetch_ctx *ctx, struct scram_credential *cred)
     /* Store credential and hash type */
     memcpy(&session->scram->cred, cred, sizeof(*cred));
     session->scram->hash_type = ctx->hash_type;
-    strncpy(session->scram->client_nonce, ctx->client_nonce, sizeof(session->scram->client_nonce) - 1);
+    snprintf(session->scram->client_nonce, sizeof(session->scram->client_nonce), "%s", ctx->client_nonce);
     session->scram->iteration = cred->iteration;
 
     /* Generate server nonce */
@@ -12396,7 +12387,6 @@ sasl_external_token_callback(void *context, int result, struct access_token *tok
     struct sasl_async_ctx *ctx = context;
     struct SASLSession *session;
     struct handle_info *hi;
-    char buffer[256];
 
     (void)token;  /* Token managed by keycloak module */
 
@@ -12480,7 +12470,6 @@ sasl_async_fingerprint_callback(void *ctx_ptr, int result, char *username)
     struct sasl_async_ctx *ctx = (struct sasl_async_ctx *)ctx_ptr;
     struct SASLSession *session;
     struct handle_info *hi = NULL;
-    char buffer[256];
 
     if (!ctx) {
         log_module(NS_LOG, LOG_ERROR, "SASL fingerprint callback: NULL context");
@@ -12586,7 +12575,6 @@ sasl_async_introspect_callback(void *ctx_ptr, int result, struct kc_token_info *
     struct sasl_async_ctx *ctx = (struct sasl_async_ctx *)ctx_ptr;
     struct SASLSession *session;
     struct handle_info *hi = NULL;
-    char buffer[256];
     const char *username;
 
     if (!ctx) {
@@ -12752,7 +12740,6 @@ sasl_packet(struct SASLSession *session)
         size_t rawlen = 0;
         char *authzid = NULL;
         struct handle_info *hi = NULL;
-        static char buffer[256];
 
         base64_decode_alloc(session->buf, session->buflen, &raw, &rawlen);
 
@@ -12866,7 +12853,6 @@ sasl_packet(struct SASLSession *session)
         char *raw = NULL;
         size_t rawlen = 0;
         struct handle_info *hi = NULL;
-        static char buffer[256];
         char *token_start = NULL;
         char *authzid = NULL;
 
@@ -13505,7 +13491,7 @@ sasl_packet(struct SASLSession *session)
 
             /* Send challenge to client (base64 encoded) */
             char challenge_b64[64];
-            base64_encode(session->ecdsa_challenge, 32, challenge_b64, sizeof(challenge_b64));
+            base64_encode((const char *)session->ecdsa_challenge, 32, challenge_b64, sizeof(challenge_b64));
             irc_sasl(session->source, session->uid, "C", challenge_b64);
             session->state = SASL_STATE_ECDSA_CHALLENGE;
 
@@ -13569,6 +13555,8 @@ sasl_packet(struct SASLSession *session)
                 return 1;
             }
 
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
             eckey = EC_KEY_new_by_curve_name(NID_X9_62_prime256v1);
             if (!eckey || EC_KEY_set_public_key(eckey, point) != 1) {
                 log_module(NS_LOG, LOG_ERROR, "SASL ECDSA: Failed to set public key");
@@ -13588,6 +13576,7 @@ sasl_packet(struct SASLSession *session)
             verify_result = ECDSA_verify(0, session->ecdsa_challenge, 32,
                                           (unsigned char *)raw, rawlen, eckey);
             EC_KEY_free(eckey);
+#pragma GCC diagnostic pop
 
             if (verify_result != 1) {
                 log_module(NS_LOG, LOG_DEBUG, "SASL ECDSA: Signature verification failed for %s",

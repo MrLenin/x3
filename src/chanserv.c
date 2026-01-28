@@ -5898,8 +5898,7 @@ static void
 show_giveownership_info(struct svccmd *cmd, struct userNode *user, struct giveownership *giveownership)
 {
     char buf[MAXLEN];
-    const char *fmt = "%a %b %d %H:%M %Y";
-    strftime(buf, sizeof(buf), fmt, localtime(&giveownership->issued));
+    strftime(buf, sizeof(buf), "%a %b %d %H:%M %Y", localtime(&giveownership->issued));
 
     if(giveownership->staff_issuer)
     {
@@ -8565,33 +8564,32 @@ static void eightball(char *outcome, int method, unsigned int seed)
     srand(seed);
     if (method == 1) /* A Color */
     {
-      char tmp[MAXLEN];
+      const char *color = ballcolors[rand() % NUMOFCOLORS];
 
       answer = (rand() % 12); /* Make sure this is the # of entries */
       switch(answer)
       {
-        case 0: strcpy(tmp, "Very bright %s, I'd say.");
+        case 0: sprintf(outcome, "Very bright %s, I'd say.", color);
                 break;
-        case 1: strcpy(tmp, "Sort of a light %s color.");
+        case 1: sprintf(outcome, "Sort of a light %s color.", color);
                 break;
-        case 2: strcpy(tmp, "Dark and dreary %s.");
+        case 2: sprintf(outcome, "Dark and dreary %s.", color);
                 break;
-        case 3: strcpy(tmp, "Quite a pale shade of %s.");
+        case 3: sprintf(outcome, "Quite a pale shade of %s.", color);
                 break;
-        case 4: strcpy(tmp, "A gross kind of mucky %s.");
+        case 4: sprintf(outcome, "A gross kind of mucky %s.", color);
                 break;
-        case 5: strcpy(tmp, "Brilliant whiteish %s.");
+        case 5: sprintf(outcome, "Brilliant whiteish %s.", color);
                 break;
-        case 6: case 7: case 8: case 9: strcpy(tmp, "%s.");
+        case 6: case 7: case 8: case 9: sprintf(outcome, "%s.", color);
                 break;
-        case 10: strcpy(tmp, "Solid %s.");
+        case 10: sprintf(outcome, "Solid %s.", color);
                 break;
-        case 11: strcpy(tmp, "Transparent %s.");
+        case 11: sprintf(outcome, "Transparent %s.", color);
                 break;
         default: strcpy(outcome, "An invalid random number was generated.");
                 return;
       }
-      sprintf(outcome, tmp, ballcolors[rand() % NUMOFCOLORS]);
       return;
     }
     else if (method == 2)  /* Location */
@@ -8728,6 +8726,8 @@ static CHANSERV_FUNC(cmd_d)
         total += (rand() % sides) + 1;
     total += modifier;
 
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wformat-nonliteral"
     if((count > 1) || modifier)
     {
         fmt = user_find_message(user, "CSMSG_DICE_ROLL");
@@ -8738,6 +8738,7 @@ static CHANSERV_FUNC(cmd_d)
         fmt = user_find_message(user, "CSMSG_DIE_ROLL");
         sprintf(response, fmt, total, sides);
     }
+#pragma GCC diagnostic pop
     if(channel)
         send_channel_message(channel, cmd->parent->bot, "$b%s$b: %s", user->nick, response);
     else

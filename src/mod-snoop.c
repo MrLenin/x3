@@ -54,6 +54,9 @@ const char *snoop_module_deps[] = { NULL };
 
 static int finalized;
 int snoop_finalize(void);
+int snoop_init(void);
+struct chanNode *snoop_get_channel(void);
+static void snoop_cleanup(UNUSED_ARG(void *extra));
 
 #if defined(GCC_VARMACROS)
 # define SNOOP(FORMAT, ARGS...) send_channel_message(snoop_cfg.channel, snoop_cfg.bot, "%s "FORMAT, timestamp, ARGS)
@@ -214,6 +217,7 @@ snoop_channel_mode(struct userNode *who, struct chanNode *channel, char **modes,
                                                        break;
                                                }
                                        }
+                                       /* fall through */
                                case 'b':
                                        {
                                                strcat(targets, " ");
@@ -305,7 +309,7 @@ snoop_conf_read(void) {
         snoop_finalize();
 }
 
-void
+static void
 snoop_cleanup(UNUSED_ARG(void *extra)) {
     snoop_cfg.enabled = 0;
     unreg_del_user_func(snoop_del_user, NULL);

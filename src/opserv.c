@@ -631,6 +631,7 @@ static unsigned int opserv_discrim_search(discrim_t discrim, discrim_search_func
 static int gag_helper_func(struct userNode *match, void *extra);
 static int ungag_helper_func(struct userNode *match, void *extra);
 static void alert_expire(void* name);
+struct modcmd *opserv_define_func(const char *name, modcmd_func_t *func, int min_level, int reqchan, int min_argc);
 
 typedef enum {
     REACT_NOTICE,
@@ -692,7 +693,7 @@ opserv_free_user_alert(void *data)
 # define opserv_custom_alert(chan, ...) do { if (chan) send_target_message(4, chan, opserv, __VA_ARGS__); else if (opserv_conf.alert_channel) send_channel_notice(opserv_conf.alert_channel, opserv, __VA_ARGS__); } while (0)
 #endif
 
-char *defconReverseModes(const char *modes)
+static char *defconReverseModes(const char *modes)
 {
     char *newmodes = NULL;
     unsigned int i = 0;
@@ -719,7 +720,7 @@ int checkDefCon(int level)
     return DefCon[DefConLevel] & level;
 }
 
-void showDefConSettings(struct userNode *user, struct svccmd *cmd)
+static void showDefConSettings(struct userNode *user, struct svccmd *cmd)
 {
     if (DefConLevel == 5) {
         reply("OSMSG_DEFCON_ALLOWING_ALL");
@@ -763,7 +764,7 @@ void showDefConSettings(struct userNode *user, struct svccmd *cmd)
     return;
 }
 
-void do_mass_mode(char *modes)
+static void do_mass_mode(char *modes)
 {
     dict_iterator_t it;
 
@@ -942,6 +943,8 @@ static MODCMD_FUNC(cmd_ban)
     return 1;
 }
 
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wformat-nonliteral"
 static MODCMD_FUNC(cmd_chaninfo)
 {
     char buffer[MAXLEN];
@@ -1018,6 +1021,7 @@ static MODCMD_FUNC(cmd_chaninfo)
     }
     return 1;
 }
+#pragma GCC diagnostic pop
 
 /* This command has been replaced by 'alert notice channel #foo' */
 /*
@@ -2206,7 +2210,7 @@ static MODCMD_FUNC(cmd_mode)
     return 1;
 }
 
-int is_valid_mark(char *mark)
+static int is_valid_mark(char *mark)
 {
     char *ptr; 
 
@@ -3530,7 +3534,7 @@ free_routing_plan(void *data)
 /*************************************************
 * Functions to handle the active routing struct */
 
-struct routeList 
+static struct routeList
 *find_routeList_server(struct route *route, const char *server)
 {
     struct routeList *rptr;
@@ -3545,7 +3549,7 @@ struct routeList
 
 /* Wipes out the routing structure, freeing properly.
  * note: does NOT free itself, we just re-use it usually.*/
-void 
+static void
 wipe_route_list(struct route *route) {
     struct routeList *nextptr, *rptr;
     if(!route)
@@ -3567,7 +3571,7 @@ wipe_route_list(struct route *route) {
 }
 
 
-int
+static int
 rank_outside_rec(struct route *route, char *server, int count)
 {
     struct routeList *rptr;
@@ -3597,8 +3601,8 @@ rank_outside_rec(struct route *route, char *server, int count)
     }
 }
 
-int
-rank_outsideness(struct route *route) 
+static int
+rank_outsideness(struct route *route)
 {
     log_module(MAIN_LOG, LOG_DEBUG, "rank_outsideness(): Running...");
     route->maxdepth = rank_outside_rec(route, self->uplink->name, 0) - 1;
@@ -3612,7 +3616,7 @@ rank_outsideness(struct route *route)
 
 
 /* Add servers to the routing structure */
-void 
+static void
 add_routestruct_server(struct route *route, const char *server, unsigned int port, char *uplink, char *secondary)
 {
     struct routeList *rptr;
@@ -3651,7 +3655,7 @@ add_routestruct_server(struct route *route, const char *server, unsigned int por
 }
 
 /* Recenter the routing struct around our current uplink */
-int
+static int
 change_route_uplinks(struct route *route)
 {
     struct routeList *rptr;
@@ -3786,7 +3790,7 @@ activate_routing(struct svccmd *cmd, struct userNode *user, char *plan_name)
 }
 
 
-void routing_init()
+void routing_init(void)
 {
     activate_routing(NULL, NULL, NULL);
 
@@ -3830,7 +3834,7 @@ static void route_show_options(struct svccmd *cmd, struct userNode *user)
 }
 
 /* called from timeq */
-void routing_connect_timeout(void *data)
+static void routing_connect_timeout(void *data)
 {
     struct waitingConnection *wc = data;
     struct server *target = GetServerH(wc->target);
@@ -3843,7 +3847,7 @@ void routing_connect_timeout(void *data)
     dict_remove(opserv_waiting_connections, wc->server);
 }
 
-void routing_delete_connect_timer(char *server)
+static void routing_delete_connect_timer(char *server)
 {
     struct waitingConnection *wc = dict_find(opserv_waiting_connections, server, 0);
     if(wc) {
@@ -3853,7 +3857,7 @@ void routing_delete_connect_timer(char *server)
 }
 
 
-void
+static void
 routing_connect_server(char *server, int port, struct server *to)
 {
     struct waitingConnection *wc = calloc(1, sizeof(*wc));
@@ -3870,7 +3874,7 @@ routing_connect_server(char *server, int port, struct server *to)
     irc_connect(opserv, server, port, to);
 }
 
-int 
+static int
 routing_connect_one(struct route *route, char *server)
 {
     struct routeList *rptr;
@@ -3893,7 +3897,7 @@ routing_connect_one(struct route *route, char *server)
     return 0; /* server wasnt found in active route struct. */
 }
 
-int routing_connect_children(struct route *route, char *server)
+static int routing_connect_children(struct route *route, char *server)
 {
     struct routeList *rptr;
     struct server *sptr, *suptr;
@@ -3914,7 +3918,7 @@ int routing_connect_children(struct route *route, char *server)
     return 1; /* server wasnt found in active route struct ?! */
 }
 
-int reroute(struct route *route, struct userNode *user, struct svccmd *cmd, char *directive)
+static int reroute(struct route *route, struct userNode *user, struct svccmd *cmd, char *directive)
 {
     struct routeList *rptr;
     struct server *sptr, *suptr;
@@ -4022,7 +4026,7 @@ static MODCMD_FUNC(cmd_reroute) {
  * but dont run reroute now. otherwise reroute 
  * and setup timer.
  */
-void reroute_timer(void *data) {
+static void reroute_timer(void *data) {
     /* Delete any other timers such as this one.. */
     timeq_del(0, reroute_timer, NULL, TIMEQ_IGNORE_DATA | TIMEQ_IGNORE_WHEN);
 
@@ -4046,7 +4050,7 @@ void reroute_timer(void *data) {
     timeq_add(now + freq, reroute_timer, "run");
 }
 
-void routing_change_karma(struct routingPlanServer *rps, const char *server, int change) {
+static void routing_change_karma(struct routingPlanServer *rps, const char *server, int change) {
 
     int oldkarma = rps->karma;
     rps->karma += change;
@@ -4067,7 +4071,7 @@ void routing_change_karma(struct routingPlanServer *rps, const char *server, int
     }
 }
 
-void routing_karma_timer(void *data) {
+static void routing_karma_timer(void *data) {
     time_t next;
     time_t timer_init = data ? atoi(data) : 0;
     char buf[MAXLEN];
@@ -4108,7 +4112,7 @@ void routing_karma_timer(void *data) {
     timeq_add(next, routing_karma_timer, NULL);
 }
 
-void routing_handle_neg_karma(char *server, char *uplink, int change)
+static void routing_handle_neg_karma(char *server, char *uplink, int change)
 {
     /* if server's primary uplink is uplink, OR, uplink's primary uplink is server,
      * then whichever one, gets its karma changed. */
@@ -4486,7 +4490,7 @@ static MODCMD_FUNC(cmd_routing_delserver)
 
 /* Figures out how many downlinks there are for proper
  * drawing of the route map */
-int 
+static int
 num_route_downlinks(struct route *route, char *name)
 {
     struct routeList *rptr;
@@ -4500,7 +4504,7 @@ num_route_downlinks(struct route *route, char *name)
     return num;
 }
 
-void
+static void
 show_route_downlinks(struct svccmd *cmd, struct route *route, struct userNode *user, char *name, char *prevpre, char *arrowchar, int reset)
 {
     struct routeList *servPtr;
@@ -4555,7 +4559,7 @@ show_route_downlinks(struct svccmd *cmd, struct route *route, struct userNode *u
     free(nextpre);
 }
 
-int
+static int
 show_route_map(struct route *route, struct userNode *user, struct svccmd *cmd)
 {
     if(!route || !route->servers) {
@@ -5045,7 +5049,7 @@ opserv_define_func(const char *name, modcmd_func_t *func, int min_level, int req
     }
 }
 
-int add_reserved(const char *key, void *data, void *extra)
+static int add_reserved(const char *key, void *data, void *extra)
 {
     struct chanNode *chan;
     struct record_data *rd = data;
@@ -6927,11 +6931,11 @@ static unsigned int opserv_cdiscrim_search(cdiscrim_t discrim, cdiscrim_search_f
     return count;
 }
 
-void channel_count(UNUSED_ARG(struct chanNode *channel), UNUSED_ARG(void *data), UNUSED_ARG(struct userNode *bot))
+static void channel_count(UNUSED_ARG(struct chanNode *channel), UNUSED_ARG(void *data), UNUSED_ARG(struct userNode *bot))
 {
 }
 
-void channel_print(struct chanNode *channel, void *data, struct userNode *bot)
+static void channel_print(struct chanNode *channel, void *data, struct userNode *bot)
 {
     char modes[MAXLEN];
     irc_make_chanmode(channel, modes);
@@ -7691,8 +7695,8 @@ opserv_conf_read(void)
 }
 
 /* lame way to export opserv_conf value to nickserv.c ... */
-unsigned int 
-opserv_conf_admin_level()
+unsigned int
+opserv_conf_admin_level(void)
 {
     return(opserv_conf.admin_level);
 }

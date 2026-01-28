@@ -88,7 +88,7 @@ uplink_readable(struct io_fd *fd) {
     lines_processed++;
 }
 
-void
+static void
 socket_destroyed(struct io_fd *fd)
 {
     if (fd && fd->state != IO_CONNECTED)
@@ -367,7 +367,7 @@ static void timed_ping_timeout(void *data);
 
 /* Ping state is kept in the timeq (only one of these two can be in
  * the queue at any given time). */
-void
+static void
 timed_send_ping(UNUSED_ARG(void *data))
 {
     irc_ping(self->name);
@@ -879,17 +879,6 @@ reg_user_mode_func(user_mode_func_t handler, void *extra)
     um_list_extra[um_used++] = extra;
 }
 
-void
-unreg_user_mode_func(user_mode_func_t handler)
-{
-	unsigned int i;
-	for (i=0; i<um_used; i++) {
-		if (um_list[i] == handler) break;
-	}
-	if (i == um_used) return;
-	memmove(um_list+i, um_list+i+1, (um_used-i-1)*sizeof(um_list[0]));
-	um_used--;
-}
 
 static void
 call_user_mode_funcs(struct userNode *user, const char *mode_change)
@@ -922,17 +911,6 @@ reg_channel_mode_func(channel_mode_func_t handler, void *extra)
     cm_list_extra[cm_used++] = extra;
 }
 
-void
-unreg_channel_mode_func(channel_mode_func_t handler)
-{
-	unsigned int i;
-	for (i=0; i<cm_used; i++) {
-		if(cm_list[i] == handler) break;
-	}
-	if (i == cm_used) return;
-	memmove(cm_list+i, cm_list+i+1, (cm_used-i-1)*sizeof(cm_list[0]));
-	cm_used--;
-}
 
 static void
 call_channel_mode_funcs(struct userNode *who, struct chanNode *channel, char **modes, unsigned int argc)

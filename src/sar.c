@@ -816,7 +816,7 @@ sar_append_name(struct string_buffer *cv, const char *name, struct name_ofs *ofs
  * *name and unsigned int qtype.  A null name argument terminates the
  * list.
  */
-unsigned int
+static unsigned int
 sar_request_vbuild(struct sar_request *req, va_list args)
 {
     struct name_ofs suffixes[32];

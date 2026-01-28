@@ -1615,7 +1615,7 @@ SPAMSERV_FUNC(cmd_set)
 	return subcmd->command->func(user, channel, argc - 1, argv + 1, subcmd);
 }
 
-int ss_check_user_level(struct chanNode *channel, struct userNode *user, unsigned int minimum, int allow_override, int exempt_owner)
+static int ss_check_user_level(struct chanNode *channel, struct userNode *user, unsigned int minimum, int allow_override, int exempt_owner)
 {
     struct userData *uData;
     struct chanData *cData = channel->channel_info;

@@ -47,6 +47,10 @@
 #include "mail.h"
 #include "timeq.h"
 
+int memoserv_init(void);
+int memoserv_finalize(void);
+static void do_expire(void);
+
 #define KEY_MAIN_ACCOUNTS "accounts"
 #define KEY_FLAGS "flags"
 #define KEY_LIMIT "limit"
@@ -251,7 +255,7 @@ delete_memo_account(void *data)
     free(ma);
 }
 
-void
+static void
 do_expire(void)
 {
     dict_iterator_t it;
@@ -475,10 +479,13 @@ static MODCMD_FUNC(cmd_send)
     email = atoi(estr);
     if (email && (ma->flags & MEMO_NOTIFY_NEW)) {
         fmt = handle_find_message(hi, "MSEMAIL_NEWMEMO_SUBJECT");
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wformat-nonliteral"
         snprintf(subject, sizeof(subject), fmt, netname, memoserv->nick, user->nick);
 
         fmt = handle_find_message(hi, "MSEMAIL_NEWMEMO_BODY");
         snprintf(body, sizeof(body), fmt, user->nick, memoserv->nick, message, memoserv->nick, memo_id, netname);
+#pragma GCC diagnostic pop
 
         mail_send(memoserv, hi, subject, body, 0);
     }

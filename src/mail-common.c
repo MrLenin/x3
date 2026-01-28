@@ -19,6 +19,7 @@
  */
 
 #include "conf.h"
+#include "mail.h"
 #include "modcmd.h"
 #include "nickserv.h"
 #include "saxdb.h"

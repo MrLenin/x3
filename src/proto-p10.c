@@ -577,7 +577,7 @@ irc_server(struct server *srv)
     }
 }
 
-void
+static void
 irc_p10_pton(irc_in_addr_t *ip, const char *input)
 {
     if (strlen(input) == 6) {
@@ -604,7 +604,7 @@ irc_p10_pton(irc_in_addr_t *ip, const char *input)
     }
 }
 
-void
+static void
 irc_p10_ntop(char *output, const irc_in_addr_t *ip)
 {
     if (!irc_in_addr_is_valid(*ip)) {
@@ -852,13 +852,13 @@ irc_version_user(struct userNode *from, struct userNode *to)
     irc_privmsg_user(from, to, "\001VERSION\001");
 }
 
-void
+static void
 irc_eob(void)
 {
     putsock("%s " P10_EOB, self->numeric);
 }
 
-void
+static void
 irc_eob_ack(void)
 {
     putsock("%s " P10_EOB_ACK, self->numeric);
@@ -876,7 +876,7 @@ irc_eob_ack(void)
     }
 }
 
-void
+static void
 irc_rpong(const char *from1, const char *from2, const char *pingtime, const char *clientinfo)
 {
     putsock("%s " P10_RPONG " %s %s %s :%s", self->numeric, from1, from2, pingtime, clientinfo);
@@ -894,7 +894,7 @@ irc_pong(const char *who, const char *data)
     putsock("%s " P10_PONG " %s :%s", self->numeric, who, data);
 }
 
-void
+static void
 irc_pong_asll(const char *who, const char *orig_ts)
 {
     char *delim;
@@ -909,7 +909,7 @@ irc_pong_asll(const char *who, const char *orig_ts)
     putsock("%s " P10_PONG " %s %s %d %lu.%06lu", self->numeric, who, orig_ts, diff, (unsigned long)sys_now.tv_sec, (unsigned long)sys_now.tv_usec);
 }
 
-void
+static void
 irc_pass(const char *passwd)
 {
     putsock(P10_PASS " :%s", passwd);
@@ -918,8 +918,6 @@ irc_pass(const char *passwd)
 void
 irc_introduce(const char *passwd)
 {
-    void timed_send_ping(void *data);
-
     self->self_burst = self->burst = 1;
     irc_pass(passwd);
     irc_server(self);
@@ -962,7 +960,7 @@ irc_unshun(const char *mask)
     putsock("%s " P10_SHUN " * -%s " FMT_TIME_T, self->numeric, mask, now);
 }
 
-void
+static void
 irc_burst(struct chanNode *chan)
 {
     char burst_line[512];
@@ -1936,7 +1934,7 @@ char *client_report_privs(struct userNode *client)
   return privbuf;
 }
 
-int clear_privs(struct userNode *who) {
+static int clear_privs(struct userNode *who) {
   int i = 0;
   assert(0 != who);
 
@@ -2859,7 +2857,7 @@ static CMD_FUNC(cmd_svsnick)
     return 1;
 }
 
-void
+static void
 free_user(struct userNode *user)
 {
     free(user->nick);
@@ -3021,8 +3019,8 @@ send_chathistory_query(const char *target, char subcmd, const char *ref,
 
     /* Create pending query tracker */
     pending = calloc(1, sizeof(*pending));
-    strncpy(pending->reqid, reqid, sizeof(pending->reqid) - 1);
-    strncpy(pending->target, target, sizeof(pending->target) - 1);
+    snprintf(pending->reqid, sizeof(pending->reqid), "%s", reqid);
+    snprintf(pending->target, sizeof(pending->target), "%s", target);
     pending->callback = callback;
     pending->extra = extra;
     pending->created = now;
@@ -3923,27 +3921,6 @@ AddLocalUser(const char *nick, const char *ident, const char *hostname, const ch
         hostname = self->name;
     make_numeric(self, local_num, numeric);
     return AddUser(self, nick, ident, hostname, modes, numeric, desc, timestamp, "AAAAAA");
-}
-
-struct userNode *
-AddClone(const char *nick, const char *ident, const char *hostname, const char *desc)
-{
-    char numeric[COMBO_NUMERIC_LEN+1];
-    int local_num = get_local_numeric();
-    time_t timestamp = now;
-    struct userNode *old_user = GetUserH(nick);
-
-    if (old_user) {
-        if (IsLocal(old_user))
-            return old_user;
-        timestamp = old_user->timestamp - 1;
-    }
-    if (local_num == -1) {
-        log_module(MAIN_LOG, LOG_ERROR, "Unable to allocate numnick for clone %s", nick);
-        return 0;
-    }
-    make_numeric(self, local_num, numeric);
-    return AddUser(self, nick, ident, hostname, "+i", numeric, desc, timestamp, "AAAAAA");
 }
 
 int

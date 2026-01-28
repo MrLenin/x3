@@ -136,6 +136,12 @@ struct handle_info_list {
     char *tag; /* e.g. email address */
 };
 
+/* Prototypes for DEFINE_LIST(handle_info_list, ...) generated functions */
+void handle_info_list_init(struct handle_info_list *list);
+void handle_info_list_append(struct handle_info_list *list, struct handle_info *new_item);
+int handle_info_list_remove(struct handle_info_list *list, struct handle_info *new_item);
+void handle_info_list_clean(struct handle_info_list *list);
+
 extern const char *handle_flags;
 
 enum reclaim_action {

@@ -124,7 +124,8 @@ am_x3_OBJECTS = base64.$(OBJEXT) chanserv.$(OBJEXT) compat.$(OBJEXT) \
 	helpfile.$(OBJEXT) ioset.$(OBJEXT) log.$(OBJEXT) \
 	log_async.$(OBJEXT) main.$(OBJEXT) math.$(OBJEXT) \
 	md5.$(OBJEXT) modcmd.$(OBJEXT) modules.$(OBJEXT) \
-	password.$(OBJEXT) keycloak.$(OBJEXT) \
+	password.$(OBJEXT) keycloak.$(OBJEXT) kc_async.$(OBJEXT) \
+	kc_token.$(OBJEXT) kc_sync.$(OBJEXT) \
 	keycloak_webhook.$(OBJEXT) nickserv.$(OBJEXT) opserv.$(OBJEXT) \
 	policer.$(OBJEXT) recdb.$(OBJEXT) sar.$(OBJEXT) \
 	saxdb.$(OBJEXT) spamserv.$(OBJEXT) shun.$(OBJEXT) \
@@ -158,28 +159,29 @@ am__depfiles_remade = ./$(DEPDIR)/alloc-slab.Po \
 	./$(DEPDIR)/heap.Po ./$(DEPDIR)/helpfile.Po \
 	./$(DEPDIR)/ioset-epoll.Po ./$(DEPDIR)/ioset-kevent.Po \
 	./$(DEPDIR)/ioset-select.Po ./$(DEPDIR)/ioset.Po \
-	./$(DEPDIR)/keycloak.Po ./$(DEPDIR)/keycloak_webhook.Po \
-	./$(DEPDIR)/log.Po ./$(DEPDIR)/log_async.Po \
-	./$(DEPDIR)/mail-common.Po ./$(DEPDIR)/mail-sendmail.Po \
-	./$(DEPDIR)/main-common.Po ./$(DEPDIR)/main.Po \
-	./$(DEPDIR)/math.Po ./$(DEPDIR)/md5.Po ./$(DEPDIR)/mempool.Po \
-	./$(DEPDIR)/mod-blacklist.Po ./$(DEPDIR)/mod-helpserv.Po \
-	./$(DEPDIR)/mod-histserv.Po ./$(DEPDIR)/mod-memoserv.Po \
-	./$(DEPDIR)/mod-python.Po ./$(DEPDIR)/mod-qserver.Po \
-	./$(DEPDIR)/mod-snoop.Po ./$(DEPDIR)/mod-sockcheck.Po \
-	./$(DEPDIR)/mod-track.Po ./$(DEPDIR)/mod-webtv.Po \
-	./$(DEPDIR)/modcmd.Po ./$(DEPDIR)/modules.Po \
-	./$(DEPDIR)/nickserv.Po ./$(DEPDIR)/opserv.Po \
-	./$(DEPDIR)/password.Po ./$(DEPDIR)/policer.Po \
-	./$(DEPDIR)/proto-common.Po ./$(DEPDIR)/proto-p10.Po \
-	./$(DEPDIR)/recdb.Po ./$(DEPDIR)/sar.Po ./$(DEPDIR)/saxdb.Po \
-	./$(DEPDIR)/shun.Po ./$(DEPDIR)/slab-read.Po \
-	./$(DEPDIR)/spamserv.Po ./$(DEPDIR)/threadpool.Po \
-	./$(DEPDIR)/timeq.Po ./$(DEPDIR)/tools.Po \
-	./$(DEPDIR)/version.Po ./$(DEPDIR)/x3_compress.Po \
-	./$(DEPDIR)/x3_kc_adapter.Po ./$(DEPDIR)/x3_kc_bridge.Po \
-	./$(DEPDIR)/x3_lmdb.Po ./$(DEPDIR)/x3_ssl.Po \
-	./$(DEPDIR)/x3ldap.Po
+	./$(DEPDIR)/kc_async.Po ./$(DEPDIR)/kc_sync.Po \
+	./$(DEPDIR)/kc_token.Po ./$(DEPDIR)/keycloak.Po \
+	./$(DEPDIR)/keycloak_webhook.Po ./$(DEPDIR)/log.Po \
+	./$(DEPDIR)/log_async.Po ./$(DEPDIR)/mail-common.Po \
+	./$(DEPDIR)/mail-sendmail.Po ./$(DEPDIR)/main-common.Po \
+	./$(DEPDIR)/main.Po ./$(DEPDIR)/math.Po ./$(DEPDIR)/md5.Po \
+	./$(DEPDIR)/mempool.Po ./$(DEPDIR)/mod-blacklist.Po \
+	./$(DEPDIR)/mod-helpserv.Po ./$(DEPDIR)/mod-histserv.Po \
+	./$(DEPDIR)/mod-memoserv.Po ./$(DEPDIR)/mod-python.Po \
+	./$(DEPDIR)/mod-qserver.Po ./$(DEPDIR)/mod-snoop.Po \
+	./$(DEPDIR)/mod-sockcheck.Po ./$(DEPDIR)/mod-track.Po \
+	./$(DEPDIR)/mod-webtv.Po ./$(DEPDIR)/modcmd.Po \
+	./$(DEPDIR)/modules.Po ./$(DEPDIR)/nickserv.Po \
+	./$(DEPDIR)/opserv.Po ./$(DEPDIR)/password.Po \
+	./$(DEPDIR)/policer.Po ./$(DEPDIR)/proto-common.Po \
+	./$(DEPDIR)/proto-p10.Po ./$(DEPDIR)/recdb.Po \
+	./$(DEPDIR)/sar.Po ./$(DEPDIR)/saxdb.Po ./$(DEPDIR)/shun.Po \
+	./$(DEPDIR)/slab-read.Po ./$(DEPDIR)/spamserv.Po \
+	./$(DEPDIR)/threadpool.Po ./$(DEPDIR)/timeq.Po \
+	./$(DEPDIR)/tools.Po ./$(DEPDIR)/version.Po \
+	./$(DEPDIR)/x3_compress.Po ./$(DEPDIR)/x3_kc_adapter.Po \
+	./$(DEPDIR)/x3_kc_bridge.Po ./$(DEPDIR)/x3_lmdb.Po \
+	./$(DEPDIR)/x3_ssl.Po ./$(DEPDIR)/x3ldap.Po
 am__mv = mv -f
 COMPILE = $(CC) $(DEFS) $(DEFAULT_INCLUDES) $(INCLUDES) $(AM_CPPFLAGS) \
 	$(CPPFLAGS) $(AM_CFLAGS) $(CFLAGS)
@@ -415,6 +417,10 @@ x3_SOURCES = \
 	modules.c modules.h \
 	password.c password.h \
 	keycloak.c keycloak.h \
+	kc_async.c kc_async.h \
+	kc_token.c kc_token.h \
+	kc_sync.c kc_sync.h \
+	kc_http_internal.h \
 	keycloak_webhook.c keycloak_webhook.h \
 	x3_kc_adapter.h \
 	x3_kc_bridge.h \
@@ -535,6 +541,9 @@ distclean-compile:
 @AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/ioset-kevent.Po@am__quote@ # am--include-marker
 @AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/ioset-select.Po@am__quote@ # am--include-marker
 @AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/ioset.Po@am__quote@ # am--include-marker
+@AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/kc_async.Po@am__quote@ # am--include-marker
+@AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/kc_sync.Po@am__quote@ # am--include-marker
+@AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/kc_token.Po@am__quote@ # am--include-marker
 @AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/keycloak.Po@am__quote@ # am--include-marker
 @AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/keycloak_webhook.Po@am__quote@ # am--include-marker
 @AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/log.Po@am__quote@ # am--include-marker
@@ -745,6 +754,9 @@ distclean: distclean-am
 	-rm -f ./$(DEPDIR)/ioset-kevent.Po
 	-rm -f ./$(DEPDIR)/ioset-select.Po
 	-rm -f ./$(DEPDIR)/ioset.Po
+	-rm -f ./$(DEPDIR)/kc_async.Po
+	-rm -f ./$(DEPDIR)/kc_sync.Po
+	-rm -f ./$(DEPDIR)/kc_token.Po
 	-rm -f ./$(DEPDIR)/keycloak.Po
 	-rm -f ./$(DEPDIR)/keycloak_webhook.Po
 	-rm -f ./$(DEPDIR)/log.Po
@@ -856,6 +868,9 @@ maintainer-clean: maintainer-clean-am
 	-rm -f ./$(DEPDIR)/ioset-kevent.Po
 	-rm -f ./$(DEPDIR)/ioset-select.Po
 	-rm -f ./$(DEPDIR)/ioset.Po
+	-rm -f ./$(DEPDIR)/kc_async.Po
+	-rm -f ./$(DEPDIR)/kc_sync.Po
+	-rm -f ./$(DEPDIR)/kc_token.Po
 	-rm -f ./$(DEPDIR)/keycloak.Po
 	-rm -f ./$(DEPDIR)/keycloak_webhook.Po
 	-rm -f ./$(DEPDIR)/log.Po

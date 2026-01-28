@@ -200,7 +200,7 @@ string_list_copy(struct string_list *slist)
     return new_list;
 }
 
-int slist_compare_two(const void *pa, const void *pb)
+static int slist_compare_two(const void *pa, const void *pb)
 {
     return irccasecmp(*(const char**)pa, *(const char **)pb);
 }
@@ -334,7 +334,7 @@ dbungetc(int c, RECDB *recdb)
 }
 
 /* returns first non-whitespace, non-comment character (-1 for EOF found) */
-int
+static int
 parse_skip_ws(RECDB *recdb)
 {
     int c, d, in_comment = 0;
@@ -365,7 +365,7 @@ parse_skip_ws(RECDB *recdb)
     return -1;
 }
 
-char *
+static char *
 parse_qstring(RECDB *recdb)
 {
     char *buff;
@@ -473,7 +473,7 @@ parse_qstring(RECDB *recdb)
     }
 }
 
-dict_t
+static dict_t
 parse_object(RECDB *recdb)
 {
     dict_t obj;
@@ -494,7 +494,7 @@ parse_object(RECDB *recdb)
     return obj;
 }
 
-struct string_list *
+static struct string_list *
 parse_string_list(RECDB *recdb)
 {
     struct string_list *slist;
@@ -555,7 +555,7 @@ parse_database_int(RECDB *recdb)
     return db;
 }
 
-const char *
+static const char *
 failure_reason(int code)
 {
     const char *reason;
@@ -574,7 +574,7 @@ failure_reason(int code)
     return reason;
 }
 
-void
+static void
 explain_failure(RECDB *recdb, int code)
 {
     static char msg[1024];

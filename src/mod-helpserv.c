@@ -39,6 +39,9 @@
 #define HELPSERV_HELPFILE_NAME "mod-helpserv.help"
 const char *helpserv_module_deps[] = { NULL };
 
+int helpserv_init(void);
+int helpserv_finalize(void);
+
 /* db entries */
 #define KEY_BOTS "bots"
 #define KEY_LAST_STATS_UPDATE "last_stats_update"
@@ -600,7 +603,7 @@ struct helpserv_request {
 };
 
 #define DEFINE_LIST_ALLOC(STRUCTNAME) \
-struct STRUCTNAME * STRUCTNAME##_alloc() {\
+struct STRUCTNAME * STRUCTNAME##_alloc(void) {\
     struct STRUCTNAME *newlist; \
     newlist = malloc(sizeof(struct STRUCTNAME)); \
     STRUCTNAME##_init(newlist); \
@@ -614,14 +617,20 @@ void STRUCTNAME##_free(void *data) {\
 
 DECLARE_LIST(helpserv_botlist, struct helpserv_bot *);
 DEFINE_LIST(helpserv_botlist, struct helpserv_bot *)
+struct helpserv_botlist *helpserv_botlist_alloc(void);
+void helpserv_botlist_free(void *data);
 DEFINE_LIST_ALLOC(helpserv_botlist)
 
 DECLARE_LIST(helpserv_reqlist, struct helpserv_request *);
 DEFINE_LIST(helpserv_reqlist, struct helpserv_request *)
+struct helpserv_reqlist *helpserv_reqlist_alloc(void);
+void helpserv_reqlist_free(void *data);
 DEFINE_LIST_ALLOC(helpserv_reqlist)
 
 DECLARE_LIST(helpserv_userlist, struct helpserv_user *);
 DEFINE_LIST(helpserv_userlist, struct helpserv_user *)
+struct helpserv_userlist *helpserv_userlist_alloc(void);
+void helpserv_userlist_free(void *data);
 DEFINE_LIST_ALLOC(helpserv_userlist)
 
 struct helpfile *helpserv_helpfile;
@@ -776,7 +785,7 @@ static struct chanNode *helpserv_get_page_type(struct helpserv_bot *hs, enum pag
             break;
         default:
             log_module(HS_LOG, LOG_ERROR, "helpserv_page() called but %s has an invalid page type %d.", hs->helpserv->nick, type);
-            /* and fall through */
+            /* fall through */
         case PAGE_NONE:
             return NULL;
     }
@@ -877,6 +886,10 @@ static struct helpserv_request * smart_get_request(struct helpserv_bot *hs, stru
     return oldest_assigned ? oldest_assigned : oldest;
 }
 
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wformat-nonliteral"
+#pragma GCC diagnostic ignored "-Wformat-truncation"
+#pragma GCC diagnostic ignored "-Wformat-overflow"
 static struct helpserv_request * create_request(struct userNode *user, struct helpserv_bot *hs, int from_join) {
     struct helpserv_request *req = calloc(1, sizeof(struct helpserv_request));
     char lbuf[3][MAX_LINE_SIZE], req_id[INTERVALLEN], abuf[1][MAX_LINE_SIZE];
@@ -1018,6 +1031,7 @@ static struct helpserv_request * create_request(struct userNode *user, struct he
             break;
         default:
             log_module(HS_LOG, LOG_ERROR, "%s has an invalid req_persist.", hs->helpserv->nick);
+            /* fall through */
         case PERSIST_CLOSE:
             if (user->handle_info) {
                 fmt = user_find_message(user, "HSMSG_REQ_PERSIST_HANDLE");
@@ -1040,7 +1054,11 @@ static struct helpserv_request * create_request(struct userNode *user, struct he
 
     return req;
 }
+#pragma GCC diagnostic pop
 
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wformat-truncation"
+#pragma GCC diagnostic ignored "-Wformat-overflow"
 /* Handle a message from a user to a HelpServ bot. */
 static void helpserv_usermsg(struct userNode *user, struct helpserv_bot *hs, const char *text, char *argv[], int argc) {
     const int from_opserv = 0; /* for helpserv_notice */
@@ -1194,6 +1212,7 @@ static void helpserv_usermsg(struct userNode *user, struct helpserv_bot *hs, con
     else
         helpserv_msguser(user, "HSMSG_REQ_MAXLEN");
 }
+#pragma GCC diagnostic pop
 
 /* Handle messages direct to a HelpServ bot. */
 static void helpserv_botmsg(struct userNode *user, struct userNode *target, const char *text, UNUSED_ARG(int server_qualified)) {
@@ -2248,6 +2267,9 @@ static HELPSERV_FUNC(cmd_reassign) {
     return 1;
 }
 
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wformat-truncation"
+#pragma GCC diagnostic ignored "-Wformat-overflow"
 static HELPSERV_FUNC(cmd_addnote) {
     char text[MAX_LINE_SIZE], timestr[MAX_LINE_SIZE], *note;
     struct helpserv_request *req;
@@ -2276,6 +2298,7 @@ static HELPSERV_FUNC(cmd_addnote) {
 
     return 1;
 }
+#pragma GCC diagnostic pop
 
 static HELPSERV_FUNC(cmd_page) {
     REQUIRE_PARMS(2);
@@ -2992,6 +3015,8 @@ static void helpserv_expire_suspension(void *data) {
     mod_chanmode_free(change);
 }
 
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wformat-nonliteral"
 static void helpserv_unregister(struct helpserv_bot *bot, const char *quit_fmt, const char *global_fmt, const char *actor) {
     char reason[MAXLEN], channame[CHANNELLEN], botname[NICKLEN];
     struct helpserv_botlist *botlist;
@@ -3013,6 +3038,7 @@ static void helpserv_unregister(struct helpserv_bot *bot, const char *quit_fmt, 
     dict_remove(helpserv_bots_dict, botname);
     global_message_args(MESSAGE_RECIPIENT_OPERS, global_fmt, botname, channame, actor);
 }
+#pragma GCC diagnostic pop
 
 static HELPSERV_FUNC(cmd_unregister) {
     if (!from_opserv) {
@@ -4915,7 +4941,7 @@ static void helpserv_db_cleanup(UNUSED_ARG(void *extra)) {
         fclose(reqlog_f);
 }
 
-int helpserv_init() {
+int helpserv_init(void) {
     HS_LOG = log_register_type("HelpServ", "file:helpserv.log");
     conf_register_reload(helpserv_conf_read);
 
