@@ -1,5 +1,5 @@
 # -D__USE_ISOC23=0 prevents glibc C23 strtol redirects that cause linker errors on Debian 12
-AM_CPPFLAGS = @RX_INCLUDES@ -DPREFIX=\"@prefix@\" -D__USE_ISOC23=0 -I$(top_srcdir)/../libkc/include
+AM_CPPFLAGS = @RX_INCLUDES@ -DPREFIX=\"@prefix@\" -D__USE_ISOC23=0
 LIBS = @LIBS@ @RX_LIBS@
 TRACK = @TRACK@
 pythonpath = @pythonpath@
@@ -53,7 +53,7 @@ EXTRA_x3_SOURCES = \
 	x3_kc_adapter.c \
 	x3_kc_bridge.c
 
-x3_LDADD = @MODULE_OBJS@ $(top_srcdir)/../libkc/libkc.a
+x3_LDADD = @MODULE_OBJS@ -lkc
 x3_DEPENDENCIES = @MODULE_OBJS@
 x3_SOURCES = \
 	base64.c base64.h \
