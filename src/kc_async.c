@@ -679,6 +679,23 @@ kc_async_handle_result(struct kc_async_request *req, long http_code,
                 if (user_id && user_id[1]) {
                     user_id++;
                     kc_userid_cache_put(req->create_username, user_id);
+
+                    /* Cache the user representation so subsequent updates
+                     * (email, attributes) get cache hits instead of racing
+                     * concurrent GETs against Keycloak */
+                    if (req->post_fields) {
+                        json_error_t error;
+                        json_t *repr = json_loads(req->post_fields, 0, &error);
+                        if (repr) {
+                            json_object_set_new(repr, "id", json_string(user_id));
+                            json_object_del(repr, "credentials");
+                            kc_user_repr_cache_put(user_id, repr);
+                            log_module(KC_LOG, LOG_DEBUG,
+                                       "[%s] kc_async create_user: Cached repr for %s",
+                                       req_id, user_id);
+                            json_decref(repr);
+                        }
+                    }
                 }
             }
         } else if (http_code == 409) {
@@ -2108,6 +2125,11 @@ kc_coalesce_flush_cb(void *data)
                 json_object_set_new(attrs, p->attrs[i].name, empty_array);
             }
         }
+
+        /* Update cache with merged attrs BEFORE the PUT, so concurrent
+         * operations (e.g. email update) see the merged state immediately
+         * rather than racing against the Keycloak round-trip */
+        kc_user_repr_cache_put(p->user_id, repr);
 
         char *json_body = json_dumps(repr, JSON_COMPACT);
         json_decref(repr);
