@@ -720,8 +720,12 @@ ioset_events(struct io_fd *fd, int readable, int writable)
         }
 
         assert(active_fd == NULL || active_fd == fd);
-        if (active_fd && writable)
-            ioset_try_write(fd);
+        if (active_fd && writable) {
+            if (fd->writable_cb)
+                fd->writable_cb(fd);
+            else
+                ioset_try_write(fd);
+        }
         break;
     }
 }

@@ -52,6 +52,7 @@ struct io_fd {
     void (*accept_cb)(struct io_fd *listener, struct io_fd *new_connect);
     void (*connect_cb)(struct io_fd *fd, int error);
     void (*readable_cb)(struct io_fd *fd);
+    void (*writable_cb)(struct io_fd *fd);  /* External write interest (e.g., curl) */
     void (*destroy_cb)(struct io_fd *fd);
     /* SSL/TLS support */
     struct x3_ssl_conn *ssl;  /* SSL connection (NULL if plaintext) */

@@ -10392,6 +10392,11 @@ nickserv_conf_read(void)
         keycloak_token_manager_init(realm, client);
         log_module(NS_LOG, LOG_INFO, "Keycloak integration enabled for realm %s", nickserv_conf.keycloak_realm);
 
+        /* Eagerly initialize the libkc bridge so kc_init() runs before
+         * webhook init needs kc_get_event_ops(). The bridge is idempotent
+         * so the lazy init path in kc_async.c becomes a no-op. */
+        kc_async_init();
+
         /* Initialize webhook listener if configured */
         if (nickserv_conf.keycloak_webhook_port > 0) {
             if (keycloak_webhook_init(nickserv_conf.keycloak_webhook_port,

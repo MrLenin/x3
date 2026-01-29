@@ -25,7 +25,7 @@
 
 struct timeval;
 
-#define fd_wants_writes(FD) (((FD)->send.get != (FD)->send.put) || (FD)->state == IO_CONNECTING)
+#define fd_wants_writes(FD) (((FD)->send.get != (FD)->send.put) || (FD)->state == IO_CONNECTING || (FD)->writable_cb != NULL)
 
 struct io_engine {
     const char *name;

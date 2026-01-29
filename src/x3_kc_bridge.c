@@ -42,6 +42,8 @@ struct bridge_ctx {
     char *url_copy;
     char *body_copy;
     char *bearer_copy;
+    char *auth_user_copy;
+    char *auth_passwd_copy;
     struct curl_slist *headers_copy;
 };
 
@@ -126,17 +128,34 @@ x3_kc_bridge_submit(const char *url, const char *method,
     }
 
     if (body && body_len > 0) {
-        ctx->body_copy = malloc(body_len);
+        ctx->body_copy = malloc(body_len + 1);
         if (!ctx->body_copy) {
             bridge_ctx_free(ctx);
             return -1;
         }
         memcpy(ctx->body_copy, body, body_len);
+        ctx->body_copy[body_len] = '\0';
     }
 
     if (bearer_token) {
         ctx->bearer_copy = strdup(bearer_token);
         if (!ctx->bearer_copy) {
+            bridge_ctx_free(ctx);
+            return -1;
+        }
+    }
+
+    /* HTTP Basic auth (used for client_credentials grant) */
+    if (auth_user) {
+        ctx->auth_user_copy = strdup(auth_user);
+        if (!ctx->auth_user_copy) {
+            bridge_ctx_free(ctx);
+            return -1;
+        }
+    }
+    if (auth_passwd) {
+        ctx->auth_passwd_copy = strdup(auth_passwd);
+        if (!ctx->auth_passwd_copy) {
             bridge_ctx_free(ctx);
             return -1;
         }
@@ -161,14 +180,9 @@ x3_kc_bridge_submit(const char *url, const char *method,
     req.body_len = body ? body_len : 0;
     req.headers = ctx->headers_copy;
     req.bearer_token = ctx->bearer_copy;
+    req.auth_user = ctx->auth_user_copy;
+    req.auth_passwd = ctx->auth_passwd_copy;
     req.timeout_ms = 30000;  /* 30s default; keycloak.c's ASYNC_TIMEOUT_SEC is 30 */
-
-    /* Note: auth_user/auth_passwd for HTTP Basic auth (resource owner password grant)
-     * is not directly supported by kc_http_request. For password verification,
-     * keycloak.c encodes credentials in the POST body as form data, which works
-     * through the body parameter. */
-    (void)auth_user;
-    (void)auth_passwd;
 
     rc = kc_http_request(&req, bridge_http_callback, ctx);
     if (rc != 0) {
@@ -218,6 +232,14 @@ bridge_ctx_free(struct bridge_ctx *ctx)
     if (ctx->bearer_copy) {
         memset(ctx->bearer_copy, 0, strlen(ctx->bearer_copy));
         free(ctx->bearer_copy);
+    }
+    if (ctx->auth_user_copy) {
+        memset(ctx->auth_user_copy, 0, strlen(ctx->auth_user_copy));
+        free(ctx->auth_user_copy);
+    }
+    if (ctx->auth_passwd_copy) {
+        memset(ctx->auth_passwd_copy, 0, strlen(ctx->auth_passwd_copy));
+        free(ctx->auth_passwd_copy);
     }
     if (ctx->headers_copy)
         curl_slist_free_all(ctx->headers_copy);

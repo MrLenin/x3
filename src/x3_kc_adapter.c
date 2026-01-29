@@ -8,10 +8,11 @@
  *   - kc_event_ops.poll_hint  →  ioset_set_poll_hint_ms()
  *   - kc_log_ops.log          →  log_module()
  *
- * X3's ioset only has readable_cb (no separate writable_cb). When ioset fires
- * readable_cb, we report both KC_EVENT_READ and KC_EVENT_WRITE to libkc since
- * ioset's epoll/select integration monitors for both; the actual I/O direction
- * is determined by curl_multi internally.
+ * ioset dispatches read and write events separately: readable_cb for EPOLLIN,
+ * writable_cb for EPOLLOUT. We register both callbacks so libkc receives the
+ * correct event direction for curl_multi_socket_action().
+ * EPOLLOUT is only registered when writable_cb is non-NULL (controlled by
+ * fd_wants_writes()), so we set/clear writable_cb as curl's interest changes.
  */
 
 #include "x3_kc_adapter.h"
@@ -44,18 +45,26 @@ static struct x3_kc_socket *kc_sockets[MAX_KC_SOCKETS];
 
 static struct log_type *x3_kc_log_type = NULL;
 
-/* ioset readable_cb: fired when the socket is ready */
+/* ioset readable_cb: fired when the socket has data to read */
 static void
-x3_kc_socket_ready(struct io_fd *fd)
+x3_kc_socket_read_ready(struct io_fd *fd)
 {
     struct x3_kc_socket *sock = fd->data;
     if (!sock || !sock->kc_callback)
         return;
 
-    /* Report the events that libkc registered interest in.
-     * ioset doesn't distinguish read/write — it fires readable_cb for any
-     * activity. libkc (via curl) will determine what's actually ready. */
-    sock->kc_callback(sock->fd, sock->events, sock->kc_data);
+    sock->kc_callback(sock->fd, KC_EVENT_READ, sock->kc_data);
+}
+
+/* ioset writable_cb: fired when the socket is ready for writing */
+static void
+x3_kc_socket_write_ready(struct io_fd *fd)
+{
+    struct x3_kc_socket *sock = fd->data;
+    if (!sock || !sock->kc_callback)
+        return;
+
+    sock->kc_callback(sock->fd, KC_EVENT_WRITE, sock->kc_data);
 }
 
 static int
@@ -86,21 +95,42 @@ x3_socket_add(int fd, int events,
 
     io->state = IO_CONNECTED;  /* Already connected by curl */
     io->line_reads = 0;        /* Raw socket, no line buffering */
-    io->readable_cb = x3_kc_socket_ready;
+    io->readable_cb = x3_kc_socket_read_ready;
     io->data = sock;
 
+    /* Set writable_cb if curl wants write events; this also causes
+     * fd_wants_writes() to return true so EPOLLOUT gets registered. */
+    if (events & KC_EVENT_WRITE)
+        io->writable_cb = x3_kc_socket_write_ready;
+
     kc_sockets[fd] = sock;
+
+    /* Update epoll registration now that callbacks are configured */
+    ioset_update(io);
+
     return 0;
 }
 
 static int
 x3_socket_update(int fd, int events)
 {
+    struct x3_kc_socket *sock;
+
     if (fd < 0 || fd >= MAX_KC_SOCKETS || !kc_sockets[fd])
         return -1;
 
-    /* Update the events we'll report when ioset fires readable_cb */
-    kc_sockets[fd]->events = events;
+    sock = kc_sockets[fd];
+    sock->events = events;
+
+    /* Update writable_cb to match curl's write interest.
+     * This controls whether fd_wants_writes() includes this fd,
+     * which in turn controls EPOLLOUT registration. */
+    if (sock->io_fd) {
+        sock->io_fd->writable_cb = (events & KC_EVENT_WRITE)
+            ? x3_kc_socket_write_ready : NULL;
+        ioset_update(sock->io_fd);
+    }
+
     return 0;
 }
 
