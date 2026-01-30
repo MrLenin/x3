@@ -616,6 +616,7 @@ static const struct message_entry msgtab[] = {
     { "NSMSG_KEYCLOAK_FAIL_AUTH", "Authentication with the identity server failed: %s." },
     { "NSMSG_KEYCLOAK_FAIL_EMAIL", "There was a problem updating your email in the identity server: %s." },
     { "NSMSG_KEYCLOAK_UNAVAILABLE", "The identity server is currently unavailable. Please try again later." },
+    { "NSMSG_UNABLE_TO_ADD", "Unable to create your account. Please try again later." },
     { "NSMSG_PARTIAL_REGISTER", "Account has been registered to you; nick was already registered to someone else." },
     { "NSMSG_OREGISTER_VICTIM", "%s has registered a new account for you (named %s)." },
     { "NSMSG_OREGISTER_H_SUCCESS", "Account has been registered." },
@@ -7153,12 +7154,24 @@ auth_async_complete(struct auth_async_ctx *ctx)
     /* Handle autocreate if account doesn't exist (only on KC_SUCCESS) */
     if (!hi && nickserv_conf.keycloak_autocreate && ctx->state == AUTH_STATE_EMAIL_LOOKUP) {
         char *mask;
-        hi = nickserv_register(user, user, ctx->handle, "*", NULL, 0);
+        /* Use register_handle() directly - Keycloak-authenticated users don't
+         * need a local password, so bypass nickserv_register() which would
+         * reject the placeholder password via is_secure_password(). */
+        log_module(NS_LOG, LOG_INFO, "AUTH async: Auto-creating account for %s", ctx->handle);
+        hi = register_handle(ctx->handle, "", 0);
         if (!hi) {
             send_message(user, nickserv, "NSMSG_UNABLE_TO_ADD");
             auth_async_ctx_free(ctx);
             return;
         }
+        hi->masks = alloc_string_list(1);
+        hi->sslfps = alloc_string_list(1);
+        hi->ignores = alloc_string_list(1);
+        hi->users = NULL;
+        hi->language = lang_C;
+        hi->registered = now;
+        hi->lastseen = now;
+        hi->flags = HI_DEFAULT_FLAGS;
         /* Add default hostmask */
         if (nickserv_conf.default_hostmask)
             mask = "*@*";
