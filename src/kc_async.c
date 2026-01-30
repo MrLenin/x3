@@ -1577,11 +1577,19 @@ kc_async_handle_result_continued(struct kc_async_request *req, long http_code,
                                 opts.header_list[0] = "Content-Type: application/json";
                                 opts.header_count = 1;
 
+                                /* Save values before curl_perform_async, which may
+                                 * complete synchronously and free pending via the
+                                 * KC_ASYNC_SET_ATTR completion handler */
+                                int saved_pending_count = pending->attr_count;
+                                char saved_pending_id[64];
+                                snprintf(saved_pending_id, sizeof(saved_pending_id),
+                                         "%s", pending->user_id);
+
                                 if (curl_perform_async(put_req, opts) == 0) {
                                     log_module(KC_LOG, LOG_DEBUG,
                                                "[%s] kc_async coalesce_get: GET succeeded, "
                                                "issued PUT with %d merged attrs for %s",
-                                               req_id, pending->attr_count, pending->user_id);
+                                               req_id, saved_pending_count, saved_pending_id);
                                     result = KC_SUCCESS;
                                     req->coalesce_pending = NULL;
                                 } else {
@@ -2175,6 +2183,12 @@ kc_coalesce_flush_cb(void *data)
         opts.header_list[0] = "Content-Type: application/json";
         opts.header_count = 1;
 
+        /* Save values before curl_perform_async, which may complete
+         * synchronously and free p via the completion callback */
+        int saved_attr_count = p->attr_count;
+        char saved_user_id[64];
+        snprintf(saved_user_id, sizeof(saved_user_id), "%s", p->user_id);
+
         if (curl_perform_async(req, opts) < 0) {
             log_module(KC_LOG, LOG_ERROR, "coalesce: curl_perform_async failed");
             free(req->uri);
@@ -2187,7 +2201,7 @@ kc_coalesce_flush_cb(void *data)
         }
 
         log_module(KC_LOG, LOG_DEBUG, "coalesce: Started PUT with %d merged attrs for %s",
-                   p->attr_count, p->user_id);
+                   saved_attr_count, saved_user_id);
         return;
     }
 
@@ -2224,6 +2238,12 @@ kc_coalesce_flush_cb(void *data)
     opts.method = HTTP_GET;
     opts.xoauth2_bearer = req->bearer_token_copy;
 
+    /* Save values before curl_perform_async, which may complete
+     * synchronously and free p via the completion callback */
+    int saved_attr_count2 = p->attr_count;
+    char saved_user_id2[64];
+    snprintf(saved_user_id2, sizeof(saved_user_id2), "%s", p->user_id);
+
     if (curl_perform_async(req, opts) < 0) {
         log_module(KC_LOG, LOG_ERROR, "coalesce: curl_perform_async failed for GET");
         free(req->uri);
@@ -2235,7 +2255,7 @@ kc_coalesce_flush_cb(void *data)
     }
 
     log_module(KC_LOG, LOG_DEBUG, "coalesce: Started GET for %s before merging %d attrs",
-               p->user_id, p->attr_count);
+               saved_user_id2, saved_attr_count2);
 }
 
 int
