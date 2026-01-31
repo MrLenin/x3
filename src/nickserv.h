@@ -424,7 +424,7 @@ int handle_is_present(struct handle_info *hi);
 void handle_update_last_present(struct handle_info *hi);
 
 /* Positive auth cache support (for Keycloak webhook invalidation) */
-#ifdef WITH_LMDB
+#ifdef WITH_MDBX
 /**
  * Invalidate positive auth cache for a user.
  * Called by keycloak_webhook when password changes.

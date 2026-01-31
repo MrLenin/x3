@@ -36,7 +36,7 @@
 #include "opserv.h"
 #include "spamserv.h"
 
-#ifdef WITH_LMDB
+#ifdef WITH_MDBX
 #include "x3_lmdb.h"
 #endif
 

@@ -4,12 +4,18 @@ ENV GID=1234
 ENV UID=1234
 
 RUN DEBIAN_FRONTEND=noninteractive RUNLEVEL=1 apt-get update 
-RUN DEBIAN_FRONTEND=noninteractive RUNLEVEL=1 apt-get update && apt-get -y install build-essential libcurl4-openssl-dev libjansson-dev libssl-dev flex byacc gawk git vim procps net-tools libtre5 libtre-dev liblmdb-dev gdb valgrind linux-perf autoconf automake libtool
+RUN DEBIAN_FRONTEND=noninteractive RUNLEVEL=1 apt-get update && apt-get -y install build-essential libcurl4-openssl-dev libjansson-dev libssl-dev flex byacc gawk git vim procps net-tools libtre5 libtre-dev gdb valgrind linux-perf autoconf automake libtool cmake
 
 # Build and install libkc (shared Keycloak/HTTP library)
 COPY --from=libkc . /tmp/libkc
 WORKDIR /tmp/libkc
 RUN autoreconf -fi && ./configure --prefix=/usr && make && make install && ldconfig
+WORKDIR /
+
+# Build and install libmdbx
+COPY --from=libmdbx . /tmp/libmdbx
+WORKDIR /tmp/libmdbx
+RUN cmake -B build -DCMAKE_INSTALL_PREFIX=/usr -DMDBX_BUILD_TOOLS=OFF -DMDBX_BUILD_CXX=OFF && cmake --build build && cmake --install build && ldconfig
 WORKDIR /
 
 RUN mkdir -p /x3
@@ -30,7 +36,7 @@ WORKDIR  /x3/x3src
 # Disable glibc C23 features to avoid __isoc23_strtol linker errors on Debian 12
 ENV CFLAGS="-D__USE_ISOC23=0 -g -O2 -fno-omit-frame-pointer"
 ENV CPPFLAGS="-D__USE_ISOC23=0"
-RUN ./configure --prefix=/x3 --enable-modules=snoop,memoserv,helpserv,histserv --with-keycloak --with-lmdb --with-ssl CFLAGS="-D__USE_ISOC23=0 -g -O2 -fno-omit-frame-pointer" CPPFLAGS="-D__USE_ISOC23=0"
+RUN ./configure --prefix=/x3 --enable-modules=snoop,memoserv,helpserv,histserv --with-keycloak --with-mdbx --with-ssl CFLAGS="-D__USE_ISOC23=0 -g -O2 -fno-omit-frame-pointer" CPPFLAGS="-D__USE_ISOC23=0"
 
 RUN make
 RUN make install

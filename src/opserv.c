@@ -2882,7 +2882,7 @@ static MODCMD_FUNC(cmd_stats_memory) {
 /* LMDB commands */
 static MODCMD_FUNC(cmd_lmdb_snapshot)
 {
-#ifdef WITH_LMDB
+#ifdef WITH_MDBX
     char path_out[256];
     const struct lmdb_snapshot_stats *stats;
 
@@ -2911,7 +2911,7 @@ static MODCMD_FUNC(cmd_lmdb_snapshot)
 
 static MODCMD_FUNC(cmd_lmdb_export)
 {
-#ifdef WITH_LMDB
+#ifdef WITH_MDBX
     char path_out[256];
 
     if (!x3_lmdb_is_available()) {
@@ -2936,7 +2936,7 @@ static MODCMD_FUNC(cmd_lmdb_export)
 
 static MODCMD_FUNC(cmd_lmdb_stats)
 {
-#ifdef WITH_LMDB
+#ifdef WITH_MDBX
     const struct lmdb_snapshot_stats *snap_stats;
     const struct lmdb_purge_stats *purge_stats;
     char time_buf[64];

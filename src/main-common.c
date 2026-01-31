@@ -549,7 +549,7 @@ conf_globals(void)
     /* Initialize SSL library early (needed for crypto operations) */
     x3_ssl_init();
 
-#ifdef WITH_LMDB
+#ifdef WITH_MDBX
     /* Initialize LMDB early so other modules can use it */
     init_x3_lmdb();
 #endif

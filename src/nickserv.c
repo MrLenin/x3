@@ -43,7 +43,7 @@
 #include "keycloak.h"
 #endif
 
-#ifdef WITH_LMDB
+#ifdef WITH_MDBX
 #include "x3_lmdb.h"
 #include "md5.h"  /* For negative auth cache hash */
 #endif
@@ -307,7 +307,7 @@ static void kc_do_add(const char *handle, const char *hash, const char *email);
 static void kc_do_modify(const char *handle, const char *hash, const char *email);
 static void kc_delete_account(const char *handle);
 static void kc_do_oslevel(const char *handle, int level, int oldlevel);
-#if defined(WITH_LMDB) && defined(WITH_SSL)
+#if defined(WITH_MDBX) && defined(WITH_SSL)
 static void kc_sync_scram(const char *handle);
 #endif
 static void kc_add2group(const char *handle, const char *group);
@@ -342,7 +342,7 @@ static void local_auth_verify_callback(void *ctx, int result, const char *hash);
 static void local_auth_rehash_callback(void *ctx, int result, const char *hash);
 static void local_auth_complete(struct local_auth_ctx *ctx);
 
-#if defined(WITH_LMDB) && defined(WITH_SSL)
+#if defined(WITH_MDBX) && defined(WITH_SSL)
 /* Context for async SCRAM creation with user notification */
 struct scram_async_ctx {
     char handle[NICKSERV_HANDLE_LEN + 1];
@@ -424,7 +424,7 @@ static void scram_create_async(const char *handle, const char *password,
         free(ctx);
     }
 }
-#endif /* WITH_LMDB && WITH_SSL */
+#endif /* WITH_MDBX && WITH_SSL */
 
 /* ========== Async Registration Context ========== */
 
@@ -1077,7 +1077,7 @@ nickserv_unregister_handle(struct handle_info *hi, struct userNode *notify, stru
     }
 #endif
 
-#ifdef WITH_LMDB
+#ifdef WITH_MDBX
     /* Clean up all LMDB data for this account */
     if (x3_lmdb_is_available()) {
         int cleared;
@@ -1725,7 +1725,7 @@ nickserv_register(struct userNode *user, struct userNode *settee, const char *ha
     hi->lastseen = now;
     hi->flags = HI_DEFAULT_FLAGS;
 
-#if defined(WITH_LMDB) && defined(WITH_SSL)
+#if defined(WITH_MDBX) && defined(WITH_SSL)
     /* Create SCRAM credentials for password-based registration (async to avoid blocking).
      * Only create if no_auth is false - if email verification is required,
      * the password is invalidated until cookie verification, so we should
@@ -3222,7 +3222,7 @@ const char *nickserv_get_sasl_mechanisms(void)
     /* Add EXTERNAL if SSL is available (client cert auth) */
     strcat(mechs, ",EXTERNAL");
 
-#if defined(WITH_LMDB) && defined(WITH_SSL)
+#if defined(WITH_MDBX) && defined(WITH_SSL)
     /* Add all SCRAM variants for session token auth (requires LMDB + SSL) */
     if (x3_lmdb_is_available()) {
         strcat(mechs, ",SCRAM-SHA-1");
@@ -3328,7 +3328,7 @@ void nickserv_do_autoauth(struct userNode *user)
     send_message_type(4, user, nickserv,
                       handle_find_message(hi, "NSMSG_AUTH_SUCCESS"));
 
-#ifdef WITH_LMDB
+#ifdef WITH_MDBX
     /* Check certificate expiry and warn if expiring soon */
     if (user->sslfp) {
         time_t cert_expires = 0;
@@ -4119,7 +4119,7 @@ static NICKSERV_FUNC(cmd_cookie)
         /* Restore the password hash from cookie */
         safestrncpy(hi->passwd, hi->cookie->data, sizeof(hi->passwd));
 
-#if defined(WITH_LMDB) && defined(WITH_SSL)
+#if defined(WITH_MDBX) && defined(WITH_SSL)
         /* Create SCRAM credentials (async) - we have plaintext password here */
 #ifdef WITH_KEYCLOAK
         scram_create_async(hi->handle, password, user, 1);
@@ -4188,7 +4188,7 @@ static NICKSERV_FUNC(cmd_cookie)
 #endif
         set_user_handle_info(user, hi, 1);
         safestrncpy(hi->passwd, hi->cookie->data, sizeof(hi->passwd));
-#ifdef WITH_LMDB
+#ifdef WITH_MDBX
         /* Revoke all session tokens on password change */
         x3_lmdb_session_revoke_all(hi->handle);
 #ifdef WITH_SSL
@@ -4367,7 +4367,7 @@ static void cmd_pass_hash_callback(void *ctx_ptr, int result, const char *hash)
     if (nickserv_conf.sync_log)
         SyncLog("PASSCHANGE %s %s", hi->handle, hi->passwd);
 
-#ifdef WITH_LMDB
+#ifdef WITH_MDBX
     /* Revoke all session tokens on password change */
     x3_lmdb_session_revoke_all(hi->handle);
 #ifdef WITH_SSL
@@ -4476,7 +4476,7 @@ static NICKSERV_FUNC(cmd_pass)
         if (nickserv_conf.sync_log)
           SyncLog("PASSCHANGE %s %s", hi->handle, hi->passwd);
 
-#ifdef WITH_LMDB
+#ifdef WITH_MDBX
         /* Revoke all session tokens on password change */
         x3_lmdb_session_revoke_all(hi->handle);
 #ifdef WITH_SSL
@@ -4597,7 +4597,7 @@ nickserv_addsslfp_silent(struct handle_info *hi, const char *sslfp)
     }
     string_list_append(hi->sslfps, new_sslfp);
 
-#ifdef WITH_LMDB
+#ifdef WITH_MDBX
     /* Store fingerprint in LMDB with registration timestamp and 90-day TTL */
     x3_lmdb_fingerprint_set(new_sslfp, hi->handle, now, now);
 #endif
@@ -4626,7 +4626,7 @@ nickserv_addsslfp(struct userNode *user, struct handle_info *hi, const char *ssl
     }
     string_list_append(hi->sslfps, new_sslfp);
 
-#ifdef WITH_LMDB
+#ifdef WITH_MDBX
     /* Store fingerprint in LMDB with registration timestamp and 90-day TTL */
     x3_lmdb_fingerprint_set(new_sslfp, hi->handle, now, now);
 #endif
@@ -4670,7 +4670,7 @@ nickserv_delsslfp(struct svccmd *cmd, struct userNode *user, struct handle_info 
             char *old_sslfp = hi->sslfps->list[i];
             hi->sslfps->list[i] = hi->sslfps->list[--hi->sslfps->used];
 
-#ifdef WITH_LMDB
+#ifdef WITH_MDBX
             /* Remove fingerprint from LMDB */
             x3_lmdb_fingerprint_delete(old_sslfp);
 #endif
@@ -4726,7 +4726,7 @@ nickserv_listsslfp(struct svccmd *cmd, struct userNode *user, struct handle_info
     for (i = 0; i < hi->sslfps->used; i++) {
         const char *fp = hi->sslfps->list[i];
 
-#ifdef WITH_LMDB
+#ifdef WITH_MDBX
         /* Try to get additional info from LMDB */
         char account_out[64];
         time_t registered, last_used, expires;
@@ -4806,7 +4806,7 @@ static NICKSERV_FUNC(cmd_searchsslfp)
         }
     }
 
-#ifdef WITH_LMDB
+#ifdef WITH_MDBX
     /* Check LMDB cache */
     char account_out[64];
     time_t registered, last_used, expires;
@@ -5172,7 +5172,7 @@ static OPTION_FUNC(opt_password)
     if (nickserv_conf.sync_log)
         SyncLog("PASSCHANGE %s %s", hi->handle, hi->passwd);
 
-#if defined(WITH_LMDB) && defined(WITH_SSL)
+#if defined(WITH_MDBX) && defined(WITH_SSL)
     /* Create SCRAM credentials for the new password (async) */
 #ifdef WITH_KEYCLOAK
     scram_create_async(hi->handle, argv[1], user, 1);
@@ -6874,7 +6874,7 @@ nickserv_db_read_handle(char *handle, dict_t obj)
     }
 
     /* LMDB Activity Migration: sync activity data between SAXDB and LMDB */
-#ifdef WITH_LMDB
+#ifdef WITH_MDBX
     if (x3_lmdb_is_available()) {
         time_t lmdb_lastseen = 0, lmdb_last_present = 0;
         int rc = x3_lmdb_activity_get(hi->handle, &lmdb_lastseen, &lmdb_last_present);
@@ -7715,7 +7715,7 @@ cookie_pw_verify_callback(void *context, int result, const char *hash)
 #endif
             kc_do_modify(ctx->handle, ctx->password_hash, NULL);
             safestrncpy(hi->passwd, ctx->password_hash, sizeof(hi->passwd));
-#if defined(WITH_LMDB) && defined(WITH_SSL)
+#if defined(WITH_MDBX) && defined(WITH_SSL)
             if (ctx->plaintext_password) {
                 scram_create_async(ctx->handle, ctx->plaintext_password, user, 1);
             }
@@ -7742,7 +7742,7 @@ cookie_pw_verify_callback(void *context, int result, const char *hash)
             kc_do_modify(ctx->handle, ctx->password_hash, NULL);
             set_user_handle_info(user, hi, 1);
             safestrncpy(hi->passwd, ctx->password_hash, sizeof(hi->passwd));
-#ifdef WITH_LMDB
+#ifdef WITH_MDBX
             x3_lmdb_session_revoke_all(ctx->handle);
 #ifdef WITH_SSL
             x3_lmdb_scram_revoke_all(ctx->handle);
@@ -7936,7 +7936,7 @@ cookie_async_update_callback(void *session, int result)
         /* Restore the password hash from cookie */
         safestrncpy(hi->passwd, hi->cookie->data, sizeof(hi->passwd));
 
-#if defined(WITH_LMDB) && defined(WITH_SSL)
+#if defined(WITH_MDBX) && defined(WITH_SSL)
         /* Create SCRAM credentials if we have plaintext password (async) */
         if (ctx->plaintext_password) {
 #ifdef WITH_KEYCLOAK
@@ -7961,7 +7961,7 @@ cookie_async_update_callback(void *session, int result)
         set_user_handle_info(user, hi, 1);
         safestrncpy(hi->passwd, hi->cookie->data, sizeof(hi->passwd));
 
-#ifdef WITH_LMDB
+#ifdef WITH_MDBX
         /* Revoke all session tokens on password change */
         x3_lmdb_session_revoke_all(hi->handle);
 #ifdef WITH_SSL
@@ -8393,7 +8393,7 @@ kc_do_modify(const char *handle, const char *hash, const char *email)
 }
 
 /* ========== SCRAM Credential Sync to Keycloak ========== */
-#if defined(WITH_LMDB) && defined(WITH_SSL)
+#if defined(WITH_MDBX) && defined(WITH_SSL)
 
 /* Context for async SCRAM sync to Keycloak */
 struct kc_scram_sync_ctx {
@@ -8589,7 +8589,7 @@ static void kc_sync_scram(const char *handle) {
                handle);
 }
 
-#endif /* WITH_LMDB && WITH_SSL */
+#endif /* WITH_MDBX && WITH_SSL */
 
 /* Context for async delete account */
 struct kc_delete_account_ctx {
@@ -9785,7 +9785,7 @@ loc_auth_external(const char *fingerprint, const char *authzid, const char *host
     log_module(NS_LOG, LOG_DEBUG, "loc_auth_external: Looking up fingerprint %s", fingerprint);
 
     /* Step 1: Check LMDB fingerprint cache (with 90-day TTL) */
-#ifdef WITH_LMDB
+#ifdef WITH_MDBX
     rc = x3_lmdb_fingerprint_get(fingerprint, cached_account, NULL, NULL, NULL);
     if (rc == LMDB_SUCCESS) {
         log_module(NS_LOG, LOG_DEBUG, "loc_auth_external: LMDB cache hit: %s -> %s",
@@ -9831,7 +9831,7 @@ loc_auth_external(const char *fingerprint, const char *authzid, const char *host
     hi = loc_auth((char*)fingerprint, (char*)authzid, NULL, (char*)hostmask);
     if (hi) {
         log_module(NS_LOG, LOG_DEBUG, "loc_auth_external: Local lookup found %s", hi->handle);
-#ifdef WITH_LMDB
+#ifdef WITH_MDBX
         /* Cache in LMDB with enhanced format (account, registered, last_used, TTL) */
         x3_lmdb_fingerprint_set(fingerprint, hi->handle, 0, 0);
 #endif
@@ -9860,7 +9860,7 @@ loc_auth_external(const char *fingerprint, const char *authzid, const char *host
                 "loc_auth_external: Keycloak returned user '%s' for fingerprint",
                 kc_username);
 
-#ifdef WITH_LMDB
+#ifdef WITH_MDBX
             /* Cache in LMDB with enhanced format (account, registered, last_used, TTL) */
             x3_lmdb_fingerprint_set(fingerprint, kc_username, 0, 0);
 #endif
@@ -10001,7 +10001,7 @@ loc_auth_external(const char *fingerprint, const char *authzid, const char *host
 static void
 nickserv_update_activity_lmdb(struct handle_info *hi, int update_lastseen, int update_last_present)
 {
-#ifdef WITH_LMDB
+#ifdef WITH_MDBX
     if (!hi || !x3_lmdb_is_available())
         return;
 
@@ -10461,7 +10461,7 @@ nickserv_conf_read(void)
     pw_config.enable_lazy_migration = nickserv_conf.password_lazy_migration;
 
     /* Apply SCRAM and sync config to LMDB module */
-#ifdef WITH_LMDB
+#ifdef WITH_MDBX
     x3_lmdb_set_scram_iterations(nickserv_conf.scram_iterations);
     x3_lmdb_set_nosync(nickserv_conf.lmdb_nosync);
     x3_lmdb_set_sync_interval(nickserv_conf.lmdb_sync_interval);
@@ -10734,7 +10734,7 @@ static uint32_t reg_sequence_counter = 0;
 /* Registration session stale timeout in seconds */
 #define REG_STALE_TIMEOUT 120
 
-#if defined(WITH_LMDB) && defined(WITH_SSL)
+#if defined(WITH_MDBX) && defined(WITH_SSL)
 /* Pending SCRAM passwords - stores plaintext passwords for IRCv3 email verification flow.
  * Keyed by account name (lowercase), stores password + creation time for cleanup. */
 struct pending_scram_entry {
@@ -10824,7 +10824,7 @@ static void pending_scram_cleanup_stale(UNUSED_ARG(void *data)) {
     /* Reschedule cleanup */
     timeq_add(now + 3600, pending_scram_cleanup_stale, NULL);
 }
-#endif /* WITH_LMDB && WITH_SSL */
+#endif /* WITH_MDBX && WITH_SSL */
 
 /**
  * Async callback context for registration
@@ -11051,7 +11051,7 @@ reg_complete_registration(struct RegSession *session)
         /* Create activation cookie with hashed password */
         nickserv_make_cookie(NULL, hi, ACTIVATION, session->password_hash, 0);
 
-#if defined(WITH_LMDB) && defined(WITH_SSL)
+#if defined(WITH_MDBX) && defined(WITH_SSL)
         /* Store plaintext password for SCRAM creation at VERIFY time */
         if (session->password_plain[0]) {
             pending_scram_store(session->account, session->password_plain);
@@ -11087,7 +11087,7 @@ reg_complete_registration(struct RegSession *session)
         if (session->use_email)
             nickserv_set_email_addr(hi, session->email);
 
-#if defined(WITH_LMDB) && defined(WITH_SSL)
+#if defined(WITH_MDBX) && defined(WITH_SSL)
         /* Create SCRAM credentials - we have plaintext password in session (async).
          * Note: User is pre-registration (no userNode), so pass NULL - failure logged only */
         if (session->password_plain[0]) {
@@ -11302,7 +11302,7 @@ struct SASLSession
     char *authzid;          /* Authorization identity for impersonation */
     char cred_hash[33];     /* MD5 hash of credentials for negative cache (hex string) */
     uint32_t sequence;      /* Unique sequence number for async callback validation */
-#ifdef WITH_LMDB
+#ifdef WITH_MDBX
     struct scram_session *scram;  /* SCRAM-SHA-256 session state (if using SCRAM) */
 #endif
 #ifdef WITH_SSL
@@ -11396,7 +11396,7 @@ sasl_session_is_terminal(struct SASLSession *session)
 /* Negative auth cache TTL - how long to remember failed auths */
 #define AUTHFAIL_CACHE_TTL 60  /* 60 seconds */
 
-#if defined(WITH_LMDB) && defined(WITH_SSL) && defined(WITH_KEYCLOAK)
+#if defined(WITH_MDBX) && defined(WITH_SSL) && defined(WITH_KEYCLOAK)
 /**
  * Context for async SCRAM credential fetch from Keycloak.
  * Used when LMDB doesn't have SCRAM credentials and we need to
@@ -11827,9 +11827,9 @@ scram_fetch_start(struct SASLSession *session, const char *username,
     log_module(NS_LOG, LOG_DEBUG, "SCRAM fetch: Started async credential fetch for %s", username);
     return 0;
 }
-#endif /* WITH_LMDB && WITH_SSL && WITH_KEYCLOAK */
+#endif /* WITH_MDBX && WITH_SSL && WITH_KEYCLOAK */
 
-#ifdef WITH_LMDB
+#ifdef WITH_MDBX
 /**
  * Compute MD5 hash of credentials for negative cache lookup
  * Format: MD5(username + ":" + password) as hex string
@@ -12004,12 +12004,12 @@ invalidate_authsuccess_cache(const char *username)
     log_module(NS_LOG, LOG_DEBUG, "Invalidated auth success cache for %s", username);
 }
 
-#endif /* WITH_LMDB */
+#endif /* WITH_MDBX */
 
 /* Fingerprint failure cache TTL - how long to remember failed fingerprint lookups */
 #define FPFAIL_CACHE_TTL 60  /* 60 seconds */
 
-#ifdef WITH_LMDB
+#ifdef WITH_MDBX
 
 /**
  * Check if fingerprint is in the negative lookup cache
@@ -12058,7 +12058,7 @@ cache_fpfail(const char *fingerprint)
     x3_lmdb_set(LMDB_DB_METADATA, lmdb_key, cache_value);
     log_module(NS_LOG, LOG_DEBUG, "Cached fingerprint failure for %s", fingerprint);
 }
-#endif /* WITH_LMDB */
+#endif /* WITH_MDBX */
 
 static void
 sasl_delete_session(struct SASLSession *session)
@@ -12091,7 +12091,7 @@ sasl_delete_session(struct SASLSession *session)
         pool_strfree(session->authzid);
     session->authzid = NULL;
 
-#ifdef WITH_LMDB
+#ifdef WITH_MDBX
     if (session->scram)
         free(session->scram);
     session->scram = NULL;
@@ -12323,7 +12323,7 @@ sasl_async_auth_callback(void *ctx_ptr, int result)
         }
         irc_sasl_login(session->source, session->uid, hi->handle, hi->registered);
 
-#ifdef WITH_LMDB
+#ifdef WITH_MDBX
         /* Issue session token for faster reconnects (only for non-impersonating users) */
         if (!hii) {
             char session_token[128];
@@ -12360,10 +12360,12 @@ sasl_async_auth_callback(void *ctx_ptr, int result)
             nickserv_addsslfp_silent(hi, session->sslclifp);
         }
 
+#ifdef WITH_MDBX
         /* Cache successful auth for faster future logins (only for non-impersonating users) */
         if (!hii && session->cred_hash[0]) {
             cache_authsuccess(hi->handle, session->cred_hash);
         }
+#endif
 
         irc_sasl(session->source, session->uid, "D", "S");
         log_module(NS_LOG, LOG_DEBUG, "SASL async: Success for %s", hi->handle);
@@ -12372,7 +12374,7 @@ sasl_async_auth_callback(void *ctx_ptr, int result)
         if (result != KC_SUCCESS) {
             log_module(NS_LOG, LOG_DEBUG, "SASL async: Keycloak auth failed for %s (result=%d)",
                        session->authcid ? session->authcid : "(null)", result);
-#ifdef WITH_LMDB
+#ifdef WITH_MDBX
             /* Only cache credential failures for actual auth failures, not account issues */
             if (session->cred_hash[0]) {
                 cache_authfail(session->cred_hash);
@@ -12429,7 +12431,7 @@ sasl_external_token_callback(void *context, int result, struct access_token *tok
         hi = loc_auth_external(session->sslclifp, session->authzid, session->hostmask);
         if (!hi) {
             log_module(NS_LOG, LOG_DEBUG, "SASL EXTERNAL: No matching account (sync fallback)");
-#ifdef WITH_LMDB
+#ifdef WITH_MDBX
             if (session->sslclifp)
                 cache_fpfail(session->sslclifp);
 #endif
@@ -12463,7 +12465,7 @@ sasl_external_token_callback(void *context, int result, struct access_token *tok
     hi = loc_auth_external(session->sslclifp, session->authzid, session->hostmask);
     if (!hi) {
         log_module(NS_LOG, LOG_DEBUG, "SASL EXTERNAL: No matching account (sync fallback)");
-#ifdef WITH_LMDB
+#ifdef WITH_MDBX
         if (session->sslclifp)
             cache_fpfail(session->sslclifp);
 #endif
@@ -12572,7 +12574,7 @@ sasl_async_fingerprint_callback(void *ctx_ptr, int result, char *username)
         irc_sasl(session->source, session->uid, "D", "S");
     } else {
         log_module(NS_LOG, LOG_DEBUG, "SASL EXTERNAL: No matching account for fingerprint");
-#ifdef WITH_LMDB
+#ifdef WITH_MDBX
         /* Cache this failure to avoid repeated Keycloak lookups */
         if (session->sslclifp)
             cache_fpfail(session->sslclifp);
@@ -12774,7 +12776,7 @@ sasl_packet(struct SASLSession *session)
             return 1;
         }
 
-#ifdef WITH_LMDB
+#ifdef WITH_MDBX
         /* Check negative cache before expensive Keycloak lookup */
         if (check_fpfail_cache(session->sslclifp)) {
             log_module(NS_LOG, LOG_DEBUG, "SASL EXTERNAL: Fingerprint in negative cache, rejecting");
@@ -12838,7 +12840,7 @@ sasl_packet(struct SASLSession *session)
         if (!hi)
         {
             log_module(NS_LOG, LOG_DEBUG, "SASL EXTERNAL: No matching account for fingerprint");
-#ifdef WITH_LMDB
+#ifdef WITH_MDBX
             /* Cache this failure to avoid repeated lookups */
             if (session->sslclifp)
                 cache_fpfail(session->sslclifp);
@@ -13040,7 +13042,7 @@ sasl_packet(struct SASLSession *session)
         return 1;
     }
 #endif /* WITH_KEYCLOAK */
-#if defined(WITH_LMDB) && defined(WITH_SSL)
+#if defined(WITH_MDBX) && defined(WITH_SSL)
     else if (!strncmp(session->mech, "SCRAM-SHA-", 10))
     {
         /*
@@ -13415,7 +13417,7 @@ sasl_packet(struct SASLSession *session)
             return 1;
         }
     }
-#endif /* WITH_LMDB && WITH_SSL */
+#endif /* WITH_MDBX && WITH_SSL */
 #ifdef WITH_SSL
     else if (!strcmp(session->mech, "ECDSA-NIST256P-CHALLENGE"))
     {
@@ -13675,7 +13677,7 @@ sasl_packet(struct SASLSession *session)
             /* Use async Keycloak auth - non-blocking! */
             log_module(NS_LOG, LOG_DEBUG, "SASL: Starting async Keycloak auth for %s", authcid);
 
-#ifdef WITH_LMDB
+#ifdef WITH_MDBX
             /* Check if password is a session token (x3tok:...) */
             if (x3_lmdb_is_session_token(passwd)) {
                 char token_username[128];
@@ -14321,7 +14323,7 @@ nickserv_ircv3_verify(struct userNode *user, const char *handle,
 #endif
     safestrncpy(hi->passwd, hi->cookie->data, sizeof(hi->passwd));
 
-#if defined(WITH_LMDB) && defined(WITH_SSL)
+#if defined(WITH_MDBX) && defined(WITH_SSL)
     /* Create SCRAM credentials if we have the pending plaintext password (async) */
     {
         const char *pending_password = pending_scram_get(handle);
@@ -14450,7 +14452,7 @@ init_nickserv(const char *nick)
                    SASL_STALE_CHECK_INTERVAL, SASL_STALE_TIMEOUT);
     }
 
-#if defined(WITH_LMDB) && defined(WITH_SSL)
+#if defined(WITH_MDBX) && defined(WITH_SSL)
     /* Start pending SCRAM password cleanup timer - runs hourly */
     timeq_add(now + 3600, pending_scram_cleanup_stale, NULL);
 #endif

@@ -16,7 +16,7 @@
 #include <time.h>
 
 /* Webhook is only available when both Keycloak and LMDB are enabled */
-#if defined(WITH_KEYCLOAK) && defined(WITH_LMDB)
+#if defined(WITH_KEYCLOAK) && defined(WITH_MDBX)
 #define WITH_KEYCLOAK_WEBHOOK 1
 #else
 #define WITH_KEYCLOAK_WEBHOOK 0

@@ -2280,7 +2280,7 @@ static CMD_FUNC(cmd_mark)
         if (argc > 3) {
             time_t cert_expires = (time_t)strtoul(argv[3], NULL, 10);
             if (target->sslfp && cert_expires > 0) {
-#ifdef WITH_LMDB
+#ifdef WITH_MDBX
                 x3_lmdb_certexp_set(target->sslfp, cert_expires);
 #endif
             }

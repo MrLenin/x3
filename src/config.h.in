@@ -366,7 +366,7 @@
 #undef WITH_LDAP
 
 /* Define if LMDB support is enabled */
-#undef WITH_LMDB
+#undef WITH_MDBX
 
 /* Define if using the Boehm GC to garbage collect and check memory leaks */
 #undef WITH_MALLOC_BOEHM_GC

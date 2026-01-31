@@ -2144,7 +2144,7 @@ unregister_channel(struct chanData *channel, const char *reason)
     chanserv_delete_keycloak_channel(channel->channel->name);
 #endif
 
-#ifdef WITH_LMDB
+#ifdef WITH_MDBX
     /* Clean up all LMDB data for this channel */
     if (x3_lmdb_is_available()) {
         const char *chan_name = channel->channel->name;
@@ -10681,7 +10681,7 @@ chanserv_set_channel_metadata(struct chanData *cData, const char *key, const cha
     if (!cData || !cData->channel || !key)
         return -1;
 
-#ifdef WITH_LMDB
+#ifdef WITH_MDBX
     if (x3_lmdb_is_available()) {
         char stored_value[2048];
         int rc;
@@ -11764,7 +11764,7 @@ adduser_final_cb(void *session, int result)
                ctx->channel, ctx->username, result, ctx->access);
 
     if (result == KC_SUCCESS) {
-#ifdef WITH_LMDB
+#ifdef WITH_MDBX
         /* Update LMDB cache on success */
         if (x3_lmdb_is_available()) {
             if (ctx->access > 0) {
@@ -11861,7 +11861,7 @@ cs_group_async_callback(void *session, int result)
                    ctx->is_add ? "adding" : "removing",
                    ctx->username, ctx->is_add ? "to" : "from");
 
-#ifdef WITH_LMDB
+#ifdef WITH_MDBX
         /* Update LMDB cache on success */
         if (x3_lmdb_is_available()) {
             if (ctx->is_add) {
@@ -12757,7 +12757,7 @@ chanserv_keycloak_access_update(const char *channel, const char *account,
                        account, channel);
             del_channel_user(uData, 1);
         }
-#ifdef WITH_LMDB
+#ifdef WITH_MDBX
         if (x3_lmdb_is_available()) {
             x3_lmdb_chanaccess_delete(channel, account);
         }
@@ -12789,7 +12789,7 @@ chanserv_keycloak_access_update(const char *channel, const char *account,
             }
         }
 
-#ifdef WITH_LMDB
+#ifdef WITH_MDBX
         if (x3_lmdb_is_available()) {
             x3_lmdb_chanaccess_set(channel, account, level);
         }

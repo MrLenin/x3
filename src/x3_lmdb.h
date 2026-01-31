@@ -30,9 +30,9 @@ struct lmdb_chansync_meta {
     int last_entry_count;         /* Number of entries in last sync */
 };
 
-#ifdef WITH_LMDB
+#ifdef WITH_MDBX
 
-#include <lmdb.h>
+#include <mdbx.h>
 #include <stddef.h>
 
 /* Database names */
@@ -375,7 +375,7 @@ void x3_lmdb_free_chanaccess_entries(struct lmdb_chanaccess_entry *entries);
 #define LMDB_PREFIX_CHANSYNC "kcsyncmeta:"
 
 /* Note: struct lmdb_chansync_meta is defined at the top of this header,
- * outside #ifdef WITH_LMDB, so code can use the struct even without LMDB */
+ * outside #ifdef WITH_MDBX, so code can use the struct even without LMDB */
 
 /**
  * Get channel sync metadata
@@ -1119,7 +1119,7 @@ int scram_sha256_verify_proof(const unsigned char *stored_key,
  */
 void init_x3_lmdb(void);
 
-#else /* !WITH_LMDB */
+#else /* !WITH_MDBX */
 
 /* Stub functions when LMDB is not available */
 #define x3_lmdb_init(p, s)              (0)
@@ -1213,6 +1213,6 @@ void init_x3_lmdb(void);
 #define scram_sha256_verify_proof(sk, m, l, p) (-1)
 #define init_x3_lmdb()                  do {} while(0)
 
-#endif /* WITH_LMDB */
+#endif /* WITH_MDBX */
 
 #endif /* X3_LMDB_H */
