@@ -36,6 +36,8 @@ WORKDIR  /x3/x3src
 # Disable glibc C23 features to avoid __isoc23_strtol linker errors on Debian 12
 ENV CFLAGS="-D__USE_ISOC23=0 -g -O2 -fno-omit-frame-pointer"
 ENV CPPFLAGS="-D__USE_ISOC23=0"
+# Regenerate configure script from configure.in (needed for --with-mdbx support)
+RUN autoconf && autoheader
 RUN ./configure --prefix=/x3 --enable-modules=snoop,memoserv,helpserv,histserv --with-keycloak --with-mdbx --with-ssl CFLAGS="-D__USE_ISOC23=0 -g -O2 -fno-omit-frame-pointer" CPPFLAGS="-D__USE_ISOC23=0"
 
 RUN make

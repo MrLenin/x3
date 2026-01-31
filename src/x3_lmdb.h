@@ -591,6 +591,15 @@ int x3_lmdb_set(const char *db, const char *key, const char *value);
  */
 int x3_lmdb_delete(const char *db, const char *key);
 
+/**
+ * Get per-DBI statistics (entry count, size estimate)
+ * @param db Database name (LMDB_DB_ACCOUNTS, etc.)
+ * @param entries_out Pointer to receive entry count (can be NULL)
+ * @param size_out Pointer to receive size estimate in bytes (can be NULL)
+ * @return LMDB_SUCCESS on success, LMDB_ERROR on failure
+ */
+int x3_lmdb_dbi_stats(const char *db, size_t *entries_out, size_t *size_out);
+
 /* ========== Utility Functions ========== */
 
 /**

@@ -51,7 +51,7 @@ static int lmdb_autogrow = 1;                  /* 1 = auto-grow enabled (default
 static intptr_t lmdb_growth_step = 16 * 1024 * 1024; /* 16MB default growth step */
 
 /* Get/set SCRAM iteration count */
-unsigned int x3_lmdbx_get_scram_iterations(void)
+unsigned int x3_lmdb_get_scram_iterations(void)
 {
     return scram_iterations;
 }
@@ -68,7 +68,7 @@ void x3_lmdb_set_scram_iterations(unsigned int iterations)
 }
 
 /* Get/set LMDB nosync mode */
-int x3_lmdbx_get_nosync(void)
+int x3_lmdb_get_nosync(void)
 {
     return lmdb_nosync;
 }
@@ -81,7 +81,7 @@ void x3_lmdb_set_nosync(int nosync)
 }
 
 /* Get/set LMDB sync interval (only used when nosync enabled) */
-unsigned int x3_lmdbx_get_sync_interval(void)
+unsigned int x3_lmdb_get_sync_interval(void)
 {
     return lmdb_sync_interval;
 }
@@ -303,7 +303,7 @@ int x3_lmdb_account_get(const char *account, const char *key, char *value)
     mkey.iov_len = account_len + 1 + strlen(key) + 1;
     mkey.iov_base = keybuf;
 
-    rc = mdbx_txn_begin(lmdb_env, NULL, MDBX_RDONLY, &txn);
+    rc = mdbx_txn_begin(lmdb_env, NULL, MDBX_TXN_RDONLY, &txn);
     if (rc != 0) {
         return LMDB_ERROR;
     }
@@ -428,7 +428,7 @@ int x3_lmdb_account_get_raw(const char *account, const char *key,
     mkey.iov_len = account_len + 1 + strlen(key) + 1;
     mkey.iov_base = keybuf;
 
-    rc = mdbx_txn_begin(lmdb_env, NULL, MDBX_RDONLY, &txn);
+    rc = mdbx_txn_begin(lmdb_env, NULL, MDBX_TXN_RDONLY, &txn);
     if (rc != 0) {
         return LMDB_ERROR;
     }
@@ -521,7 +521,7 @@ int x3_lmdb_account_list(const char *account, struct lmdb_metadata_entry **entri
     snprintf(prefix, sizeof(prefix), "%s", account);
     prefix[prefix_len - 1] = '\0';
 
-    rc = mdbx_txn_begin(lmdb_env, NULL, MDBX_RDONLY, &txn);
+    rc = mdbx_txn_begin(lmdb_env, NULL, MDBX_TXN_RDONLY, &txn);
     if (rc != 0) {
         return LMDB_ERROR;
     }
@@ -615,7 +615,7 @@ int x3_lmdb_account_list_raw(const char *account, struct lmdb_raw_metadata_entry
     snprintf(prefix, sizeof(prefix), "%s", account);
     prefix[prefix_len - 1] = '\0';
 
-    rc = mdbx_txn_begin(lmdb_env, NULL, MDBX_RDONLY, &txn);
+    rc = mdbx_txn_begin(lmdb_env, NULL, MDBX_TXN_RDONLY, &txn);
     if (rc != 0) {
         return LMDB_ERROR;
     }
@@ -718,7 +718,7 @@ int x3_lmdb_channel_get(const char *channel, const char *key, char *value)
     mkey.iov_len = channel_len + 1 + strlen(key) + 1;
     mkey.iov_base = keybuf;
 
-    rc = mdbx_txn_begin(lmdb_env, NULL, MDBX_RDONLY, &txn);
+    rc = mdbx_txn_begin(lmdb_env, NULL, MDBX_TXN_RDONLY, &txn);
     if (rc != 0) {
         return LMDB_ERROR;
     }
@@ -840,7 +840,7 @@ int x3_lmdb_channel_list(const char *channel, struct lmdb_metadata_entry **entri
     snprintf(prefix, sizeof(prefix), "%s", channel);
     prefix[prefix_len - 1] = '\0';
 
-    rc = mdbx_txn_begin(lmdb_env, NULL, MDBX_RDONLY, &txn);
+    rc = mdbx_txn_begin(lmdb_env, NULL, MDBX_TXN_RDONLY, &txn);
     if (rc != 0) {
         return LMDB_ERROR;
     }
@@ -1287,7 +1287,7 @@ static int resolve_dbi(const char *db, MDBX_dbi *dbi_out)
     return LMDB_SUCCESS;
 }
 
-int x3_lmdbx_get(const char *db, const char *key, char *value, size_t value_size)
+int x3_lmdb_get(const char *db, const char *key, char *value, size_t value_size)
 {
     MDBX_txn *txn;
     MDBX_val mkey, mdata;
@@ -1305,7 +1305,7 @@ int x3_lmdbx_get(const char *db, const char *key, char *value, size_t value_size
     mkey.iov_len = strlen(key) + 1;
     mkey.iov_base = (void *)key;
 
-    rc = mdbx_txn_begin(lmdb_env, NULL, MDBX_RDONLY, &txn);
+    rc = mdbx_txn_begin(lmdb_env, NULL, MDBX_TXN_RDONLY, &txn);
     if (rc != 0) {
         return LMDB_ERROR;
     }
@@ -1344,7 +1344,7 @@ int x3_lmdb_set(const char *db, const char *key, const char *value)
 
     /* NULL value means delete */
     if (!value) {
-        return x3_lmdbx_delete(db, key);
+        return x3_lmdb_delete(db, key);
     }
 
     mkey.iov_len = strlen(key) + 1;
@@ -1367,7 +1367,7 @@ int x3_lmdb_set(const char *db, const char *key, const char *value)
     return rc == 0 ? LMDB_SUCCESS : LMDB_ERROR;
 }
 
-int x3_lmdbx_delete(const char *db, const char *key)
+int x3_lmdb_delete(const char *db, const char *key)
 {
     MDBX_txn *txn;
     MDBX_val mkey;
@@ -1403,7 +1403,7 @@ int x3_lmdbx_delete(const char *db, const char *key)
     return rc == 0 ? LMDB_SUCCESS : LMDB_ERROR;
 }
 
-int x3_lmdbx_dbi_stats(const char *db, size_t *entries_out, size_t *size_out)
+int x3_lmdb_dbi_stats(const char *db, size_t *entries_out, size_t *size_out)
 {
     MDBX_txn *txn;
     MDBX_stat stat;
@@ -1414,7 +1414,7 @@ int x3_lmdbx_dbi_stats(const char *db, size_t *entries_out, size_t *size_out)
         return LMDB_ERROR;
     }
 
-    rc = mdbx_txn_begin(lmdb_env, NULL, MDBX_RDONLY, &txn);
+    rc = mdbx_txn_begin(lmdb_env, NULL, MDBX_TXN_RDONLY, &txn);
     if (rc != 0) {
         return LMDB_ERROR;
     }
@@ -1499,7 +1499,7 @@ int x3_lmdb_chanaccess_get(const char *channel, const char *account, unsigned sh
     mkey.iov_len = prefix_len + channel_len + 1 + account_len + 1;
     mkey.iov_base = keybuf;
 
-    rc = mdbx_txn_begin(lmdb_env, NULL, MDBX_RDONLY, &txn);
+    rc = mdbx_txn_begin(lmdb_env, NULL, MDBX_TXN_RDONLY, &txn);
     if (rc != 0) {
         return LMDB_ERROR;
     }
@@ -1548,7 +1548,7 @@ int x3_lmdb_chanaccess_get_ex(const char *channel, const char *account,
     mkey.iov_len = prefix_len + channel_len + 1 + account_len + 1;
     mkey.iov_base = keybuf;
 
-    rc = mdbx_txn_begin(lmdb_env, NULL, MDBX_RDONLY, &txn);
+    rc = mdbx_txn_begin(lmdb_env, NULL, MDBX_TXN_RDONLY, &txn);
     if (rc != 0) {
         return LMDB_ERROR;
     }
@@ -1675,7 +1675,7 @@ int x3_lmdb_chanaccess_list(const char *channel, struct lmdb_chanaccess_entry **
     memcpy(prefix + chanaccess_len, channel, channel_len);
     prefix[chanaccess_len + channel_len] = '\0';
 
-    rc = mdbx_txn_begin(lmdb_env, NULL, MDBX_RDONLY, &txn);
+    rc = mdbx_txn_begin(lmdb_env, NULL, MDBX_TXN_RDONLY, &txn);
     if (rc != 0) {
         return LMDB_ERROR;
     }
@@ -1746,7 +1746,7 @@ int x3_lmdb_chanaccess_list_account(const char *account, struct lmdb_chanaccess_
 
     *entries_out = NULL;
 
-    rc = mdbx_txn_begin(lmdb_env, NULL, MDBX_RDONLY, &txn);
+    rc = mdbx_txn_begin(lmdb_env, NULL, MDBX_TXN_RDONLY, &txn);
     if (rc != 0) {
         return LMDB_ERROR;
     }
@@ -1865,7 +1865,7 @@ int x3_lmdb_chansync_get(const char *channel, struct lmdb_chansync_meta *meta_ou
     mkey.iov_len = strlen(keybuf) + 1;
     mkey.iov_base = keybuf;
 
-    rc = mdbx_txn_begin(lmdb_env, NULL, MDBX_RDONLY, &txn);
+    rc = mdbx_txn_begin(lmdb_env, NULL, MDBX_TXN_RDONLY, &txn);
     if (rc != 0) {
         return LMDB_ERROR;
     }
@@ -2076,7 +2076,7 @@ int x3_lmdb_activity_get(const char *account, time_t *lastseen_out, time_t *last
     mkey.iov_len = strlen(keybuf) + 1;
     mkey.iov_base = keybuf;
 
-    rc = mdbx_txn_begin(lmdb_env, NULL, MDBX_RDONLY, &txn);
+    rc = mdbx_txn_begin(lmdb_env, NULL, MDBX_TXN_RDONLY, &txn);
     if (rc != 0) {
         return LMDB_ERROR;
     }
@@ -2264,7 +2264,7 @@ int x3_lmdb_fingerprint_get(const char *fingerprint, char *account_out,
     mkey.iov_len = strlen(keybuf) + 1;
     mkey.iov_base = keybuf;
 
-    rc = mdbx_txn_begin(lmdb_env, NULL, MDBX_RDONLY, &txn);
+    rc = mdbx_txn_begin(lmdb_env, NULL, MDBX_TXN_RDONLY, &txn);
     if (rc != 0) {
         return LMDB_ERROR;
     }
@@ -2471,7 +2471,7 @@ int x3_lmdb_fingerprint_list_account(const char *account, struct lmdb_fingerprin
 
     *entries_out = NULL;
 
-    rc = mdbx_txn_begin(lmdb_env, NULL, MDBX_RDONLY, &txn);
+    rc = mdbx_txn_begin(lmdb_env, NULL, MDBX_TXN_RDONLY, &txn);
     if (rc != 0) {
         return LMDB_ERROR;
     }
@@ -2636,7 +2636,7 @@ int x3_lmdb_certexp_get(const char *fingerprint, time_t *cert_expires_out)
     mkey.iov_len = strlen(keybuf) + 1;
     mkey.iov_base = keybuf;
 
-    rc = mdbx_txn_begin(lmdb_env, NULL, MDBX_RDONLY, &txn);
+    rc = mdbx_txn_begin(lmdb_env, NULL, MDBX_TXN_RDONLY, &txn);
     if (rc != 0) {
         return LMDB_ERROR;
     }
@@ -2808,7 +2808,7 @@ int x3_lmdb_snapshot_auto(const char *base_path, int compact, char *path_out)
     return rc;
 }
 
-const struct lmdb_snapshot_stats *x3_lmdbx_get_snapshot_stats(void)
+const struct lmdb_snapshot_stats *x3_lmdb_get_snapshot_stats(void)
 {
     return &snapshot_stats;
 }
@@ -3007,7 +3007,7 @@ static int json_export_db(FILE *fp, MDBX_dbi dbi, const char *db_name, int *firs
     int rc;
     int entry_count = 0;
 
-    rc = mdbx_txn_begin(lmdb_env, NULL, MDBX_RDONLY, &txn);
+    rc = mdbx_txn_begin(lmdb_env, NULL, MDBX_TXN_RDONLY, &txn);
     if (rc != 0) {
         return 0;
     }
@@ -3448,7 +3448,7 @@ int x3_lmdb_purge_expired(struct lmdb_purge_stats *stats_out)
     return (int)stats.total_purged;
 }
 
-const struct lmdb_purge_stats *x3_lmdbx_get_purge_stats(void)
+const struct lmdb_purge_stats *x3_lmdb_get_purge_stats(void)
 {
     return &purge_stats;
 }
@@ -3631,7 +3631,7 @@ int x3_lmdb_session_validate(const char *token, char *username_out, size_t usern
     snprintf(lmdb_key, sizeof(lmdb_key), "%s%s", LMDB_PREFIX_SESSION, token_id);
 
     /* Start read transaction */
-    rc = mdbx_txn_begin(lmdb_env, NULL, MDBX_RDONLY, &txn);
+    rc = mdbx_txn_begin(lmdb_env, NULL, MDBX_TXN_RDONLY, &txn);
     if (rc != 0) {
         return LMDB_ERROR;
     }
@@ -3729,7 +3729,7 @@ int x3_lmdb_session_revoke(const char *token)
     /* Build LMDB key and delete */
     snprintf(lmdb_key, sizeof(lmdb_key), "%s%s", LMDB_PREFIX_SESSION, token_id);
 
-    return x3_lmdbx_delete(LMDB_DB_METADATA, lmdb_key);
+    return x3_lmdb_delete(LMDB_DB_METADATA, lmdb_key);
 }
 
 int x3_lmdb_session_revoke_all(const char *username)
@@ -3797,7 +3797,7 @@ int x3_lmdb_session_get_version(const char *username, unsigned int *version_out)
     snprintf(lmdb_key, sizeof(lmdb_key), "%s%s", LMDB_PREFIX_SESSVER, username);
 
     /* Start read transaction */
-    rc = mdbx_txn_begin(lmdb_env, NULL, MDBX_RDONLY, &txn);
+    rc = mdbx_txn_begin(lmdb_env, NULL, MDBX_TXN_RDONLY, &txn);
     if (rc != 0) {
         *version_out = 0;
         return LMDB_ERROR;
@@ -4359,7 +4359,7 @@ int x3_lmdb_scram_create_ex(const char *token_id, const char *username,
 
     /* Derive SCRAM keys using the generic function */
     if (scram_derive_keys(hash_type, password, salt, SCRAM_SALT_LEN,
-                          x3_lmdbx_get_scram_iterations(),
+                          x3_lmdb_get_scram_iterations(),
                           stored_key, server_key) != 0) {
         log_module(MAIN_LOG, LOG_ERROR, "x3_lmdb: Failed to derive SCRAM keys");
         return LMDB_ERROR;
@@ -4382,7 +4382,7 @@ int x3_lmdb_scram_create_ex(const char *token_id, const char *username,
     /* Build value: expiry:hashtype:iteration:salt:storedkey:serverkey:username */
     expiry = now + SESSION_TOKEN_TTL;
     snprintf(value_buf, sizeof(value_buf), "%lu:%d:%u:%s:%s:%s:%s",
-             (unsigned long)expiry, (int)hash_type, x3_lmdbx_get_scram_iterations(),
+             (unsigned long)expiry, (int)hash_type, x3_lmdb_get_scram_iterations(),
              salt_hex, stored_key_hex, server_key_hex, username);
 
     /* Start write transaction */
@@ -4460,7 +4460,7 @@ int x3_lmdb_scram_get_ex(const char *token_id, enum scram_hash_type hash_type,
     snprintf(lmdb_key, sizeof(lmdb_key), "%s%d:%s", LMDB_PREFIX_SCRAM, (int)hash_type, token_id);
 
     /* Start read transaction */
-    rc = mdbx_txn_begin(lmdb_env, NULL, MDBX_RDONLY, &txn);
+    rc = mdbx_txn_begin(lmdb_env, NULL, MDBX_TXN_RDONLY, &txn);
     if (rc != 0) {
         return LMDB_ERROR;
     }
@@ -4755,7 +4755,7 @@ int x3_lmdb_scram_acct_create(const char *account, const char *password,
 
     /* Derive SCRAM keys */
     if (scram_derive_keys(hash_type, password, salt, SCRAM_SALT_LEN,
-                          x3_lmdbx_get_scram_iterations(),
+                          x3_lmdb_get_scram_iterations(),
                           stored_key, server_key) != 0) {
         log_module(MAIN_LOG, LOG_ERROR, "x3_lmdb: Failed to derive SCRAM keys for account");
         return LMDB_ERROR;
@@ -4778,7 +4778,7 @@ int x3_lmdb_scram_acct_create(const char *account, const char *password,
     /* Build value: 0:hashtype:iteration:salt:storedkey:serverkey:account
      * Note: expiry=0 means no expiry for password-based SCRAM */
     snprintf(value_buf, sizeof(value_buf), "0:%d:%u:%s:%s:%s:%s",
-             (int)hash_type, x3_lmdbx_get_scram_iterations(),
+             (int)hash_type, x3_lmdb_get_scram_iterations(),
              salt_hex, stored_key_hex, server_key_hex, account);
 
     /* Start write transaction */
@@ -4989,7 +4989,7 @@ int x3_lmdb_scram_acct_get(const char *account, enum scram_hash_type hash_type,
     snprintf(lmdb_key, sizeof(lmdb_key), "%s%d:%s", LMDB_PREFIX_SCRAM_ACCT, (int)hash_type, account);
 
     /* Start read transaction */
-    rc = mdbx_txn_begin(lmdb_env, NULL, MDBX_RDONLY, &txn);
+    rc = mdbx_txn_begin(lmdb_env, NULL, MDBX_TXN_RDONLY, &txn);
     if (rc != 0) {
         return LMDB_ERROR;
     }
