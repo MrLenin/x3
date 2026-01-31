@@ -1711,7 +1711,7 @@ nickserv_register(struct userNode *user, struct userNode *settee, const char *ha
     /* Create Keycloak user at registration time (mirrors LDAP pattern):
      * - If no_auth or no password: create WITHOUT password (set at activation)
      * - Otherwise: create WITH hashed password (crypted)
-     * - Email is set later via kc_do_modify()
+     * - Email is set later via kc_do_modify() which coalesces with SCRAM sync
      * Fire-and-forget async - errors logged but don't block registration */
     kc_do_add(handle, (no_auth || !passwd ? NULL : crypted), NULL);
 #endif
@@ -7868,21 +7868,17 @@ cookie_async_lookup_callback(void *session, int result, struct kc_user *kc_user)
     log_module(NS_LOG, LOG_DEBUG, "COOKIE async: cred_data = %s", cred_data);
     log_module(NS_LOG, LOG_DEBUG, "COOKIE async: secret_data = %s", secret_data);
 
-    /* Build update struct and start phase 2 */
-    struct kc_user_update update = {0};
-    update.username = ctx->handle;  /* Required for Keycloak credential import */
-    update.cred_data = cred_data;
-    update.secret_data = secret_data;
-
     ctx->state = COOKIE_STATE_UPDATE;
 
-    /* Note: Log before async call because callback may free ctx synchronously */
-    log_module(NS_LOG, LOG_DEBUG, "COOKIE async: Starting phase 2 (update) for %s", ctx->handle);
+    /* Route credential update through coalesce system to avoid clobbering email.
+     * Direct PUT via keycloak_update_user_representation_async uses cached repr
+     * which may not include email (cached at creation time before email was set).
+     * Coalescing ensures credentials merge with any pending email update. */
+    log_module(NS_LOG, LOG_DEBUG, "COOKIE async: Starting phase 2 (coalesced cred update) for %s", ctx->handle);
 
-    if (keycloak_update_user_representation_async(keycloak_get_realm(), keycloak_get_authed_client(),
-                                                   ctx->user_id, &update,
-                                                   ctx, cookie_async_update_callback) != 0) {
-        log_module(NS_LOG, LOG_WARNING, "COOKIE async: Failed to start update for %s", ctx->handle);
+    if (keycloak_coalesce_credentials(ctx->user_id, cred_data, secret_data,
+                                       ctx, cookie_async_update_callback) != 0) {
+        log_module(NS_LOG, LOG_WARNING, "COOKIE async: Failed to queue credential update for %s", ctx->handle);
         send_message(user, nickserv, "NSMSG_KEYCLOAK_FAIL", "Failed to start password update");
         cookie_async_ctx_free(ctx);
         return 0;
@@ -8234,7 +8230,6 @@ static int
 kc_modify_user_cb(void *session, int result, struct kc_user *user)
 {
     struct kc_modify_ctx *ctx = session;
-    struct kc_user_update update = {0};
     int rc;
 
     if (!ctx) {
@@ -8267,30 +8262,59 @@ kc_modify_user_cb(void *session, int result, struct kc_user *user)
     ctx->user_id = pool_strdup(user->id);
     keycloak_user_free_fields(user);
 
-    /* Build update struct */
-    update.username = ctx->handle;  /* Required for Keycloak credential import */
-    if (ctx->cred_data && ctx->secret_data) {
-        update.cred_data = ctx->cred_data;
-        update.secret_data = ctx->secret_data;
-    }
-    if (ctx->email) {
-        update.email = ctx->email;
+    /* Route all updates through the coalesce system so that concurrent
+     * email, credential, and attribute updates for the same user are
+     * batched into a single Keycloak PUT, preventing race conditions
+     * where one PUT overwrites another's changes. */
+    {
+        int coalesced = 0;
+
+        if (ctx->email) {
+            rc = keycloak_coalesce_email(ctx->user_id, ctx->email,
+                                         ctx, kc_modify_done_cb);
+            if (rc == 0) {
+                log_module(NS_LOG, LOG_DEBUG,
+                           "kc_modify_user_cb[%s]: Email update coalesced",
+                           ctx->handle);
+                coalesced = 1;
+            } else {
+                log_module(NS_LOG, LOG_WARNING,
+                           "kc_modify_user_cb[%s]: Failed to coalesce email: %d",
+                           ctx->handle, rc);
+            }
+        }
+
+        if (ctx->cred_data && ctx->secret_data) {
+            /* If email already coalesced, don't pass ctx again as callback
+             * session - use NULL to avoid double-free. The email callback
+             * will handle ctx cleanup. */
+            rc = keycloak_coalesce_credentials(ctx->user_id,
+                                               ctx->cred_data, ctx->secret_data,
+                                               coalesced ? NULL : ctx,
+                                               coalesced ? NULL : kc_modify_done_cb);
+            if (rc == 0) {
+                log_module(NS_LOG, LOG_DEBUG,
+                           "kc_modify_user_cb[%s]: Credential update coalesced",
+                           ctx->handle);
+                coalesced = 1;
+            } else {
+                log_module(NS_LOG, LOG_WARNING,
+                           "kc_modify_user_cb[%s]: Failed to coalesce credentials: %d",
+                           ctx->handle, rc);
+            }
+        }
+
+        if (!coalesced) {
+            /* Nothing coalesced - free ctx */
+            log_module(NS_LOG, LOG_WARNING,
+                       "kc_modify_user_cb[%s]: No updates coalesced, giving up",
+                       ctx->handle);
+            kc_modify_ctx_free(ctx);
+        }
+        /* If coalesced, ctx is owned by the coalesce callback (kc_modify_done_cb) */
     }
 
-    /* Start async update */
-    rc = keycloak_update_user_representation_async(keycloak_get_realm(), keycloak_get_authed_client(),
-                                                    ctx->user_id, &update,
-                                                    ctx, kc_modify_done_cb);
-    if (rc < 0) {
-        log_module(NS_LOG, LOG_WARNING, "kc_modify_user_cb[%s]: Failed to start async update: %d",
-                   ctx->handle, rc);
-        kc_modify_ctx_free(ctx);
-        return 1;
-    }
-
-    log_module(NS_LOG, LOG_DEBUG, "kc_modify_user_cb[%s]: Started async user update",
-               ctx->handle);
-    return 1;  /* Terminal - async continues via next callback */
+    return 1;  /* Terminal - coalesce timer will flush */
 }
 
 /* Token callback for user modify */
@@ -8403,7 +8427,6 @@ struct kc_scram_sync_ctx {
     char stored_key_b64[64];
     char server_key_b64[64];
     char *user_id;      /* Keycloak user ID (from lookup) */
-    int attr_index;     /* Which attribute we're setting (0-3) */
 };
 
 static void kc_scram_sync_ctx_free(struct kc_scram_sync_ctx *ctx) {
@@ -8414,66 +8437,62 @@ static void kc_scram_sync_ctx_free(struct kc_scram_sync_ctx *ctx) {
 }
 
 /* Forward declarations */
-static int kc_scram_sync_attr_cb(void *session, int result);
+static int kc_scram_sync_done_cb(void *session, int result);
 static int kc_scram_sync_user_cb(void *session, int result, struct kc_user *user);
 static void kc_scram_sync_token_cb(void *session, int result, struct access_token *token);
 
-/* Set the next SCRAM attribute */
-static void kc_scram_sync_next_attr(struct kc_scram_sync_ctx *ctx) {
-    const char *attr_name = NULL;
-    const char *attr_value = NULL;
-    int rc;
+/* Queue all SCRAM attributes into the coalesce system at once.
+ * This ensures all 4 attrs land in the same pending update batch
+ * and get flushed in a single PUT, rather than chaining through
+ * callbacks which causes 4 separate PUTs (each overwriting the previous). */
+static void kc_scram_sync_all_attrs(struct kc_scram_sync_ctx *ctx) {
+    static const struct { const char *name; size_t offset; } attrs[] = {
+        { "x3_scram_salt",       offsetof(struct kc_scram_sync_ctx, salt_b64) },
+        { "x3_scram_iterations", offsetof(struct kc_scram_sync_ctx, iterations_str) },
+        { "x3_scram_stored_key", offsetof(struct kc_scram_sync_ctx, stored_key_b64) },
+        { "x3_scram_server_key", offsetof(struct kc_scram_sync_ctx, server_key_b64) },
+    };
+    int i, rc;
+    int any_failed = 0;
 
-    /* Select attribute based on index */
-    switch (ctx->attr_index) {
-    case 0:
-        attr_name = "x3_scram_salt";
-        attr_value = ctx->salt_b64;
-        break;
-    case 1:
-        attr_name = "x3_scram_iterations";
-        attr_value = ctx->iterations_str;
-        break;
-    case 2:
-        attr_name = "x3_scram_stored_key";
-        attr_value = ctx->stored_key_b64;
-        break;
-    case 3:
-        attr_name = "x3_scram_server_key";
-        attr_value = ctx->server_key_b64;
-        break;
-    default:
-        /* All done */
-        log_module(NS_LOG, LOG_DEBUG, "kc_scram_sync[%s]: All SCRAM attributes synced",
+    for (i = 0; i < 4; i++) {
+        const char *value = (const char *)((char *)ctx + attrs[i].offset);
+        /* Pass callback only on the last attr to avoid multiple frees */
+        rc = keycloak_set_user_attribute_async(keycloak_get_realm(), keycloak_get_authed_client(),
+                                               ctx->user_id, attrs[i].name, value,
+                                               (i == 3) ? ctx : NULL,
+                                               (i == 3) ? kc_scram_sync_done_cb : NULL);
+        if (rc < 0) {
+            log_module(NS_LOG, LOG_WARNING, "kc_scram_sync[%s]: Failed to queue attr %s",
+                       ctx->handle, attrs[i].name);
+            any_failed = 1;
+        }
+    }
+
+    if (any_failed) {
+        log_module(NS_LOG, LOG_WARNING, "kc_scram_sync[%s]: Some attributes failed to queue",
                    ctx->handle);
-        kc_scram_sync_ctx_free(ctx);
-        return;
     }
 
-    rc = keycloak_set_user_attribute_async(keycloak_get_realm(), keycloak_get_authed_client(),
-                                           ctx->user_id, attr_name, attr_value,
-                                           ctx, kc_scram_sync_attr_cb);
-    if (rc < 0) {
-        log_module(NS_LOG, LOG_WARNING, "kc_scram_sync[%s]: Failed to start attribute set for %s",
-                   ctx->handle, attr_name);
-        kc_scram_sync_ctx_free(ctx);
-    }
+    log_module(NS_LOG, LOG_DEBUG, "kc_scram_sync[%s]: Queued all 4 SCRAM attrs for coalesced flush",
+               ctx->handle);
 }
 
-/* Callback for attribute set completion */
-static int kc_scram_sync_attr_cb(void *session, int result) {
+/* Callback when coalesced SCRAM sync completes */
+static int kc_scram_sync_done_cb(void *session, int result) {
     struct kc_scram_sync_ctx *ctx = session;
 
+    if (!ctx) return 0;
+
     if (result != KC_SUCCESS) {
-        log_module(NS_LOG, LOG_WARNING, "kc_scram_sync[%s]: Attribute %d set failed: %d",
-                   ctx->handle, ctx->attr_index, result);
-        kc_scram_sync_ctx_free(ctx);
-        return 0;
+        log_module(NS_LOG, LOG_WARNING, "kc_scram_sync[%s]: Coalesced SCRAM sync failed: %d",
+                   ctx->handle, result);
+    } else {
+        log_module(NS_LOG, LOG_DEBUG, "kc_scram_sync[%s]: All SCRAM attributes synced",
+                   ctx->handle);
     }
 
-    /* Move to next attribute */
-    ctx->attr_index++;
-    kc_scram_sync_next_attr(ctx);
+    kc_scram_sync_ctx_free(ctx);
     return 0;
 }
 
@@ -8491,9 +8510,8 @@ static int kc_scram_sync_user_cb(void *session, int result, struct kc_user *user
     ctx->user_id = pool_strdup(user->id);
     keycloak_user_free_fields(user);
 
-    /* Start setting attributes */
-    ctx->attr_index = 0;
-    kc_scram_sync_next_attr(ctx);
+    /* Queue all 4 SCRAM attributes into the coalesce system at once */
+    kc_scram_sync_all_attrs(ctx);
     return 0;
 }
 

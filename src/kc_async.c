@@ -51,6 +51,13 @@ struct kc_pending_user_update {
     char user_id[64];
     struct kc_pending_attr attrs[KC_COALESCE_MAX_PENDING];
     int attr_count;
+    char *email;                /* Pending email update (NULL = no change) */
+    kc_async_callback email_cb; /* Callback for email update */
+    void *email_session;        /* Session for email callback */
+    char *cred_data;            /* Pending credential update (NULL = no change) */
+    char *secret_data;          /* Credential secret data */
+    kc_async_callback cred_cb;  /* Callback for credential update */
+    void *cred_session;         /* Session for credential callback */
     time_t scheduled_flush;
     struct kc_pending_user_update *next;
 };
@@ -71,6 +78,12 @@ kc_pending_invoke_all_callbacks(struct kc_pending_user_update *p, int result)
             p->attrs[i].cb(p->attrs[i].session, result);
         }
     }
+    if (p->email_cb) {
+        p->email_cb(p->email_session, result);
+    }
+    if (p->cred_cb) {
+        p->cred_cb(p->cred_session, result);
+    }
 }
 
 static void
@@ -81,6 +94,9 @@ kc_pending_update_free(struct kc_pending_user_update *p)
         free(p->attrs[i].name);
         free(p->attrs[i].value);
     }
+    free(p->email);
+    if (p->cred_data) { memset(p->cred_data, 0, strlen(p->cred_data)); free(p->cred_data); }
+    if (p->secret_data) { memset(p->secret_data, 0, strlen(p->secret_data)); free(p->secret_data); }
     free(p);
 }
 
@@ -167,6 +183,66 @@ kc_coalesce_add_attr(struct kc_pending_user_update *p,
 
     log_module(KC_LOG, LOG_DEBUG, "coalesce: Added pending attr %s for %s (count=%d)",
                attr_name, p->user_id, p->attr_count);
+    return 0;
+}
+
+/**
+ * Coalesce an email update for a user.
+ * The email will be included in the next coalesced PUT for this user.
+ */
+int
+keycloak_coalesce_email(const char *user_id, const char *email,
+                        void *session, kc_async_callback callback)
+{
+    if (!user_id || !email) {
+        log_module(KC_LOG, LOG_DEBUG, "coalesce_email: Invalid arguments");
+        return -1;
+    }
+
+    struct kc_pending_user_update *p = kc_coalesce_get_or_create(user_id);
+    if (!p) {
+        log_module(KC_LOG, LOG_ERROR, "coalesce_email: Failed to create pending update");
+        return -1;
+    }
+
+    free(p->email);
+    p->email = strdup(email);
+    p->email_cb = callback;
+    p->email_session = session;
+
+    log_module(KC_LOG, LOG_DEBUG, "coalesce: Pending email update for %s: %s",
+               user_id, email);
+    return 0;
+}
+
+/**
+ * Coalesce a credential update for a user.
+ * The credentials will be included in the next coalesced PUT for this user.
+ */
+int
+keycloak_coalesce_credentials(const char *user_id,
+                              const char *cred_data, const char *secret_data,
+                              void *session, kc_async_callback callback)
+{
+    if (!user_id || !cred_data || !secret_data) {
+        log_module(KC_LOG, LOG_DEBUG, "coalesce_credentials: Invalid arguments");
+        return -1;
+    }
+
+    struct kc_pending_user_update *p = kc_coalesce_get_or_create(user_id);
+    if (!p) {
+        log_module(KC_LOG, LOG_ERROR, "coalesce_credentials: Failed to create pending update");
+        return -1;
+    }
+
+    if (p->cred_data) { memset(p->cred_data, 0, strlen(p->cred_data)); free(p->cred_data); }
+    if (p->secret_data) { memset(p->secret_data, 0, strlen(p->secret_data)); free(p->secret_data); }
+    p->cred_data = strdup(cred_data);
+    p->secret_data = strdup(secret_data);
+    p->cred_cb = callback;
+    p->cred_session = session;
+
+    log_module(KC_LOG, LOG_DEBUG, "coalesce: Pending credential update for %s", user_id);
     return 0;
 }
 
@@ -1538,9 +1614,32 @@ kc_async_handle_result_continued(struct kc_async_request *req, long http_code,
                     }
                 }
 
+                /* Include pending email update in the same PUT */
+                if (pending->email) {
+                    json_object_set_new(repr, "email", json_string(pending->email));
+                }
+
+                /* Include pending credential update */
+                if (pending->cred_data && pending->secret_data) {
+                    json_t *cred = json_object();
+                    json_object_set_new(cred, "type", json_string("password"));
+                    json_object_set_new(cred, "credentialData", json_string(pending->cred_data));
+                    json_object_set_new(cred, "secretData", json_string(pending->secret_data));
+                    json_object_set_new(cred, "temporary", json_false());
+                    json_t *creds = json_array();
+                    json_array_append_new(creds, cred);
+                    json_object_set_new(repr, "credentials", creds);
+                }
+
+                /* Cache repr WITHOUT credentials (to avoid re-sending stale creds) */
                 json_t *id_json = json_object_get(repr, "id");
                 if (id_json && json_is_string(id_json)) {
-                    kc_user_repr_cache_put(json_string_value(id_json), repr);
+                    json_t *cache_copy = json_deep_copy(repr);
+                    if (cache_copy) {
+                        json_object_del(cache_copy, "credentials");
+                        kc_user_repr_cache_put(json_string_value(id_json), cache_copy);
+                        json_decref(cache_copy);
+                    }
                 }
 
                 char *json_body = json_dumps(repr, JSON_COMPACT);
@@ -2054,7 +2153,7 @@ keycloak_set_user_attribute_async(struct kc_realm realm, struct kc_client client
     (void)realm;
     (void)client;
 
-    if (!user_id || !attr_name || !callback) {
+    if (!user_id || !attr_name) {
         log_module(KC_LOG, LOG_DEBUG, "set_attr_async: Invalid arguments");
         return -1;
     }
@@ -2086,10 +2185,11 @@ kc_coalesce_flush_cb(void *data)
         }
     }
 
-    log_module(KC_LOG, LOG_DEBUG, "coalesce: Flushing %d attrs for user %s",
-               p->attr_count, p->user_id);
+    log_module(KC_LOG, LOG_DEBUG, "coalesce: Flushing %d attrs%s%s for user %s",
+               p->attr_count, p->email ? " + email" : "",
+               p->cred_data ? " + credentials" : "", p->user_id);
 
-    if (p->attr_count == 0) {
+    if (p->attr_count == 0 && !p->email && !p->cred_data) {
         kc_pending_update_free(p);
         return;
     }
@@ -2134,10 +2234,37 @@ kc_coalesce_flush_cb(void *data)
             }
         }
 
-        /* Update cache with merged attrs BEFORE the PUT, so concurrent
-         * operations (e.g. email update) see the merged state immediately
-         * rather than racing against the Keycloak round-trip */
-        kc_user_repr_cache_put(p->user_id, repr);
+        /* Include pending email update in the same PUT to avoid the race
+         * where a separate email PUT and attribute PUT overwrite each other */
+        if (p->email) {
+            json_object_set_new(repr, "email", json_string(p->email));
+        }
+
+        /* Include pending credential update */
+        if (p->cred_data && p->secret_data) {
+            json_t *cred = json_object();
+            json_object_set_new(cred, "type", json_string("password"));
+            json_object_set_new(cred, "credentialData", json_string(p->cred_data));
+            json_object_set_new(cred, "secretData", json_string(p->secret_data));
+            json_object_set_new(cred, "temporary", json_false());
+            json_t *creds = json_array();
+            json_array_append_new(creds, cred);
+            json_object_set_new(repr, "credentials", creds);
+        }
+
+        /* Update cache with merged state BEFORE the PUT, so concurrent
+         * operations see the merged state immediately rather than racing
+         * against the Keycloak round-trip.
+         * Strip credentials from cache copy - Keycloak PUT adds them,
+         * but re-sending stale credentials causes duplicates. */
+        {
+            json_t *cache_copy = json_deep_copy(repr);
+            if (cache_copy) {
+                json_object_del(cache_copy, "credentials");
+                kc_user_repr_cache_put(p->user_id, cache_copy);
+                json_decref(cache_copy);
+            }
+        }
 
         char *json_body = json_dumps(repr, JSON_COMPACT);
         json_decref(repr);

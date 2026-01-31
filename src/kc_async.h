@@ -162,6 +162,13 @@ int keycloak_update_user_representation_async(struct kc_realm realm, struct kc_c
                                                void *session,
                                                kc_async_callback callback);
 
+/* Coalesced update functions - batch multiple updates into one PUT */
+int keycloak_coalesce_email(const char *user_id, const char *email,
+                            void *session, kc_async_callback callback);
+int keycloak_coalesce_credentials(const char *user_id,
+                                  const char *cred_data, const char *secret_data,
+                                  void *session, kc_async_callback callback);
+
 int keycloak_get_group_by_path_async(struct kc_realm realm, struct kc_client client,
                                       const char *group_path, void *session,
                                       kc_string_callback callback);
