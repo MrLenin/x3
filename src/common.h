@@ -131,6 +131,7 @@ extern char *x3_msnprintf(const int size, const char *format, ...);
 
 extern time_t now;
 extern int quit_services;
+extern int x3_crash_recovery;
 extern struct log_type *MAIN_LOG;
 
 typedef union irc_in_addr {

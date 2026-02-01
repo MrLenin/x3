@@ -142,6 +142,7 @@ int main(int argc, char *argv[])
     sv.sa_handler = sigaction_writedb;
     sigaction(SIGINT, &sv, NULL);
     sv.sa_handler = sigaction_exit;
+    sigaction(SIGTERM, &sv, NULL);
     sigaction(SIGQUIT, &sv, NULL);
     sv.sa_handler = sigaction_wait;
     sigaction(SIGCHLD, &sv, NULL);
@@ -258,6 +259,16 @@ int main(int argc, char *argv[])
     if (debug)
         log_debug();
 
+    /* Check for clean exit sentinel — absence means crash or first run */
+    if (access("x3.clean_exit", F_OK) == 0) {
+        remove("x3.clean_exit");
+        x3_crash_recovery = 0;
+    } else {
+        x3_crash_recovery = 1;
+        log_module(MAIN_LOG, LOG_WARNING,
+                   "No clean exit sentinel found -- entering crash recovery mode");
+    }
+
     /* Initialize memory pools early (before other modules that use them) */
     if (mempool_init_global() < 0) {
         log_module(MAIN_LOG, LOG_WARNING, "Failed to initialize memory pools, continuing without");
@@ -300,6 +311,10 @@ int main(int argc, char *argv[])
     saxdb_finalize();
     helpfile_finalize();
     modules_finalize();
+
+    /* Schedule crash recovery mode auto-clear after 60 seconds */
+    if (x3_crash_recovery)
+        timeq_add(now + 60, clear_crash_recovery, NULL);
 
     /* The first exit func to be called *should* be saxdb_write_all(). */
     reg_exit_func(saxdb_write_all, NULL);

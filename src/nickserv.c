@@ -304,7 +304,7 @@ static void cookie_async_ctx_free(struct cookie_async_ctx *ctx);
 static int kc_check_auth(const char *handle, const char *password);
 static int kc_get_user_info(const char *handle, char **email_out);
 static void kc_do_add(const char *handle, const char *hash, const char *email);
-static void kc_do_modify(const char *handle, const char *hash, const char *email);
+static void kc_do_modify(const char *handle, const char *hash, const char *email, int email_verified);
 static void kc_delete_account(const char *handle);
 static void kc_do_oslevel(const char *handle, int level, int oldlevel);
 #if defined(WITH_MDBX) && defined(WITH_SSL)
@@ -2036,7 +2036,7 @@ cmd_register_hash_callback(void *ctx_ptr, int result, const char *hash)
             nickserv_set_email_addr(hi, ctx->email);
 #endif
 #ifdef WITH_KEYCLOAK
-            kc_do_modify(hi->handle, NULL, ctx->email);
+            kc_do_modify(hi->handle, NULL, ctx->email, -1);
 #endif
         }
 
@@ -2090,7 +2090,7 @@ cmd_register_hash_callback(void *ctx_ptr, int result, const char *hash)
             nickserv_set_email_addr(hi, ctx->email);
 #endif
 #ifdef WITH_KEYCLOAK
-            kc_do_modify(hi->handle, NULL, ctx->email);
+            kc_do_modify(hi->handle, NULL, ctx->email, -1);
 #endif
         }
 
@@ -2283,7 +2283,7 @@ static NICKSERV_FUNC(cmd_register)
 #endif
 #ifdef WITH_KEYCLOAK
         /* Fire-and-forget async email sync to Keycloak */
-        kc_do_modify(hi->handle, NULL, email_addr);
+        kc_do_modify(hi->handle, NULL, email_addr, -1);
 #endif
     }
 
@@ -2432,7 +2432,7 @@ static NICKSERV_FUNC(cmd_oregister)
 #endif
 #ifdef WITH_KEYCLOAK
         /* Fire-and-forget async email sync to Keycloak */
-        kc_do_modify(hi->handle, NULL, email);
+        kc_do_modify(hi->handle, NULL, email, -1);
 #endif
     }
     if (mask) {
@@ -4110,10 +4110,10 @@ static NICKSERV_FUNC(cmd_cookie)
         }
 #endif
 #ifdef WITH_KEYCLOAK
-        /* Set password hash in Keycloak (user was created at registration without password). */
+        /* Set password hash in Keycloak (user was created at registration without password).
+         * Also set emailVerified=true since activation cookie proves email ownership. */
         if (nickserv_conf.keycloak_enable) {
-            /* fire-and-forget async (pre-registration users or async path failed) */
-            kc_do_modify(hi->handle, hi->cookie->data, NULL);
+            kc_do_modify(hi->handle, hi->cookie->data, NULL, 1);
         }
 #endif
         /* Restore the password hash from cookie */
@@ -4183,7 +4183,7 @@ static NICKSERV_FUNC(cmd_cookie)
         /* Sync password hash to Keycloak */
         if (nickserv_conf.keycloak_enable) {
             /* fire-and-forget async (pre-registration users or async path failed) */
-            kc_do_modify(hi->handle, hi->cookie->data, NULL);
+            kc_do_modify(hi->handle, hi->cookie->data, NULL, -1);
         }
 #endif
         set_user_handle_info(user, hi, 1);
@@ -4358,7 +4358,7 @@ static void cmd_pass_hash_callback(void *ctx_ptr, int result, const char *hash)
 #endif
 #ifdef WITH_KEYCLOAK
     /* Fire-and-forget async password sync to Keycloak */
-    kc_do_modify(hi->handle, hash, NULL);
+    kc_do_modify(hi->handle, hash, NULL, -1);
 #endif
 
     /* Update local password */
@@ -4470,7 +4470,7 @@ static NICKSERV_FUNC(cmd_pass)
 #endif
 #ifdef WITH_KEYCLOAK
         /* Fire-and-forget async password sync to Keycloak */
-        kc_do_modify(hi->handle, crypted, NULL);
+        kc_do_modify(hi->handle, crypted, NULL, -1);
 #endif
         strcpy(hi->passwd, crypted);
         if (nickserv_conf.sync_log)
@@ -5245,7 +5245,7 @@ static OPTION_FUNC(opt_email)
 #endif
 #ifdef WITH_KEYCLOAK
             /* Fire-and-forget async email sync to Keycloak */
-            kc_do_modify(hi->handle, NULL, argv[1]);
+            kc_do_modify(hi->handle, NULL, argv[1], -1);
 #endif
             nickserv_set_email_addr(hi, argv[1]);
             if (hi->cookie)
@@ -7713,7 +7713,7 @@ cookie_pw_verify_callback(void *context, int result, const char *hash)
                 }
             }
 #endif
-            kc_do_modify(ctx->handle, ctx->password_hash, NULL);
+            kc_do_modify(ctx->handle, ctx->password_hash, NULL, 1);
             safestrncpy(hi->passwd, ctx->password_hash, sizeof(hi->passwd));
 #if defined(WITH_MDBX) && defined(WITH_SSL)
             if (ctx->plaintext_password) {
@@ -7739,7 +7739,7 @@ cookie_pw_verify_callback(void *context, int result, const char *hash)
                 }
             }
 #endif
-            kc_do_modify(ctx->handle, ctx->password_hash, NULL);
+            kc_do_modify(ctx->handle, ctx->password_hash, NULL, -1);
             set_user_handle_info(user, hi, 1);
             safestrncpy(hi->passwd, ctx->password_hash, sizeof(hi->passwd));
 #ifdef WITH_MDBX
@@ -7875,6 +7875,11 @@ cookie_async_lookup_callback(void *session, int result, struct kc_user *kc_user)
      * which may not include email (cached at creation time before email was set).
      * Coalescing ensures credentials merge with any pending email update. */
     log_module(NS_LOG, LOG_DEBUG, "COOKIE async: Starting phase 2 (coalesced cred update) for %s", ctx->handle);
+
+    /* For ACTIVATION cookies, also set emailVerified (cookie proves email ownership) */
+    if (ctx->cookie_type == ACTIVATION) {
+        keycloak_coalesce_email_verified(ctx->user_id, 1);
+    }
 
     if (keycloak_coalesce_credentials(ctx->user_id, cred_data, secret_data,
                                        ctx, cookie_async_update_callback) != 0) {
@@ -8030,6 +8035,159 @@ static void kc_add_ctx_free(struct kc_add_ctx *ctx) {
     }
 }
 
+/* ---- KC_USER_EXISTS reconciliation: clear stale x3.channel.* attrs ---- */
+
+struct kc_reconcile_ctx {
+    char handle[NICKSERV_HANDLE_LEN + 1];
+    char user_id[128];
+    char *cred_data;      /* From kc_add_ctx (Keycloak credential JSON) */
+    char *secret_data;    /* From kc_add_ctx (Keycloak secret JSON) */
+};
+
+static void kc_reconcile_ctx_free(struct kc_reconcile_ctx *rctx) {
+    if (rctx) {
+        if (rctx->cred_data) {
+            memset(rctx->cred_data, 0, strlen(rctx->cred_data));
+            free(rctx->cred_data);
+        }
+        if (rctx->secret_data) {
+            memset(rctx->secret_data, 0, strlen(rctx->secret_data));
+            free(rctx->secret_data);
+        }
+        free(rctx);
+    }
+}
+
+/* Step D done: reconciliation complete */
+static int
+kc_reconcile_done_cb(void *session, int result)
+{
+    struct kc_reconcile_ctx *rctx = session;
+    if (result == KC_SUCCESS) {
+        log_module(NS_LOG, LOG_INFO, "kc_reconcile[%s]: Credentials re-synced after reconciliation",
+                   rctx ? rctx->handle : "?");
+    } else {
+        log_module(NS_LOG, LOG_WARNING, "kc_reconcile[%s]: Credential re-sync failed: %d",
+                   rctx ? rctx->handle : "?", result);
+    }
+    kc_reconcile_ctx_free(rctx);
+    return 1;
+}
+
+/* Step D: re-sync current credentials from the original kc_do_add context */
+static void
+kc_reconcile_resync(struct kc_reconcile_ctx *rctx)
+{
+    if (rctx->cred_data) {
+        log_module(NS_LOG, LOG_DEBUG, "kc_reconcile[%s]: Re-syncing credentials",
+                   rctx->handle);
+        keycloak_coalesce_credentials(rctx->user_id,
+                                       rctx->cred_data, rctx->secret_data,
+                                       rctx, kc_reconcile_done_cb);
+    } else {
+        log_module(NS_LOG, LOG_DEBUG, "kc_reconcile[%s]: No credentials to re-sync",
+                   rctx->handle);
+        kc_reconcile_ctx_free(rctx);
+    }
+}
+
+/* Step C: clear stale x3.channel.* attributes found by the list query */
+static int
+kc_reconcile_list_cb(void *session, int result, struct kc_metadata_entry *entries)
+{
+    struct kc_reconcile_ctx *rctx = session;
+    struct kc_metadata_entry *entry;
+    int cleared = 0;
+
+    if (result != KC_SUCCESS) {
+        log_module(NS_LOG, LOG_WARNING, "kc_reconcile[%s]: Failed to list attributes: %d",
+                   rctx ? rctx->handle : "?", result);
+        if (entries) keycloak_free_metadata_entries(entries);
+        kc_reconcile_ctx_free(rctx);
+        return 1;
+    }
+
+    /* Only clear x3.channel.* -- everything else is KC-authoritative or user-managed */
+    for (entry = entries; entry; entry = entry->next) {
+        if (strncmp(entry->key, "x3.channel.", 11) == 0) {
+            keycloak_set_user_attribute_async(keycloak_get_realm(), keycloak_get_authed_client(),
+                                               rctx->user_id, entry->key, NULL, NULL, NULL);
+            cleared++;
+        }
+    }
+
+    log_module(NS_LOG, LOG_INFO, "kc_reconcile[%s]: Cleared %d stale x3.channel.* attributes",
+               rctx->handle, cleared);
+
+    if (entries) keycloak_free_metadata_entries(entries);
+
+    /* Step D: re-push current credentials if available */
+    kc_reconcile_resync(rctx);
+    return 1;
+}
+
+/* Step B: list all x3.* attributes on the user */
+static int
+kc_reconcile_user_cb(void *session, int result, struct kc_user *user)
+{
+    struct kc_add_ctx *ctx = session;
+    struct kc_reconcile_ctx *rctx;
+    int rc;
+
+    if (result != KC_SUCCESS || !user || !user->id) {
+        log_module(NS_LOG, LOG_WARNING, "kc_reconcile[%s]: User lookup failed: %d",
+                   ctx ? ctx->handle : "?", result);
+        kc_add_ctx_free(ctx);
+        return 1;
+    }
+
+    /* Transfer ownership from kc_add_ctx to kc_reconcile_ctx */
+    rctx = calloc(1, sizeof(*rctx));
+    if (!rctx) {
+        log_module(NS_LOG, LOG_ERROR, "kc_reconcile[%s]: Out of memory", ctx->handle);
+        kc_add_ctx_free(ctx);
+        return 1;
+    }
+    safestrncpy(rctx->handle, ctx->handle, sizeof(rctx->handle));
+    safestrncpy(rctx->user_id, user->id, sizeof(rctx->user_id));
+    rctx->cred_data = ctx->cred_data;
+    rctx->secret_data = ctx->secret_data;
+    ctx->cred_data = NULL;   /* Ownership transferred */
+    ctx->secret_data = NULL;
+    kc_add_ctx_free(ctx);
+
+    log_module(NS_LOG, LOG_DEBUG, "kc_reconcile[%s]: Listing x3.* attributes on user %s",
+               rctx->handle, rctx->user_id);
+
+    rc = keycloak_list_user_attributes_async(keycloak_get_realm(), keycloak_get_authed_client(),
+                                              rctx->user_id, "x3.",
+                                              rctx, kc_reconcile_list_cb);
+    if (rc < 0) {
+        log_module(NS_LOG, LOG_WARNING, "kc_reconcile[%s]: Failed to start attribute list: %d",
+                   rctx->handle, rc);
+        kc_reconcile_ctx_free(rctx);
+    }
+    return 1;
+}
+
+/* Step A: look up user to get UUID, then list attributes */
+static void
+kc_reconcile_stale_attrs(struct kc_add_ctx *ctx)
+{
+    int rc;
+    log_module(NS_LOG, LOG_DEBUG, "kc_reconcile[%s]: Starting reconciliation (looking up user)",
+               ctx->handle);
+    rc = keycloak_get_user_async(keycloak_get_realm(), keycloak_get_authed_client(),
+                                  ctx->handle, ctx, kc_reconcile_user_cb);
+    if (rc < 0) {
+        log_module(NS_LOG, LOG_WARNING, "kc_reconcile[%s]: Failed to start user lookup: %d",
+                   ctx->handle, rc);
+        kc_add_ctx_free(ctx);
+    }
+}
+
+/* ---- End reconciliation ---- */
+
 /* Final callback for user creation (fire-and-forget) */
 static int
 kc_add_done_cb(void *session, int result)
@@ -8039,8 +8197,17 @@ kc_add_done_cb(void *session, int result)
         log_module(NS_LOG, LOG_DEBUG, "kc_add_done_cb[%s]: Keycloak user created",
                    ctx ? ctx->handle : "?");
     } else if (result == KC_USER_EXISTS) {
-        log_module(NS_LOG, LOG_DEBUG, "kc_add_done_cb[%s]: Keycloak user already exists",
-                   ctx ? ctx->handle : "?");
+        if (x3_crash_recovery) {
+            log_module(NS_LOG, LOG_INFO, "kc_add_done_cb[%s]: KC user exists, "
+                       "crash recovery mode -- preserving KC attributes",
+                       ctx ? ctx->handle : "?");
+        } else {
+            log_module(NS_LOG, LOG_INFO, "kc_add_done_cb[%s]: KC user exists, "
+                       "reconciling stale channel attributes",
+                       ctx ? ctx->handle : "?");
+            kc_reconcile_stale_attrs(ctx);
+            return 1;  /* ctx ownership transferred to reconcile chain */
+        }
     } else {
         log_module(NS_LOG, LOG_WARNING, "kc_add_done_cb[%s]: Keycloak user creation failed: %d",
                    ctx ? ctx->handle : "?", result);
@@ -8164,6 +8331,7 @@ struct kc_modify_ctx {
     char *secret_data;     /* Allocated, may be NULL */
     char *user_id;         /* Keycloak user UUID, allocated */
     int retries;           /* Retry count for user-not-found race condition */
+    int email_verified;    /* -1 = no change, 0 = false, 1 = true */
 };
 
 #define KC_MODIFY_MAX_RETRIES 3
@@ -8304,11 +8472,21 @@ kc_modify_user_cb(void *session, int result, struct kc_user *user)
             }
         }
 
+        /* Coalesce emailVerified flag if requested (piggybacks on the PUT) */
+        if (ctx->email_verified >= 0) {
+            if (keycloak_coalesce_email_verified(ctx->user_id, ctx->email_verified) == 0) {
+                log_module(NS_LOG, LOG_DEBUG,
+                           "kc_modify_user_cb[%s]: emailVerified=%d coalesced",
+                           ctx->handle, ctx->email_verified);
+                /* If nothing else coalesced, this still creates a pending PUT.
+                 * No callback needed — fire-and-forget. */
+            }
+        }
+
         if (!coalesced) {
-            /* Nothing coalesced - free ctx */
-            log_module(NS_LOG, LOG_WARNING,
-                       "kc_modify_user_cb[%s]: No updates coalesced, giving up",
-                       ctx->handle);
+            /* ctx not owned by any callback — free it now.
+             * emailVerified (if set) lives in the pending update struct
+             * and will be flushed by the coalesce timer. */
             kc_modify_ctx_free(ctx);
         }
         /* If coalesced, ctx is owned by the coalesce callback (kc_modify_done_cb) */
@@ -8355,12 +8533,13 @@ kc_modify_token_cb(void *context, int result, struct access_token *token)
 /**
  * Modify user password hash and/or email in Keycloak (fire-and-forget, fully async).
  *
- * @param handle  Account name
- * @param hash    X3 password hash (NULL = no password change)
- * @param email   Email address (NULL = no email change)
+ * @param handle          Account name
+ * @param hash            X3 password hash (NULL = no password change)
+ * @param email           Email address (NULL = no email change)
+ * @param email_verified  -1 = no change, 0 = set unverified, 1 = set verified
  */
 static void
-kc_do_modify(const char *handle, const char *hash, const char *email)
+kc_do_modify(const char *handle, const char *hash, const char *email, int email_verified)
 {
     struct kc_modify_ctx *ctx;
     char cred_data[256];
@@ -8372,8 +8551,8 @@ kc_do_modify(const char *handle, const char *hash, const char *email)
     }
 
     log_module(NS_LOG, LOG_DEBUG,
-               "kc_do_modify: called for %s, hash=%s, email=%s",
-               handle, hash ? "yes" : "no", email ? email : "null");
+               "kc_do_modify: called for %s, hash=%s, email=%s, email_verified=%d",
+               handle, hash ? "yes" : "no", email ? email : "null", email_verified);
 
     /* Allocate context */
     ctx = calloc(1, sizeof(*ctx));
@@ -8382,6 +8561,7 @@ kc_do_modify(const char *handle, const char *hash, const char *email)
         return;
     }
     safestrncpy(ctx->handle, handle, sizeof(ctx->handle));
+    ctx->email_verified = email_verified;
 
     if (email) {
         ctx->email = pool_strdup(email);

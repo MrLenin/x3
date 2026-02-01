@@ -15,6 +15,16 @@ struct log_type *MAIN_LOG;
 
 int quit_services;
 int max_cycles;
+int x3_crash_recovery;
+
+static void
+clear_crash_recovery(UNUSED_ARG(void *data))
+{
+    if (x3_crash_recovery) {
+        log_module(MAIN_LOG, LOG_INFO, "Clearing crash recovery mode (startup window elapsed)");
+        x3_crash_recovery = 0;
+    }
+}
 
 char *services_config = "x3.conf";
 
@@ -723,6 +733,14 @@ static void main_shutdown(UNUSED_ARG(void *extra))
     tools_cleanup();
     conf_close();
 #if defined(PID_FILE)
+    /* Write clean exit sentinel before removing PID file */
+    {
+        FILE *sentinel = fopen("x3.clean_exit", "w");
+        if (sentinel) {
+            fprintf(sentinel, "%lu\n", (unsigned long)now);
+            fclose(sentinel);
+        }
+    }
     remove(PID_FILE);
 #endif
     policer_params_delete(god_policer_params);

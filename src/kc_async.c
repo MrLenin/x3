@@ -58,6 +58,7 @@ struct kc_pending_user_update {
     char *secret_data;          /* Credential secret data */
     kc_async_callback cred_cb;  /* Callback for credential update */
     void *cred_session;         /* Session for credential callback */
+    int email_verified;         /* -1 = no change, 0 = false, 1 = true */
     time_t scheduled_flush;
     struct kc_pending_user_update *next;
 };
@@ -137,6 +138,7 @@ kc_coalesce_get_or_create(const char *user_id)
     }
 
     safestrncpy(p->user_id, user_id, sizeof(p->user_id));
+    p->email_verified = -1;  /* No change pending */
     p->scheduled_flush = now + KC_COALESCE_DELAY_SEC;
     p->next = kc_pending_updates;
     kc_pending_updates = p;
@@ -243,6 +245,32 @@ keycloak_coalesce_credentials(const char *user_id,
     p->cred_session = session;
 
     log_module(KC_LOG, LOG_DEBUG, "coalesce: Pending credential update for %s", user_id);
+    return 0;
+}
+
+/**
+ * Coalesce an emailVerified flag update for a user.
+ * The flag will be included in the next coalesced PUT for this user.
+ * Fire-and-forget — no callback needed since this piggybacks on the PUT.
+ */
+int
+keycloak_coalesce_email_verified(const char *user_id, int verified)
+{
+    if (!user_id) {
+        log_module(KC_LOG, LOG_DEBUG, "coalesce_email_verified: Invalid arguments");
+        return -1;
+    }
+
+    struct kc_pending_user_update *p = kc_coalesce_get_or_create(user_id);
+    if (!p) {
+        log_module(KC_LOG, LOG_ERROR, "coalesce_email_verified: Failed to create pending update");
+        return -1;
+    }
+
+    p->email_verified = verified ? 1 : 0;
+
+    log_module(KC_LOG, LOG_DEBUG, "coalesce: Pending emailVerified=%d for %s",
+               verified, user_id);
     return 0;
 }
 
@@ -1619,6 +1647,12 @@ kc_async_handle_result_continued(struct kc_async_request *req, long http_code,
                     json_object_set_new(repr, "email", json_string(pending->email));
                 }
 
+                /* Include pending emailVerified flag */
+                if (pending->email_verified >= 0) {
+                    json_object_set_new(repr, "emailVerified",
+                                        pending->email_verified ? json_true() : json_false());
+                }
+
                 /* Include pending credential update */
                 if (pending->cred_data && pending->secret_data) {
                     json_t *cred = json_object();
@@ -2238,6 +2272,12 @@ kc_coalesce_flush_cb(void *data)
          * where a separate email PUT and attribute PUT overwrite each other */
         if (p->email) {
             json_object_set_new(repr, "email", json_string(p->email));
+        }
+
+        /* Include pending emailVerified flag */
+        if (p->email_verified >= 0) {
+            json_object_set_new(repr, "emailVerified",
+                                p->email_verified ? json_true() : json_false());
         }
 
         /* Include pending credential update */
