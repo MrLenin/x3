@@ -453,6 +453,9 @@ static const struct message_entry msgtab[] = {
     { "OSMSG_LMDB_EXPORT_SUCCESS", "LMDB exported to: $b%s$b" },
     { "OSMSG_LMDB_EXPORT_FAILED", "LMDB export failed." },
     { "OSMSG_LMDB_STATS_HEADER", "LMDB Statistics:" },
+    { "OSMSG_LMDB_STATS_GEOMETRY", "  Geometry: %lu / %lu MB (current/max), grow=%lu MB" },
+    { "OSMSG_LMDB_STATS_PAGES", "  Pages: branch=%lu leaf=%lu overflow=%lu free=%lu (psize=%u)" },
+    { "OSMSG_LMDB_STATS_READERS", "  Readers: %u active, nosync=%s" },
     { "OSMSG_LMDB_STATS_SNAPSHOT", "  Last snapshot: %s (%lu bytes, %u retained)" },
     { "OSMSG_LMDB_STATS_PURGE", "  Last purge: %s (%lu entries purged)" },
     { "OSMSG_LMDB_STATS_NONE", "  No snapshot/purge history." },
@@ -2948,6 +2951,26 @@ static MODCMD_FUNC(cmd_lmdb_stats)
     }
 
     reply("OSMSG_LMDB_STATS_HEADER");
+
+    /* Environment-level diagnostics */
+    {
+        struct lmdb_env_info env_info;
+        if (x3_lmdb_env_info(&env_info) == LMDB_SUCCESS) {
+            reply("OSMSG_LMDB_STATS_GEOMETRY",
+                  (unsigned long)(env_info.geo_current / (1024 * 1024)),
+                  (unsigned long)(env_info.geo_upper / (1024 * 1024)),
+                  (unsigned long)(env_info.geo_grow / (1024 * 1024)));
+            reply("OSMSG_LMDB_STATS_PAGES",
+                  (unsigned long)env_info.branch_pages,
+                  (unsigned long)env_info.leaf_pages,
+                  (unsigned long)env_info.overflow_pages,
+                  (unsigned long)env_info.free_pages,
+                  env_info.page_size);
+            reply("OSMSG_LMDB_STATS_READERS",
+                  env_info.num_readers,
+                  env_info.nosync_enabled ? "yes" : "no");
+        }
+    }
 
     snap_stats = x3_lmdb_get_snapshot_stats();
     purge_stats = x3_lmdb_get_purge_stats();

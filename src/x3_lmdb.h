@@ -600,6 +600,24 @@ int x3_lmdb_delete(const char *db, const char *key);
  */
 int x3_lmdb_dbi_stats(const char *db, size_t *entries_out, size_t *size_out);
 
+/**
+ * Environment-level mdbx diagnostics
+ */
+struct lmdb_env_info {
+    size_t geo_current;       /* Current database file size */
+    size_t geo_upper;         /* Maximum database size */
+    size_t geo_grow;          /* Growth step size */
+    unsigned int num_readers;
+    size_t branch_pages;
+    size_t leaf_pages;
+    size_t overflow_pages;
+    size_t free_pages;
+    unsigned int page_size;
+    int nosync_enabled;
+    int nordahead_enabled;
+};
+int x3_lmdb_env_info(struct lmdb_env_info *info_out);
+
 /* ========== Utility Functions ========== */
 
 /**
@@ -1182,6 +1200,7 @@ void init_x3_lmdb(void);
 #define x3_lmdb_free_entries(e)         do {} while(0)
 #define x3_lmdb_sync(f)                 (0)
 #define x3_lmdb_stats(d, e, s)          (-1)
+#define x3_lmdb_env_info(i)             (-1)
 #define x3_lmdb_purge_expired(s)        (0)
 #define x3_lmdb_get_purge_stats()       ((const struct lmdb_purge_stats *)NULL)
 #define x3_lmdb_set_purge_interval(i)   do {} while(0)

@@ -50,6 +50,12 @@ static unsigned int lmdb_sync_interval = 10;   /* seconds between syncs when nos
 static int lmdb_autogrow = 1;                  /* 1 = auto-grow enabled (default), 0 = fixed size */
 static intptr_t lmdb_growth_step = 16 * 1024 * 1024; /* 16MB default growth step */
 
+/* NORDAHEAD configuration - disable OS readahead for random-access pattern */
+static int lmdb_nordahead = 1;                 /* 1 = disable readahead (default for random access) */
+
+/* Purge batch size - limit how long write transactions are held during purge */
+static unsigned int lmdb_purge_batch_size = 100;
+
 /* Get/set SCRAM iteration count */
 unsigned int x3_lmdb_get_scram_iterations(void)
 {
@@ -98,7 +104,12 @@ void x3_lmdb_set_sync_interval(unsigned int interval)
 static void lmdb_periodic_sync_timer(UNUSED_ARG(void *data))
 {
     if (lmdb_nosync && lmdb_initialized && lmdb_env) {
+        int dead = 0;
         mdbx_env_sync_ex(lmdb_env, false, false);  /* Non-forced sync */
+        /* Clean up stale reader slots to prevent GC blockage */
+        mdbx_reader_check(lmdb_env, &dead);
+        if (dead > 0)
+            log_module(MAIN_LOG, LOG_WARNING, "x3_lmdb: cleared %d stale reader(s)", dead);
         log_module(MAIN_LOG, LOG_DEBUG, "x3_lmdb: periodic sync completed");
     }
 
@@ -202,6 +213,10 @@ int x3_lmdb_init(const char *dbpath, size_t mapsize)
             log_module(MAIN_LOG, LOG_INFO, "x3_lmdb: Using MDBX_SAFE_NOSYNC mode with %u second sync interval",
                        lmdb_sync_interval);
         }
+        if (lmdb_nordahead) {
+            env_flags |= MDBX_NORDAHEAD;
+            log_module(MAIN_LOG, LOG_INFO, "x3_lmdb: Using MDBX_NORDAHEAD for random-access pattern");
+        }
         rc = mdbx_env_open(lmdb_env, lmdb_path, env_flags, 0644);
     }
     if (rc != 0) {
@@ -243,6 +258,12 @@ int x3_lmdb_init(const char *dbpath, size_t mapsize)
     lmdb_initialized = 1;
     log_module(MAIN_LOG, LOG_INFO, "x3_lmdb: Initialized at '%s' with %luMB map",
                lmdb_path, (unsigned long)(lmdb_mapsize / (1024 * 1024)));
+
+    /* Pre-fault database pages into OS page cache for faster initial queries */
+    rc = mdbx_env_warmup(lmdb_env, NULL, MDBX_warmup_default, 0);
+    if (rc != MDBX_SUCCESS && rc != MDBX_RESULT_TRUE)
+        log_module(MAIN_LOG, LOG_WARNING, "x3_lmdb: mdbx_env_warmup failed: %s",
+                   mdbx_strerror(rc));
 
     /* Start periodic sync timer if nosync mode enabled */
     if (lmdb_nosync) {
@@ -1464,6 +1485,45 @@ int x3_lmdb_dbi_stats(const char *db, size_t *entries_out, size_t *size_out)
         if (size_out) {
             *size_out = stat.ms_psize * (stat.ms_branch_pages + stat.ms_leaf_pages + stat.ms_overflow_pages);
         }
+    }
+
+    return LMDB_SUCCESS;
+}
+
+int x3_lmdb_env_info(struct lmdb_env_info *info_out)
+{
+    MDBX_envinfo info;
+    MDBX_stat envstat;
+    int rc;
+
+    if (!x3_lmdb_is_available() || !info_out)
+        return LMDB_ERROR;
+
+    memset(info_out, 0, sizeof(*info_out));
+
+    rc = mdbx_env_info_ex(lmdb_env, NULL, &info, sizeof(info));
+    if (rc != MDBX_SUCCESS)
+        return LMDB_ERROR;
+
+    rc = mdbx_env_stat_ex(lmdb_env, NULL, &envstat, sizeof(envstat));
+    if (rc != MDBX_SUCCESS)
+        return LMDB_ERROR;
+
+    info_out->geo_current = info.mi_geo.current;
+    info_out->geo_upper = info.mi_geo.upper;
+    info_out->geo_grow = info.mi_geo.grow;
+    info_out->num_readers = info.mi_numreaders;
+    info_out->branch_pages = envstat.ms_branch_pages;
+    info_out->leaf_pages = envstat.ms_leaf_pages;
+    info_out->overflow_pages = envstat.ms_overflow_pages;
+    info_out->page_size = envstat.ms_psize;
+    info_out->nosync_enabled = lmdb_nosync;
+    info_out->nordahead_enabled = lmdb_nordahead;
+
+    {
+        size_t total_pages = info.mi_last_pgno + 1;
+        size_t data_pages = envstat.ms_branch_pages + envstat.ms_leaf_pages + envstat.ms_overflow_pages;
+        info_out->free_pages = total_pages > data_pages ? total_pages - data_pages : 0;
     }
 
     return LMDB_SUCCESS;
@@ -3186,68 +3246,135 @@ static struct lmdb_purge_stats purge_stats = {0};
 static unsigned int purge_interval = LMDB_PURGE_INTERVAL_DEFAULT;
 
 /**
- * Helper to purge expired entries from account/channel metadata databases
- * Scans for entries with TTL prefix that have expired
+ * Helper to purge expired entries from account/channel metadata databases.
+ * Uses batched read/write transactions to avoid holding a write lock for the
+ * entire scan — collects up to batch_size expired keys in a read txn, then
+ * deletes them in a short write txn, and repeats.
  */
 static unsigned long purge_metadata_db(MDBX_dbi dbi, const char *db_name)
 {
-    MDBX_txn *txn;
-    MDBX_cursor *cursor;
-    MDBX_val mkey, mdata;
     unsigned long purged = 0;
-    int rc;
     time_t now = time(NULL);
-    char value_buf[LMDB_MAX_VALUE_SIZE];
-    time_t expires;
+    unsigned int batch_size = lmdb_purge_batch_size;
 
-    if (!lmdb_initialized) {
+    if (!lmdb_initialized)
+        return 0;
+
+    /* Key collection buffer for batch deletes */
+    char (*key_batch)[LMDB_KEY_BUFFER_SIZE] = NULL;
+    size_t *key_lens = NULL;
+    key_batch = malloc(batch_size * LMDB_KEY_BUFFER_SIZE);
+    key_lens = malloc(batch_size * sizeof(size_t));
+    if (!key_batch || !key_lens) {
+        free(key_batch);
+        free(key_lens);
         return 0;
     }
 
-    rc = mdbx_txn_begin(lmdb_env, NULL, 0, &txn);
-    if (rc != 0) {
-        log_module(MAIN_LOG, LOG_WARNING, "x3_lmdb: Purge %s: Failed to begin txn: %s",
-                   db_name, mdbx_strerror(rc));
-        return 0;
-    }
+    /* Resume key for pagination across batches */
+    char resume_key[LMDB_KEY_BUFFER_SIZE];
+    size_t resume_key_len = 0;
+    int has_resume = 0;
 
-    rc = mdbx_cursor_open(txn, dbi, &cursor);
-    if (rc != 0) {
-        log_module(MAIN_LOG, LOG_WARNING, "x3_lmdb: Purge %s: Failed to open cursor: %s",
-                   db_name, mdbx_strerror(rc));
-        mdbx_txn_abort(txn);
-        return 0;
-    }
+    for (;;) {
+        MDBX_txn *txn;
+        MDBX_cursor *cursor;
+        MDBX_val mkey, mdata;
+        unsigned int collected = 0;
+        int rc;
+        char value_buf[LMDB_MAX_VALUE_SIZE];
+        time_t expires;
 
-    rc = mdbx_cursor_get(cursor, &mkey, &mdata, MDBX_FIRST);
-    while (rc == 0) {
-        const char *stored = (const char *)mdata.iov_base;
+        /* Phase 1: Read transaction — collect expired keys */
+        rc = mdbx_txn_begin(lmdb_env, NULL, MDBX_TXN_RDONLY, &txn);
+        if (rc != 0) {
+            log_module(MAIN_LOG, LOG_WARNING, "x3_lmdb: Purge %s: Failed to begin read txn: %s",
+                       db_name, mdbx_strerror(rc));
+            break;
+        }
 
-        /* Check if entry has TTL prefix and is expired */
-        if (stored[0] == 'T' && stored[1] == ':') {
-            /* Parse expiration time */
-            if (decode_ttl_value(stored, value_buf, sizeof(value_buf), &expires) == 0) {
-                if (expires > 0 && expires <= now) {
-                    /* Entry is expired, delete it */
-                    rc = mdbx_cursor_del(cursor, 0);
-                    if (rc == 0) {
-                        purged++;
+        rc = mdbx_cursor_open(txn, dbi, &cursor);
+        if (rc != 0) {
+            mdbx_txn_abort(txn);
+            break;
+        }
+
+        /* Position cursor: resume from last batch or start from beginning */
+        if (has_resume) {
+            mkey.iov_base = resume_key;
+            mkey.iov_len = resume_key_len;
+            rc = mdbx_cursor_get(cursor, &mkey, &mdata, MDBX_SET_RANGE);
+            /* Skip the resume key itself (already processed) */
+            if (rc == 0 && mkey.iov_len == resume_key_len &&
+                memcmp(mkey.iov_base, resume_key, resume_key_len) == 0) {
+                rc = mdbx_cursor_get(cursor, &mkey, &mdata, MDBX_NEXT);
+            }
+        } else {
+            rc = mdbx_cursor_get(cursor, &mkey, &mdata, MDBX_FIRST);
+        }
+
+        while (rc == 0) {
+            const char *stored = (const char *)mdata.iov_base;
+
+            /* Save position for resume */
+            if (mkey.iov_len < LMDB_KEY_BUFFER_SIZE) {
+                memcpy(resume_key, mkey.iov_base, mkey.iov_len);
+                resume_key_len = mkey.iov_len;
+                has_resume = 1;
+            }
+
+            /* Check if entry has TTL prefix and is expired */
+            if (stored[0] == 'T' && stored[1] == ':') {
+                if (decode_ttl_value(stored, value_buf, sizeof(value_buf), &expires) == 0) {
+                    if (expires > 0 && expires <= now) {
+                        if (mkey.iov_len < LMDB_KEY_BUFFER_SIZE && collected < batch_size) {
+                            memcpy(key_batch[collected], mkey.iov_base, mkey.iov_len);
+                            key_lens[collected] = mkey.iov_len;
+                            collected++;
+                        }
+                        if (collected >= batch_size)
+                            break;
                     }
                 }
             }
+
+            rc = mdbx_cursor_get(cursor, &mkey, &mdata, MDBX_NEXT);
         }
 
-        rc = mdbx_cursor_get(cursor, &mkey, &mdata, MDBX_NEXT);
+        int scan_complete = (rc == MDBX_NOTFOUND && collected < batch_size);
+        mdbx_cursor_close(cursor);
+        mdbx_txn_abort(txn);
+
+        if (collected == 0)
+            break;
+
+        /* Phase 2: Write transaction — delete collected keys */
+        rc = mdbx_txn_begin(lmdb_env, NULL, 0, &txn);
+        if (rc != 0)
+            break;
+
+        for (unsigned int i = 0; i < collected; i++) {
+            MDBX_val dkey;
+            dkey.iov_base = key_batch[i];
+            dkey.iov_len = key_lens[i];
+            rc = mdbx_del(txn, dbi, &dkey, NULL);
+            if (rc == 0)
+                purged++;
+        }
+
+        rc = mdbx_txn_commit(txn);
+        if (rc != 0) {
+            log_module(MAIN_LOG, LOG_WARNING, "x3_lmdb: Purge %s: Failed to commit batch: %s",
+                       db_name, mdbx_strerror(rc));
+            break;
+        }
+
+        if (scan_complete)
+            break;
     }
 
-    mdbx_cursor_close(cursor);
-
-    rc = mdbx_txn_commit(txn);
-    if (rc != 0) {
-        log_module(MAIN_LOG, LOG_WARNING, "x3_lmdb: Purge %s: Failed to commit: %s",
-                   db_name, mdbx_strerror(rc));
-        return 0;
-    }
+    free(key_batch);
+    free(key_lens);
 
     if (purged > 0) {
         log_module(MAIN_LOG, LOG_DEBUG, "x3_lmdb: Purged %lu expired entries from %s",
@@ -3258,63 +3385,132 @@ static unsigned long purge_metadata_db(MDBX_dbi dbi, const char *db_name)
 }
 
 /**
- * Purge expired activity entries (30-day TTL)
+ * Purge expired activity entries (30-day TTL).
+ * Uses prefix-based cursor positioning and batched transactions.
  */
 static unsigned long purge_activity_entries(void)
 {
-    MDBX_txn *txn;
-    MDBX_cursor *cursor;
-    MDBX_val mkey, mdata;
     unsigned long purged = 0;
-    int rc;
     time_t now = time(NULL);
     const char *prefix = "activity:";
     size_t prefix_len = strlen(prefix);
+    unsigned int batch_size = lmdb_purge_batch_size;
 
-    if (!lmdb_initialized) {
+    if (!lmdb_initialized)
+        return 0;
+
+    char (*key_batch)[LMDB_KEY_BUFFER_SIZE] = NULL;
+    size_t *key_lens = NULL;
+    key_batch = malloc(batch_size * LMDB_KEY_BUFFER_SIZE);
+    key_lens = malloc(batch_size * sizeof(size_t));
+    if (!key_batch || !key_lens) {
+        free(key_batch);
+        free(key_lens);
         return 0;
     }
 
-    rc = mdbx_txn_begin(lmdb_env, NULL, 0, &txn);
-    if (rc != 0) {
-        return 0;
-    }
+    char resume_key[LMDB_KEY_BUFFER_SIZE];
+    size_t resume_key_len = 0;
+    int has_resume = 0;
 
-    rc = mdbx_cursor_open(txn, dbi_metadata, &cursor);
-    if (rc != 0) {
-        mdbx_txn_abort(txn);
-        return 0;
-    }
+    for (;;) {
+        MDBX_txn *txn;
+        MDBX_cursor *cursor;
+        MDBX_val mkey, mdata;
+        unsigned int collected = 0;
+        int rc;
 
-    rc = mdbx_cursor_get(cursor, &mkey, &mdata, MDBX_FIRST);
-    while (rc == 0) {
-        const char *key = (const char *)mkey.iov_base;
+        /* Phase 1: Read transaction — collect expired keys */
+        rc = mdbx_txn_begin(lmdb_env, NULL, MDBX_TXN_RDONLY, &txn);
+        if (rc != 0)
+            break;
 
-        /* Check if this is an activity entry */
-        if (mkey.iov_len > prefix_len && strncmp(key, prefix, prefix_len) == 0) {
+        rc = mdbx_cursor_open(txn, dbi_metadata, &cursor);
+        if (rc != 0) {
+            mdbx_txn_abort(txn);
+            break;
+        }
+
+        /* Position cursor at prefix range */
+        if (has_resume) {
+            mkey.iov_base = resume_key;
+            mkey.iov_len = resume_key_len;
+        } else {
+            mkey.iov_base = (void *)prefix;
+            mkey.iov_len = prefix_len;
+        }
+        rc = mdbx_cursor_get(cursor, &mkey, &mdata, MDBX_SET_RANGE);
+
+        /* Skip resume key if exact match */
+        if (has_resume && rc == 0 && mkey.iov_len == resume_key_len &&
+            memcmp(mkey.iov_base, resume_key, resume_key_len) == 0) {
+            rc = mdbx_cursor_get(cursor, &mkey, &mdata, MDBX_NEXT);
+        }
+
+        while (rc == 0) {
+            const char *key = (const char *)mkey.iov_base;
+
+            /* Stop once past the prefix range */
+            if (mkey.iov_len <= prefix_len || strncmp(key, prefix, prefix_len) != 0)
+                break;
+
+            /* Save position for resume */
+            if (mkey.iov_len < LMDB_KEY_BUFFER_SIZE) {
+                memcpy(resume_key, mkey.iov_base, mkey.iov_len);
+                resume_key_len = mkey.iov_len;
+                has_resume = 1;
+            }
+
             const char *stored = (const char *)mdata.iov_base;
-
-            /* Check for TTL prefix */
             if (stored[0] == 'T' && stored[1] == ':') {
                 time_t expires = 0;
                 char *colon = strchr(stored + 2, ':');
                 if (colon) {
                     expires = (time_t)strtol(stored + 2, NULL, 10);
                     if (expires > 0 && expires <= now) {
-                        rc = mdbx_cursor_del(cursor, 0);
-                        if (rc == 0) {
-                            purged++;
+                        if (mkey.iov_len < LMDB_KEY_BUFFER_SIZE && collected < batch_size) {
+                            memcpy(key_batch[collected], mkey.iov_base, mkey.iov_len);
+                            key_lens[collected] = mkey.iov_len;
+                            collected++;
                         }
+                        if (collected >= batch_size)
+                            break;
                     }
                 }
             }
+
+            rc = mdbx_cursor_get(cursor, &mkey, &mdata, MDBX_NEXT);
         }
 
-        rc = mdbx_cursor_get(cursor, &mkey, &mdata, MDBX_NEXT);
+        int scan_complete = (collected < batch_size);
+        mdbx_cursor_close(cursor);
+        mdbx_txn_abort(txn);
+
+        if (collected == 0)
+            break;
+
+        /* Phase 2: Write transaction — delete collected keys */
+        rc = mdbx_txn_begin(lmdb_env, NULL, 0, &txn);
+        if (rc != 0)
+            break;
+
+        for (unsigned int i = 0; i < collected; i++) {
+            MDBX_val dkey;
+            dkey.iov_base = key_batch[i];
+            dkey.iov_len = key_lens[i];
+            rc = mdbx_del(txn, dbi_metadata, &dkey, NULL);
+            if (rc == 0)
+                purged++;
+        }
+
+        mdbx_txn_commit(txn);
+
+        if (scan_complete)
+            break;
     }
 
-    mdbx_cursor_close(cursor);
-    mdbx_txn_commit(txn);
+    free(key_batch);
+    free(key_lens);
 
     if (purged > 0) {
         log_module(MAIN_LOG, LOG_DEBUG, "x3_lmdb: Purged %lu expired activity entries", purged);
@@ -3324,63 +3520,128 @@ static unsigned long purge_activity_entries(void)
 }
 
 /**
- * Purge expired fingerprint entries (90-day TTL)
+ * Purge expired fingerprint entries (90-day TTL).
+ * Uses prefix-based cursor positioning and batched transactions.
  */
 static unsigned long purge_fingerprint_entries(void)
 {
-    MDBX_txn *txn;
-    MDBX_cursor *cursor;
-    MDBX_val mkey, mdata;
     unsigned long purged = 0;
-    int rc;
     time_t now = time(NULL);
     const char *prefix = "fp:";
     size_t prefix_len = strlen(prefix);
+    unsigned int batch_size = lmdb_purge_batch_size;
 
-    if (!lmdb_initialized) {
+    if (!lmdb_initialized)
+        return 0;
+
+    char (*key_batch)[LMDB_KEY_BUFFER_SIZE] = NULL;
+    size_t *key_lens = NULL;
+    key_batch = malloc(batch_size * LMDB_KEY_BUFFER_SIZE);
+    key_lens = malloc(batch_size * sizeof(size_t));
+    if (!key_batch || !key_lens) {
+        free(key_batch);
+        free(key_lens);
         return 0;
     }
 
-    rc = mdbx_txn_begin(lmdb_env, NULL, 0, &txn);
-    if (rc != 0) {
-        return 0;
-    }
+    char resume_key[LMDB_KEY_BUFFER_SIZE];
+    size_t resume_key_len = 0;
+    int has_resume = 0;
 
-    rc = mdbx_cursor_open(txn, dbi_metadata, &cursor);
-    if (rc != 0) {
-        mdbx_txn_abort(txn);
-        return 0;
-    }
+    for (;;) {
+        MDBX_txn *txn;
+        MDBX_cursor *cursor;
+        MDBX_val mkey, mdata;
+        unsigned int collected = 0;
+        int rc;
 
-    rc = mdbx_cursor_get(cursor, &mkey, &mdata, MDBX_FIRST);
-    while (rc == 0) {
-        const char *key = (const char *)mkey.iov_base;
+        /* Phase 1: Read transaction — collect expired keys */
+        rc = mdbx_txn_begin(lmdb_env, NULL, MDBX_TXN_RDONLY, &txn);
+        if (rc != 0)
+            break;
 
-        /* Check if this is a fingerprint entry */
-        if (mkey.iov_len > prefix_len && strncmp(key, prefix, prefix_len) == 0) {
+        rc = mdbx_cursor_open(txn, dbi_metadata, &cursor);
+        if (rc != 0) {
+            mdbx_txn_abort(txn);
+            break;
+        }
+
+        if (has_resume) {
+            mkey.iov_base = resume_key;
+            mkey.iov_len = resume_key_len;
+        } else {
+            mkey.iov_base = (void *)prefix;
+            mkey.iov_len = prefix_len;
+        }
+        rc = mdbx_cursor_get(cursor, &mkey, &mdata, MDBX_SET_RANGE);
+
+        if (has_resume && rc == 0 && mkey.iov_len == resume_key_len &&
+            memcmp(mkey.iov_base, resume_key, resume_key_len) == 0) {
+            rc = mdbx_cursor_get(cursor, &mkey, &mdata, MDBX_NEXT);
+        }
+
+        while (rc == 0) {
+            const char *key = (const char *)mkey.iov_base;
+
+            if (mkey.iov_len <= prefix_len || strncmp(key, prefix, prefix_len) != 0)
+                break;
+
+            if (mkey.iov_len < LMDB_KEY_BUFFER_SIZE) {
+                memcpy(resume_key, mkey.iov_base, mkey.iov_len);
+                resume_key_len = mkey.iov_len;
+                has_resume = 1;
+            }
+
             const char *stored = (const char *)mdata.iov_base;
-
-            /* Check for TTL prefix */
             if (stored[0] == 'T' && stored[1] == ':') {
                 time_t expires = 0;
                 char *colon = strchr(stored + 2, ':');
                 if (colon) {
                     expires = (time_t)strtol(stored + 2, NULL, 10);
                     if (expires > 0 && expires <= now) {
-                        rc = mdbx_cursor_del(cursor, 0);
-                        if (rc == 0) {
-                            purged++;
+                        if (collected < batch_size) {
+                            memcpy(key_batch[collected], mkey.iov_base, mkey.iov_len);
+                            key_lens[collected] = mkey.iov_len;
+                            collected++;
                         }
+                        if (collected >= batch_size)
+                            break;
                     }
                 }
             }
+
+            rc = mdbx_cursor_get(cursor, &mkey, &mdata, MDBX_NEXT);
         }
 
-        rc = mdbx_cursor_get(cursor, &mkey, &mdata, MDBX_NEXT);
+        int scan_complete = (collected < batch_size);
+        mdbx_cursor_close(cursor);
+        mdbx_txn_abort(txn);
+
+        if (collected == 0)
+            break;
+
+        /* Phase 2: Write transaction — delete collected keys */
+        rc = mdbx_txn_begin(lmdb_env, NULL, 0, &txn);
+        if (rc != 0)
+            break;
+
+        for (unsigned int i = 0; i < collected; i++) {
+            MDBX_val dkey;
+            dkey.iov_base = key_batch[i];
+            dkey.iov_len = key_lens[i];
+            rc = mdbx_del(txn, dbi_metadata, &dkey, NULL);
+            if (rc == 0)
+                purged++;
+        }
+
+        mdbx_txn_commit(txn);
+
+        if (scan_complete)
+            break;
     }
 
-    mdbx_cursor_close(cursor);
-    mdbx_txn_commit(txn);
+    free(key_batch);
+    free(key_lens);
 
     if (purged > 0) {
         log_module(MAIN_LOG, LOG_DEBUG, "x3_lmdb: Purged %lu expired fingerprint entries", purged);
@@ -3890,6 +4151,28 @@ void init_x3_lmdb(void)
         } else {
             log_module(MAIN_LOG, LOG_INFO, "x3_lmdb: Auto-growth disabled (fixed size: %lu bytes)",
                        (unsigned long)lmdb_mapsize);
+        }
+    }
+
+    /* Configure NORDAHEAD */
+    {
+        const char *nordahead_str = conf_get_data("services/x3/lmdb_nordahead", RECDB_QSTRING);
+        if (nordahead_str) {
+            if (!strcasecmp(nordahead_str, "no") || !strcasecmp(nordahead_str, "false") || !strcmp(nordahead_str, "0")) {
+                lmdb_nordahead = 0;
+            } else {
+                lmdb_nordahead = 1;
+            }
+        }
+    }
+
+    /* Configure purge batch size */
+    {
+        const char *batch_str = conf_get_data("services/x3/lmdb_purge_batch_size", RECDB_QSTRING);
+        if (batch_str) {
+            unsigned int val = (unsigned int)strtoul(batch_str, NULL, 10);
+            if (val >= 10 && val <= 10000)
+                lmdb_purge_batch_size = val;
         }
     }
 
@@ -4638,12 +4921,10 @@ int x3_lmdb_scram_delete(const char *token_id)
 
 int x3_lmdb_scram_revoke_all(const char *username)
 {
-    MDBX_txn *txn;
-    MDBX_cursor *cursor;
-    MDBX_val key, data;
-    int rc, count = 0;
+    int count = 0;
     char prefix[64];
     size_t prefix_len;
+    unsigned int batch_size = lmdb_purge_batch_size;
 
     if (!lmdb_initialized || !username) {
         return -1;
@@ -4652,26 +4933,66 @@ int x3_lmdb_scram_revoke_all(const char *username)
     snprintf(prefix, sizeof(prefix), "%s", LMDB_PREFIX_SCRAM);
     prefix_len = strlen(prefix);
 
-    rc = mdbx_txn_begin(lmdb_env, NULL, 0, &txn);
-    if (rc != 0) {
+    char (*key_batch)[LMDB_KEY_BUFFER_SIZE] = NULL;
+    size_t *key_lens = NULL;
+    key_batch = malloc(batch_size * LMDB_KEY_BUFFER_SIZE);
+    key_lens = malloc(batch_size * sizeof(size_t));
+    if (!key_batch || !key_lens) {
+        free(key_batch);
+        free(key_lens);
         return -1;
     }
 
-    rc = mdbx_cursor_open(txn, dbi_metadata, &cursor);
-    if (rc != 0) {
-        mdbx_txn_abort(txn);
-        return -1;
-    }
+    char resume_key[LMDB_KEY_BUFFER_SIZE];
+    size_t resume_key_len = 0;
+    int has_resume = 0;
 
-    /* Iterate through all SCRAM entries */
-    rc = mdbx_cursor_get(cursor, &key, &data, MDBX_FIRST);
-    while (rc == 0) {
-        if (key.iov_len > prefix_len &&
-            memcmp(key.iov_base, prefix, prefix_len) == 0) {
+    for (;;) {
+        MDBX_txn *txn;
+        MDBX_cursor *cursor;
+        MDBX_val key, data;
+        unsigned int collected = 0;
+        int rc;
+
+        /* Phase 1: Read transaction — find matching keys */
+        rc = mdbx_txn_begin(lmdb_env, NULL, MDBX_TXN_RDONLY, &txn);
+        if (rc != 0)
+            break;
+
+        rc = mdbx_cursor_open(txn, dbi_metadata, &cursor);
+        if (rc != 0) {
+            mdbx_txn_abort(txn);
+            break;
+        }
+
+        if (has_resume) {
+            key.iov_base = resume_key;
+            key.iov_len = resume_key_len;
+        } else {
+            key.iov_base = prefix;
+            key.iov_len = prefix_len;
+        }
+        rc = mdbx_cursor_get(cursor, &key, &data, MDBX_SET_RANGE);
+
+        if (has_resume && rc == 0 && key.iov_len == resume_key_len &&
+            memcmp(key.iov_base, resume_key, resume_key_len) == 0) {
+            rc = mdbx_cursor_get(cursor, &key, &data, MDBX_NEXT);
+        }
+
+        while (rc == 0) {
+            if (key.iov_len <= prefix_len ||
+                memcmp(key.iov_base, prefix, prefix_len) != 0)
+                break;
+
+            if (key.iov_len < LMDB_KEY_BUFFER_SIZE) {
+                memcpy(resume_key, key.iov_base, key.iov_len);
+                resume_key_len = key.iov_len;
+                has_resume = 1;
+            }
+
             /* Check if this credential belongs to the user */
             char *value_copy = strndup(data.iov_base, data.iov_len);
             if (value_copy) {
-                /* Parse to find username (last field) */
                 char *p = value_copy;
                 int colons = 0;
                 while (*p && colons < 5) {
@@ -4679,20 +5000,50 @@ int x3_lmdb_scram_revoke_all(const char *username)
                     p++;
                 }
                 if (colons == 5 && strcasecmp(p, username) == 0) {
-                    mdbx_cursor_del(cursor, 0);
-                    count++;
+                    if (key.iov_len < LMDB_KEY_BUFFER_SIZE && collected < batch_size) {
+                        memcpy(key_batch[collected], key.iov_base, key.iov_len);
+                        key_lens[collected] = key.iov_len;
+                        collected++;
+                    }
                 }
                 free(value_copy);
             }
+
+            if (collected >= batch_size)
+                break;
+
+            rc = mdbx_cursor_get(cursor, &key, &data, MDBX_NEXT);
         }
-        rc = mdbx_cursor_get(cursor, &key, &data, MDBX_NEXT);
+
+        int scan_complete = (collected < batch_size);
+        mdbx_cursor_close(cursor);
+        mdbx_txn_abort(txn);
+
+        if (collected == 0)
+            break;
+
+        /* Phase 2: Write transaction — delete collected keys */
+        rc = mdbx_txn_begin(lmdb_env, NULL, 0, &txn);
+        if (rc != 0)
+            break;
+
+        for (unsigned int i = 0; i < collected; i++) {
+            MDBX_val dkey;
+            dkey.iov_base = key_batch[i];
+            dkey.iov_len = key_lens[i];
+            rc = mdbx_del(txn, dbi_metadata, &dkey, NULL);
+            if (rc == 0)
+                count++;
+        }
+
+        mdbx_txn_commit(txn);
+
+        if (scan_complete)
+            break;
     }
 
-    mdbx_cursor_close(cursor);
-    rc = mdbx_txn_commit(txn);
-    if (rc != 0) {
-        return -1;
-    }
+    free(key_batch);
+    free(key_lens);
 
     if (count > 0) {
         log_module(MAIN_LOG, LOG_DEBUG, "x3_lmdb: Revoked %d SCRAM credential(s) for %s",
