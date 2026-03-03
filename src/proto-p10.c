@@ -143,6 +143,8 @@
 #define TOK_ASLL		"LL"
 #define TOK_AWAY                "A"
 #define TOK_BURST               "B"
+#define TOK_BOUNCER_TRANSFER    "BX"
+#define CMD_BOUNCER_TRANSFER    "BOUNCER_TRANSFER"
 #define TOK_CLEARMODE           "CM"
 #define TOK_CLOSE               "CLOSE"
 #define TOK_CNOTICE             "CN"
@@ -1775,6 +1777,177 @@ static CMD_FUNC(cmd_pong)
         timeq_del(0, timed_ping_timeout, 0, TIMEQ_IGNORE_WHEN|TIMEQ_IGNORE_DATA);
         timeq_add(now + ping_freq, timed_send_ping, 0);
         received_ping();
+    }
+    return 1;
+}
+
+static CMD_FUNC(cmd_bouncer_transfer)
+{
+    char subcmd;
+
+    if (argc < 2)
+        return 0;
+
+    subcmd = argv[1][0];
+    switch (subcmd) {
+    case 'C': {
+        /* BX C <primary_numeric> <alias_numeric> <account> <sessid> :<channels>
+         * Create alias: add to numeric array, set FLAGS_ALIAS, skip clients dict.
+         */
+        struct userNode *primary, *alias;
+        struct server *alias_serv;
+        const char *alias_numeric;
+        unsigned int num_local;
+
+        if (argc < 7)
+            return 0;
+
+        primary = GetUserN(argv[2]);
+        alias_numeric = argv[3];
+        if (!primary || strlen(alias_numeric) < 3)
+            return 1;
+
+        alias_serv = GetServerN(alias_numeric);
+        if (!alias_serv)
+            return 1;
+
+        /* Don't create duplicate */
+        if (GetUserN(alias_numeric))
+            return 1;
+
+        /* Create userNode manually — NOT via AddUser (which inserts into clients dict) */
+        alias = calloc(1, sizeof(*alias));
+        alias->nick = strdup(primary->nick);
+        safestrncpy(alias->ident, primary->ident, sizeof(alias->ident));
+        safestrncpy(alias->info, primary->info, sizeof(alias->info));
+        safestrncpy(alias->hostname, primary->hostname, sizeof(alias->hostname));
+        safestrncpy(alias->fakehost, primary->fakehost, sizeof(alias->fakehost));
+        safestrncpy(alias->numeric, alias_numeric, sizeof(alias->numeric));
+        memcpy(&alias->ip, &primary->ip, sizeof(alias->ip));
+        alias->timestamp = primary->timestamp;
+        alias->idle_since = primary->idle_since;
+        alias->uplink = alias_serv;
+        modeList_init(&alias->channels);
+
+        /* Register in server's numeric array */
+        num_local = base64toint(alias_numeric + strlen(alias_serv->numeric), 3) & alias_serv->num_mask;
+        alias->num_local = num_local;
+        alias_serv->users[num_local] = alias;
+        alias_serv->clients++;
+        if (alias_serv->clients > alias_serv->max_clients)
+            alias_serv->max_clients = alias_serv->clients;
+
+        /* Mark as alias — NOT in clients dict, NOT processed by NickChange */
+        alias->modes = primary->modes | FLAGS_ALIAS;
+
+        /* Copy handle_info from primary for account association */
+        alias->handle_info = primary->handle_info;
+
+        break;
+    }
+    case 'X': {
+        /* BX X <alias_numeric>
+         * Destroy alias: remove from numeric array, free userNode.
+         */
+        struct userNode *alias;
+
+        if (argc < 3)
+            return 0;
+
+        alias = GetUserN(argv[2]);
+        if (!alias || !IsAlias(alias))
+            return 1;
+
+        /* Remove from channels silently */
+        while (alias->channels.used > 0)
+            DelChannelUser(alias, alias->channels.list[alias->channels.used-1]->channel, NULL, 0);
+
+        /* Remove from server's numeric array */
+        alias->uplink->clients--;
+        alias->uplink->users[alias->num_local] = NULL;
+
+        /* Clean up — do NOT remove from clients dict (never added) */
+        modeList_clean(&alias->channels);
+        free(alias->nick);
+        free(alias->version_reply);
+        free(alias->sslfp);
+        free(alias->mark);
+        free_string_list(alias->marks);
+        free(alias->country_code);
+        free(alias->city);
+        free(alias->region);
+        free(alias->postal_code);
+        free(alias);
+        break;
+    }
+    case 'P': {
+        /* BX P <old_numeric> <new_numeric> <sessid> <nick>
+         * Promote/transfer — handled by Nefarious, X3 just tracks state.
+         */
+        break;
+    }
+    case 'N': {
+        /* BX N <primary_numeric> <new_nick> <ts>
+         * Nick sync: update alias nicks directly (no NickChange call).
+         */
+        struct userNode *primary;
+        unsigned int sn, ii;
+
+        if (argc < 4)
+            return 0;
+
+        primary = GetUserN(argv[2]);
+        if (!primary)
+            return 1;
+
+        /* Find aliases by matching handle_info (same account) + FLAGS_ALIAS.
+         * Iterate all servers' user arrays — bounded by 64*64 servers. */
+        for (sn = 0; sn < 64*64; sn++) {
+            struct server *s = servers_num[sn];
+            if (!s) continue;
+            for (ii = 0; ii <= s->num_mask; ii++) {
+                struct userNode *u = s->users[ii];
+                if (u && IsAlias(u) && u->handle_info == primary->handle_info) {
+                    free(u->nick);
+                    u->nick = strdup(argv[3]);
+                }
+            }
+        }
+        break;
+    }
+    case 'U': {
+        /* BX U <alias_numeric> <field>=<value>
+         * Identity update: update alias's identity fields.
+         */
+        struct userNode *alias;
+        char *eq;
+
+        if (argc < 4)
+            return 0;
+
+        alias = GetUserN(argv[2]);
+        if (!alias || !IsAlias(alias))
+            return 1;
+
+        eq = strchr(argv[3], '=');
+        if (!eq)
+            return 1;
+
+        *eq = '\0';
+        if (!strcmp(argv[3], "host"))
+            safestrncpy(alias->hostname, eq + 1, sizeof(alias->hostname));
+        else if (!strcmp(argv[3], "fakehost"))
+            safestrncpy(alias->fakehost, eq + 1, sizeof(alias->fakehost));
+        else if (!strcmp(argv[3], "realname"))
+            safestrncpy(alias->info, eq + 1, sizeof(alias->info));
+        else if (!strcmp(argv[3], "username"))
+            safestrncpy(alias->ident, eq + 1, sizeof(alias->ident));
+        *eq = '=';  /* restore for any further processing */
+        break;
+    }
+    default:
+        /* Unknown subcommand — ignore */
+        break;
     }
     return 1;
 }
@@ -3571,6 +3744,10 @@ init_parse(void)
 
     dict_insert(irc_func_dict, CMD_SASL, cmd_sasl);
     dict_insert(irc_func_dict, TOK_SASL, cmd_sasl);
+
+    /* Bouncer alias management */
+    dict_insert(irc_func_dict, CMD_BOUNCER_TRANSFER, cmd_bouncer_transfer);
+    dict_insert(irc_func_dict, TOK_BOUNCER_TRANSFER, cmd_bouncer_transfer);
 
     /* IRCv3 account-registration support */
     dict_insert(irc_func_dict, CMD_REGISTER_ACCT, cmd_register_acct);
