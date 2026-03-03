@@ -56,6 +56,49 @@ static int lmdb_nordahead = 1;                 /* 1 = disable readahead (default
 /* Purge batch size - limit how long write transactions are held during purge */
 static unsigned int lmdb_purge_batch_size = 100;
 
+/* B-tree traversal cache for hot lookups */
+#define LMDB_CACHE_SLOTS_DEFAULT 128
+static MDBX_cache_entry_t *lmdb_cache = NULL;
+static uint32_t *lmdb_cache_hash = NULL;
+static unsigned int lmdb_cache_slots = 0;
+
+/* Cache statistics */
+static unsigned long lmdb_cache_hits = 0;
+static unsigned long lmdb_cache_misses = 0;
+
+/** FNV-1a 32-bit hash for cache slot selection */
+static uint32_t lmdb_cache_fnv1a(const void *data, size_t len)
+{
+    const unsigned char *p = (const unsigned char *)data;
+    uint32_t h = 2166136261u;
+    for (size_t i = 0; i < len; i++) {
+        h ^= p[i];
+        h *= 16777619u;
+    }
+    return h ? h : 1; /* avoid 0 so we can distinguish from empty */
+}
+
+/** Cached mdbx_get — falls back to mdbx_get when cache is disabled.
+ * Returns the same error code as mdbx_get(). */
+static int lmdb_cached_get(MDBX_txn *txn, MDBX_dbi dbi, MDBX_val *key, MDBX_val *data)
+{
+    if (lmdb_cache) {
+        uint32_t h = lmdb_cache_fnv1a(key->iov_base, key->iov_len);
+        unsigned int slot = h & (lmdb_cache_slots - 1);
+        if (lmdb_cache_hash[slot] != h) {
+            mdbx_cache_init(&lmdb_cache[slot]);
+            lmdb_cache_hash[slot] = h;
+        }
+        MDBX_cache_result_t cr = mdbx_cache_get_SingleThreaded(txn, dbi, key, data, &lmdb_cache[slot]);
+        if (cr.status >= MDBX_CACHE_HIT)
+            lmdb_cache_hits++;
+        else
+            lmdb_cache_misses++;
+        return cr.errcode;
+    }
+    return mdbx_get(txn, dbi, key, data);
+}
+
 /* Get/set SCRAM iteration count */
 unsigned int x3_lmdb_get_scram_iterations(void)
 {
@@ -256,6 +299,37 @@ int x3_lmdb_init(const char *dbpath, size_t mapsize)
     }
 
     lmdb_initialized = 1;
+
+    /* Initialize B-tree traversal cache */
+    {
+        const char *cache_str = conf_get_data("services/x3/lmdb_cache_slots", RECDB_QSTRING);
+        unsigned int slots = LMDB_CACHE_SLOTS_DEFAULT;
+        if (cache_str) {
+            unsigned int val = (unsigned int)strtoul(cache_str, NULL, 10);
+            slots = val; /* 0 = disabled */
+        }
+        if (slots > 0) {
+            /* Round up to next power of 2 */
+            unsigned int s = 1;
+            while (s < slots) s <<= 1;
+            lmdb_cache_slots = s;
+            lmdb_cache = calloc(s, sizeof(MDBX_cache_entry_t));
+            lmdb_cache_hash = calloc(s, sizeof(uint32_t));
+            if (lmdb_cache && lmdb_cache_hash) {
+                for (unsigned int i = 0; i < s; i++)
+                    mdbx_cache_init(&lmdb_cache[i]);
+                log_module(MAIN_LOG, LOG_INFO, "x3_lmdb: B-tree cache initialized (%u slots)", s);
+            } else {
+                free(lmdb_cache);
+                free(lmdb_cache_hash);
+                lmdb_cache = NULL;
+                lmdb_cache_hash = NULL;
+                lmdb_cache_slots = 0;
+                log_module(MAIN_LOG, LOG_WARNING, "x3_lmdb: Failed to allocate B-tree cache");
+            }
+        }
+    }
+
     log_module(MAIN_LOG, LOG_INFO, "x3_lmdb: Initialized at '%s' with %luMB map",
                lmdb_path, (unsigned long)(lmdb_mapsize / (1024 * 1024)));
 
@@ -329,7 +403,7 @@ int x3_lmdb_account_get(const char *account, const char *key, char *value)
         return LMDB_ERROR;
     }
 
-    rc = mdbx_get(txn, dbi_accounts, &mkey, &mdata);
+    rc = lmdb_cached_get(txn, dbi_accounts, &mkey, &mdata);
     mdbx_txn_abort(txn);
 
     if (rc == MDBX_NOTFOUND) {
@@ -454,7 +528,7 @@ int x3_lmdb_account_get_raw(const char *account, const char *key,
         return LMDB_ERROR;
     }
 
-    rc = mdbx_get(txn, dbi_accounts, &mkey, &mdata);
+    rc = lmdb_cached_get(txn, dbi_accounts, &mkey, &mdata);
     mdbx_txn_abort(txn);
 
     if (rc == MDBX_NOTFOUND) {
@@ -744,7 +818,7 @@ int x3_lmdb_channel_get(const char *channel, const char *key, char *value)
         return LMDB_ERROR;
     }
 
-    rc = mdbx_get(txn, dbi_channels, &mkey, &mdata);
+    rc = lmdb_cached_get(txn, dbi_channels, &mkey, &mdata);
     mdbx_txn_abort(txn);
 
     if (rc == MDBX_NOTFOUND) {
@@ -1564,7 +1638,7 @@ int x3_lmdb_chanaccess_get(const char *channel, const char *account, unsigned sh
         return LMDB_ERROR;
     }
 
-    rc = mdbx_get(txn, dbi_metadata, &mkey, &mdata);
+    rc = lmdb_cached_get(txn, dbi_metadata, &mkey, &mdata);
     mdbx_txn_abort(txn);
 
     if (rc == MDBX_NOTFOUND) {
@@ -3276,6 +3350,9 @@ static unsigned long purge_metadata_db(MDBX_dbi dbi, const char *db_name)
     size_t resume_key_len = 0;
     int has_resume = 0;
 
+    {
+    MDBX_txn *read_txn = NULL; /* Carried over from commit_embark_read */
+
     for (;;) {
         MDBX_txn *txn;
         MDBX_cursor *cursor;
@@ -3286,11 +3363,16 @@ static unsigned long purge_metadata_db(MDBX_dbi dbi, const char *db_name)
         time_t expires;
 
         /* Phase 1: Read transaction — collect expired keys */
-        rc = mdbx_txn_begin(lmdb_env, NULL, MDBX_TXN_RDONLY, &txn);
-        if (rc != 0) {
-            log_module(MAIN_LOG, LOG_WARNING, "x3_lmdb: Purge %s: Failed to begin read txn: %s",
-                       db_name, mdbx_strerror(rc));
-            break;
+        if (read_txn) {
+            txn = read_txn;
+            read_txn = NULL;
+        } else {
+            rc = mdbx_txn_begin(lmdb_env, NULL, MDBX_TXN_RDONLY, &txn);
+            if (rc != 0) {
+                log_module(MAIN_LOG, LOG_WARNING, "x3_lmdb: Purge %s: Failed to begin read txn: %s",
+                           db_name, mdbx_strerror(rc));
+                break;
+            }
         }
 
         rc = mdbx_cursor_open(txn, dbi, &cursor);
@@ -3362,15 +3444,25 @@ static unsigned long purge_metadata_db(MDBX_dbi dbi, const char *db_name)
                 purged++;
         }
 
-        rc = mdbx_txn_commit(txn);
+        if (!scan_complete) {
+            /* Commit write and immediately start read for next batch */
+            rc = mdbx_txn_commit_embark_read(txn, &read_txn);
+        } else {
+            rc = mdbx_txn_commit(txn);
+        }
         if (rc != 0) {
             log_module(MAIN_LOG, LOG_WARNING, "x3_lmdb: Purge %s: Failed to commit batch: %s",
                        db_name, mdbx_strerror(rc));
+            read_txn = NULL;
             break;
         }
 
         if (scan_complete)
             break;
+    }
+
+    if (read_txn)
+        mdbx_txn_abort(read_txn);
     }
 
     free(key_batch);
@@ -3413,6 +3505,9 @@ static unsigned long purge_activity_entries(void)
     size_t resume_key_len = 0;
     int has_resume = 0;
 
+    {
+    MDBX_txn *read_txn = NULL;
+
     for (;;) {
         MDBX_txn *txn;
         MDBX_cursor *cursor;
@@ -3421,9 +3516,14 @@ static unsigned long purge_activity_entries(void)
         int rc;
 
         /* Phase 1: Read transaction — collect expired keys */
-        rc = mdbx_txn_begin(lmdb_env, NULL, MDBX_TXN_RDONLY, &txn);
-        if (rc != 0)
-            break;
+        if (read_txn) {
+            txn = read_txn;
+            read_txn = NULL;
+        } else {
+            rc = mdbx_txn_begin(lmdb_env, NULL, MDBX_TXN_RDONLY, &txn);
+            if (rc != 0)
+                break;
+        }
 
         rc = mdbx_cursor_open(txn, dbi_metadata, &cursor);
         if (rc != 0) {
@@ -3503,10 +3603,22 @@ static unsigned long purge_activity_entries(void)
                 purged++;
         }
 
-        mdbx_txn_commit(txn);
+        if (!scan_complete) {
+            rc = mdbx_txn_commit_embark_read(txn, &read_txn);
+        } else {
+            rc = mdbx_txn_commit(txn);
+        }
+        if (rc != 0) {
+            read_txn = NULL;
+            break;
+        }
 
         if (scan_complete)
             break;
+    }
+
+    if (read_txn)
+        mdbx_txn_abort(read_txn);
     }
 
     free(key_batch);
@@ -3548,6 +3660,9 @@ static unsigned long purge_fingerprint_entries(void)
     size_t resume_key_len = 0;
     int has_resume = 0;
 
+    {
+    MDBX_txn *read_txn = NULL;
+
     for (;;) {
         MDBX_txn *txn;
         MDBX_cursor *cursor;
@@ -3556,9 +3671,14 @@ static unsigned long purge_fingerprint_entries(void)
         int rc;
 
         /* Phase 1: Read transaction — collect expired keys */
-        rc = mdbx_txn_begin(lmdb_env, NULL, MDBX_TXN_RDONLY, &txn);
-        if (rc != 0)
-            break;
+        if (read_txn) {
+            txn = read_txn;
+            read_txn = NULL;
+        } else {
+            rc = mdbx_txn_begin(lmdb_env, NULL, MDBX_TXN_RDONLY, &txn);
+            if (rc != 0)
+                break;
+        }
 
         rc = mdbx_cursor_open(txn, dbi_metadata, &cursor);
         if (rc != 0) {
@@ -3634,10 +3754,22 @@ static unsigned long purge_fingerprint_entries(void)
                 purged++;
         }
 
-        mdbx_txn_commit(txn);
+        if (!scan_complete) {
+            rc = mdbx_txn_commit_embark_read(txn, &read_txn);
+        } else {
+            rc = mdbx_txn_commit(txn);
+        }
+        if (rc != 0) {
+            read_txn = NULL;
+            break;
+        }
 
         if (scan_complete)
             break;
+    }
+
+    if (read_txn)
+        mdbx_txn_abort(read_txn);
     }
 
     free(key_batch);
@@ -3712,6 +3844,13 @@ int x3_lmdb_purge_expired(struct lmdb_purge_stats *stats_out)
 const struct lmdb_purge_stats *x3_lmdb_get_purge_stats(void)
 {
     return &purge_stats;
+}
+
+void x3_lmdb_get_cache_stats(unsigned long *hits_out, unsigned long *misses_out, unsigned int *slots_out)
+{
+    if (hits_out) *hits_out = lmdb_cache_hits;
+    if (misses_out) *misses_out = lmdb_cache_misses;
+    if (slots_out) *slots_out = lmdb_cache_slots;
 }
 
 void x3_lmdb_set_purge_interval(unsigned int interval_secs)
@@ -3812,8 +3951,48 @@ int x3_lmdb_session_create(const char *username, char *token_out, size_t token_s
         return LMDB_ERROR;
     }
 
-    /* Get current session version for the user (if any) */
-    x3_lmdb_session_get_version(username, &version);
+    /* Build version key: sessver:<username> */
+    {
+        char ver_key_buf[LMDB_KEY_BUFFER_SIZE];
+        MDBX_val ver_key, ver_data;
+
+        snprintf(ver_key_buf, sizeof(ver_key_buf), "%s%s", LMDB_PREFIX_SESSVER, username);
+        ver_key.iov_len = strlen(ver_key_buf);
+        ver_key.iov_base = ver_key_buf;
+
+        /* Start as read transaction to atomically read version then write token */
+        rc = mdbx_txn_begin(lmdb_env, NULL, MDBX_TXN_RDONLY, &txn);
+        if (rc != 0) {
+            log_module(MAIN_LOG, LOG_ERROR, "x3_lmdb: session_create txn_begin failed: %s",
+                       mdbx_strerror(rc));
+            return LMDB_ERROR;
+        }
+
+        /* Read current session version */
+        rc = mdbx_get(txn, dbi_metadata, &ver_key, &ver_data);
+        if (rc == 0) {
+            version = (unsigned int)strtoul(ver_data.iov_base, NULL, 10);
+        } else if (rc != MDBX_NOTFOUND) {
+            mdbx_txn_abort(txn);
+            return LMDB_ERROR;
+        }
+
+        /* Promote to write transaction on same MVCC snapshot */
+        rc = mdbx_txn_amend(txn);
+        if (rc == MDBX_RESULT_TRUE) {
+            /* Snapshot advanced — re-read version */
+            rc = mdbx_get(txn, dbi_metadata, &ver_key, &ver_data);
+            if (rc == 0) {
+                version = (unsigned int)strtoul(ver_data.iov_base, NULL, 10);
+            } else if (rc != MDBX_NOTFOUND) {
+                mdbx_txn_abort(txn);
+                return LMDB_ERROR;
+            }
+        } else if (rc != MDBX_SUCCESS) {
+            mdbx_txn_abort(txn);
+            return LMDB_ERROR;
+        }
+    }
 
     /* Build LMDB key: session:<token_id> */
     snprintf(lmdb_key, sizeof(lmdb_key), "%s%s", LMDB_PREFIX_SESSION, token_id);
@@ -3822,15 +4001,7 @@ int x3_lmdb_session_create(const char *username, char *token_out, size_t token_s
     time_t expiry = now + SESSION_TOKEN_TTL;
     snprintf(lmdb_value, sizeof(lmdb_value), "%lu:%u:%s", (unsigned long)expiry, version, username);
 
-    /* Start write transaction */
-    rc = mdbx_txn_begin(lmdb_env, NULL, 0, &txn);
-    if (rc != 0) {
-        log_module(MAIN_LOG, LOG_ERROR, "x3_lmdb: session_create txn_begin failed: %s",
-                   mdbx_strerror(rc));
-        return LMDB_ERROR;
-    }
-
-    /* Store the token */
+    /* Store the token (still in write txn from amend) */
     key.iov_len = strlen(lmdb_key);
     key.iov_base = lmdb_key;
     data.iov_len = strlen(lmdb_value) + 1;
@@ -3867,11 +4038,11 @@ int x3_lmdb_session_validate(const char *token, char *username_out, size_t usern
     MDBX_val key, data;
     char lmdb_key[LMDB_KEY_BUFFER_SIZE];
     const char *token_id;
-    char *value_copy;
+    char *value_copy = NULL;
     char *expiry_str, *version_str, *username;
     time_t expiry;
     unsigned int stored_version, current_version = 0;
-    int rc;
+    int rc, need_delete = 0;
 
     if (!lmdb_initialized || !token) {
         return LMDB_ERROR;
@@ -3891,7 +4062,7 @@ int x3_lmdb_session_validate(const char *token, char *username_out, size_t usern
     /* Build LMDB key */
     snprintf(lmdb_key, sizeof(lmdb_key), "%s%s", LMDB_PREFIX_SESSION, token_id);
 
-    /* Start read transaction */
+    /* Start read transaction — all reads + optional delete in one txn */
     rc = mdbx_txn_begin(lmdb_env, NULL, MDBX_TXN_RDONLY, &txn);
     if (rc != 0) {
         return LMDB_ERROR;
@@ -3902,18 +4073,19 @@ int x3_lmdb_session_validate(const char *token, char *username_out, size_t usern
     key.iov_base = lmdb_key;
 
     rc = mdbx_get(txn, dbi_metadata, &key, &data);
-    mdbx_txn_abort(txn);
-
     if (rc == MDBX_NOTFOUND) {
+        mdbx_txn_abort(txn);
         return LMDB_NOT_FOUND;
     }
     if (rc != 0) {
+        mdbx_txn_abort(txn);
         return LMDB_ERROR;
     }
 
-    /* Parse value: expiry:version:username */
+    /* Parse value: expiry:version:username — copy since data points into mmap */
     value_copy = strndup(data.iov_base, data.iov_len);
     if (!value_copy) {
+        mdbx_txn_abort(txn);
         return LMDB_ERROR;
     }
 
@@ -3921,6 +4093,7 @@ int x3_lmdb_session_validate(const char *token, char *username_out, size_t usern
     version_str = strchr(expiry_str, ':');
     if (!version_str) {
         free(value_copy);
+        mdbx_txn_abort(txn);
         return LMDB_ERROR;
     }
     *version_str++ = '\0';
@@ -3928,6 +4101,7 @@ int x3_lmdb_session_validate(const char *token, char *username_out, size_t usern
     username = strchr(version_str, ':');
     if (!username) {
         free(value_copy);
+        mdbx_txn_abort(txn);
         return LMDB_ERROR;
     }
     *username++ = '\0';
@@ -3938,24 +4112,47 @@ int x3_lmdb_session_validate(const char *token, char *username_out, size_t usern
     /* Check if token has expired */
     if (now >= expiry) {
         log_module(MAIN_LOG, LOG_DEBUG, "x3_lmdb: Session token expired for %s", username);
-        /* Delete expired token */
-        x3_lmdb_session_revoke(token);
+        need_delete = 1;
+    }
+
+    /* Check session version (for revoke-all support) — read in same txn */
+    if (!need_delete) {
+        char ver_key_buf[LMDB_KEY_BUFFER_SIZE];
+        MDBX_val ver_key, ver_data;
+
+        snprintf(ver_key_buf, sizeof(ver_key_buf), "%s%s", LMDB_PREFIX_SESSVER, username);
+        ver_key.iov_len = strlen(ver_key_buf);
+        ver_key.iov_base = ver_key_buf;
+
+        rc = mdbx_get(txn, dbi_metadata, &ver_key, &ver_data);
+        if (rc == 0) {
+            current_version = (unsigned int)strtoul(ver_data.iov_base, NULL, 10);
+        }
+
+        if (stored_version < current_version) {
+            log_module(MAIN_LOG, LOG_DEBUG, "x3_lmdb: Session token version mismatch for %s (%u < %u)",
+                       username, stored_version, current_version);
+            need_delete = 1;
+        }
+    }
+
+    /* If token is invalid, promote to write and delete it atomically */
+    if (need_delete) {
+        rc = mdbx_txn_amend(txn);
+        if (rc == MDBX_SUCCESS || rc == MDBX_RESULT_TRUE) {
+            mdbx_del(txn, dbi_metadata, &key, NULL);
+            mdbx_txn_commit(txn);
+        } else {
+            mdbx_txn_abort(txn);
+        }
         free(value_copy);
         return LMDB_NOT_FOUND;
     }
 
-    /* Check session version (for revoke-all support) */
-    x3_lmdb_session_get_version(username, &current_version);
-    if (stored_version < current_version) {
-        log_module(MAIN_LOG, LOG_DEBUG, "x3_lmdb: Session token version mismatch for %s (%u < %u)",
-                   username, stored_version, current_version);
-        /* Delete revoked token */
-        x3_lmdb_session_revoke(token);
-        free(value_copy);
-        return LMDB_NOT_FOUND;
-    }
+    /* Token is valid — abort read txn */
+    mdbx_txn_abort(txn);
 
-    /* Token is valid - copy username if requested */
+    /* Copy username if requested */
     if (username_out && username_size > 0) {
         strncpy(username_out, username, username_size - 1);
         username_out[username_size - 1] = '\0';
@@ -4006,23 +4203,47 @@ int x3_lmdb_session_revoke_all(const char *username)
         return LMDB_ERROR;
     }
 
-    /* Get current version and increment */
-    x3_lmdb_session_get_version(username, &version);
-    version++;
-
     /* Build key: sessver:<username> */
     snprintf(lmdb_key, sizeof(lmdb_key), "%s%s", LMDB_PREFIX_SESSVER, username);
-    snprintf(version_str, sizeof(version_str), "%u", version);
 
-    /* Start write transaction */
-    rc = mdbx_txn_begin(lmdb_env, NULL, 0, &txn);
+    /* Start as read transaction to atomically read-then-write */
+    rc = mdbx_txn_begin(lmdb_env, NULL, MDBX_TXN_RDONLY, &txn);
     if (rc != 0) {
         return LMDB_ERROR;
     }
 
-    /* Store new version */
     key.iov_len = strlen(lmdb_key);
     key.iov_base = lmdb_key;
+
+    /* Read current version */
+    rc = mdbx_get(txn, dbi_metadata, &key, &data);
+    if (rc == 0) {
+        version = (unsigned int)strtoul(data.iov_base, NULL, 10);
+    } else if (rc != MDBX_NOTFOUND) {
+        mdbx_txn_abort(txn);
+        return LMDB_ERROR;
+    }
+
+    /* Promote to write transaction on same MVCC snapshot */
+    rc = mdbx_txn_amend(txn);
+    if (rc == MDBX_RESULT_TRUE) {
+        /* Snapshot advanced — re-read to get current version */
+        rc = mdbx_get(txn, dbi_metadata, &key, &data);
+        if (rc == 0) {
+            version = (unsigned int)strtoul(data.iov_base, NULL, 10);
+        } else if (rc != MDBX_NOTFOUND) {
+            mdbx_txn_abort(txn);
+            return LMDB_ERROR;
+        }
+    } else if (rc != MDBX_SUCCESS) {
+        mdbx_txn_abort(txn);
+        return LMDB_ERROR;
+    }
+
+    /* Increment and store new version */
+    version++;
+    snprintf(version_str, sizeof(version_str), "%u", version);
+
     data.iov_len = strlen(version_str) + 1;
     data.iov_base = version_str;
 
@@ -4067,7 +4288,7 @@ int x3_lmdb_session_get_version(const char *username, unsigned int *version_out)
     key.iov_len = strlen(lmdb_key);
     key.iov_base = lmdb_key;
 
-    rc = mdbx_get(txn, dbi_metadata, &key, &data);
+    rc = lmdb_cached_get(txn, dbi_metadata, &key, &data);
     mdbx_txn_abort(txn);
 
     if (rc == MDBX_NOTFOUND) {
@@ -4947,6 +5168,8 @@ int x3_lmdb_scram_revoke_all(const char *username)
     size_t resume_key_len = 0;
     int has_resume = 0;
 
+    MDBX_txn *read_txn = NULL;
+
     for (;;) {
         MDBX_txn *txn;
         MDBX_cursor *cursor;
@@ -4955,9 +5178,14 @@ int x3_lmdb_scram_revoke_all(const char *username)
         int rc;
 
         /* Phase 1: Read transaction — find matching keys */
-        rc = mdbx_txn_begin(lmdb_env, NULL, MDBX_TXN_RDONLY, &txn);
-        if (rc != 0)
-            break;
+        if (read_txn) {
+            txn = read_txn;
+            read_txn = NULL;
+        } else {
+            rc = mdbx_txn_begin(lmdb_env, NULL, MDBX_TXN_RDONLY, &txn);
+            if (rc != 0)
+                break;
+        }
 
         rc = mdbx_cursor_open(txn, dbi_metadata, &cursor);
         if (rc != 0) {
@@ -5036,11 +5264,20 @@ int x3_lmdb_scram_revoke_all(const char *username)
                 count++;
         }
 
-        mdbx_txn_commit(txn);
+        if (!scan_complete) {
+            rc = mdbx_txn_commit_embark_read(txn, &read_txn);
+            if (rc != MDBX_SUCCESS)
+                read_txn = NULL;
+        } else {
+            mdbx_txn_commit(txn);
+        }
 
         if (scan_complete)
             break;
     }
+
+    if (read_txn)
+        mdbx_txn_abort(read_txn);
 
     free(key_batch);
     free(key_lens);
@@ -5348,7 +5585,7 @@ int x3_lmdb_scram_acct_get(const char *account, enum scram_hash_type hash_type,
     key.iov_len = strlen(lmdb_key);
     key.iov_base = lmdb_key;
 
-    rc = mdbx_get(txn, dbi_metadata, &key, &data);
+    rc = lmdb_cached_get(txn, dbi_metadata, &key, &data);
     if (rc == MDBX_NOTFOUND) {
         mdbx_txn_abort(txn);
         return LMDB_NOT_FOUND;

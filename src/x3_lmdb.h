@@ -755,6 +755,14 @@ const struct lmdb_purge_stats *x3_lmdb_get_purge_stats(void);
  */
 void x3_lmdb_set_purge_interval(unsigned int interval_secs);
 
+/**
+ * Get B-tree cache statistics.
+ * @param hits_out Pointer to receive hit count (may be NULL)
+ * @param misses_out Pointer to receive miss count (may be NULL)
+ * @param slots_out Pointer to receive configured slot count (may be NULL)
+ */
+void x3_lmdb_get_cache_stats(unsigned long *hits_out, unsigned long *misses_out, unsigned int *slots_out);
+
 /* ========== Session Token API ========== */
 
 /* Session token TTL (24 hours) */
