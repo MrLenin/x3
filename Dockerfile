@@ -20,35 +20,33 @@ RUN autoreconf -fi && ./configure --prefix=/usr && make -j$(nproc) && make insta
 FROM base AS build-libmdbx
 COPY --from=libmdbx . /tmp/libmdbx
 WORKDIR /tmp/libmdbx
-RUN cmake -B build -DCMAKE_INSTALL_PREFIX=/usr -DMDBX_BUILD_TOOLS=OFF \
-      -DMDBX_BUILD_CXX=OFF && \
+RUN cmake -B build -DCMAKE_INSTALL_PREFIX=/usr \
+      -DCMAKE_INSTALL_LIBDIR=lib \
+      -DMDBX_BUILD_TOOLS=OFF -DMDBX_BUILD_CXX=OFF && \
     cmake --build build -j$(nproc) && cmake --install build
 
 # --- Merge libraries into base ---
 
 FROM base AS libs
 COPY --from=build-libkc /usr/lib/libkc* /usr/lib/
-COPY --from=build-libkc /usr/include/kc* /usr/include/
+COPY --from=build-libkc /usr/include/kc/ /usr/include/kc/
 COPY --from=build-libmdbx /usr/lib/libmdbx* /usr/lib/
 COPY --from=build-libmdbx /usr/include/mdbx.h /usr/include/
 RUN ldconfig
 
-# --- Configure stage: only invalidated by autotools input changes ---
+# --- Build stage ---
 
-FROM libs AS configure
+FROM libs AS build
 
-RUN mkdir -p /x3/x3src/src /x3/x3src/rx
+RUN mkdir -p /x3/x3src
 WORKDIR /x3/x3src
 
 # Disable glibc C23 features to avoid __isoc23_strtol linker errors on Debian 12
 ENV CFLAGS="-D__USE_ISOC23=0 -g -O2 -fno-omit-frame-pointer"
 ENV CPPFLAGS="-D__USE_ISOC23=0"
 
-# Copy only autotools inputs — source changes won't bust this cache
-COPY configure.in aclocal.m4 ./
-COPY Makefile.in Makefile.am ./
-COPY src/Makefile.in src/Makefile.am src/config.h.in ./src/
-COPY rx/Makefile.in rx/Makefile.am ./rx/
+# Copy full source tree
+COPY . /x3/x3src
 
 # Regenerate configure script from configure.in (needed for --with-mdbx support)
 RUN autoconf && autoheader
@@ -60,17 +58,14 @@ RUN ./configure --prefix=/x3 \
       CFLAGS="-D__USE_ISOC23=0 -g -O2 -fno-omit-frame-pointer" \
       CPPFLAGS="-D__USE_ISOC23=0"
 
-# --- Build stage: ccache makes incremental rebuilds fast ---
-
-FROM configure AS build
-
-# Copy all remaining source (this layer busts on any .c/.h change)
-COPY . /x3/x3src
-
 # ccache via BuildKit cache mount — persists across docker builds
 ENV PATH="/usr/lib/ccache:${PATH}"
+# Build src/ first with parallelism, then run top-level make which copies
+# the binary. Top-level Makefile has a race: `all: x3` and `x3: src/x3`
+# compete with `all: all-recursive` under -j, failing because src/x3
+# doesn't exist yet when the top-level rule runs.
 RUN --mount=type=cache,target=/root/.ccache \
-    make -j$(nproc)
+    make -C src -j$(nproc) && make
 RUN make install
 
 # --- Runtime stage ---

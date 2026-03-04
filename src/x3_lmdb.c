@@ -3446,7 +3446,8 @@ static unsigned long purge_metadata_db(MDBX_dbi dbi, const char *db_name)
 
         if (!scan_complete) {
             /* Commit write and immediately start read for next batch */
-            rc = mdbx_txn_commit_embark_read(txn, &read_txn);
+            rc = mdbx_txn_commit_embark_read(&txn, NULL);
+            read_txn = txn;
         } else {
             rc = mdbx_txn_commit(txn);
         }
@@ -3604,7 +3605,8 @@ static unsigned long purge_activity_entries(void)
         }
 
         if (!scan_complete) {
-            rc = mdbx_txn_commit_embark_read(txn, &read_txn);
+            rc = mdbx_txn_commit_embark_read(&txn, NULL);
+            read_txn = txn;
         } else {
             rc = mdbx_txn_commit(txn);
         }
@@ -3755,7 +3757,8 @@ static unsigned long purge_fingerprint_entries(void)
         }
 
         if (!scan_complete) {
-            rc = mdbx_txn_commit_embark_read(txn, &read_txn);
+            rc = mdbx_txn_commit_embark_read(&txn, NULL);
+            read_txn = txn;
         } else {
             rc = mdbx_txn_commit(txn);
         }
@@ -3978,7 +3981,13 @@ int x3_lmdb_session_create(const char *username, char *token_out, size_t token_s
         }
 
         /* Promote to write transaction on same MVCC snapshot */
-        rc = mdbx_txn_amend(txn);
+        {
+            MDBX_txn *write_txn = NULL;
+            rc = mdbx_txn_amend(txn, &write_txn, 0, NULL);
+            if (rc == MDBX_SUCCESS || rc == MDBX_RESULT_TRUE) {
+                txn = write_txn;
+            }
+        }
         if (rc == MDBX_RESULT_TRUE) {
             /* Snapshot advanced — re-read version */
             rc = mdbx_get(txn, dbi_metadata, &ver_key, &ver_data);
@@ -4138,10 +4147,11 @@ int x3_lmdb_session_validate(const char *token, char *username_out, size_t usern
 
     /* If token is invalid, promote to write and delete it atomically */
     if (need_delete) {
-        rc = mdbx_txn_amend(txn);
+        MDBX_txn *write_txn = NULL;
+        rc = mdbx_txn_amend(txn, &write_txn, 0, NULL);
         if (rc == MDBX_SUCCESS || rc == MDBX_RESULT_TRUE) {
-            mdbx_del(txn, dbi_metadata, &key, NULL);
-            mdbx_txn_commit(txn);
+            mdbx_del(write_txn, dbi_metadata, &key, NULL);
+            mdbx_txn_commit(write_txn);
         } else {
             mdbx_txn_abort(txn);
         }
@@ -4225,7 +4235,13 @@ int x3_lmdb_session_revoke_all(const char *username)
     }
 
     /* Promote to write transaction on same MVCC snapshot */
-    rc = mdbx_txn_amend(txn);
+    {
+        MDBX_txn *write_txn = NULL;
+        rc = mdbx_txn_amend(txn, &write_txn, 0, NULL);
+        if (rc == MDBX_SUCCESS || rc == MDBX_RESULT_TRUE) {
+            txn = write_txn;
+        }
+    }
     if (rc == MDBX_RESULT_TRUE) {
         /* Snapshot advanced — re-read to get current version */
         rc = mdbx_get(txn, dbi_metadata, &key, &data);
@@ -5265,7 +5281,8 @@ int x3_lmdb_scram_revoke_all(const char *username)
         }
 
         if (!scan_complete) {
-            rc = mdbx_txn_commit_embark_read(txn, &read_txn);
+            rc = mdbx_txn_commit_embark_read(&txn, NULL);
+            read_txn = txn;
             if (rc != MDBX_SUCCESS)
                 read_txn = NULL;
         } else {
