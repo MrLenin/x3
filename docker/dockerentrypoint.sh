@@ -60,6 +60,8 @@ else
     : "${X3_OFF_CHANNEL:=no}"
     : "${X3_MAX_OWNED:=2}"
     : "${X3_MAX_CHAN_USERS:=512}"
+    # evilnet/channel-relocate: must mirror the ircd's RELOCATE_GRACE feature.
+    : "${X3_RELOCATE_GRACE:=900}"
     # Value is a conf list body: each channel stays individually quoted.
     : "${X3_SUPPORT_CHANNEL:=\"#Operations\", \"#Help\"}"
     : "${X3_GLOBAL_NICK:=Global}"
