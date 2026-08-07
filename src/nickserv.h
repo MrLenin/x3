@@ -105,6 +105,12 @@ struct handle_info {
     char *infoline;
     char *handle;
     char *fakehost;
+    /* Directory identity key (entryUUID) this handle was bound to, or NULL for
+     * handles that predate identity binding. The handle NAME is a reusable
+     * label; this is what actually identifies the account. See
+     * nickserv_verify_ldap_identity().
+     */
+    char *ldap_uuid;
     time_t registered;
     time_t lastseen;
     int karma;
@@ -210,6 +216,7 @@ struct nickserv_config {
     const char *ldap_field_account;
     const char *ldap_field_password;
     const char *ldap_field_email;
+    const char *ldap_field_uuid;
     const char *ldap_field_oslevel;
     struct string_list *ldap_object_classes;
     const char *ldap_oper_group_dn;

@@ -136,7 +136,11 @@ unsigned int ldap_check_auth( const char *account, const char *pass)
 
 }
 
-int ldap_search_user(const char *account, LDAPMessage **entry)
+/* attrs: NULL requests the default set (all user attributes). Operational
+ * attributes such as entryUUID are NOT in that set and must be named
+ * explicitly, so callers that want one pass their own list.
+ */
+int ldap_search_user(const char *account, char **attrs, LDAPMessage **entry)
 {
 
    char filter[MAXLEN+1];
@@ -157,7 +161,7 @@ int ldap_search_user(const char *account, LDAPMessage **entry)
        return rc;
     }
    //if( (rc = ldap_search_st(ld, nickserv_conf.ldap_base, LDAP_SCOPE_ONELEVEL, filter, NULL, 0, &timeout, &res)) != LDAP_SUCCESS) {
-   if( (rc = ldap_search_st(ld, nickserv_conf.ldap_base, LDAP_SCOPE_SUBTREE, filter, NULL, 0, &timeout, &res)) != LDAP_SUCCESS) {
+   if( (rc = ldap_search_st(ld, nickserv_conf.ldap_base, LDAP_SCOPE_SUBTREE, filter, attrs, 0, &timeout, &res)) != LDAP_SUCCESS) {
        log_module(MAIN_LOG, LOG_ERROR, "search failed: %s   %s: %s", nickserv_conf.ldap_base, filter, ldap_err2string(rc));
        return(rc);
    }
@@ -185,7 +189,7 @@ int ldap_get_user_info(const char *account, char **email)
     LDAPMessage *entry, *res;
     if(email)
       *email = NULL;
-    if( (rc = ldap_search_user(account, &res)) == LDAP_SUCCESS) {
+    if( (rc = ldap_search_user(account, NULL, &res)) == LDAP_SUCCESS) {
         entry = ldap_first_entry(ld, res);
         value = ldap_get_values_len(ld, entry, nickserv_conf.ldap_field_email);
         if(!value) {
@@ -203,6 +207,50 @@ int ldap_get_user_info(const char *account, char **email)
         */
     }
     return(rc);
+}
+
+/* Fetch the directory's immutable identity key for account (entryUUID, or
+ * whatever ldap_field_uuid names -- objectGUID on AD).
+ *
+ * This is the key that distinguishes "the same account, renamed" from "a
+ * different account that happens to have taken the same name": a modrdn
+ * preserves it, a delete-and-recreate mints a new one.
+ *
+ * Returns LDAP_SUCCESS with *uuid allocated, LDAP_NO_SUCH_ATTRIBUTE if the
+ * entry exists but carries no such attribute, or the search's error code.
+ * Callers MUST distinguish those: an absent attribute means the directory
+ * cannot support identity binding (operator error), while a mismatch means
+ * the name has been reused by someone else.
+ */
+int ldap_get_user_uuid(const char *account, char **uuid)
+{
+    int rc;
+    struct berval **value;
+    char *attrs[] = { NULL, NULL };
+    LDAPMessage *entry, *res;
+
+    if(uuid)
+      *uuid = NULL;
+    if(!(nickserv_conf.ldap_field_uuid && *nickserv_conf.ldap_field_uuid))
+      return LDAP_NO_SUCH_ATTRIBUTE;
+
+    /* entryUUID is operational; it is only returned when named explicitly. */
+    attrs[0] = (char *) nickserv_conf.ldap_field_uuid;
+
+    if( (rc = ldap_search_user(account, attrs, &res)) != LDAP_SUCCESS)
+        return(rc);
+
+    entry = ldap_first_entry(ld, res);
+    value = ldap_get_values_len(ld, entry, nickserv_conf.ldap_field_uuid);
+    if(!value || !value[0]) {
+        if(value)
+          ldap_value_free_len(value);
+        return(LDAP_NO_SUCH_ATTRIBUTE);
+    }
+    if(uuid)
+      *uuid = strdup(value[0]->bv_val);
+    ldap_value_free_len(value);
+    return(LDAP_SUCCESS);
 }
 
    /*
@@ -689,7 +737,7 @@ int ldap_user_exists(const char *account)
   int rc;
   LDAPMessage *res;
 
-  rc = ldap_search_user(account, &res);
+  rc = ldap_search_user(account, NULL, &res);
 
   return rc;
 }

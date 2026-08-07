@@ -281,6 +281,11 @@
         //"ldap_field_password" "userPassword";
         //"ldap_field_email" "mail";
         //"ldap_field_oslevel" "X3AccountLevel";
+        // Immutable per-entry identity key, used to detect account-name reuse:
+        // a rename preserves it, a delete-and-recreate does not. Without it an
+        // account deleted in the directory leaves its handle (and its channel
+        // access and oper level) available to whoever registers the name next.
+        //"ldap_field_uuid" "entryUUID";   // objectGUID on Active Directory
         //"ldap_filter" "(objectClass=inetOrgPerson)"; // LDAP search filter for finding users
         ////      NOTE: X3AccountLevel is a custom LDAP attribute
         ////      that LDAP servers will not know by default. A custom

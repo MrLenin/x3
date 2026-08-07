@@ -121,6 +121,7 @@ else
     : "${X3_LDAP_FIELD_PASSWORD:=userPassword}"
     : "${X3_LDAP_FIELD_EMAIL:=mail}"
     : "${X3_LDAP_FIELD_OSLEVEL:=X3AccountLevel}"
+    : "${X3_LDAP_FIELD_UUID:=entryUUID}"
     : "${X3_LDAP_FILTER:=(objectClass=inetOrgPerson)}"
     : "${X3_LDAP_AUTOCREATE:=1}"
     : "${X3_LDAP_TIMEOUT:=10}"
