@@ -3617,6 +3617,8 @@ mod_chanmode_parse(struct chanNode *channel, char **modes, unsigned int argc, un
         case 'a': do_chan_mode(MODE_ADMINSONLY); break;
         case 'Z': do_chan_mode(MODE_SSLONLY); break;
 	case 'L': do_chan_mode(MODE_HIDEMODE); break;
+	case 'H': do_chan_mode(MODE_PUBLICHISTORY); break;
+	case 'P': do_chan_mode(MODE_NOSTORAGE); break;
 	case 'z':
 	  if (!(flags & MCP_REGISTERED)) {
               do_chan_mode(MODE_REGISTERED);
@@ -3853,6 +3855,8 @@ mod_chanmode_announce(struct userNode *who, struct chanNode *channel, struct mod
         DO_MODE_CHAR(REGISTERED, 'z');
         DO_MODE_CHAR(SSLONLY, 'Z');
 	DO_MODE_CHAR(HIDEMODE, 'L');
+	DO_MODE_CHAR(PUBLICHISTORY, 'H');
+	DO_MODE_CHAR(NOSTORAGE, 'P');
 #undef DO_MODE_CHAR
         if (change->modes_clear & channel->modes & MODE_KEY)
             mod_chanmode_append(&chbuf, 'k', channel->key);
@@ -3910,6 +3914,8 @@ mod_chanmode_announce(struct userNode *who, struct chanNode *channel, struct mod
         DO_MODE_CHAR(REGISTERED, 'z');
         DO_MODE_CHAR(SSLONLY, 'Z');
 	DO_MODE_CHAR(HIDEMODE, 'L');
+	DO_MODE_CHAR(PUBLICHISTORY, 'H');
+	DO_MODE_CHAR(NOSTORAGE, 'P');
 #undef DO_MODE_CHAR
         if(change->modes_set & MODE_KEY)
             mod_chanmode_append(&chbuf, 'k', change->new_key);
@@ -3986,6 +3992,8 @@ mod_chanmode_format(struct mod_chanmode *change, char *outbuff)
         DO_MODE_CHAR(REGISTERED, 'z');
         DO_MODE_CHAR(SSLONLY, 'Z');
 	DO_MODE_CHAR(HIDEMODE, 'L');
+	DO_MODE_CHAR(PUBLICHISTORY, 'H');
+	DO_MODE_CHAR(NOSTORAGE, 'P');
 #undef DO_MODE_CHAR
     }
     if (change->modes_set) {
@@ -4011,6 +4019,8 @@ mod_chanmode_format(struct mod_chanmode *change, char *outbuff)
         DO_MODE_CHAR(REGISTERED, 'z');
         DO_MODE_CHAR(SSLONLY, 'Z');
 	DO_MODE_CHAR(HIDEMODE, 'L');
+	DO_MODE_CHAR(PUBLICHISTORY, 'H');
+	DO_MODE_CHAR(NOSTORAGE, 'P');
 
 	DO_MODE_CHAR(KEY, 'k');
 	DO_MODE_CHAR(LIMIT, 'l');
@@ -4077,6 +4087,8 @@ clear_chanmode(struct chanNode *channel, const char *modes)
         case 'z': cleared |= MODE_REGISTERED; break;
         case 'Z': cleared |= MODE_SSLONLY; break;
 	case 'L': cleared |= MODE_HIDEMODE; break;
+	case 'H': cleared |= MODE_PUBLICHISTORY; break;
+	case 'P': cleared |= MODE_NOSTORAGE; break;
         }
     }
 
