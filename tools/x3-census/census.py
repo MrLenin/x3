@@ -155,6 +155,10 @@ def main():
 
     oper_no_kc = flagged(no_kc, lambda r: r.get("opserv_level"))
     cert_no_kc = flagged(no_kc, lambda r: r.get("sslfp_count"))
+    # A database from an X3 that never ran the ldap_uuid binding -- production,
+    # as of 2026-09 -- carries no stored identities at all. Then the mismatch
+    # count is not "0 reused names", it is "cannot tell", and must say so.
+    have_identities = any(h.get("ldap_uuid") for h in handles)
 
     print("=" * 66)
     print("X3 -> Keycloak account census (READ ONLY)")
@@ -163,17 +167,24 @@ def main():
         ("X3 handles in saxdb", len(handles)),
         ("resolved to a Keycloak user", len(resolved)),
         ("  seedable (Keycloak id, no identity conflict)", len(seedable)),
-        ("  IDENTITY MISMATCH (stored ldap_uuid != LDAP_ID)", len(uuid_mismatch)),
+        ("  IDENTITY MISMATCH (stored ldap_uuid != LDAP_ID)",
+         len(uuid_mismatch) if have_identities else None),
         ("NO Keycloak user", len(no_kc)),
         ("  blank password -> deleted from directory: DISPOSE", len(no_kc_blank)),
         ("  password set   -> break-glass OR deleted: HOLD", len(no_kc_hash)),
         ("    ...of which carry an oper level  (LOOK FIRST)", len(oper_no_kc)),
-        ("    ...of which have a certificate fingerprint", len(cert_no_kc)),
+        ("    ...of which have a certificate fingerprint", len(cert_no_kc)),  # informational
         ("dates step 1 would still save", len(dates_saved)),
         ("Keycloak users with no X3 handle", kc_only),
         ("Keycloak usernames colliding under X3's fold", len(collisions)),
     ]:
-        print("%-52s %6d" % (label, n))
+        if n is None:
+            print("%-52s %6s" % (label, "n/a"))
+        else:
+            print("%-52s %6d" % (label, n))
+    if not have_identities:
+        print("\n  n/a: no handle in this database carries a stored identity (ldap_uuid),\n"
+              "  so name reuse cannot be detected here -- the count is unknown, not zero.")
 
     def show(title, rows, note=None):
         if not rows:

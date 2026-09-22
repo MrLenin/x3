@@ -6,7 +6,7 @@ It answers what the account-identity work needs to know about a network:
 
 - which handles have **no Keycloak user**, and of those, which were deleted from the
   directory (safe to dispose) and which might be **break-glass** accounts (hold);
-- which of those carry an **oper level** or a **certificate fingerprint**;
+- which of those carry an **oper level** (the likeliest break-glass or admin account);
 - how many handles have a Keycloak id to **seed** for the wire-carried identity, optionally
   writing that map out.
 
@@ -61,11 +61,11 @@ when done; the `.gitignore` already refuses to commit it.
 | Row | Meaning | Action |
 |---|---|---|
 | `seedable` | resolves to a Keycloak user with no identity conflict | candidate for the identity seed (`--map-out`) |
-| `IDENTITY MISMATCH` | stored `ldap_uuid` disagrees with the live `LDAP_ID`: the name now belongs to a different principal | never seed; investigate |
+| `IDENTITY MISMATCH` | stored `ldap_uuid` disagrees with the live `LDAP_ID`: the name now belongs to a different principal | never seed; investigate. **Prints `n/a` on a database with no stored identities — production never ran the `ldap_uuid` binding, so there it means *cannot tell*, not *none*.** |
 | `blank password -> ... DISPOSE` | no Keycloak user, and X3 never saw a password — it was created from the directory, which has since deleted it | disposal candidate |
 | `password set -> ... HOLD` | no Keycloak user, but X3 holds a password: a break-glass account **or** a deleted one, and nothing in the data separates them | hold; never dispose blindly |
 | `...of which carry an oper level` | the highest-value case | **look at these first** |
-| `...of which have a certificate fingerprint` | break-glass accounts are certificate-based, so this is the strongest break-glass signal | protect, don't dispose |
+| `...of which have a certificate fingerprint` | informational. **Not a break-glass signal today:** certificate-based break-glass is the planned design, not current practice, so an existing break-glass account would carry a password and appear under HOLD | protect, don't dispose |
 | `dates step 1 would still save` | saxdb's registration date still differs from the directory's, so it survives if the LDAP-backfill fix deploys before the owner next logs in | informational |
 | `usernames colliding under X3's fold` | Keycloak names that X3 would treat as one handle | investigate |
 
