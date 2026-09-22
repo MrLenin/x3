@@ -2,12 +2,19 @@
 
 Read-only census of X3 saxdb handles joined against Keycloak.
 
-Reports what seeding the `account_created_at` attribute would do, and enumerates
-**stranded handles** — handles with no backing Keycloak user, the latent name-reuse
-takeover class.
+It answers what the account-identity work needs to know about a network:
 
-**It writes nothing.** Not to saxdb, not to LDAP, not to Keycloak. Safe to run against
+- which handles have **no Keycloak user**, and of those, which were deleted from the
+  directory (safe to dispose) and which might be **break-glass** accounts (hold);
+- which of those carry an **oper level** or a **certificate fingerprint**;
+- how many handles have a Keycloak id to **seed** for the wire-carried identity, optionally
+  writing that map out.
+
+**It writes nothing** — not to saxdb, not to LDAP, not to Keycloak. Safe to run against
 production.
+
+Background: `.claude/para/projects/account-timestamp-authority-2026-09.md` in the testnet
+repo, sections F, I and J.
 
 ## Build
 
@@ -23,45 +30,65 @@ cd tools/x3-census && make
 ## Run
 
 ```sh
-# 1. dump handles from a COPY of the database (never the live file)
+# 1. dump handles from a COPY of the database -- never the live file
 cp /path/to/x3.db ./x3.db
 ./x3dump x3.db > handles.json
 
-# 2. join against Keycloak
+# 2. join against Keycloak (password from the environment, or you are prompted)
+export KC_ADMIN_PASSWORD='...'
 python3 census.py handles.json \
     --base https://keycloak.example.net \
     --realm <realm> \
-    --password '<admin password>'
+    [--map-out seedmap.json]
 ```
 
 `--user` defaults to `admin`, `--admin-realm` to `master`. Python 3.8+, stdlib only.
 
+The password is **never** accepted on the command line, where it would land in shell
+history and the process list.
+
+## Handle the database copy as secret material
+
+X3 stores **unsalted md5 of real passwords** in saxdb — the same hash it writes to LDAP at
+registration. A copy of `x3.db` is therefore a set of crackable password hashes. Delete it
+when done; the `.gitignore` already refuses to commit it.
+
+`x3dump` itself never emits a hash. It reports only whether one is present
+(`has_passwd`), because that is all the census needs.
+
 ## Reading the output
 
-| Row | Meaning |
-|---|---|
-| `STRANDED (no KC user)` | handle with no Keycloak account — inheritable by whoever registers the name next |
-| `UUID MISMATCH` | stored `ldap_uuid` disagrees with the live `LDAP_ID`; the name was taken by a different principal |
-| `RESCUABLE` | saxdb still differs from the directory, so the lazy backfill has not reached this handle — seeding now preserves its original date |
-| `would write account_created_at` | rows a seeding run would touch |
-| `Keycloak users with no X3 handle` | the inverse: KC-only accounts |
+| Row | Meaning | Action |
+|---|---|---|
+| `seedable` | resolves to a Keycloak user with no identity conflict | candidate for the identity seed (`--map-out`) |
+| `IDENTITY MISMATCH` | stored `ldap_uuid` disagrees with the live `LDAP_ID`: the name now belongs to a different principal | never seed; investigate |
+| `blank password -> ... DISPOSE` | no Keycloak user, and X3 never saw a password — it was created from the directory, which has since deleted it | disposal candidate |
+| `password set -> ... HOLD` | no Keycloak user, but X3 holds a password: a break-glass account **or** a deleted one, and nothing in the data separates them | hold; never dispose blindly |
+| `...of which carry an oper level` | the highest-value case | **look at these first** |
+| `...of which have a certificate fingerprint` | break-glass accounts are certificate-based, so this is the strongest break-glass signal | protect, don't dispose |
+| `dates step 1 would still save` | saxdb's registration date still differs from the directory's, so it survives if the LDAP-backfill fix deploys before the owner next logs in | informational |
+| `usernames colliding under X3's fold` | Keycloak names that X3 would treat as one handle | investigate |
 
-**A row can be both RESCUABLE and UUID MISMATCH**, and those demand opposite actions —
-the mismatch means a different principal holds the name, so its old date must *not* be
-preserved. Such rows are flagged inline and must never be seeded.
+"Blank means X3 never saw the password" is exact, not a heuristic: autocreate registers
+with a NULL password, and an unredeemed activation cookie blanks it. A failed LDAP add
+never produces a blank handle — it produces no handle at all.
 
-Where no `ldap_uuid` is stored (all of production, as of 2026-09), RESCUABLE rows are
-**ambiguous** between "same principal, directory entry recreated" and "different principal
-took the name". Nothing in the data separates them. Treat the RESCUABLE list as a review
-set, not as an action list.
+Handles flagged `SUSPENDED` or `NODELETE` are marked in the lists.
 
-## Gotcha
+## Name matching
 
-`x3dump` calls `tools_init()` before `parse_database()`. It must. `irccasecmp()` folds
+The join folds names exactly as X3's `irccasecmp()` does under P10: ASCII case, RFC 1459's
+`[]\^` onto `{|}~`, and the Latin-1 upper ranges. Verified byte for byte against X3's own
+folding table. Plain lower-casing would treat `foo[` and `foo{` as different names when X3
+treats them as the same handle.
+
+## Gotchas
+
+**`x3dump` calls `tools_init()` before `parse_database()`, and must.** `irccasecmp()` folds
 through a static table that `tools_init()` populates; uninitialised, every byte maps to
-`'\0'`, every dict key compares equal, and **the database silently collapses to a single
-entry** — no error, just a wrong answer.
+`'\0'`, every dict key compares equal, and the database silently collapses to a single
+entry — no error, just a wrong answer.
 
-## Background
-
-`.claude/para/projects/account-timestamp-authority-2026-09.md` in the testnet repo.
+**An X3 that does not know a saxdb key erases it on the next write.** If the database came
+from an X3 build older than the one that introduced a key (such as `ldap_uuid`), that key
+will be absent here even though it once existed.

@@ -6,3 +6,6 @@ x3dump
 x3.db
 *.db
 handles.json
+
+# python bytecode from importing census.py
+__pycache__/

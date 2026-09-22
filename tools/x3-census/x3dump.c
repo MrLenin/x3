@@ -1,7 +1,14 @@
 /* x3dump — dump X3 saxdb NickServ handles as JSON, using X3's own recdb parser.
  * Exact by construction: no hand-rolled parsing of quoting, nested blocks or lists.
  *
- * Emits one JSON object per handle: handle, register, lastseen, ldap_uuid, opserv_level.
+ * Emits one JSON object per handle: handle, register, lastseen, ldap_uuid,
+ * opserv_level, flags, has_passwd, sslfp_count.
+ *
+ * It deliberately never emits the password hash itself -- only whether one is
+ * stored. X3 keeps unsalted md5 of real passwords in saxdb (the same hash it
+ * writes to LDAP at registration), so the hash is crackable and must not end
+ * up in a JSON file that gets copied around. Blank vs present is all the
+ * census needs: blank means X3 never saw the password.
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -81,7 +88,9 @@ int main(int argc, char *argv[])
     for (it = dict_first(ns); it; it = iter_next(it)) {
         struct record_data *rd = iter_data(it);
         dict_t h = GET_RECORD_OBJECT(rd);
-        const char *reg, *seen, *uuid, *osl;
+        const char *reg, *seen, *uuid, *osl, *flags, *pw;
+        struct record_data *fp_rd;
+        struct string_list *fps;
 
         if (!h) continue;                       /* not a handle object */
 
@@ -89,6 +98,10 @@ int main(int argc, char *argv[])
         seen = qs(h, "lastseen");
         uuid = qs(h, "ldap_uuid");
         osl  = qs(h, "opserv_level");
+        flags = qs(h, "flags");
+        pw   = qs(h, "passwd");
+        fp_rd = dict_find(h, "sslfps", NULL);
+        fps  = fp_rd ? GET_RECORD_STRING_LIST(fp_rd) : NULL;
 
         if (!first) puts(",");
         first = 0;
@@ -103,6 +116,11 @@ int main(int argc, char *argv[])
         if (uuid) json_str(uuid); else fputs("null", stdout);
         fputs(", \"opserv_level\": ", stdout);
         printf("%s", osl ? osl : "null");
+        fputs(", \"flags\": ", stdout);
+        json_str(flags ? flags : "");
+        /* presence only -- never the hash (see header) */
+        printf(", \"has_passwd\": %s", (pw && *pw) ? "true" : "false");
+        printf(", \"sslfp_count\": %u", fps ? fps->used : 0u);
         fputs("}", stdout);
     }
     puts("\n]");
