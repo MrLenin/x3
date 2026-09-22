@@ -1,0 +1,8 @@
+# build artifacts
+x3dump
+*.o
+
+# never commit a database copy or its dump — they contain password hashes
+x3.db
+*.db
+handles.json
