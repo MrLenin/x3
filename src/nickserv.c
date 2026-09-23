@@ -258,6 +258,7 @@ static const struct message_entry msgtab[] = {
     { "NSMSG_HANDLEINFO_INFOLINE", "Infoline: %s" },
     { "NSMSG_HANDLEINFO_FLAGS", "Flags: %s" },
     { "NSMSG_HANDLEINFO_OPSERV_LEVEL", "Opserv level: %d " },
+    { "NSMSG_HANDLEINFO_KC_ID", "Keycloak ID: %s" },
     { "NSMSG_HANDLEINFO_EPITHET", "Epithet: %s" },
     { "NSMSG_HANDLEINFO_NOTE", "Note (by %s on %s): %s " },
     { "NSMSG_HANDLEINFO_FAKEHOST", "Fake host: %s" },
@@ -1808,6 +1809,9 @@ static NICKSERV_FUNC(cmd_handleinfo)
     } else {
 	reply("NSMSG_HANDLEINFO_FLAGS", nsmsg_none);
     }
+
+    if (hi->kc_id)
+        reply("NSMSG_HANDLEINFO_KC_ID", hi->kc_id);
 
     if (hi->opserv_level > 0) {
         reply("NSMSG_HANDLEINFO_OPSERV_LEVEL", hi->opserv_level);
