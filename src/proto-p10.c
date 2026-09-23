@@ -1715,7 +1715,19 @@ static CMD_FUNC(cmd_account)
             return 1;
         if (!strcmp(argv[2],"M"))
             nickserv_unbind_user(user);
-        call_account_func(user, argv[3]);
+        /* Hand nickserv what the ircd sent, in the burst's form
+         * account[:timestamp[:id]], so the timestamp and anything after it
+         * (the Keycloak id) reach handle_account as they do from +r. */
+        {
+            char stamp[MAXLEN];
+            if (argc > 5)
+                snprintf(stamp, sizeof(stamp), "%s:%s:%s", argv[3], argv[4], argv[5]);
+            else if (argc > 4)
+                snprintf(stamp, sizeof(stamp), "%s:%s", argv[3], argv[4]);
+            else
+                safestrncpy(stamp, argv[3], sizeof(stamp));
+            call_account_func(user, stamp);
+        }
     }
     else if(!strcmp(argv[2],"U"))
     {
