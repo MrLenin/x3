@@ -348,6 +348,9 @@ static const struct message_entry msgtab[] = {
     { "NSMSG_RECLAIM_WARN", "%s is a registered nick - you must auth to account %s or change your nick." },
     { "NSMSG_RECLAIM_HOWTO", "To auth to account %s you must use /msg %s@%s AUTH %s <password>" },
     { "NSMSG_RECLAIM_KILL", "Unauthenticated user of nick." },
+    { "NSMSG_REBIND_CLEARED", "Keycloak id binding cleared for account %s; the next login will adopt one." },
+    { "NSMSG_REBIND_SET", "Keycloak id set for account %s." },
+    { "NSMSG_REBIND_BADID", "Give the account's Keycloak ID -- the UUID from the admin console (e.g. 6ba7b810-9dad-11d1-80b4-00c04fd430c8), or * to clear." },
     { "NSMSG_RECLAIMED_NONE", "You cannot manually reclaim a nick." },
     { "NSMSG_RECLAIMED_WARN", "Sent a request for %s to change their nick." },
     { "NSMSG_RECLAIMED_SVSNICK", "Forcibly changed %s's nick." },
@@ -2016,6 +2019,79 @@ static NICKSERV_FUNC(cmd_nickinfo)
 
     reply("NSMSG_NICKINFO_END");
 
+    return 1;
+}
+
+/* 16 UUID bytes -> 22 unpadded base64url chars.  Mirrors nefarious's
+ * account_id, the form the ircd announces and saxdb stores. */
+static const char kcid_b64[] =
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+static int
+handle_kcid_from_uuid(const char *uuid, char out[23])
+{
+    unsigned char raw[16];
+    int digits = 0, hi = -1, i, o = 0;
+    const char *p;
+
+    if (!uuid)
+        return 0;
+    for (p = uuid; *p; p++) {
+        int v;
+        if (*p == '-')
+            continue;
+        if (*p >= '0' && *p <= '9') v = *p - '0';
+        else if (*p >= 'a' && *p <= 'f') v = *p - 'a' + 10;
+        else if (*p >= 'A' && *p <= 'F') v = *p - 'A' + 10;
+        else return 0;
+        if (digits == 32)
+            return 0;
+        if (hi < 0) hi = v; else { raw[digits/2] = (hi << 4) | v; hi = -1; }
+        digits++;
+    }
+    if (digits != 32)
+        return 0;
+    for (i = 0; i < 16; i += 3) {                 /* last group is 16%3==1 byte */
+        unsigned int n = raw[i] << 16;
+        int bytes = 1;
+        if (i + 1 < 16) { n |= raw[i+1] << 8; bytes = 2; }
+        if (i + 2 < 16) { n |= raw[i+2];      bytes = 3; }
+        out[o++] = kcid_b64[(n >> 18) & 63];
+        out[o++] = kcid_b64[(n >> 12) & 63];
+        if (bytes > 1) out[o++] = kcid_b64[(n >> 6) & 63];
+        if (bytes > 2) out[o++] = kcid_b64[n & 63];
+    }
+    out[o] = 0;
+    return o == 22;
+}
+
+/* REBIND <*account> <keycloak-uuid|*>: set or clear the Keycloak user id
+ * an account is bound to, by hand.  A login that carries a different id
+ * from the stored one resets the account (handle_account), so this is for
+ * correcting a binding before that happens, or clearing one so the next
+ * login adopts whatever it carries.  Not an OSET option on purpose: SEARCH
+ * SET applies OSET options without the outranking check that
+ * get_victim_oper enforces here. */
+static NICKSERV_FUNC(cmd_rebind)
+{
+    struct handle_info *hi;
+    char compact[23];
+
+    NICKSERV_MIN_PARMS(3);
+    if (!(hi = get_victim_oper(user, argv[1])))
+        return 0;
+    if (!strcmp(argv[2], "*")) {
+        free(hi->kc_id);
+        hi->kc_id = NULL;
+        reply("NSMSG_REBIND_CLEARED", hi->handle);
+        return 1;
+    }
+    if (!handle_kcid_from_uuid(argv[2], compact)) {
+        reply("NSMSG_REBIND_BADID");
+        return 0;
+    }
+    free(hi->kc_id);
+    hi->kc_id = strdup(compact);
+    reply("NSMSG_REBIND_SET", hi->handle);
     return 1;
 }
 
@@ -6141,6 +6217,7 @@ init_nickserv(const char *nick)
     nickserv_define_func("ACCOUNTINFO", cmd_handleinfo, -1, 0, 0);
     nickserv_define_func("USERINFO", cmd_userinfo, -1, 1, 0);
     nickserv_define_func("RENAME", cmd_rename_handle, -1, 1, 0);
+    nickserv_define_func("REBIND", cmd_rebind, 0, 1, 0);
     nickserv_define_func("VACATION", cmd_vacation, -1, 1, 0);
     nickserv_define_func("MERGE", cmd_merge, 750, 1, 0);
     if (!nickserv_conf.disable_nicks) {

@@ -596,6 +596,12 @@
         "This command is only accessible to helpers and IRC operators.",
         "$uSee Also:$u merge"
 );
+"REBIND" (
+        "/msg $N REBIND <nick|*account> <keycloak-id|*>",
+        "Sets or clears the Keycloak user id an account is bound to. Use the UUID from the Keycloak admin console, or * to clear the binding so the next login adopts one. A login that carries a different id from the stored one resets the account, so use this to correct a binding beforehand.",
+        "This command is only accessible to IRC operators.",
+        "$uSee Also:$u accountinfo"
+);
 
 "VACATION" (
         "/msg $N VACATION",
