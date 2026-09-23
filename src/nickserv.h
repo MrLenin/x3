@@ -105,6 +105,7 @@ struct handle_info {
     char *infoline;
     char *handle;
     char *fakehost;
+    char *kc_id;    /* Keycloak user id (compact base64url); NULL = unknown */
     time_t registered;
     time_t lastseen;
     int karma;

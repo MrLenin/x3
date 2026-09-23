@@ -117,6 +117,7 @@
 #define KEY_ANNOUNCEMENTS "announcements"
 #define KEY_MAXLOGINS "maxlogins"
 #define KEY_FAKEHOST "fakehost"
+#define KEY_KC_ID "kc_id"
 #define KEY_NOTE_NOTE "note"
 #define KEY_NOTE_SETTER "setter"
 #define KEY_NOTE_DATE "date"
@@ -571,6 +572,7 @@ free_handle_info(void *vhi)
     free(hi->epithet);
     free(hi->note);
     free(hi->fakehost);
+    free(hi->kc_id);
     if (hi->cookie) {
         timeq_del(hi->cookie->expires, nickserv_free_cookie, hi->cookie, 0);
         nickserv_free_cookie(hi->cookie);
@@ -4204,6 +4206,8 @@ nickserv_saxdb_write(struct saxdb_context *ctx) {
         }
         if (hi->infoline)
             saxdb_write_string(ctx, KEY_INFO, hi->infoline);
+        if (hi->kc_id)
+            saxdb_write_string(ctx, KEY_KC_ID, hi->kc_id);
         if (hi->last_quit_host[0])
             saxdb_write_string(ctx, KEY_LAST_QUIT_HOST, hi->last_quit_host);
         saxdb_write_int(ctx, KEY_LAST_SEEN, hi->lastseen);
@@ -4937,6 +4941,9 @@ nickserv_db_read_handle(char *handle, dict_t obj)
     str = database_get_data(obj, KEY_INFO, RECDB_QSTRING);
     if (str)
         hi->infoline = strdup(str);
+    str = database_get_data(obj, KEY_KC_ID, RECDB_QSTRING);
+    if (str)
+        hi->kc_id = strdup(str);
     str = database_get_data(obj, KEY_REGISTER_ON, RECDB_QSTRING);
     hi->registered = str ? (time_t)strtoul(str, NULL, 0) : now;
     str = database_get_data(obj, KEY_LAST_SEEN, RECDB_QSTRING);
