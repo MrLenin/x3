@@ -1705,10 +1705,30 @@ static CMD_FUNC(cmd_account)
         }
         return 1;
     }
-    else if(!strcmp(argv[2],"R"))
-       call_account_func(user, argv[3]);
+    else if(!strcmp(argv[2],"R") || !strcmp(argv[2],"M"))
+    {
+        /* R: the ircd set an account; M: it changed one.  Either way argv[3]
+         * is the account the user has now.  For M, drop the old binding
+         * first, so a name X3 does not know (or refuses) leaves the user
+         * unbound rather than on the previous handle. */
+        if (argc < 4)
+            return 1;
+        if (!strcmp(argv[2],"M"))
+            nickserv_unbind_user(user);
+        call_account_func(user, argv[3]);
+    }
+    else if(!strcmp(argv[2],"U"))
+    {
+        /* The ircd removed the account.  Unbind only: FLAGS_STAMPED stays
+         * set on purpose (one account per session), as after UNREGISTER. */
+        nickserv_unbind_user(user);
+    }
+    else if(!strcmp(argv[2],"A") || !strcmp(argv[2],"D"))
+    {
+        /* Replies to an S/H request, never something to bind. */
+    }
     else
-        call_account_func(user, argv[2]); /* For backward compatability */
+        call_account_func(user, argv[2]); /* legacy AC <user> <account> [ts] */
     return 1;
 }
 
