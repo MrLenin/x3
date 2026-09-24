@@ -106,6 +106,7 @@ struct handle_info {
     char *handle;
     char *fakehost;
     char *kc_id;    /* Keycloak user id (compact base64url); NULL = unknown */
+    char *kc_id_prev; /* the id a reset replaced: announcements carrying it are this name's earlier sessions, not another recreate */
     time_t registered;
     time_t lastseen;
     int karma;

@@ -118,6 +118,7 @@
 #define KEY_MAXLOGINS "maxlogins"
 #define KEY_FAKEHOST "fakehost"
 #define KEY_KC_ID "kc_id"
+#define KEY_KC_ID_PREV "kc_id_prev"
 #define KEY_NOTE_NOTE "note"
 #define KEY_NOTE_SETTER "setter"
 #define KEY_NOTE_DATE "date"
@@ -259,6 +260,7 @@ static const struct message_entry msgtab[] = {
     { "NSMSG_HANDLEINFO_FLAGS", "Flags: %s" },
     { "NSMSG_HANDLEINFO_OPSERV_LEVEL", "Opserv level: %d " },
     { "NSMSG_HANDLEINFO_KC_ID", "Keycloak ID: %s" },
+    { "NSMSG_HANDLEINFO_KC_ID_PREV", "Previous Keycloak ID: %s (replaced by a reset)" },
     { "NSMSG_HANDLEINFO_EPITHET", "Epithet: %s" },
     { "NSMSG_HANDLEINFO_NOTE", "Note (by %s on %s): %s " },
     { "NSMSG_HANDLEINFO_FAKEHOST", "Fake host: %s" },
@@ -351,6 +353,7 @@ static const struct message_entry msgtab[] = {
     { "NSMSG_REBIND_CLEARED", "Keycloak id binding cleared for account %s; the next login will adopt one." },
     { "NSMSG_REBIND_SET", "Keycloak id set for account %s." },
     { "NSMSG_REBIND_BADID", "Give the account's Keycloak ID -- the UUID from the admin console (e.g. 6ba7b810-9dad-11d1-80b4-00c04fd430c8), or * to clear." },
+    { "NSMSG_IDENTITY_RESET", "Account $b%s$b was recreated in Keycloak (id %s, was %s): its data has been reset." },
     { "NSMSG_RECLAIMED_NONE", "You cannot manually reclaim a nick." },
     { "NSMSG_RECLAIMED_WARN", "Sent a request for %s to change their nick." },
     { "NSMSG_RECLAIMED_SVSNICK", "Forcibly changed %s's nick." },
@@ -577,6 +580,7 @@ free_handle_info(void *vhi)
     free(hi->note);
     free(hi->fakehost);
     free(hi->kc_id);
+    free(hi->kc_id_prev);
     if (hi->cookie) {
         timeq_del(hi->cookie->expires, nickserv_free_cookie, hi->cookie, 0);
         nickserv_free_cookie(hi->cookie);
@@ -1815,6 +1819,8 @@ static NICKSERV_FUNC(cmd_handleinfo)
 
     if (hi->kc_id)
         reply("NSMSG_HANDLEINFO_KC_ID", hi->kc_id);
+    if (hi->kc_id_prev)
+        reply("NSMSG_HANDLEINFO_KC_ID_PREV", hi->kc_id_prev);
 
     if (hi->opserv_level > 0) {
         reply("NSMSG_HANDLEINFO_OPSERV_LEVEL", hi->opserv_level);
@@ -2082,6 +2088,8 @@ static NICKSERV_FUNC(cmd_rebind)
     if (!strcmp(argv[2], "*")) {
         free(hi->kc_id);
         hi->kc_id = NULL;
+        free(hi->kc_id_prev);
+        hi->kc_id_prev = NULL;
         reply("NSMSG_REBIND_CLEARED", hi->handle);
         return 1;
     }
@@ -2091,6 +2099,8 @@ static NICKSERV_FUNC(cmd_rebind)
     }
     free(hi->kc_id);
     hi->kc_id = strdup(compact);
+    free(hi->kc_id_prev);
+    hi->kc_id_prev = NULL;
     reply("NSMSG_REBIND_SET", hi->handle);
     return 1;
 }
@@ -4288,6 +4298,8 @@ nickserv_saxdb_write(struct saxdb_context *ctx) {
             saxdb_write_string(ctx, KEY_INFO, hi->infoline);
         if (hi->kc_id)
             saxdb_write_string(ctx, KEY_KC_ID, hi->kc_id);
+        if (hi->kc_id_prev)
+            saxdb_write_string(ctx, KEY_KC_ID_PREV, hi->kc_id_prev);
         if (hi->last_quit_host[0])
             saxdb_write_string(ctx, KEY_LAST_QUIT_HOST, hi->last_quit_host);
         saxdb_write_int(ctx, KEY_LAST_SEEN, hi->lastseen);
@@ -5024,6 +5036,9 @@ nickserv_db_read_handle(char *handle, dict_t obj)
     str = database_get_data(obj, KEY_KC_ID, RECDB_QSTRING);
     if (str)
         hi->kc_id = strdup(str);
+    str = database_get_data(obj, KEY_KC_ID_PREV, RECDB_QSTRING);
+    if (str)
+        hi->kc_id_prev = strdup(str);
     str = database_get_data(obj, KEY_REGISTER_ON, RECDB_QSTRING);
     hi->registered = str ? (time_t)strtoul(str, NULL, 0) : now;
     str = database_get_data(obj, KEY_LAST_SEEN, RECDB_QSTRING);
@@ -5645,6 +5660,75 @@ new_user_event(struct userNode *user, void *extra) {
     return check_user_nick(user, extra);
 }
 
+#ifdef WITH_PROTOCOL_P10
+/* A different Keycloak id under a bound name means the account was
+ * recreated in Keycloak: the name is the same person's, the account is a
+ * new one, so the handle starts over (Rubin, 2026-09-24: "if its there but
+ * different, delete+recreate data in x3.db").  Drop the handle's data the
+ * way UNREGISTER does -- the modules' unregister hooks (channel access,
+ * memos, ...), the registered nicks, everything hanging off the record --
+ * but leave the directory alone (the entry belongs to the new user) and
+ * disconnect nobody: the users logged in to the old handle are carried over
+ * to the fresh one without being re-stamped.  Same in and out of a burst.
+ * Returns the fresh handle, or NULL when it could not be created (the old
+ * one is gone then; the caller treats the announcement as unknown). */
+static struct handle_info *
+nickserv_reset_handle(struct handle_info *hi, const char *wire_id,
+                      struct userNode *claimant)
+{
+    struct userNode *users, *u, *next;
+    struct handle_info *fresh;
+    char name[NICKSERV_HANDLE_LEN+1];
+    char old_id[23];
+    unsigned int n;
+
+    safestrncpy(name, hi->handle, sizeof(name));
+    safestrncpy(old_id, hi->kc_id ? hi->kc_id : "", sizeof(old_id));
+    log_module(MAIN_LOG, LOG_WARNING,
+               "%s announced account %s with a different Keycloak id%s "
+               "(%s, was %s): account data reset (opserv level was %d)",
+               claimant->nick, name,
+               claimant->uplink->burst ? " during a burst" : "",
+               wire_id, old_id, hi->opserv_level);
+    global_message_args(MESSAGE_RECIPIENT_OPERS, "NSMSG_IDENTITY_RESET",
+                        name, wire_id, old_id);
+
+    /* Detach the logged-in users first: the modules' hooks and the free
+     * below must not find them on the record.  Detaching sends nothing to
+     * the ircd, and leaves each user's next_authed link intact, so the
+     * chain can be walked again below. */
+    users = hi->users;
+    for (u = users; u; u = u->next_authed)
+        set_user_handle_info(u, NULL, 0);
+    for (n = 0; n < unreg_func_used; n++)
+        unreg_func_list[n](NULL, hi, unreg_func_list_extra[n]);
+    if (nickserv_conf.sync_log)
+        SyncLog("UNREGISTER %s", name);
+    dict_remove(nickserv_handle_dict, name);          /* frees hi */
+    hi = NULL;
+
+    /* The same name, from nothing: X3's own registration date, no password.
+     * The directory entry that already exists is tolerated by
+     * nickserv_register(). */
+    if (!(fresh = nickserv_register(NULL, NULL, name, NULL, 1))) {
+        log_module(MAIN_LOG, LOG_ERROR,
+                   "account %s could not be recreated after its Keycloak id changed",
+                   name);
+        return NULL;
+    }
+    fresh->kc_id = strdup(wire_id);
+    /* Sessions that logged in before the recreate still carry the old id on
+     * the ircd (a burst replay, an alias attach, the ircd's login cache);
+     * remembering it keeps them from being taken for yet another recreate. */
+    fresh->kc_id_prev = old_id[0] ? strdup(old_id) : NULL;
+    for (u = users; u; u = next) {
+        next = u->next_authed;              /* re-attaching rewrites the link */
+        set_user_handle_info(u, fresh, 0);
+    }
+    return fresh;
+}
+#endif
+
 void
 handle_account(struct userNode *user, const char *stamp)
 {
@@ -5653,14 +5737,36 @@ handle_account(struct userNode *user, const char *stamp)
 
 #ifdef WITH_PROTOCOL_P10
     time_t timestamp = 0;
+    char wire_id[23] = "";            /* compact Keycloak id, "" = none */
+    char *colon2;
 
     colon = strchr(stamp, ':');
     if(colon && colon[1])
     {
+        /* Second colon, if any, begins the Keycloak id: account:ts:id */
+        colon2 = strchr(colon + 1, ':');
+        if (colon2 && colon2[1] && strlen(colon2 + 1) == 22)
+            safestrncpy(wire_id, colon2 + 1, sizeof(wire_id));
         *colon = 0;
         timestamp = strtol(colon+1, NULL, 10);
     }
     hi = dict_find(nickserv_handle_dict, stamp, NULL);
+    /* The identity first: a stored Keycloak id that differs from the
+     * announced one is a recreated account under the same name, and the
+     * handle starts over -- the timestamp check below then sees the fresh
+     * record.  No id on the wire, or none stored yet, checks nothing here
+     * (fail open; an id is adopted once the login goes through). */
+    if (hi && wire_id[0] && hi->kc_id && strcmp(hi->kc_id, wire_id)) {
+        if (hi->kc_id_prev && !strcmp(hi->kc_id_prev, wire_id))
+            /* One of this name's sessions from before the last reset (a burst
+             * replay, an alias attach, the ircd's login cache), not another
+             * recreate: it belongs to the fresh record. */
+            log_module(MAIN_LOG, LOG_INFO,
+                       "%s announced account %s with the Keycloak id a reset replaced: binding",
+                       user->nick, stamp);
+        else
+            hi = nickserv_reset_handle(hi, wire_id, user);
+    }
     /* The account timestamp is a delete detector: the wire stamp must be the
      * registration date X3 knows, or the handle is not the one the wire is
      * talking about -- a stale stamp, or an account unregistered and
@@ -5719,6 +5825,13 @@ handle_account(struct userNode *user, const char *stamp)
         if (HANDLE_FLAGGED(hi, SUSPENDED)) {
             return;
         }
+#ifdef WITH_PROTOCOL_P10
+        /* Adopt the announced id only now that the login goes through: on
+         * first use, or for a handle the LDAP autocreate made just now.  A
+         * refused login (timestamp, suspension) must not bind the handle. */
+        if (!hi->kc_id && wire_id[0])
+            hi->kc_id = strdup(wire_id);
+#endif
         set_user_handle_info(user, hi, 0);
     } else {
         log_module(MAIN_LOG, LOG_WARNING, "%s had unknown account stamp %s.", user->nick, stamp);
