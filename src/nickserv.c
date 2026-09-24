@@ -5574,60 +5574,21 @@ handle_account(struct userNode *user, const char *stamp)
         timestamp = strtol(colon+1, NULL, 10);
     }
     hi = dict_find(nickserv_handle_dict, stamp, NULL);
+    /* The account timestamp is a delete detector: the wire stamp must be the
+     * registration date X3 knows, or the handle is not the one the wire is
+     * talking about -- a stale stamp, or an account unregistered and
+     * registered again underneath a still-authenticated user -- and the bind
+     * is refused.  X3's date is never rewritten here.  (a52968b turned this
+     * into a reconciliation against the directory that overwrote the date and
+     * bound anyway; this is the check as it was before that.) */
     if(hi && timestamp && hi->registered != timestamp)
     {
-#ifdef WITH_LDAP
-        if (nickserv_conf.ldap_enable) {
-            /* Reconcile: LDAP createTimestamp is authoritative */
-            time_t ldap_time = ldap_get_user_create_time(stamp);
-
-            if (ldap_time > 0) {
-                if (ldap_time == timestamp) {
-                    /* Wire matches LDAP — correct saxdb from LDAP */
-                    log_module(MAIN_LOG, LOG_INFO,
-                               "%s using account %s: wire timestamp %lu matches LDAP, "
-                               "correcting saxdb from %lu",
-                               user->nick, stamp, (unsigned long)timestamp,
-                               (unsigned long)hi->registered);
-                    hi->registered = ldap_time;
-                } else {
-                    /* Wire doesn't match LDAP — reject */
-                    log_module(MAIN_LOG, LOG_ERROR,
-                               "%s using account %s: timestamp mismatch! "
-                               "wire=%lu saxdb=%lu ldap=%lu",
-                               user->nick, stamp, (unsigned long)timestamp,
-                               (unsigned long)hi->registered, (unsigned long)ldap_time);
-                    return;
-                }
-            } else {
-                /* LDAP unavailable or no createTimestamp — accept wire if sane */
-                if (timestamp > 946684800 && timestamp <= (time_t)(now + 60)) {
-                    log_module(MAIN_LOG, LOG_INFO,
-                               "%s using account %s: LDAP lookup failed, "
-                               "accepting wire timestamp %lu (was %lu)",
-                               user->nick, stamp, (unsigned long)timestamp,
-                               (unsigned long)hi->registered);
-                    hi->registered = timestamp;
-                } else {
-                    log_module(MAIN_LOG, LOG_WARNING,
-                               "%s using account %s: LDAP lookup failed and wire "
-                               "timestamp %lu is out of range (saxdb=%lu), rejecting",
-                               user->nick, stamp, (unsigned long)timestamp,
-                               (unsigned long)hi->registered);
-                    return;
-                }
-            }
-        } else
-#endif
-        {
-            /* No LDAP — original behavior: reject on mismatch */
-            log_module(MAIN_LOG, LOG_WARNING,
-                       "%s using account %s but timestamp does not match: "
-                       "wire=%lu saxdb=%lu",
-                       user->nick, stamp, (unsigned long)timestamp,
-                       (unsigned long)hi->registered);
-            return;
-        }
+        log_module(MAIN_LOG, LOG_WARNING,
+                   "%s using account %s but timestamp does not match: "
+                   "wire=%lu saxdb=%lu",
+                   user->nick, stamp, (unsigned long)timestamp,
+                   (unsigned long)hi->registered);
+        return;
     }
 #else
     hi = dict_find(nickserv_id_dict, stamp, NULL);
@@ -5662,13 +5623,6 @@ handle_account(struct userNode *user, const char *stamp)
             if(email) {
                 nickserv_set_email_addr(hi, email);
                 free(email);
-            }
-
-            /* Set registered time from LDAP createTimestamp if available */
-            {
-                time_t ldap_time = ldap_get_user_create_time(stamp);
-                if (ldap_time > 0)
-                    hi->registered = ldap_time;
             }
         }
     }
