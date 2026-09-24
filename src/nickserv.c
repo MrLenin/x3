@@ -2097,10 +2097,14 @@ static NICKSERV_FUNC(cmd_rebind)
         reply("NSMSG_REBIND_BADID");
         return 0;
     }
-    free(hi->kc_id);
-    hi->kc_id = strdup(compact);
-    free(hi->kc_id_prev);
-    hi->kc_id_prev = NULL;
+    if (!hi->kc_id || strcmp(hi->kc_id, compact)) {
+        /* The id being replaced is remembered, as after a reset: the
+         * sessions still carrying it are this name's, and must bind rather
+         * than reset the account the operator is trying to keep. */
+        free(hi->kc_id_prev);
+        hi->kc_id_prev = hi->kc_id;
+        hi->kc_id = strdup(compact);
+    }
     reply("NSMSG_REBIND_SET", hi->handle);
     return 1;
 }
@@ -5670,17 +5674,17 @@ new_user_event(struct userNode *user, void *extra) {
  * but leave the directory alone (the entry belongs to the new user) and
  * disconnect nobody: the users logged in to the old handle are carried over
  * to the fresh one without being re-stamped.  Same in and out of a burst.
- * Returns the fresh handle, or NULL when it could not be created (the old
- * one is gone then; the caller treats the announcement as unknown). */
+ * Returns the fresh handle. */
 static struct handle_info *
 nickserv_reset_handle(struct handle_info *hi, const char *wire_id,
                       struct userNode *claimant)
 {
-    struct userNode *users, *u, *next;
+    struct userNode *carried = NULL, *u, *next;
     struct handle_info *fresh;
     char name[NICKSERV_HANDLE_LEN+1];
     char old_id[23];
     unsigned int n;
+    int warn_clones;
 
     safestrncpy(name, hi->handle, sizeof(name));
     safestrncpy(old_id, hi->kc_id ? hi->kc_id : "", sizeof(old_id));
@@ -5693,13 +5697,18 @@ nickserv_reset_handle(struct handle_info *hi, const char *wire_id,
     global_message_args(MESSAGE_RECIPIENT_OPERS, "NSMSG_IDENTITY_RESET",
                         name, wire_id, old_id);
 
-    /* Detach the logged-in users first: the modules' hooks and the free
-     * below must not find them on the record.  Detaching sends nothing to
-     * the ircd, and leaves each user's next_authed link intact, so the
-     * chain can be walked again below. */
-    users = hi->users;
-    for (u = users; u; u = u->next_authed)
+    /* Detach every logged-in user first: the modules' hooks and the free
+     * below must not find them on the record.  set_user_handle_info(u, NULL)
+     * unlinks u from the head and nulls u->next_authed, so take them off one
+     * at a time and keep them on a chain of our own.  Detaching sends
+     * nothing to the ircd. */
+    while ((u = hi->users)) {
         set_user_handle_info(u, NULL, 0);
+        if (!u->dead) {
+            u->next_authed = carried;
+            carried = u;
+        }
+    }
     for (n = 0; n < unreg_func_used; n++)
         unreg_func_list[n](NULL, hi, unreg_func_list_extra[n]);
     if (nickserv_conf.sync_log)
@@ -5707,24 +5716,35 @@ nickserv_reset_handle(struct handle_info *hi, const char *wire_id,
     dict_remove(nickserv_handle_dict, name);          /* frees hi */
     hi = NULL;
 
-    /* The same name, from nothing: X3's own registration date, no password.
-     * The directory entry that already exists is tolerated by
-     * nickserv_register(). */
-    if (!(fresh = nickserv_register(NULL, NULL, name, NULL, 1))) {
-        log_module(MAIN_LOG, LOG_ERROR,
-                   "account %s could not be recreated after its Keycloak id changed",
-                   name);
-        return NULL;
-    }
+    /* The same name, from nothing: X3's own registration date, no password,
+     * no registered nick, and no directory step -- the entry there already
+     * belongs to the new user, and a failing writeback must not be able to
+     * lose the record after the old one is gone.  Mirrors what
+     * nickserv_register() initialises. */
+    fresh = register_handle(name, "", 0);
+    fresh->masks = alloc_string_list(1);
+    fresh->sslfps = alloc_string_list(1);
+    fresh->ignores = alloc_string_list(1);
+    fresh->users = NULL;
+    fresh->language = lang_C;
+    fresh->lastseen = now;
+    fresh->registered = now;
+    fresh->flags = HI_DEFAULT_FLAGS;
     fresh->kc_id = strdup(wire_id);
     /* Sessions that logged in before the recreate still carry the old id on
      * the ircd (a burst replay, an alias attach, the ircd's login cache);
      * remembering it keeps them from being taken for yet another recreate. */
     fresh->kc_id_prev = old_id[0] ? strdup(old_id) : NULL;
-    for (u = users; u; u = next) {
+
+    /* Re-attach the carried users: a real re-auth as far as the modules are
+     * concerned, minus the clone-login warnings, since nobody logged in. */
+    warn_clones = nickserv_conf.warn_clone_auth;
+    nickserv_conf.warn_clone_auth = 0;
+    for (u = carried; u; u = next) {
         next = u->next_authed;              /* re-attaching rewrites the link */
         set_user_handle_info(u, fresh, 0);
     }
+    nickserv_conf.warn_clone_auth = warn_clones;
     return fresh;
 }
 #endif
