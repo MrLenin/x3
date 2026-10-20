@@ -355,7 +355,7 @@ static const struct message_entry msgtab[] = {
     { "NSMSG_REBIND_SET", "Keycloak id set for account %s." },
     { "NSMSG_REBIND_BADID", "Give the account's Keycloak ID -- the UUID from the admin console (e.g. 6ba7b810-9dad-11d1-80b4-00c04fd430c8), or * to clear." },
     { "NSMSG_IDENTITY_RESET", "Account $b%s$b was recreated in Keycloak (id %s, was %s): its data has been reset." },
-    { "NSMSG_IDENTITY_MISMATCH", "Account $b%s$b was announced with a different Keycloak id (%s, stored %s): not reset; keeping the stored id." },
+    { "NSMSG_IDENTITY_MISMATCH", "Account $b%s$b was announced with a different Keycloak id (%s, stored %s): login refused. REBIND the account if the user was recreated." },
     { "NSMSG_RECLAIMED_NONE", "You cannot manually reclaim a nick." },
     { "NSMSG_RECLAIMED_WARN", "Sent a request for %s to change their nick." },
     { "NSMSG_RECLAIMED_SVSNICK", "Forcibly changed %s's nick." },
@@ -5779,7 +5779,7 @@ handle_account(struct userNode *user, const char *stamp)
      * announced one is a recreated account under the same name, and the
      * handle starts over -- the timestamp check below then sees the fresh
      * record -- but only when keycloak_id_reset is on; by default the
-     * mismatch is logged and told to opers and the stored id stays.  No id
+     * mismatch is logged, told to opers and the bind refused.  No id
      * on the wire, or none stored yet, checks nothing here (fail open; an
      * id is adopted once the login goes through). */
     if (hi && wire_id[0] && hi->kc_id && strcmp(hi->kc_id, wire_id)) {
@@ -5793,17 +5793,21 @@ handle_account(struct userNode *user, const char *stamp)
         else if (nickserv_conf.kc_id_reset)
             hi = nickserv_reset_handle(hi, wire_id, user);
         else {
-            /* The default: report it and keep the stored id and the data.
-             * The reset above is Rubin's "it resets them" rule, kept behind
-             * keycloak_id_reset for a network that wants it. */
+            /* The default: the wire is not talking about this handle.  Log
+             * it, tell opers, keep the stored id and the data, and refuse
+             * the bind -- the user stays logged in at the ircd but is nobody
+             * to X3 until an oper REBINDs or the id is cleared.  The reset
+             * above is the recreated-user rule, kept behind keycloak_id_reset
+             * for a network that wants it. */
             log_module(MAIN_LOG, LOG_WARNING,
                        "%s announced account %s with a different Keycloak id%s "
-                       "(%s, stored %s): not reset (keycloak_id_reset is off)",
+                       "(%s, stored %s): bind refused (keycloak_id_reset is off)",
                        user->nick, stamp,
                        user->uplink->burst ? " during a burst" : "",
                        wire_id, hi->kc_id);
             global_message_args(MESSAGE_RECIPIENT_OPERS, "NSMSG_IDENTITY_MISMATCH",
                                 stamp, wire_id, hi->kc_id);
+            return;
         }
     }
     /* The account timestamp is a delete detector: the wire stamp must be the
