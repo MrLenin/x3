@@ -119,6 +119,7 @@
 #define KEY_FAKEHOST "fakehost"
 #define KEY_KC_ID "kc_id"
 #define KEY_KC_ID_PREV "kc_id_prev"
+#define KEY_KC_ID_RESET "keycloak_id_reset"
 #define KEY_NOTE_NOTE "note"
 #define KEY_NOTE_SETTER "setter"
 #define KEY_NOTE_DATE "date"
@@ -354,6 +355,7 @@ static const struct message_entry msgtab[] = {
     { "NSMSG_REBIND_SET", "Keycloak id set for account %s." },
     { "NSMSG_REBIND_BADID", "Give the account's Keycloak ID -- the UUID from the admin console (e.g. 6ba7b810-9dad-11d1-80b4-00c04fd430c8), or * to clear." },
     { "NSMSG_IDENTITY_RESET", "Account $b%s$b was recreated in Keycloak (id %s, was %s): its data has been reset." },
+    { "NSMSG_IDENTITY_MISMATCH", "Account $b%s$b was announced with a different Keycloak id (%s, stored %s): not reset; keeping the stored id." },
     { "NSMSG_RECLAIMED_NONE", "You cannot manually reclaim a nick." },
     { "NSMSG_RECLAIMED_WARN", "Sent a request for %s to change their nick." },
     { "NSMSG_RECLAIMED_SVSNICK", "Forcibly changed %s's nick." },
@@ -5451,6 +5453,8 @@ nickserv_conf_read(void)
     nickserv_conf.email_visible_level = str ? strtoul(str, NULL, 0) : 800;
     str = database_get_data(conf_node, KEY_EMAIL_ENABLED, RECDB_QSTRING);
     nickserv_conf.email_enabled = str ? enabled_string(str) : 0;
+    str = database_get_data(conf_node, KEY_KC_ID_RESET, RECDB_QSTRING);
+    nickserv_conf.kc_id_reset = str ? enabled_string(str) : 0;
     str = database_get_data(conf_node, KEY_SYNC_LOG, RECDB_QSTRING);
     nickserv_conf.sync_log = str ? enabled_string(str) : 0;
     str = database_get_data(conf_node, KEY_COOKIE_TIMEOUT, RECDB_QSTRING);
@@ -5774,8 +5778,10 @@ handle_account(struct userNode *user, const char *stamp)
     /* The identity first: a stored Keycloak id that differs from the
      * announced one is a recreated account under the same name, and the
      * handle starts over -- the timestamp check below then sees the fresh
-     * record.  No id on the wire, or none stored yet, checks nothing here
-     * (fail open; an id is adopted once the login goes through). */
+     * record -- but only when keycloak_id_reset is on; by default the
+     * mismatch is logged and told to opers and the stored id stays.  No id
+     * on the wire, or none stored yet, checks nothing here (fail open; an
+     * id is adopted once the login goes through). */
     if (hi && wire_id[0] && hi->kc_id && strcmp(hi->kc_id, wire_id)) {
         if (hi->kc_id_prev && !strcmp(hi->kc_id_prev, wire_id))
             /* One of this name's sessions from before the last reset (a burst
@@ -5784,8 +5790,21 @@ handle_account(struct userNode *user, const char *stamp)
             log_module(MAIN_LOG, LOG_INFO,
                        "%s announced account %s with the Keycloak id a reset replaced: binding",
                        user->nick, stamp);
-        else
+        else if (nickserv_conf.kc_id_reset)
             hi = nickserv_reset_handle(hi, wire_id, user);
+        else {
+            /* The default: report it and keep the stored id and the data.
+             * The reset above is Rubin's "it resets them" rule, kept behind
+             * keycloak_id_reset for a network that wants it. */
+            log_module(MAIN_LOG, LOG_WARNING,
+                       "%s announced account %s with a different Keycloak id%s "
+                       "(%s, stored %s): not reset (keycloak_id_reset is off)",
+                       user->nick, stamp,
+                       user->uplink->burst ? " during a burst" : "",
+                       wire_id, hi->kc_id);
+            global_message_args(MESSAGE_RECIPIENT_OPERS, "NSMSG_IDENTITY_MISMATCH",
+                                stamp, wire_id, hi->kc_id);
+        }
     }
     /* The account timestamp is a delete detector: the wire stamp must be the
      * registration date X3 knows, or the handle is not the one the wire is

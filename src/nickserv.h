@@ -152,6 +152,7 @@ struct nickserv_config {
     unsigned int autogag_enabled : 1;
     unsigned int email_enabled : 1;
     unsigned int email_required : 1;
+    unsigned int kc_id_reset : 1;
     unsigned int default_hostmask : 1;
     unsigned int warn_nick_owned : 1;
     unsigned int warn_clone_auth : 1;

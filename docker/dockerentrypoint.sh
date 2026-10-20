@@ -23,6 +23,9 @@ else
     : "${X3_UPLINK_PORT:=8888}"
     : "${X3_UPLINK_PASSWORD:=changeme}"
 
+    # Keycloak identity: the reset on a different id is off unless overridden
+    : "${X3_KC_ID_RESET:=0}"
+
     # LDAP defaults (disabled unless overridden)
     : "${X3_LDAP_ENABLE:=0}"
     : "${X3_LDAP_URI:=ldap://localhost:389}"
