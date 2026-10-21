@@ -353,8 +353,10 @@ static const struct message_entry msgtab[] = {
     { "NSMSG_RECLAIM_KILL", "Unauthenticated user of nick." },
     { "NSMSG_REBIND_CLEARED", "Keycloak id binding cleared for account %s; the next login will adopt one." },
     { "NSMSG_REBIND_SET", "Keycloak id set for account %s." },
+    { "NSMSG_REBIND_DETACHED", "%d session(s) logged in under the previous id were detached." },
     { "NSMSG_REBIND_BADID", "Give the account's Keycloak ID -- the UUID from the admin console (e.g. 6ba7b810-9dad-11d1-80b4-00c04fd430c8), or * to clear." },
     { "NSMSG_IDENTITY_RESET", "Account $b%s$b was recreated in Keycloak (id %s, was %s): its data has been reset." },
+    { "NSMSG_IDENTITY_STALE", "Account $b%s$b was announced with the Keycloak id it had before (%s, now %s): login refused." },
     { "NSMSG_IDENTITY_MISMATCH", "Account $b%s$b was announced with a different Keycloak id (%s, stored %s): login refused. REBIND the account if the user was recreated." },
     { "NSMSG_RECLAIMED_NONE", "You cannot manually reclaim a nick." },
     { "NSMSG_RECLAIMED_WARN", "Sent a request for %s to change their nick." },
@@ -2100,12 +2102,22 @@ static NICKSERV_FUNC(cmd_rebind)
         return 0;
     }
     if (!hi->kc_id || strcmp(hi->kc_id, compact)) {
+        struct userNode *u;
+        unsigned int detached = 0;
+
         /* The id being replaced is remembered, as after a reset: the
-         * sessions still carrying it are this name's, and must bind rather
-         * than reset the account the operator is trying to keep. */
+         * sessions still carrying it are refused rather than taken for
+         * another recreate.  The ones logged in now authenticated under
+         * the old identity, so they go. */
         free(hi->kc_id_prev);
         hi->kc_id_prev = hi->kc_id;
         hi->kc_id = strdup(compact);
+        while ((u = hi->users)) {
+            set_user_handle_info(u, NULL, 0);
+            detached++;
+        }
+        if (detached)
+            reply("NSMSG_REBIND_DETACHED", detached);
     }
     reply("NSMSG_REBIND_SET", hi->handle);
     return 1;
@@ -5676,19 +5688,19 @@ new_user_event(struct userNode *user, void *extra) {
  * way UNREGISTER does -- the modules' unregister hooks (channel access,
  * memos, ...), the registered nicks, everything hanging off the record --
  * but leave the directory alone (the entry belongs to the new user) and
- * disconnect nobody: the users logged in to the old handle are carried over
- * to the fresh one without being re-stamped.  Same in and out of a burst.
- * Returns the fresh handle. */
+ * disconnect nobody: the users logged in to the old handle are detached
+ * (they authenticated as the previous owner; the ircd still has them logged
+ * in, X3 no longer knows them) and only the claimant is bound, by the
+ * caller.  Same in and out of a burst.  Returns the fresh handle. */
 static struct handle_info *
 nickserv_reset_handle(struct handle_info *hi, const char *wire_id,
                       struct userNode *claimant)
 {
-    struct userNode *carried = NULL, *u, *next;
+    struct userNode *u;
     struct handle_info *fresh;
     char name[NICKSERV_HANDLE_LEN+1];
     char old_id[23];
     unsigned int n;
-    int warn_clones;
 
     safestrncpy(name, hi->handle, sizeof(name));
     safestrncpy(old_id, hi->kc_id ? hi->kc_id : "", sizeof(old_id));
@@ -5701,18 +5713,14 @@ nickserv_reset_handle(struct handle_info *hi, const char *wire_id,
     global_message_args(MESSAGE_RECIPIENT_OPERS, "NSMSG_IDENTITY_RESET",
                         name, wire_id, old_id);
 
-    /* Detach every logged-in user first: the modules' hooks and the free
-     * below must not find them on the record.  set_user_handle_info(u, NULL)
-     * unlinks u from the head and nulls u->next_authed, so take them off one
-     * at a time and keep them on a chain of our own.  Detaching sends
-     * nothing to the ircd. */
-    while ((u = hi->users)) {
+    /* Detach every logged-in user: they authenticated as the user the old
+     * id named, and the fresh record belongs to someone else -- carrying
+     * them over would hand the old owner's sessions the new owner's
+     * identity.  They stay logged in at the ircd and are nobody to X3
+     * until they authenticate again (which the recreated user's
+     * credentials decide).  Detaching sends nothing to the ircd. */
+    while ((u = hi->users))
         set_user_handle_info(u, NULL, 0);
-        if (!u->dead) {
-            u->next_authed = carried;
-            carried = u;
-        }
-    }
     for (n = 0; n < unreg_func_used; n++)
         unreg_func_list[n](NULL, hi, unreg_func_list_extra[n]);
     if (nickserv_conf.sync_log)
@@ -5737,18 +5745,9 @@ nickserv_reset_handle(struct handle_info *hi, const char *wire_id,
     fresh->kc_id = strdup(wire_id);
     /* Sessions that logged in before the recreate still carry the old id on
      * the ircd (a burst replay, an alias attach, the ircd's login cache);
-     * remembering it keeps them from being taken for yet another recreate. */
+     * remembering it tells them apart from yet another recreate: they are
+     * refused, not reset. */
     fresh->kc_id_prev = old_id[0] ? strdup(old_id) : NULL;
-
-    /* Re-attach the carried users: a real re-auth as far as the modules are
-     * concerned, minus the clone-login warnings, since nobody logged in. */
-    warn_clones = nickserv_conf.warn_clone_auth;
-    nickserv_conf.warn_clone_auth = 0;
-    for (u = carried; u; u = next) {
-        next = u->next_authed;              /* re-attaching rewrites the link */
-        set_user_handle_info(u, fresh, 0);
-    }
-    nickserv_conf.warn_clone_auth = warn_clones;
     return fresh;
 }
 #endif
@@ -5783,13 +5782,21 @@ handle_account(struct userNode *user, const char *stamp)
      * on the wire, or none stored yet, checks nothing here (fail open; an
      * id is adopted once the login goes through). */
     if (hi && wire_id[0] && hi->kc_id && strcmp(hi->kc_id, wire_id)) {
-        if (hi->kc_id_prev && !strcmp(hi->kc_id_prev, wire_id))
-            /* One of this name's sessions from before the last reset (a burst
-             * replay, an alias attach, the ircd's login cache), not another
-             * recreate: it belongs to the fresh record. */
-            log_module(MAIN_LOG, LOG_INFO,
-                       "%s announced account %s with the Keycloak id a reset replaced: binding",
-                       user->nick, stamp);
+        if (hi->kc_id_prev && !strcmp(hi->kc_id_prev, wire_id)) {
+            /* A session from before the id was replaced (a burst replay, an
+             * alias attach, the ircd's login cache): the previous owner's,
+             * not the handle's.  Refused, and not taken for yet another
+             * recreate either. */
+            log_module(MAIN_LOG, LOG_WARNING,
+                       "%s announced account %s with the Keycloak id it had before%s "
+                       "(%s, now %s): bind refused",
+                       user->nick, stamp,
+                       user->uplink->burst ? " during a burst" : "",
+                       wire_id, hi->kc_id);
+            global_message_args(MESSAGE_RECIPIENT_OPERS, "NSMSG_IDENTITY_STALE",
+                                stamp, wire_id, hi->kc_id);
+            return;
+        }
         else if (nickserv_conf.kc_id_reset)
             hi = nickserv_reset_handle(hi, wire_id, user);
         else {
