@@ -1739,6 +1739,17 @@ static CMD_FUNC(cmd_account)
     {
         /* Replies to an S/H request, never something to bind. */
     }
+    else if(!argv[2][0] || !argv[2][1])
+    {
+        /* A single character is a subcommand, never an account: an
+         * extended-accounts ircd always sends one there (nefarious refuses
+         * anything longer as the old syntax).  One this X3 does not know is
+         * ignored, not bound as a handle named after the letter.  Only the
+         * old form, whose second parameter is the account itself, falls
+         * through to the bind below. */
+        log_module(MAIN_LOG, LOG_DEBUG, "Ignoring unknown ACCOUNT subcommand '%s' for %s",
+                   argv[2], user->nick);
+    }
     else
         call_account_func(user, argv[2]); /* legacy AC <user> <account> [ts] */
     return 1;
