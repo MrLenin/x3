@@ -586,6 +586,65 @@ handle_kcid_valid(const char *id)
     return i == 22;
 }
 
+/* The ids a handle's binding replaced (hi->kc_id_replaced): newest first,
+ * at most KC_ID_REPLACED_MAX, never the current id. */
+static int
+handle_kcid_was_replaced(const struct handle_info *hi, const char *id)
+{
+    unsigned int i;
+
+    for (i = 0; i < KC_ID_REPLACED_MAX && hi->kc_id_replaced[i]; i++)
+        if (!strcmp(hi->kc_id_replaced[i], id))
+            return 1;
+    return 0;
+}
+
+/* Take id off the replaced list, if it is there.  id must not be one of
+ * the list's own strings. */
+static void
+handle_kcid_unremember(struct handle_info *hi, const char *id)
+{
+    unsigned int i, j;
+
+    for (i = j = 0; i < KC_ID_REPLACED_MAX && hi->kc_id_replaced[i]; i++) {
+        if (!strcmp(hi->kc_id_replaced[i], id))
+            free(hi->kc_id_replaced[i]);
+        else
+            hi->kc_id_replaced[j++] = hi->kc_id_replaced[i];
+    }
+    while (j < i)
+        hi->kc_id_replaced[j++] = NULL;
+}
+
+/* Remember id (an allocated string the list takes over) as the newest
+ * replaced id: one already there moves to the front, and the oldest drops
+ * off when the list is full. */
+static void
+handle_kcid_remember(struct handle_info *hi, char *id)
+{
+    unsigned int n;
+
+    handle_kcid_unremember(hi, id);
+    for (n = 0; n < KC_ID_REPLACED_MAX && hi->kc_id_replaced[n]; n++)
+        ;
+    if (n == KC_ID_REPLACED_MAX)
+        free(hi->kc_id_replaced[--n]);
+    memmove(hi->kc_id_replaced + 1, hi->kc_id_replaced,
+            n * sizeof(hi->kc_id_replaced[0]));
+    hi->kc_id_replaced[0] = id;
+}
+
+static void
+handle_kcid_forget_replaced(struct handle_info *hi)
+{
+    unsigned int i;
+
+    for (i = 0; i < KC_ID_REPLACED_MAX; i++) {
+        free(hi->kc_id_replaced[i]);
+        hi->kc_id_replaced[i] = NULL;
+    }
+}
+
 static void
 free_handle_info(void *vhi)
 {
@@ -603,7 +662,7 @@ free_handle_info(void *vhi)
     free(hi->note);
     free(hi->fakehost);
     free(hi->kc_id);
-    free(hi->kc_id_prev);
+    handle_kcid_forget_replaced(hi);
     if (hi->cookie) {
         timeq_del(hi->cookie->expires, nickserv_free_cookie, hi->cookie, 0);
         nickserv_free_cookie(hi->cookie);
@@ -1845,8 +1904,8 @@ static NICKSERV_FUNC(cmd_handleinfo)
     if (IsOper(user)) {
         if (hi->kc_id)
             reply("NSMSG_HANDLEINFO_KC_ID", hi->kc_id);
-        if (hi->kc_id_prev)
-            reply("NSMSG_HANDLEINFO_KC_ID_PREV", hi->kc_id_prev);
+        for (i = 0; i < KC_ID_REPLACED_MAX && hi->kc_id_replaced[i]; i++)
+            reply("NSMSG_HANDLEINFO_KC_ID_PREV", hi->kc_id_replaced[i]);
     }
 
     if (hi->opserv_level > 0) {
@@ -2115,8 +2174,7 @@ static NICKSERV_FUNC(cmd_rebind)
     if (!strcmp(argv[2], "*")) {
         free(hi->kc_id);
         hi->kc_id = NULL;
-        free(hi->kc_id_prev);
-        hi->kc_id_prev = NULL;
+        handle_kcid_forget_replaced(hi);
         reply("NSMSG_REBIND_CLEARED", hi->handle);
         return 1;
     }
@@ -2131,9 +2189,11 @@ static NICKSERV_FUNC(cmd_rebind)
         /* The id being replaced is remembered, as after a reset: the
          * sessions still carrying it are refused rather than taken for
          * another recreate.  The ones logged in now authenticated under
-         * the old identity, so they go. */
-        free(hi->kc_id_prev);
-        hi->kc_id_prev = hi->kc_id;
+         * the old identity, so they go.  The new id is no longer a
+         * replaced one, if it was. */
+        handle_kcid_unremember(hi, compact);
+        if (hi->kc_id)
+            handle_kcid_remember(hi, hi->kc_id);
         hi->kc_id = strdup(compact);
         while ((u = hi->users)) {
             set_user_handle_info(u, NULL, 0);
@@ -4339,8 +4399,18 @@ nickserv_saxdb_write(struct saxdb_context *ctx) {
             saxdb_write_string(ctx, KEY_INFO, hi->infoline);
         if (hi->kc_id)
             saxdb_write_string(ctx, KEY_KC_ID, hi->kc_id);
-        if (hi->kc_id_prev)
-            saxdb_write_string(ctx, KEY_KC_ID_PREV, hi->kc_id_prev);
+        if (hi->kc_id_replaced[0]) {
+            /* A string list, newest first (a single-id X3 wrote a string
+             * here; the reader takes both). */
+            struct string_list replaced;
+
+            replaced.list = hi->kc_id_replaced;
+            replaced.size = KC_ID_REPLACED_MAX;
+            for (replaced.used = 0; replaced.used < KC_ID_REPLACED_MAX
+                     && hi->kc_id_replaced[replaced.used]; replaced.used++)
+                ;
+            saxdb_write_string_list(ctx, KEY_KC_ID_PREV, &replaced);
+        }
         if (hi->last_quit_host[0])
             saxdb_write_string(ctx, KEY_LAST_QUIT_HOST, hi->last_quit_host);
         saxdb_write_int(ctx, KEY_LAST_SEEN, hi->lastseen);
@@ -5077,9 +5147,16 @@ nickserv_db_read_handle(char *handle, dict_t obj)
     str = database_get_data(obj, KEY_KC_ID, RECDB_QSTRING);
     if (str)
         hi->kc_id = strdup(str);
-    str = database_get_data(obj, KEY_KC_ID_PREV, RECDB_QSTRING);
-    if (str)
-        hi->kc_id_prev = strdup(str);
+    /* The replaced ids: a list, newest first; a record written by a
+     * single-id X3 holds one string under the same key. */
+    slist = database_get_data(obj, KEY_KC_ID_PREV, RECDB_STRING_LIST);
+    if (slist) {
+        /* Oldest first, so the newest end up in front and survive a list
+         * longer than KC_ID_REPLACED_MAX. */
+        for (ii = slist->used; ii > 0; ii--)
+            handle_kcid_remember(hi, strdup(slist->list[ii - 1]));
+    } else if ((str = database_get_data(obj, KEY_KC_ID_PREV, RECDB_QSTRING)))
+        handle_kcid_remember(hi, strdup(str));
     str = database_get_data(obj, KEY_REGISTER_ON, RECDB_QSTRING);
     hi->registered = str ? (time_t)strtoul(str, NULL, 0) : now;
     str = database_get_data(obj, KEY_LAST_SEEN, RECDB_QSTRING);
@@ -5723,10 +5800,16 @@ nickserv_reset_handle(struct handle_info *hi, const char *wire_id,
     struct handle_info *fresh;
     char name[NICKSERV_HANDLE_LEN+1];
     char old_id[23];
+    char *replaced[KC_ID_REPLACED_MAX];
     unsigned int n;
 
     safestrncpy(name, hi->handle, sizeof(name));
     safestrncpy(old_id, hi->kc_id ? hi->kc_id : "", sizeof(old_id));
+    /* The ids the old record had already replaced go to the fresh one:
+     * sessions from any earlier incarnation are told apart, not just the
+     * last one's. */
+    memcpy(replaced, hi->kc_id_replaced, sizeof(replaced));
+    memset(hi->kc_id_replaced, 0, sizeof(hi->kc_id_replaced));
     log_module(MAIN_LOG, LOG_WARNING,
                "%s announced account %s with a different Keycloak id%s "
                "(%s, was %s): account data reset (opserv level was %d)",
@@ -5769,8 +5852,12 @@ nickserv_reset_handle(struct handle_info *hi, const char *wire_id,
     /* Sessions that logged in before the recreate still carry the old id on
      * the ircd (a burst replay, an alias attach, the ircd's login cache);
      * remembering it tells them apart from yet another recreate: they are
-     * refused, not reset. */
-    fresh->kc_id_prev = old_id[0] ? strdup(old_id) : NULL;
+     * refused, not reset.  The same goes for the ids the old record had
+     * replaced itself, newest first behind the old id. */
+    memcpy(fresh->kc_id_replaced, replaced, sizeof(replaced));
+    if (old_id[0])
+        handle_kcid_remember(fresh, strdup(old_id));
+    handle_kcid_unremember(fresh, wire_id);
     return fresh;
 }
 #endif
@@ -5811,7 +5898,7 @@ handle_account(struct userNode *user, const char *stamp)
      * on the wire, or none stored yet, checks nothing here (fail open; an
      * id is adopted once the login goes through). */
     if (hi && wire_id[0] && hi->kc_id && strcmp(hi->kc_id, wire_id)) {
-        if (hi->kc_id_prev && !strcmp(hi->kc_id_prev, wire_id)) {
+        if (handle_kcid_was_replaced(hi, wire_id)) {
             /* A session from before the id was replaced (a burst replay, an
              * alias attach, the ircd's login cache): the previous owner's,
              * not the handle's.  Refused, and not taken for yet another
