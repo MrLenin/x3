@@ -567,6 +567,25 @@ nickserv_free_cookie(void *data)
     free(cookie);
 }
 
+/* A compact Keycloak id as the ircd sends it: exactly 22 characters of
+ * base64url, no padding (nefarious account_id_valid).  The alphabet is
+ * spelled out rather than isalnum(), which follows the locale. */
+static int
+handle_kcid_valid(const char *id)
+{
+    int i;
+
+    if (!id)
+        return 0;
+    for (i = 0; id[i]; i++) {
+        int c = (unsigned char)id[i];
+        if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z')
+              || (c >= '0' && c <= '9') || c == '-' || c == '_'))
+            return 0;
+    }
+    return i == 22;
+}
+
 static void
 free_handle_info(void *vhi)
 {
@@ -5766,10 +5785,16 @@ handle_account(struct userNode *user, const char *stamp)
     colon = strchr(stamp, ':');
     if(colon && colon[1])
     {
-        /* Second colon, if any, begins the Keycloak id: account:ts:id */
+        /* Second colon, if any, begins the Keycloak id: account:ts:id.
+         * One that is not a compact id is no id at all. */
         colon2 = strchr(colon + 1, ':');
-        if (colon2 && colon2[1] && strlen(colon2 + 1) == 22)
-            safestrncpy(wire_id, colon2 + 1, sizeof(wire_id));
+        if (colon2 && colon2[1]) {
+            if (handle_kcid_valid(colon2 + 1))
+                safestrncpy(wire_id, colon2 + 1, sizeof(wire_id));
+            else
+                log_module(MAIN_LOG, LOG_DEBUG, "%s: malformed Keycloak id in "
+                           "account stamp %s; taken as no id", user->nick, stamp);
+        }
         *colon = 0;
         timestamp = strtol(colon+1, NULL, 10);
     }
