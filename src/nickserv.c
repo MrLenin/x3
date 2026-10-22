@@ -1840,10 +1840,14 @@ static NICKSERV_FUNC(cmd_handleinfo)
 	reply("NSMSG_HANDLEINFO_FLAGS", nsmsg_none);
     }
 
-    if (hi->kc_id)
-        reply("NSMSG_HANDLEINFO_KC_ID", hi->kc_id);
-    if (hi->kc_id_prev)
-        reply("NSMSG_HANDLEINFO_KC_ID_PREV", hi->kc_id_prev);
+    /* The Keycloak binding is for opers (what REBIND sets or clears), not
+     * for the account's owner, who also gets this far. */
+    if (IsOper(user)) {
+        if (hi->kc_id)
+            reply("NSMSG_HANDLEINFO_KC_ID", hi->kc_id);
+        if (hi->kc_id_prev)
+            reply("NSMSG_HANDLEINFO_KC_ID_PREV", hi->kc_id_prev);
+    }
 
     if (hi->opserv_level > 0) {
         reply("NSMSG_HANDLEINFO_OPSERV_LEVEL", hi->opserv_level);
